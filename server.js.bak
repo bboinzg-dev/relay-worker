@@ -1,0 +1,89 @@
+const express = require('express');
+const { Pool } = require('pg');
+const { Storage } = require('@google-cloud/storage');
+
+// ※ 방금 파일 이름을 .cjs 로 바꿨으므로 .cjs 로 require
+const { batchProcess } = require('./docai_client.cjs');
+const { extractRelayFields } = require('./docai_parse.cjs');
+
+const app = express();
+app.use(express.json());
+
+// DB 연결 (Private IP, sslmode=prefer / 워커에서는 DB_SSL=false 권장)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DB_SSL === 'true' ? {} : false
+});
+
+const storage = new Storage();
+
+function parseGs(gs) {
+  const s = gs.replace('gs://','');
+  const i = s.indexOf('/');
+  return { bucket: s.slice(0,i), name: s.slice(i+1) };
+}
+
+// 헬스체크
+app.get('/_healthz', (_req, res) => res.send('ok'));
+app.get('/api/health', async (_req, res) => {
+  try { await pool.query('select 1'); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+// DocAI → JSON → 스펙 업서트
+app.post('/api/worker/ingest', async (req, res) => {
+  try {
+    const pdfGsUri = req.body?.gcsPdfUri;
+    if (!pdfGsUri) return res.status(400).json({ ok:false, error: 'gcsPdfUri is required' });
+
+    const outPrefix = `gs://${process.env.GCS_BUCKET_DOCAI}/out/${Date.now()}/`;
+
+    // 1) DocAI 배치 처리
+    const { outputs } = await batchProcess(pdfGsUri, outPrefix);
+
+    // 2) 첫 JSON 결과 읽기
+    const first = outputs.find(u => u.endsWith('.json'));
+    if (!first) throw new Error('No JSON output from Document AI');
+
+    const { bucket, name } = parseGs(first);
+    const [buf] = await storage.bucket(bucket).file(name).download();
+    const doc = JSON.parse(buf.toString('utf8'));
+
+    // 3) JSON → 필드 추출
+    const f = extractRelayFields(doc);
+
+    // 4) DB 업서트 (brand, code 기준)
+    await pool.query(`
+      INSERT INTO public.relay_specs
+        (brand, code, series, contact_form, contact_rating_a,
+         coil_voltage_vdc, dim_l_mm, dim_w_mm, dim_h_mm, contact_rating_text, raw_json)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      ON CONFLICT (brand, code) DO UPDATE SET
+        series=EXCLUDED.series,
+        contact_form=EXCLUDED.contact_form,
+        contact_rating_a=EXCLUDED.contact_rating_a,
+        coil_voltage_vdc=EXCLUDED.coil_voltage_vdc,
+        dim_l_mm=EXCLUDED.dim_l_mm,
+        dim_w_mm=EXCLUDED.dim_w_mm,
+        dim_h_mm=EXCLUDED.dim_h_mm,
+        contact_rating_text=EXCLUDED.contact_rating_text,
+        raw_json=EXCLUDED.raw_json,
+        updated_at=now()
+    `, [
+      f.brand, f.code, f.series, f.contact_form, f.contact_rating_a,
+      f.coil_voltage_vdc, f.dim_l_mm, f.dim_w_mm, f.dim_h_mm,
+      f.contact_rating_text, f.raw_json
+    ]);
+
+    res.json({ ok: true, output: first, upserted: { brand: f.brand, code: f.code } });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error: String(e) });
+  }
+});
+
+// Cloud Run이 할당하는 포트로 리슨 (필수)
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Worker listening on ${PORT}`);
+});

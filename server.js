@@ -42,9 +42,7 @@ const vertex = new VertexAI({
   location: process.env.VERTEX_LOCATION || 'us-central1',
 });
 const EMBEDDING_MODEL = process.env.VERTEX_EMBEDDING_MODEL || 'text-embedding-004';
-// text → [float]
 async function embedText(text) {
-  // Vertex Generative API의 embedContent 사용
   const model = vertex.getGenerativeModel({ model: EMBEDDING_MODEL });
   const resp = await model.embedContent({
     content: { parts: [{ text: String(text || '').slice(0, 6000) }] },
@@ -57,7 +55,7 @@ async function embedText(text) {
 // ---------- helpers ----------
 function setCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 const norm = (s) => (s ?? '').toString().trim().toLowerCase();
@@ -155,11 +153,10 @@ app.get('/api/parts/detail', async (req, res) => {
     if (!rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
 
     const it = rows[0];
-    // 우선순위: 명시적 datasheet_url > pdf_uri > gcs_pdf_uri
     const raw = it.datasheet_url || it.pdf_uri || it.gcs_pdf_uri || null;
     let datasheet_url = raw;
     if (raw && String(raw).startsWith('gs://')) {
-      try { datasheet_url = await signUrl(raw, 20); } catch { /* 그대로 둠 */ }
+      try { datasheet_url = await signUrl(raw, 20); } catch {}
     }
     const image_url = it.image_url || it.cover || null;
     res.json({ ok: true, item: it, datasheet_url, image_url });
@@ -169,9 +166,7 @@ app.get('/api/parts/detail', async (req, res) => {
   }
 });
 
-// ---------- alternatives (v1 + v2) ----------
-// strategy=embedding 이고 embedding 존재하면 pgvector로 근접 이웃 조회,
-// 아니면 v1(규칙 점수화)로 대체.
+// ---------- alternatives (rules + embedding) ----------
 app.get('/api/parts/alternatives', async (req, res) => {
   try {
     setCORS(res);
@@ -180,7 +175,6 @@ app.get('/api/parts/alternatives', async (req, res) => {
     const strategy = String(req.query.strategy || 'auto'); // auto|embedding|rules
     if (!brand || !code) return res.status(400).json({ ok: false, error: 'brand, code are required' });
 
-    // 기준 부품
     const baseSql = `
       SELECT id, brand, series, code, contact_form, coil_voltage_vdc,
              dim_l_mm, dim_w_mm, dim_h_mm, pdf_uri, datasheet_url, gcs_pdf_uri,
@@ -196,7 +190,6 @@ app.get('/api/parts/alternatives', async (req, res) => {
 
     const useEmbedding = (strategy === 'embedding') || (strategy === 'auto' && base.embedding);
     if (useEmbedding && base.embedding) {
-      // v2: pgvector 근접 이웃 (cosine distance)
       const q = `
         SELECT id, brand, series, code, contact_form, coil_voltage_vdc,
                dim_l_mm, dim_w_mm, dim_h_mm, pdf_uri, datasheet_url, gcs_pdf_uri,
@@ -217,7 +210,6 @@ app.get('/api/parts/alternatives', async (req, res) => {
       return res.json({ ok: true, base: { brand: base.brand, code: base.code }, items });
     }
 
-    // v1: 규칙 기반
     const candSql = `
       SELECT id, brand, series, code, contact_form, coil_voltage_vdc,
              dim_l_mm, dim_w_mm, dim_h_mm, pdf_uri, datasheet_url, gcs_pdf_uri, updated_at
@@ -259,7 +251,6 @@ app.post('/api/embedding/backfill', async (req, res) => {
   try {
     setCORS(res);
     const limit = Math.min(parseInt(req.query.limit || '200', 10), 1000);
-    // (1) 아직 임베딩 없는 행 조회
     const { rows } = await pool.query(`
       SELECT id, brand, series, code, contact_form, contact_rating_text,
              coil_voltage_vdc, dim_l_mm, dim_w_mm, dim_h_mm
@@ -270,12 +261,10 @@ app.post('/api/embedding/backfill', async (req, res) => {
     `, [limit]);
     if (!rows.length) return res.json({ ok:true, updated: 0 });
 
-    // (2) 임베딩 생성 → 업데이트
     let updated = 0;
     for (const r of rows) {
       const text = buildSpecText(r);
       const vec = await embedText(text);
-      // vec(float[]) → Postgres vector 리터럴로 변환: '[x,y,...]'
       const literal = '[' + vec.map(v => (typeof v === 'number' ? v.toFixed(6) : '0')).join(',') + ']';
       await pool.query(`UPDATE public.relay_specs SET embedding = $1::vector WHERE id = $2`, [literal, r.id]);
       updated++;
@@ -287,7 +276,7 @@ app.post('/api/embedding/backfill', async (req, res) => {
   }
 });
 
-// ---------- search (v2: 임베딩 + 어휘 혼합) ----------
+// ---------- search (embedding + lexical) ----------
 app.get('/api/parts/search', async (req, res) => {
   try {
     setCORS(res);
@@ -300,11 +289,8 @@ app.get('/api/parts/search', async (req, res) => {
     try {
       const vec = await embedText(q);
       vectorLiteral = '[' + vec.map(v => (typeof v === 'number' ? v.toFixed(6) : '0')).join(',') + ']';
-    } catch {
-      // 임베딩 실패 시 어휘만
-    }
+    } catch {}
 
-    // 임베딩 경로
     if (vectorLiteral) {
       const sql = `
         SELECT id, brand, series, code, contact_form, coil_voltage_vdc,
@@ -326,7 +312,6 @@ app.get('/api/parts/search', async (req, res) => {
       return res.json({ ok:true, items, mode:'embedding' });
     }
 
-    // 어휘 경로(폴백)
     const like = `%${q}%`;
     const sql = `
       SELECT id, brand, series, code, contact_form, coil_voltage_vdc,
@@ -348,6 +333,392 @@ app.get('/api/parts/search', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok:false, error:'internal_error' });
+  }
+});
+
+/* ===========================
+   ========== 거래 API ==========
+   =========================== */
+
+/** Listings (정찰제 재고) */
+// GET /api/listings?brand=&code=&q=&status=active&limit=20
+app.get('/api/listings', async (req, res) => {
+  try {
+    setCORS(res);
+    const q = String(req.query.q || '').trim();
+    const brand = req.query.brand ? String(req.query.brand) : null;
+    const code = req.query.code ? String(req.query.code) : null;
+    const status = req.query.status ? String(req.query.status) : 'active';
+    const limit = Math.min(parseInt(req.query.limit || '20', 10), 100);
+
+    const params = [];
+    let where = 'WHERE 1=1';
+    if (status) { params.push(status); where += ` AND status = $${params.length}`; }
+    if (brand)  { params.push(brand);  where += ` AND lower(trim(brand)) = lower(trim($${params.length}))`; }
+    if (code)   { params.push(code);   where += ` AND lower(trim(code))  = lower(trim($${params.length}))`; }
+    if (q)      { params.push(`%${q}%`); where += ` AND (brand ILIKE $${params.length} OR code ILIKE $${params.length} OR series ILIKE $${params.length})`; }
+
+    const sql = `
+      SELECT *
+      FROM public.listings
+      ${where}
+      ORDER BY updated_at DESC NULLS LAST
+      LIMIT ${limit}
+    `;
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok:true, items: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  }
+});
+
+// POST /api/listings
+app.post('/api/listings', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    setCORS(res);
+    const {
+      seller_id, brand, code, series,
+      quantity_available, unit_price, currency,
+      lead_time_days, moq, pack_qty, note,
+      datasheet_url, gcs_pdf_uri, status
+    } = req.body || {};
+
+    if (!seller_id || !brand || !code || quantity_available == null || unit_price == null) {
+      return res.status(400).json({ ok:false, error:'seller_id, brand, code, quantity_available, unit_price required' });
+    }
+
+    await client.query('BEGIN');
+    const { rows } = await client.query(`
+      INSERT INTO public.listings
+        (seller_id, brand, code, series, quantity_available, unit_price, currency,
+         lead_time_days, moq, pack_qty, note, datasheet_url, gcs_pdf_uri, status)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,COALESCE($7,'USD'),
+         $8,$9,$10,$11,$12,$13,COALESCE($14,'active'))
+      RETURNING *
+    `, [seller_id, brand, code, series || null, quantity_available, unit_price, currency || null,
+        lead_time_days || null, moq || null, pack_qty || null, note || null, datasheet_url || null, gcs_pdf_uri || null, status || null]);
+    await client.query('COMMIT');
+    res.json({ ok:true, item: rows[0] });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  } finally {
+    client.release();
+  }
+});
+
+// PATCH /api/listings/:id
+app.patch('/api/listings/:id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    setCORS(res);
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ ok:false, error:'invalid id' });
+
+    const allowed = ['series','quantity_available','unit_price','currency','lead_time_days','moq','pack_qty','note','datasheet_url','gcs_pdf_uri','status'];
+    const fields = [];
+    const params = [];
+    let i = 1;
+    for (const k of allowed) {
+      if (k in (req.body || {})) {
+        fields.push(`${k} = $${i++}`);
+        params.push(req.body[k]);
+      }
+    }
+    if (!fields.length) return res.status(400).json({ ok:false, error:'no fields' });
+    params.push(id);
+
+    await client.query('BEGIN');
+    const { rows } = await client.query(`UPDATE public.listings SET ${fields.join(', ')}, updated_at = now() WHERE id = $${i} RETURNING *`, params);
+    await client.query('COMMIT');
+    res.json({ ok:true, item: rows[0] });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/listings/:id/purchase   { buyer_id, quantity }
+app.post('/api/listings/:id/purchase', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    setCORS(res);
+    const id = parseInt(req.params.id, 10);
+    const { buyer_id, quantity } = req.body || {};
+    if (!id || !buyer_id || !quantity || quantity <= 0) {
+      return res.status(400).json({ ok:false, error:'id, buyer_id, quantity required' });
+    }
+
+    await client.query('BEGIN');
+    const { rows: Ls } = await client.query('SELECT * FROM public.listings WHERE id = $1 FOR UPDATE', [id]);
+    if (!Ls.length) { await client.query('ROLLBACK'); return res.status(404).json({ ok:false, error:'listing_not_found' });}
+    const L = Ls[0];
+    if (L.status !== 'active') { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:'listing_inactive' });}
+    if (quantity > L.quantity_available) { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:'insufficient_stock' });}
+
+    const { rows: Os } = await client.query(`
+      INSERT INTO public.orders (listing_id, buyer_id, seller_id, quantity, unit_price, currency, lead_time_days, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'placed') RETURNING *
+    `, [L.id, buyer_id, L.seller_id, quantity, L.unit_price, L.currency, L.lead_time_days || null]);
+
+    await client.query('UPDATE public.listings SET quantity_available = quantity_available - $1, updated_at = now() WHERE id = $2', [quantity, id]);
+
+    await client.query('COMMIT');
+    res.json({ ok:true, order: Os[0], remaining: L.quantity_available - quantity });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  } finally {
+    client.release();
+  }
+});
+
+/** Purchase Requests (구매요청) */
+// GET /api/purchase-requests?status=open&brand=&code=&limit=20
+app.get('/api/purchase-requests', async (req, res) => {
+  try {
+    setCORS(res);
+    const status = req.query.status ? String(req.query.status) : null;
+    const brand = req.query.brand ? String(req.query.brand) : null;
+    const code = req.query.code ? String(req.query.code) : null;
+    const limit = Math.min(parseInt(req.query.limit || '20', 10), 100);
+
+    const params = [];
+    let where = 'WHERE 1=1';
+    if (status) { params.push(status); where += ` AND status = $${params.length}`; }
+    if (brand)  { params.push(brand);  where += ` AND lower(trim(brand)) = lower(trim($${params.length}))`; }
+    if (code)   { params.push(code);   where += ` AND lower(trim(code))  = lower(trim($${params.length}))`; }
+
+    const sql = `
+      SELECT *, (quantity_total - quantity_confirmed) AS quantity_outstanding
+      FROM public.purchase_requests
+      ${where}
+      ORDER BY created_at DESC
+      LIMIT ${limit}
+    `;
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok:true, items: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  }
+});
+
+// POST /api/purchase-requests
+app.post('/api/purchase-requests', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    setCORS(res);
+    const {
+      buyer_id, brand, code, family,
+      quantity_total, due_date, allow_alternatives, notes
+    } = req.body || {};
+    if (!buyer_id || !quantity_total) {
+      return res.status(400).json({ ok:false, error:'buyer_id, quantity_total required' });
+    }
+
+    await client.query('BEGIN');
+    const { rows } = await client.query(`
+      INSERT INTO public.purchase_requests
+        (buyer_id, brand, code, family, quantity_total, due_date, allow_alternatives, notes, status)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,COALESCE($7,true),$8,'open')
+      RETURNING *, (quantity_total - quantity_confirmed) AS quantity_outstanding
+    `, [buyer_id, brand || null, code || null, family || null, quantity_total, due_date || null, allow_alternatives, notes || null]);
+    await client.query('COMMIT');
+    res.json({ ok:true, item: rows[0] });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/purchase-requests/:id (상세 + bids)
+app.get('/api/purchase-requests/:id', async (req, res) => {
+  try {
+    setCORS(res);
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ ok:false, error:'invalid id' });
+    const { rows: PRs } = await pool.query(`
+      SELECT *, (quantity_total - quantity_confirmed) AS quantity_outstanding
+      FROM public.purchase_requests WHERE id = $1
+    `, [id]);
+    if (!PRs.length) return res.status(404).json({ ok:false, error:'not_found' });
+    const { rows: BIDs } = await pool.query(`SELECT * FROM public.bids WHERE pr_id = $1 ORDER BY created_at DESC`, [id]);
+    const { rows: FILLS } = await pool.query(`SELECT * FROM public.request_fills WHERE pr_id = $1 ORDER BY created_at DESC`, [id]);
+    res.json({ ok:true, pr: PRs[0], bids: BIDs, fills: FILLS });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  }
+});
+
+/** Bids (입찰) */
+// GET /api/bids?pr_id=...
+app.get('/api/bids', async (req, res) => {
+  try {
+    setCORS(res);
+    const pr_id = req.query.pr_id ? parseInt(String(req.query.pr_id), 10) : null;
+    if (!pr_id) return res.status(400).json({ ok:false, error:'pr_id required' });
+    const { rows } = await pool.query(`SELECT * FROM public.bids WHERE pr_id = $1 ORDER BY created_at DESC`, [pr_id]);
+    res.json({ ok:true, items: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  }
+});
+
+// POST /api/bids
+app.post('/api/bids', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    setCORS(res);
+    const {
+      pr_id, seller_id, brand, code, is_alternative,
+      offer_quantity, unit_price, currency, lead_time_days,
+      listing_id, expires_at
+    } = req.body || {};
+
+    if (!pr_id || !seller_id || !offer_quantity || !unit_price) {
+      return res.status(400).json({ ok:false, error:'pr_id, seller_id, offer_quantity, unit_price required' });
+    }
+
+    await client.query('BEGIN');
+    const { rows: PRs } = await client.query('SELECT * FROM public.purchase_requests WHERE id = $1 FOR UPDATE', [pr_id]);
+    if (!PRs.length) { await client.query('ROLLBACK'); return res.status(404).json({ ok:false, error:'pr_not_found' });}
+
+    const { rows } = await client.query(`
+      INSERT INTO public.bids
+      (pr_id, seller_id, brand, code, is_alternative, offer_quantity, unit_price, currency, lead_time_days, listing_id, expires_at, status)
+      VALUES ($1,$2,$3,$4,COALESCE($5,false),$6,$7,COALESCE($8,'USD'),$9,$10,$11,'proposed')
+      RETURNING *
+    `, [pr_id, seller_id, brand || null, code || null, is_alternative, offer_quantity, unit_price, currency || null, lead_time_days || null, listing_id || null, expires_at || null]);
+    await client.query('COMMIT');
+    res.json({ ok:true, item: rows[0] });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  } finally {
+    client.release();
+  }
+});
+
+/** Confirm(바이어가 특정 입찰 일부 또는 전체 채택) */
+// POST /api/purchase-requests/:id/confirm  { bid_id, buyer_id, quantity }
+app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    setCORS(res);
+    const pr_id = parseInt(req.params.id, 10);
+    const { bid_id, buyer_id, quantity } = req.body || {};
+    if (!pr_id || !bid_id || !buyer_id || !quantity || quantity <= 0) {
+      return res.status(400).json({ ok:false, error:'pr_id, bid_id, buyer_id, quantity required' });
+    }
+
+    await client.query('BEGIN');
+
+    // PR 락 + 검증
+    const { rows: PRs } = await client.query('SELECT * FROM public.purchase_requests WHERE id = $1 FOR UPDATE', [pr_id]);
+    if (!PRs.length) { await client.query('ROLLBACK'); return res.status(404).json({ ok:false, error:'pr_not_found' });}
+    const PR = PRs[0];
+    const outstanding = Number(PR.quantity_total) - Number(PR.quantity_confirmed);
+    if (quantity > outstanding) { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:'quantity_exceeds_outstanding' });}
+
+    // BID 락 + 검증
+    const { rows: BIDs } = await client.query('SELECT * FROM public.bids WHERE id = $1 AND pr_id = $2 FOR UPDATE', [bid_id, pr_id]);
+    if (!BIDs.length) { await client.query('ROLLBACK'); return res.status(404).json({ ok:false, error:'bid_not_found' });}
+    const BID = BIDs[0];
+    if (BID.status !== 'proposed' && BID.status !== 'partial') {
+      await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:'bid_not_open' });
+    }
+    if (quantity > Number(BID.offer_quantity)) {
+      await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:'quantity_exceeds_offer' });
+    }
+
+    // 재고(리스트) 연결된 제안이면 재고 차감
+    if (BID.listing_id) {
+      const { rows: Ls } = await client.query('SELECT * FROM public.listings WHERE id = $1 FOR UPDATE', [BID.listing_id]);
+      if (!Ls.length) { await client.query('ROLLBACK'); return res.status(404).json({ ok:false, error:'listing_not_found' });}
+      const L = Ls[0];
+      if (quantity > Number(L.quantity_available)) {
+        await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:'insufficient_stock' });
+      }
+      await client.query('UPDATE public.listings SET quantity_available = quantity_available - $1, updated_at = now() WHERE id = $2', [quantity, BID.listing_id]);
+    }
+
+    // fill 생성
+    const { rows: FILLs } = await client.query(`
+      INSERT INTO public.request_fills
+      (pr_id, bid_id, buyer_id, seller_id, listing_id, quantity, unit_price, currency, lead_time_days, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'committed')
+      RETURNING *
+    `, [pr_id, bid_id, buyer_id, BID.seller_id, BID.listing_id || null, quantity, BID.unit_price, BID.currency, BID.lead_time_days || null]);
+
+    // PR 집계 갱신
+    const newConfirmed = Number(PR.quantity_confirmed) + quantity;
+    const newStatus = newConfirmed >= Number(PR.quantity_total) ? 'filled' : (newConfirmed > 0 ? 'partial' : PR.status);
+    await client.query('UPDATE public.purchase_requests SET quantity_confirmed = $1, status = $2, updated_at = now() WHERE id = $3', [newConfirmed, newStatus, pr_id]);
+
+    // BID 상태 갱신(부분/완료)
+    const remainingInBid = Number(BID.offer_quantity) - quantity;
+    const bidStatus = remainingInBid > 0 ? 'partial' : 'accepted';
+    await client.query('UPDATE public.bids SET offer_quantity = $1, status = $2, updated_at = now() WHERE id = $3', [remainingInBid, bidStatus, bid_id]);
+
+    await client.query('COMMIT');
+    res.json({ ok:true, fill: FILLs[0], pr_status: newStatus, pr_confirmed: newConfirmed, bid_remaining: remainingInBid });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  } finally {
+    client.release();
+  }
+});
+
+/** BOM import (구매요청 일괄 생성)
+ * POST /api/bom/import
+ * body: { buyer_id: string, items: [{brand?, code?, family?, quantity_total, due_date?, allow_alternatives?, notes?}] }
+ */
+app.post('/api/bom/import', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    setCORS(res);
+    const { buyer_id, items } = req.body || {};
+    if (!buyer_id || !Array.isArray(items) || !items.length) {
+      return res.status(400).json({ ok:false, error:'buyer_id and items[] required' });
+    }
+    await client.query('BEGIN');
+    const created = [];
+    for (const it of items) {
+      if (!it.quantity_total) continue;
+      const { rows } = await client.query(`
+        INSERT INTO public.purchase_requests
+        (buyer_id, brand, code, family, quantity_total, due_date, allow_alternatives, notes, status)
+        VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,true),$8,'open')
+        RETURNING id
+      `, [buyer_id, it.brand || null, it.code || null, it.family || null, it.quantity_total, it.due_date || null, it.allow_alternatives, it.notes || null]);
+      created.push(rows[0].id);
+    }
+    await client.query('COMMIT');
+    res.json({ ok:true, created_pr_ids: created });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ ok:false, error:'internal_error' });
+  } finally {
+    client.release();
   }
 });
 

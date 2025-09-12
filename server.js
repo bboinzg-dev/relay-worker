@@ -1,8 +1,18 @@
+
 // server.js — Cloud Run Worker (CommonJS)
 const express = require('express');
 const { Pool } = require('pg');
 const { Storage } = require('@google-cloud/storage');
 const { VertexAI } = require('@google-cloud/vertexai');
+
+// relay-worker/package.json
+"dependencies": {
+"@google-cloud/vertexai": "^1.10.0",
+"@google-cloud/documentai": "^4.0.0",
+"@google-cloud/storage": "^7.10.0",
+"express": "^4.19.2",
+"pg": "^8.12.0"
+}
 
 const app = express();
 app.use(express.json({ limit: '16mb' }));

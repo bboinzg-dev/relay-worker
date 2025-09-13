@@ -1,0 +1,38 @@
+steps:
+  # Build image with Buildpacks (현재 트리거가 하는 것과 동일)
+  - name: gcr.io/k8s-skaffold/pack
+    args:
+      - pack
+      - build
+      - gcr.io/$PROJECT_ID/github.com/bboinzg-dev/relay-worker:$SHORT_SHA
+      - --builder
+      - gcr.io/buildpacks/builder
+    env:
+      - GCP_PROJECT_ID=$PROJECT_ID
+      - DOCAI_LOCATION=us
+      - DOCAI_PROCESSOR_ID=58b1db34ff28faba
+      - RESULT_BUCKET=gs://partsplan-docai-us
+      - DB_SSL=false
+
+  # Deploy to Cloud Run (같은 서비스로 최신 이미지 교체)
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=gcr.io/$PROJECT_ID/github.com/bboinzg-dev/relay-worker:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --quiet
+
+images:
+  - gcr.io/$PROJECT_ID/github.com/bboinzg-dev/relay-worker:$SHORT_SHA
+
+substitutions:
+  _REGION: asia-northeast3
+  _SERVICE: worker
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: "3600s"

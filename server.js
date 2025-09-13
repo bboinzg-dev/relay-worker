@@ -105,3 +105,44 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`worker listening on :${PORT}`));
 
 // register parts routes
+
+// ---- Parts: Detail (inline, no external module) ----
+const pg = require('pg');
+const __pool = global.__pgPool || (global.__pgPool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 5,
+}));
+
+async function __detailHandler(req, res) {
+  const brand = String(req.query.brand || '').trim();
+  const code  = String(req.query.code  || '').trim();
+  if (!brand || !code) return res.status(400).json({ ok:false, error:'brand and code are required' });
+  try {
+    const sql = `
+      SELECT brand, code, series, display_name, family_slug, contact_form,
+             coil_voltage_vdc, contact_rating_text,
+             dim_l_mm, dim_w_mm, dim_h_mm,
+             datasheet_url, cover
+      FROM public.relay_specs
+      WHERE lower(brand)=lower($1) AND lower(code)=lower($2)
+      LIMIT 1
+    `;
+    const { rows } = await __pool.query(sql, [brand, code]);
+    if (!rows.length) return res.status(404).json({ ok:false, error:'not_found' });
+
+    const row = rows[0];
+    const B = process.env.GCS_BUCKET;
+    const b = (row.brand||'').toLowerCase();
+    const c = (row.code||'').toLowerCase();
+    if (!row.cover && B)        row.cover        = `https://storage.googleapis.com/${B}/images/${b}/${c}/cover.png`;
+    if (!row.datasheet_url && B)row.datasheet_url= `https://storage.googleapis.com/${B}/datasheets/${c}.pdf`;
+
+    return res.json({ ok:true, data: row });
+  } catch (e) {
+    console.error('detail error', e);
+    return res.status(500).json({ ok:false, error:'internal' });
+  }
+}
+
+app.get('/parts/detail', __detailHandler);
+app.get('/api/parts/detail', __detailHandler);

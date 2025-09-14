@@ -1,18 +1,35 @@
+// server.js  (Cloud Run 엔트리, CommonJS)
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
+
 const db = require('./src/utils/db');
 const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 const authzGlobal = require('./src/mw/authzGlobal');
-const { requestLogger, patchDbLogging, logError } = (()=>{ try { return require('./src/utils/logger'); } catch { return { requestLogger: ()=>((req,res,next)=>next()), patchDbLogging: ()=>{}, logError: ()=>{} }; } })();
-const { parseActor } = (()=>{ try { return require('./src/utils/auth'); } catch { return { parseActor: ()=>({}) }; } })();
-const { notify, findFamilyForBrandCode } = (()=>{ try { return require('./src/utils/notify'); } catch { return { notify: async()=>({}), findFamilyForBrandCode: async()=>null }; } })();
+
+const { requestLogger, patchDbLogging, logError } = (() => {
+  try { return require('./src/utils/logger'); }
+  catch { return { requestLogger: () => ((req,res,next)=>next()), patchDbLogging: () => {}, logError: () => {} }; }
+})();
+
+const { parseActor } = (() => {
+  try { return require('./src/utils/auth'); }
+  catch { return { parseActor: () => ({}) }; }
+})();
+
+const { notify, findFamilyForBrandCode } = (() => {
+  try { return require('./src/utils/notify'); }
+  catch { return { notify: async () => ({}), findFamilyForBrandCode: async () => null }; }
+})();
 
 const app = express();
+app.disable('x-powered-by');
+
 app.use(requestLogger());
 app.use(cors());
 app.use(bodyParser.json({ limit: '25mb' }));
@@ -23,11 +40,17 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(authzGlobal);
 
 // DB logging
-try { const { patchDbLogging } = require('./src/utils/logger'); patchDbLogging(require('./src/utils/db')); } catch {}
+try {
+  const { patchDbLogging } = require('./src/utils/logger');
+  patchDbLogging(require('./src/utils/db'));
+} catch {}
 
+// ---- env/ports ----
 const PORT = process.env.PORT || 8080;
 const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
-const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://') ? GCS_BUCKET_URI.replace(/^gs:\/\//,'').split('/')[0] : '';
+const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
+  ? GCS_BUCKET_URI.replace(/^gs:\/\//, '').split('/')[0]
+  : '';
 
 // --- health/env ---
 app.get('/_healthz', (req, res) => res.type('text/plain').send('ok'));
@@ -220,7 +243,23 @@ app.post('/ingest/auto', async (req, res) => {
   }
 });
 
-// --- Optional mounts ---
+// ---------- [ADDED] /auth, /account 라우터 마운트 (ESM 라우터) ----------
+(async () => {
+  try {
+    const mod = await import('./src/routes/manager.js'); // default export Router
+    const authRouter = mod.default || mod;
+    app.use(authRouter);
+    console.log('[worker] mounted auth/account routes from ./src/routes/manager.js');
+  } catch (e) {
+    if (e && (e.code === 'ERR_MODULE_NOT_FOUND' || /Cannot find module/.test(String(e)))) {
+      console.log('[worker] ./src/routes/manager.js not found; skip /auth routes');
+    } else {
+      console.error('[worker] failed to mount ./src/routes/manager.js', e);
+    }
+  }
+})();
+
+// --- Optional mounts (있으면 사용, 없으면 스킵) ---
 try { const visionApp = require('./server.vision'); app.use(visionApp); } catch {}
 try { const embApp = require('./server.embedding'); app.use(embApp); } catch {}
 try { const tenApp = require('./server.tenancy'); app.use(tenApp); } catch {}

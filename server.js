@@ -8,7 +8,7 @@ const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/util
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 const { parseActor } = (()=>{ try { return require('./src/utils/auth'); } catch { return { parseActor: ()=>({}) }; } })();
-const { notify, findFamilyForBrandCode } = require('./src/utils/notify');
+const { notify, findFamilyForBrandCode } = (()=>{ try { return require('./src/utils/notify'); } catch { return { notify: async()=>({}), findFamilyForBrandCode: async()=>null }; } })();
 
 const app = express();
 app.use(cors());
@@ -208,199 +208,13 @@ app.post('/ingest/auto', async (req, res) => {
   }
 });
 
-// --- Listings / Purchase Requests / Bids / Orders / BOM(import) ---
-function stampOwnerTenant(req) {
-  const actor = parseActor(req);
-  return { owner_id: actor.id || null, tenant_id: actor.tenantId || null, actor };
-}
-
-app.get('/api/listings', async (req, res) => {
-  const brand = (req.query.brand || '').toString().toLowerCase();
-  const code = (req.query.code || '').toString().toLowerCase();
-  const text = (req.query.q || '').toString().toLowerCase();
-  const limit = Math.min(Number(req.query.limit || 50), 200);
-  const params = [];
-  let where = [];
-  if (brand) { params.push(brand); where.push('brand_norm = $' + params.length); }
-  if (code)  { params.push(code);  where.push('code_norm = $' + params.length); }
-  if (text)  { params.push('%'+text+'%'); where.push('(brand_norm LIKE $'+params.length+' OR code_norm LIKE $'+params.length+')'); }
-  const sql = `SELECT * FROM public.listings ${where.length ? 'WHERE '+where.join(' AND ') : ''} ORDER BY created_at DESC LIMIT ${limit}`;
-  const rows = await db.query(sql, params);
-  res.json({ items: rows.rows });
-});
-
-app.post('/api/listings', async (req, res) => {
-  const { owner_id, tenant_id } = stampOwnerTenant(req);
-  const { brand, code, price_cents, currency='USD', quantity_available, lead_time_days=null, seller_ref=null, note=null } = req.body || {};
-  if (!brand || !code || price_cents == null || quantity_available == null) return res.status(400).json({ error: 'missing fields' });
-  const id = uuidv4();
-  const row = await db.query(`
-    INSERT INTO public.listings (id, brand, code, brand_norm, code_norm, price_cents, currency, quantity_available, lead_time_days, seller_ref, note, owner_id, tenant_id)
-    VALUES ($1,$2,$3, lower($2), lower($3), $4,$5,$6,$7,$8,$9,$10,$11) RETURNING *;
-  `, [id, brand, code, price_cents, currency, quantity_available, lead_time_days, seller_ref, note, owner_id, tenant_id]);
-  res.json(row.rows[0]);
-});
-
-app.post('/api/listings/:id/purchase', async (req, res) => {
-  const { owner_id, tenant_id } = stampOwnerTenant(req);
-  const id = req.params.id;
-  const qty = Number(req.body.quantity || 0);
-  const buyer_ref = req.body.buyer_ref || null;
-  if (!qty || qty <= 0) return res.status(400).json({ error: 'quantity > 0 required' });
-  try {
-    await db.query('BEGIN');
-    const listing = await db.query('SELECT * FROM public.listings WHERE id=$1 FOR UPDATE', [id]);
-    if (!listing.rows.length) throw new Error('listing not found');
-    const l = listing.rows[0];
-    if (l.quantity_available < qty) throw new Error('insufficient quantity');
-    await db.query('UPDATE public.listings SET quantity_available=quantity_available-$2 WHERE id=$1', [id, qty]);
-    const orderId = uuidv4();
-    await db.query(`INSERT INTO public.orders (id, listing_id, quantity, buyer_ref, owner_id, tenant_id) VALUES ($1,$2,$3,$4,$5,$6)`, [orderId, id, qty, buyer_ref, owner_id, tenant_id]);
-    await db.query('COMMIT');
-    res.json({ ok: true, order_id: orderId });
-  } catch (e) {
-    await db.query('ROLLBACK');
-    res.status(400).json({ error: String(e.message || e) });
-  }
-});
-
-app.get('/api/purchase-requests', async (req, res) => {
-  const rows = await db.query('SELECT * FROM public.purchase_requests ORDER BY created_at DESC LIMIT 200');
-  res.json({ items: rows.rows });
-});
-
-app.post('/api/purchase-requests', async (req, res) => {
-  const { owner_id, tenant_id } = stampOwnerTenant(req);
-  const { brand, code, required_qty, lead_time_days=null, target_price_cents=null, buyer_ref=null, note=null, due_date=null } = req.body || {};
-  if (!brand || !code || !required_qty) return res.status(400).json({ error: 'missing fields' });
-  const id = uuidv4();
-  const row = await db.query(`
-    INSERT INTO public.purchase_requests (id, brand, code, brand_norm, code_norm, required_qty, lead_time_days, target_price_cents, buyer_ref, note, due_date, owner_id, tenant_id)
-    VALUES ($1,$2,$3, lower($2), lower($3), $4,$5,$6,$7,$8,$9,$10,$11) RETURNING *;
-  `, [id, brand, code, required_qty, lead_time_days, target_price_cents, buyer_ref, note, due_date, owner_id, tenant_id]);
-
-  // Notify sellers (async via Cloud Tasks)
-  try {
-    const family = await findFamilyForBrandCode(brand, code);
-    await require('./src/utils/notify').notify('purchase_request.created', {
-      tenant_id, actor_id: owner_id, family_slug: family, brand, code,
-      data: { purchase_request_id: id, required_qty, lead_time_days, target_price_cents, note, due_date }
-    });
-  } catch (e) { console.warn('notify PR failed:', e.message || e); }
-
-  res.json(row.rows[0]);
-});
-
-app.get('/api/bids', async (req, res) => {
-  const pr = (req.query.purchase_request_id || '').toString();
-  const params = []; let where = '';
-  if (pr) { params.push(pr); where = 'WHERE purchase_request_id=$1'; }
-  const rows = await db.query(`SELECT * FROM public.bids ${where} ORDER BY created_at DESC LIMIT 500`, params);
-  res.json({ items: rows.rows });
-});
-
-app.post('/api/bids', async (req, res) => {
-  const { owner_id, tenant_id } = stampOwnerTenant(req);
-  const { purchase_request_id, seller_ref=null, offer_qty, price_cents, currency='USD', lead_time_days=null, is_alternative=false, alt_brand=null, alt_code=null, note=null } = req.body || {};
-  if (!purchase_request_id || !offer_qty || price_cents == null) return res.status(400).json({ error: 'missing fields' });
-  const id = uuidv4();
-  const row = await db.query(`
-    INSERT INTO public.bids (id, purchase_request_id, seller_ref, offer_qty, price_cents, currency, lead_time_days, is_alternative, alt_brand, alt_code, note, owner_id, tenant_id)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *;
-  `, [id, purchase_request_id, seller_ref, offer_qty, price_cents, currency, lead_time_days, is_alternative, alt_brand, alt_code, note, owner_id, tenant_id]);
-  res.json(row.rows[0]);
-});
-
-app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
-  const { owner_id, tenant_id } = stampOwnerTenant(req);
-  const id = req.params.id;
-  const { bid_ids = [] } = req.body || {};
-  if (!Array.isArray(bid_ids) || !bid_ids.length) return res.status(400).json({ error: 'bid_ids required' });
-  try {
-    await db.query('BEGIN');
-    const pr = await db.query('SELECT * FROM public.purchase_requests WHERE id=$1 FOR UPDATE', [id]);
-    if (!pr.rows.length) throw new Error('purchase request not found');
-    let remaining = pr.rows[0].required_qty - (pr.rows[0].confirmed_qty || 0);
-    for (const bidId of bid_ids) {
-      if (remaining <= 0) break;
-      const b = await db.query('SELECT * FROM public.bids WHERE id=$1 FOR UPDATE', [bidId]);
-      if (!b.rows.length) throw new Error(`bid not found: ${bidId}`);
-      const bid = b.rows[0];
-      const take = Math.min(remaining, bid.offer_qty);
-      if (take <= 0) continue;
-      await db.query(`INSERT INTO public.confirmations (id, purchase_request_id, bid_id, confirmed_qty, owner_id, tenant_id) VALUES ($1,$2,$3,$4,$5,$6)`,
-        [uuidv4(), id, bidId, take, owner_id, tenant_id]);
-      remaining -= take;
-    }
-    const totalConfirmed = pr.rows[0].required_qty - remaining;
-    await db.query('UPDATE public.purchase_requests SET confirmed_qty = $2, status = CASE WHEN $2 >= required_qty THEN $3 ELSE $4 END WHERE id=$1',
-      [id, totalConfirmed, 'confirmed', 'partial']);
-    await db.query('COMMIT');
-    res.json({ ok: true });
-  } catch (e) {
-    await db.query('ROLLBACK');
-    res.status(400).json({ error: String(e.message || e) });
-  }
-});
-
-app.post('/api/bom/import', upload.single('file'), async (req, res) => {
-  const { owner_id, tenant_id } = stampOwnerTenant(req);
-  try {
-    const uploadId = uuidv4();
-    const meta = {
-      id: uploadId,
-      filename: req.file?.originalname || null,
-      size: req.file?.size || null,
-      contentType: req.file?.mimetype || null,
-      note: req.body?.note || null,
-    };
-    await db.query(`INSERT INTO public.bom_uploads (id, filename, size, content_type, note, owner_id, tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [meta.id, meta.filename, meta.size, meta.contentType, meta.note, owner_id, tenant_id]);
-    let rows = [];
-    if (req.file) {
-      const text = req.file.buffer.toString('utf8');
-      for (const line of text.split(/\r?\n/)) {
-        const t = line.trim();
-        if (!t || t.startsWith('#')) continue;
-        const [brand, code, qtyStr, needBy] = t.split(',').map(s => (s||'').trim());
-        if (!brand || !code) continue;
-        const qty = Number(qtyStr || '0');
-        rows.push({ brand, code, qty, need_by: needBy || null });
-      }
-    } else if (Array.isArray(req.body?.rows)) {
-      rows = req.body.rows;
-    }
-    for (const r of rows) {
-      await db.query(`INSERT INTO public.bom_lines (upload_id, brand, code, brand_norm, code_norm, quantity, need_by, owner_id, tenant_id) VALUES ($1,$2,$3, lower($2), lower($3), $4,$5,$6,$7)`,
-        [uploadId, r.brand, r.code, Number(r.qty || r.quantity || 0), r.need_by || null, owner_id, tenant_id]);
-    }
-
-    // notify sellers by families involved (async via Cloud Tasks)
-    try {
-      const fams = new Set();
-      for (const r of rows) {
-        const fam = await require('./src/utils/notify').findFamilyForBrandCode(r.brand, r.code);
-        if (fam) fams.add(fam);
-      }
-      for (const f of fams) {
-        await require('./src/utils/notify').notify('bom.uploaded', { tenant_id, actor_id: owner_id, family_slug: f, data: { upload_id: uploadId, line_count: rows.length } });
-      }
-    } catch (e) { console.warn('notify BOM failed:', e.message || e); }
-
-    res.json({ ok: true, upload_id: uploadId, count: rows.length });
-  } catch (e) {
-    console.error(e);
-    res.status(400).json({ error: String(e.message || e) });
-  }
-});
-
-// Optional mounts
+// --- Optional mounts ---
 try { const visionApp = require('./server.vision'); app.use(visionApp); } catch {}
 try { const embApp = require('./server.embedding'); app.use(embApp); } catch {}
 try { const tenApp = require('./server.tenancy'); app.use(tenApp); } catch {}
 try { const notifyApp = require('./server.notify'); app.use(notifyApp); } catch {}
 try { const bomApp = require('./server.bom'); app.use(bomApp); } catch {}
-try { const tasksApp = require('./server.notifyTasks'); app.use(tasksApp); } catch {}
+try { const optApp = require('./server.optimize'); app.use(optApp); } catch {}
 
 // 404
 app.use((req, res) => res.status(404).json({ error: 'not found' }));

@@ -382,3 +382,15 @@ app.post('/ingest/strict-upsert', async (req, res) => {
 });
 
 app.post('/api/ingest/strict-upsert', (req,res) => app._router.handle(req, res)); // alias
+
+// ---- debug: list routes ----
+app.get('/_routes', (_req, res) => {
+  const out = [];
+  (app._router?.stack || []).forEach((l) => {
+    if (l.route && l.route.path) {
+      const methods = Object.keys(l.route.methods).filter(k => l.route.methods[k]).map(m => m.toUpperCase());
+      out.push({ methods, path: l.route.path });
+    }
+  });
+  res.json({ ok: true, routes: out });
+});

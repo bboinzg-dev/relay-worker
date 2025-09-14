@@ -1,10 +1,23 @@
 const { Storage } = require('@google-cloud/storage');
 
-const storage = new Storage(); // ADC / WIF
+const storage = new Storage();
+
 function parseGcsUri(gcsUri) {
   if (!gcsUri?.startsWith('gs://')) throw new Error('gcsUri must start with gs://');
   const [, , bucket, ...rest] = gcsUri.split('/');
   return { bucket, name: rest.join('/') };
+}
+
+async function readText(gcsUri, limitBytes=4*1024*1024) {
+  const { bucket, name } = parseGcsUri(gcsUri);
+  const [buf] = await storage.bucket(bucket).file(name).download({ start: 0, end: limitBytes });
+  return buf.toString('utf8');
+}
+
+async function readBytes(gcsUri, limitBytes=10*1024*1024) {
+  const { bucket, name } = parseGcsUri(gcsUri);
+  const [buf] = await storage.bucket(bucket).file(name).download({ start: 0, end: limitBytes });
+  return buf;
 }
 
 async function getSignedUrl(gcsUri, minutes=15, action='read') {
@@ -38,4 +51,4 @@ async function moveObject(srcGcsUri, dstGcsUri) {
   return dstGcsUri;
 }
 
-module.exports = { storage, parseGcsUri, getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject };
+module.exports = { storage, parseGcsUri, readText, readBytes, getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject };

@@ -6,6 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('./src/utils/db');
 const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
+const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 
 const app = express();
 app.use(cors());
@@ -149,34 +150,22 @@ app.get('/parts/alternatives', async (req, res) => {
   }
 });
 
-// --- ingest: dynamic table ensure + upsert (single) ---
+// --- ingest: single (manual) ---
 app.post('/ingest', async (req, res) => {
   try {
     const {
       family_slug,
-      specs_table, // e.g., 'relay_specs' (preferred)
-      brand,
-      code,
-      series,
-      display_name,
-      datasheet_url,
-      cover,
-      source_gcs_uri,
-      raw_json = null,
-      fields = {},  // { columnName: pgTypeString }
-      values = {},  // { columnName: value }
+      specs_table, brand, code, series, display_name,
+      datasheet_url, cover, source_gcs_uri, raw_json=null,
+      fields = {}, values = {},
     } = req.body || {};
 
     const table = (specs_table || `${family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
     if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
-
     await ensureSpecsTable(table, fields);
-
-    const payload = {
-      brand, code, series, display_name, family_slug, datasheet_url, cover, source_gcs_uri, raw_json,
-      ...values,
-    };
-    const row = await upsertByBrandCode(table, payload);
+    const row = await upsertByBrandCode(table, {
+      brand, code, series, display_name, family_slug, datasheet_url, cover, source_gcs_uri, raw_json, ...values
+    });
     res.json({ ok: true, table, row });
   } catch (e) {
     console.error(e);
@@ -193,12 +182,11 @@ app.post('/ingest/bulk', async (req, res) => {
     for (const it of items) {
       const table = (it.specs_table || `${it.family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
       await ensureSpecsTable(table, it.fields || {});
-      const payload = {
+      const row = await upsertByBrandCode(table, {
         brand: it.brand, code: it.code, series: it.series, display_name: it.display_name,
         family_slug: it.family_slug, datasheet_url: it.datasheet_url, cover: it.cover,
         source_gcs_uri: it.source_gcs_uri, raw_json: it.raw_json || null, ...(it.values || {}),
-      };
-      const row = await upsertByBrandCode(table, payload);
+      });
       out.push({ table, row });
     }
     res.json({ ok: true, count: out.length, items: out });
@@ -208,7 +196,19 @@ app.post('/ingest/bulk', async (req, res) => {
   }
 });
 
-// --- Listings / Purchase Requests / Bids / Orders ---
+// --- ingest: auto (Vertex → ensure → upsert → move) ---
+app.post('/ingest/auto', async (req, res) => {
+  try {
+    const { gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null } = req.body || {};
+    const result = await runAutoIngest({ gcsUri, family_slug, brand, code, series, display_name });
+    res.json(result);
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ error: String(e.message || e) });
+  }
+});
+
+// --- Listings / Purchase Requests / Bids / Orders (same as previous step) ---
 app.get('/api/listings', async (req, res) => {
   const brand = (req.query.brand || '').toString().toLowerCase();
   const code = (req.query.code || '').toString().toLowerCase();

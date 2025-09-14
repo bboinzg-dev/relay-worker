@@ -13,25 +13,16 @@ const BASE_COLUMNS = [
   `cover text`,
   `raw_json jsonb`,
   `source_gcs_uri text`,
-  `embedding vector(768) NULL`, -- optional (requires extension)
+  `embedding vector(768) NULL`,
   `created_at timestamptz NOT NULL DEFAULT now()`,
   `updated_at timestamptz NOT NULL DEFAULT now()`
 ];
 
 async function ensureExtensions() {
   await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
-  try {
-    await db.query(`CREATE EXTENSION IF NOT EXISTS vector;`);
-  } catch (e) {
-    // ignore if not available
-  }
+  try { await db.query(`CREATE EXTENSION IF NOT EXISTS vector;`); } catch {}
 }
 
-/**
- * Ensure a specs table exists and contains at least the base columns.
- * Then extend with field columns based on "fields" map: { col: 'numeric'|'text'|'int'|'bool'|'timestamptz'|'jsonb' }.
- * Also ensure a UNIQUE constraint on (brand_norm, code_norm).
- */
 async function ensureSpecsTable(tableName, fields = {}) {
   await ensureExtensions();
   const safe = tableName.replace(/[^a-zA-Z0-9_]/g, '');
@@ -42,7 +33,6 @@ async function ensureSpecsTable(tableName, fields = {}) {
     );
   `);
 
-  // add UNIQUE constraint (brand_norm, code_norm)
   await db.query(`
     DO $$ BEGIN
       IF NOT EXISTS (
@@ -54,7 +44,6 @@ async function ensureSpecsTable(tableName, fields = {}) {
     END $$;
   `);
 
-  // Add requested fields as columns
   for (const [col, typ] of Object.entries(fields)) {
     const colSafe = col.replace(/[^a-zA-Z0-9_]/g, '');
     const mapType = (t) => {
@@ -76,10 +65,6 @@ async function ensureSpecsTable(tableName, fields = {}) {
   }
 }
 
-/**
- * Perform an upsert keyed by (brand_norm, code_norm) unique constraint.
- * values: object of columnName -> value
- */
 async function upsertByBrandCode(tableName, values) {
   const safe = tableName.replace(/[^a-zA-Z0-9_]/g, '');
   const cols = Object.keys(values).map(c => c.replace(/[^a-zA-Z0-9_]/g, ''));

@@ -7,14 +7,18 @@ const db = require('./src/utils/db');
 const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
+const { requestLogger, patchDbLogging, logError } = require('./src/utils/logger');
 const { parseActor } = (()=>{ try { return require('./src/utils/auth'); } catch { return { parseActor: ()=>({}) }; } })();
 const { notify, findFamilyForBrandCode } = (()=>{ try { return require('./src/utils/notify'); } catch { return { notify: async()=>({}), findFamilyForBrandCode: async()=>null }; } })();
 
 const app = express();
+app.use(requestLogger()); // structured logs + req_id
 app.use(cors());
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 const upload = multer({ storage: multer.memoryStorage() });
+
+patchDbLogging(db); // SQL timing logs
 
 const PORT = process.env.PORT || 8080;
 const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
@@ -215,9 +219,17 @@ try { const tenApp = require('./server.tenancy'); app.use(tenApp); } catch {}
 try { const notifyApp = require('./server.notify'); app.use(notifyApp); } catch {}
 try { const bomApp = require('./server.bom'); app.use(bomApp); } catch {}
 try { const optApp = require('./server.optimize'); app.use(optApp); } catch {}
+try { const tasksApp = require('./server.notifyTasks'); app.use(tasksApp); } catch {}
+try { const opsApp = require('./server.ops'); app.use(opsApp); } catch {}
 
 // 404
 app.use((req, res) => res.status(404).json({ error: 'not found' }));
+
+// error guard
+app.use((err, req, res, next) => {
+  logError(err, { path: req.originalUrl, req_id: res.locals.__reqId });
+  res.status(500).json({ error: 'internal error' });
+});
 
 app.listen(PORT, () => {
   console.log(`worker listening on :${PORT}`);

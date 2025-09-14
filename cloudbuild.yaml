@@ -1,0 +1,19 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ['build','-t','gcr.io/$PROJECT_ID/relay-worker:$SHORT_SHA','.']
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - worker
+      - --image=gcr.io/$PROJECT_ID/relay-worker:$SHORT_SHA
+      - --region=asia-northeast3
+      - --platform=managed
+      - --quiet
+      - --update-env-vars=GIT_SHA=$SHORT_SHA
+images:
+  - gcr.io/$PROJECT_ID/relay-worker:$SHORT_SHA
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: '3600s'

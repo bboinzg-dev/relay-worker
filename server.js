@@ -19,7 +19,7 @@ app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Global authorization/tenancy guard (before routes)
+// Global authorization/tenancy guard
 app.use(authzGlobal);
 
 // DB logging
@@ -229,6 +229,7 @@ try { const bomApp = require('./server.bom'); app.use(bomApp); } catch {}
 try { const optApp = require('./server.optimize'); app.use(optApp); } catch {}
 try { const tasksApp = require('./server.notifyTasks'); app.use(tasksApp); } catch {}
 try { const opsApp = require('./server.ops'); app.use(opsApp); } catch {}
+try { const schemaApp = require('./server.schema'); app.use(schemaApp); } catch {}
 
 // 404
 app.use((req, res) => res.status(404).json({ error: 'not found' }));

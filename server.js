@@ -11,6 +11,13 @@ const pool = new Pool({
   max: 5,
 });
 
+console.log('[ENVCHK]', {
+  hasDb: !!process.env.DATABASE_URL,
+  pgsslmode: process.env.PGSSLMODE,
+  gcsBucket: process.env.GCS_BUCKET
+});
+
+
 // ---- health/env
 app.get('/_healthz', (_req, res) => res.type('text').send('ok'));
 app.get('/_env', (_req, res) => res.json({

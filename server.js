@@ -7,18 +7,23 @@ const db = require('./src/utils/db');
 const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
-const { requestLogger, patchDbLogging, logError } = require('./src/utils/logger');
+const authzGlobal = require('./src/mw/authzGlobal');
+const { requestLogger, patchDbLogging, logError } = (()=>{ try { return require('./src/utils/logger'); } catch { return { requestLogger: ()=>((req,res,next)=>next()), patchDbLogging: ()=>{}, logError: ()=>{} }; } })();
 const { parseActor } = (()=>{ try { return require('./src/utils/auth'); } catch { return { parseActor: ()=>({}) }; } })();
 const { notify, findFamilyForBrandCode } = (()=>{ try { return require('./src/utils/notify'); } catch { return { notify: async()=>({}), findFamilyForBrandCode: async()=>null }; } })();
 
 const app = express();
-app.use(requestLogger()); // structured logs + req_id
+app.use(requestLogger());
 app.use(cors());
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 const upload = multer({ storage: multer.memoryStorage() });
 
-patchDbLogging(db); // SQL timing logs
+// Global authorization/tenancy guard (before routes)
+app.use(authzGlobal);
+
+// DB logging
+try { const { patchDbLogging } = require('./src/utils/logger'); patchDbLogging(require('./src/utils/db')); } catch {}
 
 const PORT = process.env.PORT || 8080;
 const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
@@ -163,14 +168,15 @@ app.post('/ingest', async (req, res) => {
       family_slug,
       specs_table, brand, code, series, display_name,
       datasheet_url, cover, source_gcs_uri, raw_json=null,
-      fields = {}, values = {},
+      fields = {}, values = {}, tenant_id=null, owner_id=null, created_by=null, updated_by=null
     } = req.body || {};
 
     const table = (specs_table || `${family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
     if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
     await ensureSpecsTable(table, fields);
     const row = await upsertByBrandCode(table, {
-      brand, code, series, display_name, family_slug, datasheet_url, cover, source_gcs_uri, raw_json, ...values
+      brand, code, series, display_name, family_slug, datasheet_url, cover, source_gcs_uri, raw_json,
+      tenant_id, owner_id, created_by, updated_by, ...values
     });
     res.json({ ok: true, table, row });
   } catch (e) {
@@ -190,7 +196,9 @@ app.post('/ingest/bulk', async (req, res) => {
       const row = await upsertByBrandCode(table, {
         brand: it.brand, code: it.code, series: it.series, display_name: it.display_name,
         family_slug: it.family_slug, datasheet_url: it.datasheet_url, cover: it.cover,
-        source_gcs_uri: it.source_gcs_uri, raw_json: it.raw_json || null, ...(it.values || {}),
+        source_gcs_uri: it.source_gcs_uri, raw_json: it.raw_json || null,
+        tenant_id: it.tenant_id || null, owner_id: it.owner_id || null, created_by: it.created_by || null, updated_by: it.updated_by || null,
+        ...(it.values || {}),
       });
       out.push({ table, row });
     }
@@ -227,7 +235,7 @@ app.use((req, res) => res.status(404).json({ error: 'not found' }));
 
 // error guard
 app.use((err, req, res, next) => {
-  logError(err, { path: req.originalUrl, req_id: res.locals.__reqId });
+  try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
   res.status(500).json({ error: 'internal error' });
 });
 

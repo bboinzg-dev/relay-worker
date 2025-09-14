@@ -4,6 +4,8 @@ const BASE_COLUMNS = [
   `id uuid PRIMARY KEY DEFAULT uuid_generate_v4()`,
   `brand text NOT NULL`,
   `code text NOT NULL`,
+  `brand_norm text GENERATED ALWAYS AS (lower(brand)) STORED`,
+  `code_norm text GENERATED ALWAYS AS (lower(code)) STORED`,
   `series text`,
   `display_name text`,
   `family_slug text`,
@@ -16,21 +18,19 @@ const BASE_COLUMNS = [
   `updated_at timestamptz NOT NULL DEFAULT now()`
 ];
 
-const BASE_COLSET = new Set(BASE_COLUMNS.map(s => s.split(' ')[0]));
-
 async function ensureExtensions() {
   await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
   try {
     await db.query(`CREATE EXTENSION IF NOT EXISTS vector;`);
   } catch (e) {
-    // vector extension might not be available; ignore if fails
+    // ignore if not available
   }
 }
 
 /**
  * Ensure a specs table exists and contains at least the base columns.
- * Then extend with field columns (text/numeric/int/bool/timestamp/jsonb).
- * fields is an object: { columnName: 'text'|'numeric'|'int'|'bool'|'timestamp'|'jsonb' }
+ * Then extend with field columns based on "fields" map: { col: 'numeric'|'text'|'int'|'bool'|'timestamptz'|'jsonb' }.
+ * Also ensure a UNIQUE constraint on (brand_norm, code_norm).
  */
 async function ensureSpecsTable(tableName, fields = {}) {
   await ensureExtensions();
@@ -42,13 +42,14 @@ async function ensureSpecsTable(tableName, fields = {}) {
     );
   `);
 
-  // add lower(brand), lower(code) unique
+  // add UNIQUE constraint (brand_norm, code_norm)
   await db.query(`
     DO $$ BEGIN
       IF NOT EXISTS (
-        SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname = 'ux_${safe}_brand_code_norm'
+        SELECT 1 FROM pg_constraint WHERE conname = 'uq_${safe}_brand_norm_code_norm'
       ) THEN
-        EXECUTE 'CREATE UNIQUE INDEX ux_${safe}_brand_code_norm ON public.${safe} (lower(brand), lower(code))';
+        ALTER TABLE public.${safe}
+        ADD CONSTRAINT uq_${safe}_brand_norm_code_norm UNIQUE (brand_norm, code_norm);
       END IF;
     END $$;
   `);
@@ -76,7 +77,7 @@ async function ensureSpecsTable(tableName, fields = {}) {
 }
 
 /**
- * Perform an upsert by (lower(brand), lower(code)) uniqueness.
+ * Perform an upsert keyed by (brand_norm, code_norm) unique constraint.
  * values: object of columnName -> value
  */
 async function upsertByBrandCode(tableName, values) {
@@ -87,7 +88,7 @@ async function upsertByBrandCode(tableName, values) {
   const sql = `
     INSERT INTO public.${safe} (${cols.join(',')})
     VALUES (${params.join(',')})
-    ON CONFLICT ((lower(brand)), (lower(code)))
+    ON CONFLICT (brand_norm, code_norm)
     DO UPDATE SET ${updates.join(',')}, updated_at = now()
     RETURNING *;
   `;

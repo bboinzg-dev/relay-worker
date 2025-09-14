@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const db = require('./src/utils/db');
-const { getSignedUrl } = require('./src/utils/gcs');
+const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 
 const app = express();
@@ -14,16 +14,46 @@ app.use(bodyParser.urlencoded({ extended: true }));
 const upload = multer({ storage: multer.memoryStorage() });
 
 const PORT = process.env.PORT || 8080;
-const GCS_BUCKET = process.env.GCS_BUCKET || '';
+const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
+const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://') ? GCS_BUCKET_URI.replace(/^gs:\/\//,'').split('/')[0] : '';
 
 // --- health/env ---
 app.get('/_healthz', (req, res) => res.type('text/plain').send('ok'));
 app.get('/_env', (req, res) => {
   res.json({
     node: process.version,
-    gcs_bucket: GCS_BUCKET && GCS_BUCKET.replace(/.*/,'gs://<bucket>'),
+    gcs_bucket: GCS_BUCKET ? `gs://${GCS_BUCKET}` : null,
     has_db: !!process.env.DATABASE_URL,
   });
+});
+
+// --- catalog registry / blueprint ---
+app.get('/catalog/registry', async (req, res) => {
+  try {
+    const r = await db.query(`SELECT family_slug, specs_table FROM public.component_registry ORDER BY family_slug`);
+    res.json({ items: r.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'registry failed' });
+  }
+});
+
+app.get('/catalog/blueprint/:family', async (req, res) => {
+  const family = req.params.family;
+  try {
+    const r = await db.query(`
+      SELECT b.family_slug, r.specs_table, b.fields_json, b.prompt_template
+      FROM public.component_spec_blueprint b
+      JOIN public.component_registry r USING (family_slug)
+      WHERE b.family_slug = $1
+      LIMIT 1
+    `, [family]);
+    if (!r.rows.length) return res.status(404).json({ error: 'blueprint not found' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'blueprint failed' });
+  }
 });
 
 // --- files: signed URL ---
@@ -39,16 +69,29 @@ app.get('/api/files/signed-url', async (req, res) => {
   }
 });
 
-// --- parts: simple search/detail/alternatives (rule-based v1) ---
+// --- files: move to canonical datasheet path ---
+app.post('/api/files/move', async (req, res) => {
+  try {
+    const { srcGcsUri, family_slug, brand, code, dstGcsUri } = req.body || {};
+    if (!srcGcsUri) return res.status(400).json({ error: 'srcGcsUri required' });
+    const dst = dstGcsUri || canonicalDatasheetPath(GCS_BUCKET, family_slug, brand, code);
+    const moved = await moveObject(srcGcsUri, dst);
+    res.json({ ok: true, dstGcsUri: moved });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ error: String(e.message || e) });
+  }
+});
+
+// --- parts: simple search/detail/alternatives ---
 app.get('/parts/search', async (req, res) => {
-  // Simple baseline search in relay_specs
   const q = (req.query.q || '').toString().trim();
   const limit = Math.min(Number(req.query.limit || 20), 100);
   try {
     const text = q ? `%${q.toLowerCase()}%` : '%';
     const rows = await db.query(
       `SELECT * FROM public.relay_specs
-       WHERE lower(brand) LIKE $1 OR lower(code) LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
+       WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
        ORDER BY updated_at DESC
        LIMIT $2`,
       [text, limit]
@@ -66,7 +109,7 @@ app.get('/parts/detail', async (req, res) => {
   if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
   try {
     const row = await db.query(
-      `SELECT * FROM public.relay_specs WHERE lower(brand)=lower($1) AND lower(code)=lower($2) LIMIT 1`,
+      `SELECT * FROM public.relay_specs WHERE brand_norm=lower($1) AND code_norm=lower($2) LIMIT 1`,
       [brand, code]
     );
     if (!row.rows.length) return res.status(404).json({ error: 'not found' });
@@ -84,7 +127,7 @@ app.get('/parts/alternatives', async (req, res) => {
   if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
   try {
     const base = await db.query(
-      `SELECT * FROM public.relay_specs WHERE lower(brand)=lower($1) AND lower(code)=lower($2) LIMIT 1`,
+      `SELECT * FROM public.relay_specs WHERE brand_norm=lower($1) AND code_norm=lower($2) LIMIT 1`,
       [brand, code]
     );
     if (!base.rows.length) return res.status(404).json({ error: 'base not found' });
@@ -94,7 +137,7 @@ app.get('/parts/alternatives', async (req, res) => {
         (CASE WHEN family_slug IS NOT NULL AND family_slug = $1 THEN 0 ELSE 1 END) * 1.0 +
         COALESCE(ABS(COALESCE(coil_voltage_vdc,0) - COALESCE($2::numeric,0)) / 100.0, 1.0) AS score
       FROM public.relay_specs
-      WHERE NOT (lower(brand)=lower($3) AND lower(code)=lower($4))
+      WHERE NOT (brand_norm=lower($3) AND code_norm=lower($4))
       ORDER BY score ASC
       LIMIT $5`,
       [b.family_slug || null, b.coil_voltage_vdc || null, brand, code, limit]
@@ -106,7 +149,7 @@ app.get('/parts/alternatives', async (req, res) => {
   }
 });
 
-// --- ingest: dynamic table ensure + upsert ---
+// --- ingest: dynamic table ensure + upsert (single) ---
 app.post('/ingest', async (req, res) => {
   try {
     const {
@@ -119,6 +162,7 @@ app.post('/ingest', async (req, res) => {
       datasheet_url,
       cover,
       source_gcs_uri,
+      raw_json = null,
       fields = {},  // { columnName: pgTypeString }
       values = {},  // { columnName: value }
     } = req.body || {};
@@ -129,7 +173,7 @@ app.post('/ingest', async (req, res) => {
     await ensureSpecsTable(table, fields);
 
     const payload = {
-      brand, code, series, display_name, family_slug, datasheet_url, cover, source_gcs_uri,
+      brand, code, series, display_name, family_slug, datasheet_url, cover, source_gcs_uri, raw_json,
       ...values,
     };
     const row = await upsertByBrandCode(table, payload);
@@ -137,6 +181,30 @@ app.post('/ingest', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'ingest failed', detail: String(e.message || e) });
+  }
+});
+
+// --- ingest: bulk ---
+app.post('/ingest/bulk', async (req, res) => {
+  try {
+    const { items = [] } = req.body || {};
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items[] required' });
+    const out = [];
+    for (const it of items) {
+      const table = (it.specs_table || `${it.family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
+      await ensureSpecsTable(table, it.fields || {});
+      const payload = {
+        brand: it.brand, code: it.code, series: it.series, display_name: it.display_name,
+        family_slug: it.family_slug, datasheet_url: it.datasheet_url, cover: it.cover,
+        source_gcs_uri: it.source_gcs_uri, raw_json: it.raw_json || null, ...(it.values || {}),
+      };
+      const row = await upsertByBrandCode(table, payload);
+      out.push({ table, row });
+    }
+    res.json({ ok: true, count: out.length, items: out });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'bulk ingest failed', detail: String(e.message || e) });
   }
 });
 
@@ -148,9 +216,9 @@ app.get('/api/listings', async (req, res) => {
   const limit = Math.min(Number(req.query.limit || 50), 200);
   const params = [];
   let where = [];
-  if (brand) { params.push(brand); where.push('lower(brand)= $' + params.length); }
-  if (code)  { params.push(code);  where.push('lower(code)= $' + params.length); }
-  if (text)  { params.push('%'+text+'%'); where.push('(lower(brand) LIKE $'+params.length+' OR lower(code) LIKE $'+params.length+')'); }
+  if (brand) { params.push(brand); where.push('brand_norm = $' + params.length); }
+  if (code)  { params.push(code);  where.push('code_norm = $' + params.length); }
+  if (text)  { params.push('%'+text+'%'); where.push('(brand_norm LIKE $'+params.length+' OR code_norm LIKE $'+params.length+')'); }
   const sql = `SELECT * FROM public.listings ${where.length ? 'WHERE '+where.join(' AND ') : ''} ORDER BY created_at DESC LIMIT ${limit}`;
   const rows = await db.query(sql, params);
   res.json({ items: rows.rows });
@@ -161,8 +229,8 @@ app.post('/api/listings', async (req, res) => {
   if (!brand || !code || price_cents == null || quantity_available == null) return res.status(400).json({ error: 'missing fields' });
   const id = uuidv4();
   const row = await db.query(`
-    INSERT INTO public.listings (id, brand, code, price_cents, currency, quantity_available, lead_time_days, seller_ref, note)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *;
+    INSERT INTO public.listings (id, brand, code, brand_norm, code_norm, price_cents, currency, quantity_available, lead_time_days, seller_ref, note)
+    VALUES ($1,$2,$3, lower($2), lower($3), $4,$5,$6,$7,$8,$9) RETURNING *;
   `, [id, brand, code, price_cents, currency, quantity_available, lead_time_days, seller_ref, note]);
   res.json(row.rows[0]);
 });
@@ -178,7 +246,6 @@ app.post('/api/listings/:id/purchase', async (req, res) => {
     if (!listing.rows.length) throw new Error('listing not found');
     const l = listing.rows[0];
     if (l.quantity_available < qty) throw new Error('insufficient quantity');
-    // reduce qty
     await db.query('UPDATE public.listings SET quantity_available=quantity_available-$2 WHERE id=$1', [id, qty]);
     const orderId = uuidv4();
     await db.query(`INSERT INTO public.orders (id, listing_id, quantity, buyer_ref) VALUES ($1,$2,$3,$4)`, [orderId, id, qty, buyer_ref]);
@@ -200,8 +267,8 @@ app.post('/api/purchase-requests', async (req, res) => {
   if (!brand || !code || !required_qty) return res.status(400).json({ error: 'missing fields' });
   const id = uuidv4();
   const row = await db.query(`
-    INSERT INTO public.purchase_requests (id, brand, code, required_qty, lead_time_days, target_price_cents, buyer_ref, note, due_date)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *;
+    INSERT INTO public.purchase_requests (id, brand, code, brand_norm, code_norm, required_qty, lead_time_days, target_price_cents, buyer_ref, note, due_date)
+    VALUES ($1,$2,$3, lower($2), lower($3), $4,$5,$6,$7,$8,$9) RETURNING *;
   `, [id, brand, code, required_qty, lead_time_days, target_price_cents, buyer_ref, note, due_date]);
   res.json(row.rows[0]);
 });
@@ -233,63 +300,25 @@ app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
     await db.query('BEGIN');
     const pr = await db.query('SELECT * FROM public.purchase_requests WHERE id=$1 FOR UPDATE', [id]);
     if (!pr.rows.length) throw new Error('purchase request not found');
-    let remaining = pr.rows[0].required_qty;
-    const rows = [];
+    let remaining = pr.rows[0].required_qty - (pr.rows[0].confirmed_qty || 0);
     for (const bidId of bid_ids) {
+      if (remaining <= 0) break;
       const b = await db.query('SELECT * FROM public.bids WHERE id=$1 FOR UPDATE', [bidId]);
       if (!b.rows.length) throw new Error(`bid not found: ${bidId}`);
       const bid = b.rows[0];
       const take = Math.min(remaining, bid.offer_qty);
-      if (take <= 0) break;
+      if (take <= 0) continue;
       await db.query(`INSERT INTO public.confirmations (id, purchase_request_id, bid_id, confirmed_qty) VALUES ($1,$2,$3,$4)`,
         [uuidv4(), id, bidId, take]);
       remaining -= take;
     }
-    await db.query('UPDATE public.purchase_requests SET confirmed_qty = COALESCE(confirmed_qty,0) + $2, status = CASE WHEN COALESCE(confirmed_qty,0) + $2 >= required_qty THEN '+"'confirmed'"+' ELSE '+"'partial'"+' END WHERE id=$1',
-      [id, pr.rows[0].required_qty - remaining]);
+    const totalConfirmed = pr.rows[0].required_qty - remaining;
+    await db.query('UPDATE public.purchase_requests SET confirmed_qty = $2, status = CASE WHEN $2 >= required_qty THEN $3 ELSE $4 END WHERE id=$1',
+      [id, totalConfirmed, 'confirmed', 'partial']);
     await db.query('COMMIT');
     res.json({ ok: true });
   } catch (e) {
     await db.query('ROLLBACK');
-    res.status(400).json({ error: String(e.message || e) });
-  }
-});
-
-// --- BOM import: accept CSV or JSON lines ---
-app.post('/api/bom/import', upload.single('file'), async (req, res) => {
-  try {
-    const uploadId = uuidv4();
-    const meta = {
-      id: uploadId,
-      filename: req.file?.originalname || null,
-      size: req.file?.size || null,
-      contentType: req.file?.mimetype || null,
-      note: req.body?.note || null,
-    };
-    await db.query(`INSERT INTO public.bom_uploads (id, filename, size, content_type, note) VALUES ($1,$2,$3,$4,$5)`,
-      [meta.id, meta.filename, meta.size, meta.contentType, meta.note]);
-    let rows = [];
-    if (req.file) {
-      const text = req.file.buffer.toString('utf8');
-      // naive CSV: brand,code,qty,need_by(optional)
-      for (const line of text.split(/\r?\n/)) {
-        const t = line.trim();
-        if (!t || t.startsWith('#')) continue;
-        const [brand, code, qtyStr, needBy] = t.split(',').map(s => (s||'').trim());
-        if (!brand || !code) continue;
-        const qty = Number(qtyStr || '0');
-        rows.push({ brand, code, qty, need_by: needBy || null });
-      }
-    } else if (Array.isArray(req.body?.rows)) {
-      rows = req.body.rows;
-    }
-    for (const r of rows) {
-      await db.query(`INSERT INTO public.bom_lines (upload_id, brand, code, quantity, need_by) VALUES ($1,$2,$3,$4,$5)`,
-        [uploadId, r.brand, r.code, Number(r.qty || r.quantity || 0), r.need_by || null]);
-    }
-    res.json({ ok: true, upload_id: uploadId, count: rows.length });
-  } catch (e) {
-    console.error(e);
     res.status(400).json({ error: String(e.message || e) });
   }
 });

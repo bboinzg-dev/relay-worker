@@ -1,48 +1,45 @@
 const express = require('express');
-const cors = require('cors');
 const bodyParser = require('body-parser');
+const cors = require('cors');
 const db = require('./src/utils/db');
-const { parseActor } = require('./src/utils/auth');
-const { notify, findFamilyForBrandCode, recordEvent } = require('./src/utils/notify');
+const { parseActor, hasRole } = require('./src/utils/auth');
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json({ limit: '25mb' }));
+app.use(bodyParser.json({ limit: '5mb' }));
 
-// manual dispatch
-// POST /notify/dispatch { type, payload, family_slug?, brand?, code?, targets? }
-app.post('/notify/dispatch', async (req, res) => {
-  try {
-    const actor = parseActor(req);
-    const { type, payload={}, family_slug=null, brand=null, code=null } = req.body || {};
-    if (!type) return res.status(400).json({ error: 'type required' });
-    const out = await notify(type, {
-      tenant_id: actor.tenantId || null,
-      actor_id: actor.id || null,
-      family_slug, brand, code,
-      data: payload
-    });
-    res.json(out);
-  } catch (e) {
-    console.error(e);
-    res.status(400).json({ error: String(e.message || e) });
-  }
-});
-
-// test event log
-app.get('/notify/test', async (req, res) => {
+function ensureSellerOrAdmin(req, res, next){
   const actor = parseActor(req);
-  const evt = await recordEvent({ type: 'test', tenant_id: actor.tenantId || null, actor_id: actor.id || null, payload: { hello: 'world' } });
-  res.json(evt);
+  if (!(hasRole(actor,'seller') || hasRole(actor,'admin'))) return res.status(403).json({ error: 'seller role required' });
+  res.locals.__actor = actor; next();
+}
+
+app.get('/api/subscriptions', ensureSellerOrAdmin, async (req, res) => {
+  try {
+    const actor = res.locals.__actor || {};
+    const r = await db.query(`SELECT * FROM public.subscriptions WHERE actor_id=$1 ORDER BY created_at DESC`, [actor.id||'']);
+    res.json({ items: r.rows });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-// helper to resolve family for brand/code
-app.get('/notify/family', async (req, res) => {
-  const brand = (req.query.brand || '').toString();
-  const code = (req.query.code || '').toString();
-  if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
-  const family = await findFamilyForBrandCode(brand, code);
-  res.json({ family_slug: family });
+app.post('/api/subscriptions', ensureSellerOrAdmin, async (req, res) => {
+  try {
+    const actor = res.locals.__actor || {};
+    const { family_slug, target_email, target_webhook, active=true } = req.body || {};
+    if (!family_slug) return res.status(400).json({ error: 'family_slug required' });
+    const r = await db.query(`INSERT INTO public.subscriptions(actor_id, tenant_id, family_slug, target_email, target_webhook, active) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [actor.id||'', actor.tenantId||null, family_slug, target_email||null, target_webhook||null, !!active]);
+    res.json({ ok: true, item: r.rows[0] });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// 간단한 테스트 발송
+app.post('/api/notify/test', ensureSellerOrAdmin, async (req, res) => {
+  try {
+    const actor = res.locals.__actor || {};
+    await db.query(`INSERT INTO public.notifications(type, payload, target, channel) VALUES ('test', $1, $2, 'email')`, [ { hello:'world', at: new Date().toISOString() }, actor.id || 'me' ]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 module.exports = app;

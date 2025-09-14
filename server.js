@@ -7,8 +7,8 @@ const db = require('./src/utils/db');
 const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
-const { parseActor } = require('./src/utils/auth');
-const { notify, findFamilyForBrandCode } = require('./src/utils/notify');
+const { parseActor } = (()=>{ try { return require('./src/utils/auth'); } catch { return { parseActor: ()=>({}) }; } })();
+const { notify, findFamilyForBrandCode } = (()=>{ try { return require('./src/utils/notify'); } catch { return { notify: async()=>({}), findFamilyForBrandCode: async()=>null }; } })();
 
 const app = express();
 app.use(cors());
@@ -51,7 +51,7 @@ app.get('/catalog/blueprint/:family', async (req, res) => {
       WHERE b.family_slug = $1
       LIMIT 1
     `, [family]);
-    if (!r.rows.length) return res.status(404).json({ error: 'blueprint not found' });
+  if (!r.rows.length) return res.status(404).json({ error: 'blueprint not found' });
     res.json(r.rows[0]);
   } catch (e) {
     console.error(e);
@@ -208,14 +208,10 @@ app.post('/ingest/auto', async (req, res) => {
   }
 });
 
-// --- Listings / Purchase Requests / Bids / Orders / BOM ---
-// Stamping owner/tenant from headers (lightweight, replace with real auth later)
+// --- Listings / Purchase Requests / Bids / Orders / BOM(import) ---
 function stampOwnerTenant(req) {
   const actor = parseActor(req);
-  return {
-    owner_id: actor.id || null,
-    tenant_id: actor.tenantId || null,
-  };
+  return { owner_id: actor.id || null, tenant_id: actor.tenantId || null, actor };
 }
 
 app.get('/api/listings', async (req, res) => {
@@ -283,7 +279,7 @@ app.post('/api/purchase-requests', async (req, res) => {
     VALUES ($1,$2,$3, lower($2), lower($3), $4,$5,$6,$7,$8,$9,$10,$11) RETURNING *;
   `, [id, brand, code, required_qty, lead_time_days, target_price_cents, buyer_ref, note, due_date, owner_id, tenant_id]);
 
-  // Notify sellers who subscribed to this family or brand
+  // Notify sellers
   try {
     const family = await findFamilyForBrandCode(brand, code);
     await notify('purchase_request.created', {
@@ -378,19 +374,6 @@ app.post('/api/bom/import', upload.single('file'), async (req, res) => {
       await db.query(`INSERT INTO public.bom_lines (upload_id, brand, code, brand_norm, code_norm, quantity, need_by, owner_id, tenant_id) VALUES ($1,$2,$3, lower($2), lower($3), $4,$5,$6,$7)`,
         [uploadId, r.brand, r.code, Number(r.qty || r.quantity || 0), r.need_by || null, owner_id, tenant_id]);
     }
-
-    // notify sellers by families involved
-    try {
-      const fams = new Set();
-      for (const r of rows) {
-        const fam = await findFamilyForBrandCode(r.brand, r.code);
-        if (fam) fams.add(fam);
-      }
-      for (const f of fams) {
-        await notify('bom.uploaded', { tenant_id, actor_id: owner_id, family_slug: f, data: { upload_id: uploadId, line_count: rows.length } });
-      }
-    } catch (e) { console.warn('notify BOM failed:', e.message || e); }
-
     res.json({ ok: true, upload_id: uploadId, count: rows.length });
   } catch (e) {
     console.error(e);
@@ -398,11 +381,12 @@ app.post('/api/bom/import', upload.single('file'), async (req, res) => {
   }
 });
 
-// --- Mount optional modules if present ---
+// Optional mounts
 try { const visionApp = require('./server.vision'); app.use(visionApp); } catch {}
 try { const embApp = require('./server.embedding'); app.use(embApp); } catch {}
 try { const tenApp = require('./server.tenancy'); app.use(tenApp); } catch {}
 try { const notifyApp = require('./server.notify'); app.use(notifyApp); } catch {}
+try { const bomApp = require('./server.bom'); app.use(bomApp); } catch {}
 
 // 404
 app.use((req, res) => res.status(404).json({ error: 'not found' }));

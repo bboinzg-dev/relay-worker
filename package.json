@@ -1,11 +1,15 @@
 {
   "name": "relay-worker",
-  "version": "2.0.0",
+  "version": "0.1.0",
+  "private": true,
   "type": "commonjs",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js"
+  },
   "dependencies": {
     "express": "^4.19.2",
-    "pg": "^8.16.3"
+    "pg": "^8.12.0"
   }
 }

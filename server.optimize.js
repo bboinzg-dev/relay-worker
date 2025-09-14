@@ -1,27 +1,26 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const { optimize, optimizeLine } = require('./src/opt/optimizer');
+const { optimize, optimizeLine } = (()=>{ try { return require('./src/opt/optimizer'); } catch { return { optimize: async(b)=>b, optimizeLine: async(b)=>b }; } })();
+const { ilpOptimize, ilpOptimizeLine } = (()=>{ try { return require('./src/opt/ilp'); } catch { return { ilpOptimize: async(b)=>b, ilpOptimizeLine: async(b)=>b }; } })();
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
-// POST /api/optimize/plan
-// Body: { items: [{brand,code,required_qty,due_date?}, ...], allow_alternatives?, k_alternatives?, use_bids?, lead_penalty_cents_per_unit_per_day?, alternative_penalty_cents_per_unit? }
 app.post('/api/optimize/plan', async (req, res) => {
   try {
     const body = req.body || {};
     if (!Array.isArray(body.items) || !body.items.length) return res.status(400).json({ error: 'items[] required' });
-    const out = await optimize(body);
-    res.json(out);
+    const solver = (body.solver || 'greedy').toString();
+    const out = solver === 'ilp' ? await ilpOptimize(body) : await optimize(body);
+    res.json({ solver, ...out });
   } catch (e) {
     console.error(e);
     res.status(400).json({ error: String(e.message || e) });
   }
 });
 
-// GET /api/optimize/line?brand=&code=&qty=&due_date=YYYY-MM-DD
 app.get('/api/optimize/line', async (req, res) => {
   try {
     const brand = (req.query.brand || '').toString();
@@ -36,8 +35,10 @@ app.get('/api/optimize/line', async (req, res) => {
       lead_penalty_cents_per_unit_per_day: Number(req.query.lead_penalty || 10),
       alternative_penalty_cents_per_unit: Number(req.query.alt_penalty || 0),
     };
-    const out = await optimizeLine({ brand, code, required_qty: qty, due_date: due }, opts);
-    res.json(out);
+    const solver = (req.query.solver || 'greedy').toString();
+    const out = solver === 'ilp' ? await ilpOptimizeLine({ brand, code, required_qty: qty, due_date: due }, opts)
+                                 : await optimizeLine({ brand, code, required_qty: qty, due_date: due }, opts);
+    res.json({ solver, ...out });
   } catch (e) {
     console.error(e);
     res.status(400).json({ error: String(e.message || e) });

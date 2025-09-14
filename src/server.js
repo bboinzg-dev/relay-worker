@@ -1,5 +1,6 @@
 import express from "express";
-import authRouter from "./routes/manager.js"; // ← 여기만 바꾸기
+import authRouter from "./routes/manager.js"; // ✅ 실제 라우터가 있는 파일
+
 
 const app = express();
 app.use(express.json());

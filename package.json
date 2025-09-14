@@ -1,15 +1,18 @@
 {
   "name": "relay-worker",
-  "version": "0.1.0",
   "private": true,
-  "type": "commonjs",
-  "engines": { "node": ">=20" },
+  "version": "1.0.0",
+  "description": "Cloud Run worker (Express + pg)",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "NODE_ENV=development node server.js"
+    "check": "node --check server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "pg": "^8.12.0"
+    "pg": "^8.11.3"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

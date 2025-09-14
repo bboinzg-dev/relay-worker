@@ -20,12 +20,25 @@ app.get('/_env', (_req, res) => res.json({
   GIT_SHA: process.env.GIT_SHA || null
 }));
 
+function addGcsFallback(row) {
+  if (!row) return row;
+  const B = process.env.GCS_BUCKET;
+  const b = (row.brand || '').toLowerCase();
+  const c = (row.code  || '').toLowerCase();
+  if (B) {
+    if (!row.cover)         row.cover         = `https://storage.googleapis.com/${B}/images/${b}/${c}/cover.png`;
+    if (!row.datasheet_url) row.datasheet_url = `https://storage.googleapis.com/${B}/datasheets/${c}.pdf`;
+  }
+  return row;
+}
+
 // /parts/detail
 app.get('/parts/detail', async (req, res) => {
   try {
     const brand = String(req.query.brand || '').trim();
     const code  = String(req.query.code  || '').trim();
     if (!brand || !code) return res.status(400).json({ ok:false, error:'brand and code are required' });
+
     const sql = `
       SELECT id, brand, code, series, family_slug, display_name,
              contact_form, coil_voltage_vdc, contact_rating_text,
@@ -36,15 +49,7 @@ app.get('/parts/detail', async (req, res) => {
     const { rows } = await pool.query(sql, [brand, code]);
     if (!rows.length) return res.status(404).json({ ok:false, error:'not_found' });
 
-    const row = rows[0];
-    const B = process.env.GCS_BUCKET;
-    const b = (row.brand||'').toLowerCase();
-    const c = (row.code ||'').toLowerCase();
-    if (B) {
-      if (!row.cover)         row.cover         = `https://storage.googleapis.com/${B}/images/${b}/${c}/cover.png`;
-      if (!row.datasheet_url) row.datasheet_url = `https://storage.googleapis.com/${B}/datasheets/${c}.pdf`;
-    }
-    return res.json({ ok:true, item: row });
+    return res.json({ ok:true, item: addGcsFallback(rows[0]) });
   } catch (e) {
     console.error('detail error', e);
     return res.status(500).json({ ok:false, error:'internal' });
@@ -69,7 +74,7 @@ app.get('/parts/search', async (req, res) => {
       ORDER BY brand, code
       LIMIT $2 OFFSET $3`;
     const { rows } = await pool.query(sql, [like, limit, offset]);
-    return res.json({ ok:true, items: rows, total: rows.length });
+    return res.json({ ok:true, items: rows.map(addGcsFallback), total: rows.length });
   } catch (e) {
     console.error('search error', e);
     return res.status(500).json({ ok:false, error:'internal' });

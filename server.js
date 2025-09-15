@@ -48,12 +48,14 @@ try { const { patchDbLogging } = require('./src/utils/logger'); patchDbLogging(r
 
 // envs
 const PORT = process.env.PORT || 8080;
+
 const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
 const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
   ? GCS_BUCKET_URI.replace(/^gs:\/\//, '').split('/')[0]
   : '';
 
 // ---------------- health & env ----------------
+app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));
 app.get('/_healthz', (req, res) => res.type('text/plain').send('ok'));
 app.get('/_env', (req, res) => {
   res.json({

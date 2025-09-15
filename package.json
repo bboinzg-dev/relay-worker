@@ -1,5 +1,8 @@
 {
   "name": "relay-worker",
+   "scripts": {
+    "start": "node server.js"
+  }
   "version": "0.4.0",
   "type": "commonjs",
   "main": "server.js",

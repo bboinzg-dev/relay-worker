@@ -292,18 +292,6 @@ try {
   console.log('[BOOT] fallback /auth routes registered (no manager.js)');
 }
 
-/* ======================================================================
-   [추가] 카탈로그 트리 / 검색 facet 404 방지용 스텁
-   프론트가 /catalog/tree, /api/catalog/tree, /search/facets, /api/search/facets 를 반복 호출하므로
-   임시라도 200을 내려 404 flood를 막습니다. (원 데이터가 있으면 여기에 로직을 채우세요)
-====================================================================== */
-const catalogTreeHandler = (req, res) => {
-  res.json({ ok: true, nodes: [] });
-};
-app.get('/catalog/tree', catalogTreeHandler);
-app.get('/api/catalog/tree', catalogTreeHandler);
-app.get('/search/facets', (req, res) => res.json({ ok: true, facets: {} }));
-app.get('/api/search/facets', (req, res) => res.json({ ok: true, facets: {} }));
 
 /* ======================================================================
    [추가] /auth 라우터 마운트

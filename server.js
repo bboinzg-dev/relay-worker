@@ -263,14 +263,14 @@ app.post('/ingest/auto', async (req, res) => {
 /* ===== DEBUG/BOOT MARKS (반드시 한 번만) ===== */
 console.log('[BOOT] server.js loaded, will mount /auth and catalog stubs');
 
-/* ===== (1) 카탈로그/검색 404 방지 — 프론트가 계속 치는 엔드포인트 ===== */
-const catalogTreeHandler = (req, res) => {
-  res.json({ ok: true, nodes: [] }); // TODO: 실제 구현으로 교체
-};
-app.get('/catalog/tree', catalogTreeHandler);
-app.get('/api/catalog/tree', catalogTreeHandler);      // 프록시 경로도 허용
-app.get('/search/facets', (req, res) => res.json({ ok: true, facets: {} }));
-app.get('/api/search/facets', (req, res) => res.json({ ok: true, facets: {} }));
++/* ===== (1) 카탈로그/검색 404 방지 — 프론트가 계속 치는 엔드포인트 ===== */
++(() => {
++  const h = (_req, res) => res.json({ ok: true, nodes: [] }); // TODO: 실제 구현으로 교체
++  app.get('/catalog/tree', h);
++  app.get('/api/catalog/tree', h);      // 프록시 경로도 허용
++  app.get('/search/facets',  (_req, res) => res.json({ ok: true, facets: {} }));
++  app.get('/api/search/facets', (_req, res) => res.json({ ok: true, facets: {} }));
++})();
 
 /* ===== (2) /auth 라우터 마운트 (성공/실패 로그 + 실패시 폴백) ===== */
 try {
@@ -293,23 +293,7 @@ try {
 }
 
 
-/* ======================================================================
-   [추가] /auth 라우터 마운트
-   - src/routes/manager.js 에 /auth/signup, /auth/login 구현
-   - /auth/* 와 /api/worker/auth/* 둘 다 허용 (과거 프리픽스 호환)
-====================================================================== */
-try {
-  const authRouter = require('./src/routes/manager');
-  app.use(authRouter);                // => /auth/...
-  app.use('/api/worker', authRouter); // => /api/worker/auth/...
-  console.log('[worker] mounted /auth routes from ./src/routes/manager.js');
-} catch (e) {
-  if (e && (e.code === 'MODULE_NOT_FOUND' || /Cannot find module/.test(String(e)))) {
-    console.log('[worker] ./src/routes/manager.js not found; skip /auth routes');
-  } else {
-    console.error('[worker] failed to mount ./src/routes/manager.js', e);
-  }
-}
+
 
 // ---------------- Optional mounts (있으면 사용, 없으면 스킵) ----------------
 try { const visionApp  = require('./server.vision');       app.use(visionApp); }  catch {}
@@ -330,7 +314,3 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'internal error' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-   console.log("[boot] worker up on %s (models %s/%s, project=%s, loc=%s)",
-     PORT, MODEL_CLASSIFY, MODEL_EXTRACT, GCP_PROJECT_ID, VERTEX_LOCATION);
- });

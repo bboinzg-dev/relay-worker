@@ -1,50 +1,59 @@
-// relay-worker/server.js
+/* server.js */
+'use strict';
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 
+// --- utils / services ---
 const db = require('./src/utils/db');
 const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 const authzGlobal = require('./src/mw/authzGlobal');
 
-const { requestLogger, patchDbLogging, logError } = (() => {
+// optional utils (존재 안해도 동작하도록)
+const {
+  requestLogger, patchDbLogging, logError
+} = (() => {
   try { return require('./src/utils/logger'); }
-  catch { return { requestLogger: () => ((req,res,next)=>next()), patchDbLogging: () => {}, logError: () => {} }; }
+  catch { return { requestLogger: () => (req, res, next) => next(), patchDbLogging: () => {}, logError: () => {} }; }
 })();
+
 const { parseActor } = (() => {
   try { return require('./src/utils/auth'); }
   catch { return { parseActor: () => ({}) }; }
 })();
+
 const { notify, findFamilyForBrandCode } = (() => {
   try { return require('./src/utils/notify'); }
   catch { return { notify: async () => ({}), findFamilyForBrandCode: async () => null }; }
 })();
 
+// --- app bootstrap ---
 const app = express();
-app.disable('x-powered-by');
-
 app.use(requestLogger());
 app.use(cors());
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
-
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Global authorization/tenancy guard
+// Global authorization / tenancy guard
 app.use(authzGlobal);
 
-// DB logging
+// DB logging patch (optional)
 try { const { patchDbLogging } = require('./src/utils/logger'); patchDbLogging(require('./src/utils/db')); } catch {}
 
+// envs
 const PORT = process.env.PORT || 8080;
 const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
-const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://') ? GCS_BUCKET_URI.replace(/^gs:\/\//,'').split('/')[0] : '';
+const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
+  ? GCS_BUCKET_URI.replace(/^gs:\/\//, '').split('/')[0]
+  : '';
 
-// --- health/env ---
+// ---------------- health & env ----------------
 app.get('/_healthz', (req, res) => res.type('text/plain').send('ok'));
 app.get('/_env', (req, res) => {
   res.json({
@@ -54,10 +63,14 @@ app.get('/_env', (req, res) => {
   });
 });
 
-// --- catalog registry / blueprint ---
+// --------------- catalog registry / blueprint ---------------
 app.get('/catalog/registry', async (req, res) => {
   try {
-    const r = await db.query(`SELECT family_slug, specs_table FROM public.component_registry ORDER BY family_slug`);
+    const r = await db.query(`
+      SELECT family_slug, specs_table
+      FROM public.component_registry
+      ORDER BY family_slug
+    `);
     res.json({ items: r.rows });
   } catch (e) {
     console.error(e);
@@ -83,19 +96,7 @@ app.get('/catalog/blueprint/:family', async (req, res) => {
   }
 });
 
-// --- (추가) catalog tree 최소 구현 ---
-app.get('/catalog/tree', async (req, res) => {
-  try {
-    const r = await db.query(`SELECT family_slug FROM public.component_registry ORDER BY family_slug`);
-    const items = r.rows.map(x => ({ slug: x.family_slug, name: x.family_slug }));
-    res.json({ items });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'catalog_tree_failed' });
-  }
-});
-
-// --- files: signed URL ---
+// ---------------- files: signed URL / move ----------------
 app.get('/api/files/signed-url', async (req, res) => {
   try {
     const gcsUri = req.query.gcsUri;
@@ -108,7 +109,6 @@ app.get('/api/files/signed-url', async (req, res) => {
   }
 });
 
-// --- files: move to canonical datasheet path ---
 app.post('/api/files/move', async (req, res) => {
   try {
     const { srcGcsUri, family_slug, brand, code, dstGcsUri } = req.body || {};
@@ -122,7 +122,7 @@ app.post('/api/files/move', async (req, res) => {
   }
 });
 
-// --- parts: simple search/detail/alternatives (v1) ---
+// ---------------- parts: search / detail / alternatives ----------------
 app.get('/parts/search', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const limit = Math.min(Number(req.query.limit || 20), 100);
@@ -133,7 +133,7 @@ app.get('/parts/search', async (req, res) => {
        WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
        ORDER BY updated_at DESC
        LIMIT $2`,
-      [text, limit]
+      [text, limit],
     );
     res.json({ items: rows.rows });
   } catch (e) {
@@ -144,12 +144,14 @@ app.get('/parts/search', async (req, res) => {
 
 app.get('/parts/detail', async (req, res) => {
   const brand = (req.query.brand || '').toString();
-  const code = (req.query.code || '').toString();
+  const code  = (req.query.code  || '').toString();
   if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
   try {
     const row = await db.query(
-      `SELECT * FROM public.relay_specs WHERE brand_norm=lower($1) AND code_norm=lower($2) LIMIT 1`,
-      [brand, code]
+      `SELECT * FROM public.relay_specs
+       WHERE brand_norm = lower($1) AND code_norm = lower($2)
+       LIMIT 1`,
+      [brand, code],
     );
     if (!row.rows.length) return res.status(404).json({ error: 'not found' });
     res.json(row.rows[0]);
@@ -161,25 +163,28 @@ app.get('/parts/detail', async (req, res) => {
 
 app.get('/parts/alternatives', async (req, res) => {
   const brand = (req.query.brand || '').toString();
-  const code = (req.query.code || '').toString();
+  const code  = (req.query.code  || '').toString();
   const limit = Math.min(Number(req.query.limit || 10), 50);
   if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
   try {
     const base = await db.query(
-      `SELECT * FROM public.relay_specs WHERE brand_norm=lower($1) AND code_norm=lower($2) LIMIT 1`,
-      [brand, code]
+      `SELECT * FROM public.relay_specs
+       WHERE brand_norm = lower($1) AND code_norm = lower($2)
+       LIMIT 1`,
+      [brand, code],
     );
     if (!base.rows.length) return res.status(404).json({ error: 'base not found' });
+
     const b = base.rows[0];
     const rows = await db.query(
       `SELECT *,
         (CASE WHEN family_slug IS NOT NULL AND family_slug = $1 THEN 0 ELSE 1 END) * 1.0 +
         COALESCE(ABS(COALESCE(coil_voltage_vdc,0) - COALESCE($2::numeric,0)) / 100.0, 1.0) AS score
        FROM public.relay_specs
-       WHERE NOT (brand_norm=lower($3) AND code_norm=lower($4))
+       WHERE NOT (brand_norm = lower($3) AND code_norm = lower($4))
        ORDER BY score ASC
        LIMIT $5`,
-      [b.family_slug || null, b.coil_voltage_vdc || null, brand, code, limit]
+      [b.family_slug || null, b.coil_voltage_vdc || null, brand, code, limit],
     );
     res.json({ base: b, items: rows.rows });
   } catch (e) {
@@ -188,23 +193,26 @@ app.get('/parts/alternatives', async (req, res) => {
   }
 });
 
-// --- ingest: manual / bulk / auto ---
+// ---------------- ingest: manual / bulk / auto ----------------
 app.post('/ingest', async (req, res) => {
   try {
     const {
       family_slug,
       specs_table, brand, code, series, display_name,
-      datasheet_url, cover, source_gcs_uri, raw_json=null,
-      fields = {}, values = {}, tenant_id=null, owner_id=null, created_by=null, updated_by=null
+      datasheet_url, cover, source_gcs_uri, raw_json = null,
+      fields = {}, values = {},
+      tenant_id = null, owner_id = null, created_by = null, updated_by = null,
     } = req.body || {};
 
     const table = (specs_table || `${family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
     if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
+
     await ensureSpecsTable(table, fields);
     const row = await upsertByBrandCode(table, {
       brand, code, series, display_name, family_slug, datasheet_url, cover, source_gcs_uri, raw_json,
-      tenant_id, owner_id, created_by, updated_by, ...values
+      tenant_id, owner_id, created_by, updated_by, ...values,
     });
+
     res.json({ ok: true, table, row });
   } catch (e) {
     console.error(e);
@@ -215,7 +223,9 @@ app.post('/ingest', async (req, res) => {
 app.post('/ingest/bulk', async (req, res) => {
   try {
     const { items = [] } = req.body || {};
-    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items[] required' });
+    if (!Array.isArray(items) || !items.length)
+      return res.status(400).json({ error: 'items[] required' });
+
     const out = [];
     for (const it of items) {
       const table = (it.specs_table || `${it.family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
@@ -224,7 +234,8 @@ app.post('/ingest/bulk', async (req, res) => {
         brand: it.brand, code: it.code, series: it.series, display_name: it.display_name,
         family_slug: it.family_slug, datasheet_url: it.datasheet_url, cover: it.cover,
         source_gcs_uri: it.source_gcs_uri, raw_json: it.raw_json || null,
-        tenant_id: it.tenant_id || null, owner_id: it.owner_id || null, created_by: it.created_by || null, updated_by: it.updated_by || null,
+        tenant_id: it.tenant_id || null, owner_id: it.owner_id || null,
+        created_by: it.created_by || null, updated_by: it.updated_by || null,
         ...(it.values || {}),
       });
       out.push({ table, row });
@@ -238,7 +249,7 @@ app.post('/ingest/bulk', async (req, res) => {
 
 app.post('/ingest/auto', async (req, res) => {
   try {
-    const { gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null } = req.body || {};
+    const { gcsUri, family_slug = null, brand = null, code = null, series = null, display_name = null } = req.body || {};
     const result = await runAutoIngest({ gcsUri, family_slug, brand, code, series, display_name });
     res.json(result);
   } catch (e) {
@@ -247,10 +258,28 @@ app.post('/ingest/auto', async (req, res) => {
   }
 });
 
-// ---------- /auth, /account 라우터 마운트 (CJS) ----------
+/* ======================================================================
+   [추가] 카탈로그 트리 / 검색 facet 404 방지용 스텁
+   프론트가 /catalog/tree, /api/catalog/tree, /search/facets, /api/search/facets 를 반복 호출하므로
+   임시라도 200을 내려 404 flood를 막습니다. (원 데이터가 있으면 여기에 로직을 채우세요)
+====================================================================== */
+const catalogTreeHandler = (req, res) => {
+  res.json({ ok: true, nodes: [] });
+};
+app.get('/catalog/tree', catalogTreeHandler);
+app.get('/api/catalog/tree', catalogTreeHandler);
+app.get('/search/facets', (req, res) => res.json({ ok: true, facets: {} }));
+app.get('/api/search/facets', (req, res) => res.json({ ok: true, facets: {} }));
+
+/* ======================================================================
+   [추가] /auth 라우터 마운트
+   - src/routes/manager.js 에 /auth/signup, /auth/login 구현
+   - /auth/* 와 /api/worker/auth/* 둘 다 허용 (과거 프리픽스 호환)
+====================================================================== */
 try {
-  const authRouter = require('./src/routes/manager'); // 확장자 생략해도 됨
-  app.use(authRouter); // /auth/* 경로가 실제로 올라감
+  const authRouter = require('./src/routes/manager');
+  app.use(authRouter);                // => /auth/...
+  app.use('/api/worker', authRouter); // => /api/worker/auth/...
   console.log('[worker] mounted /auth routes from ./src/routes/manager.js');
 } catch (e) {
   if (e && (e.code === 'MODULE_NOT_FOUND' || /Cannot find module/.test(String(e)))) {
@@ -260,31 +289,20 @@ try {
   }
 }
 
-// ---------- 카탈로그 트리 (프론트가 /api/catalog/tree 로 치는 케이스 대응) ----------
-const catalogTreeHandler = (req, res) => {
-  res.json({
-    tree: [{ slug: 'relay', name: 'Relay' }],
-  });
-};
-app.get('/catalog/tree', catalogTreeHandler);
-app.get('/api/catalog/tree', catalogTreeHandler); // <-- 프론트 로그에 나오던 경로까지 허용
+// ---------------- Optional mounts (있으면 사용, 없으면 스킵) ----------------
+try { const visionApp  = require('./server.vision');       app.use(visionApp); }  catch {}
+try { const embApp     = require('./server.embedding');    app.use(embApp); }     catch {}
+try { const tenApp     = require('./server.tenancy');      app.use(tenApp); }     catch {}
+try { const notifyApp  = require('./server.notify');       app.use(notifyApp); }  catch {}
+try { const bomApp     = require('./server.bom');          app.use(bomApp); }     catch {}
+try { const optApp     = require('./server.optimize');     app.use(optApp); }     catch {}
+try { const tasksApp   = require('./server.notifyTasks');  app.use(tasksApp); }   catch {}
+try { const opsApp     = require('./server.ops');          app.use(opsApp); }     catch {}
+try { const schemaApp  = require('./server.schema');       app.use(schemaApp); }  catch {}
 
-
-// --- Optional mounts (있으면 사용, 없으면 스킵) ---
-try { const visionApp = require('./server.vision'); app.use(visionApp); } catch {}
-try { const embApp = require('./server.embedding'); app.use(embApp); } catch {}
-try { const tenApp = require('./server.tenancy'); app.use(tenApp); } catch {}
-try { const notifyApp = require('./server.notify'); app.use(notifyApp); } catch {}
-try { const bomApp = require('./server.bom'); app.use(bomApp); } catch {}
-try { const optApp = require('./server.optimize'); app.use(optApp); } catch {}
-try { const tasksApp = require('./server.notifyTasks'); app.use(tasksApp); } catch {}
-try { const opsApp = require('./server.ops'); app.use(opsApp); } catch {}
-try { const schemaApp = require('./server.schema'); app.use(schemaApp); } catch {}
-
-// 404
+// ---------------- 404 & error ----------------
 app.use((req, res) => res.status(404).json({ error: 'not found' }));
 
-// error guard
 app.use((err, req, res, next) => {
   try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
   res.status(500).json({ error: 'internal error' });

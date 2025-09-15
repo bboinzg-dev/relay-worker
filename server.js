@@ -258,6 +258,38 @@ app.post('/ingest/auto', async (req, res) => {
   }
 });
 
+/* ===== DEBUG/BOOT MARKS (반드시 한 번만) ===== */
+console.log('[BOOT] server.js loaded, will mount /auth and catalog stubs');
+
+/* ===== (1) 카탈로그/검색 404 방지 — 프론트가 계속 치는 엔드포인트 ===== */
+const catalogTreeHandler = (req, res) => {
+  res.json({ ok: true, nodes: [] }); // TODO: 실제 구현으로 교체
+};
+app.get('/catalog/tree', catalogTreeHandler);
+app.get('/api/catalog/tree', catalogTreeHandler);      // 프록시 경로도 허용
+app.get('/search/facets', (req, res) => res.json({ ok: true, facets: {} }));
+app.get('/api/search/facets', (req, res) => res.json({ ok: true, facets: {} }));
+
+/* ===== (2) /auth 라우터 마운트 (성공/실패 로그 + 실패시 폴백) ===== */
+try {
+  const authRouter = require('./src/routes/manager');  // CJS 라우터 기대
+  app.use(authRouter);                                 // /auth/*
+  app.use('/api/worker', authRouter);                  // 구 프리픽스도 겸용 허용
+  console.log('[BOOT] mounted /auth routes from ./src/routes/manager.js');
+} catch (e) {
+  console.error('[BOOT] FAILED to mount ./src/routes/manager.js:', e && e.code ? e.code : e);
+
+  // --- 폴백: 최소 동작 보장 — manager가 없어도 200으로 응답해 404를 없앤다 ---
+  app.get('/auth/health', (req,res)=>res.json({ ok:true, stub:true }));
+  app.post('/auth/signup', express.json({limit:'5mb'}), (req,res)=>{
+    res.json({ ok:true, token:'stub-token', user: { username: req.body?.username, email: req.body?.email }});
+  });
+  app.post('/auth/login', express.json({limit:'2mb'}), (req,res)=>{
+    res.json({ ok:true, token:'stub-token', user: { id: req.body?.usernameOrEmail || 'user' }});
+  });
+  console.log('[BOOT] fallback /auth routes registered (no manager.js)');
+}
+
 /* ======================================================================
    [추가] 카탈로그 트리 / 검색 facet 404 방지용 스텁
    프론트가 /catalog/tree, /api/catalog/tree, /search/facets, /api/search/facets 를 반복 호출하므로

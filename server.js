@@ -243,6 +243,46 @@ app.post('/ingest/auto', async (req, res) => {
   }
 });
 
+app.post('/ingest/auto', async (req, res) => {
+  try {
+    const { gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null } = req.body || {};
+    const result = await runAutoIngest({ gcsUri, family_slug, brand, code, series, display_name });
+    res.json(result);
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ error: String(e.message || e) });
+  }
+});
+// ---------- /auth, /account 라우터 (ESM) 마운트 [ADD] ----------
+(async () => {
+  try {
+    // 실제 /auth/signup, /auth/login, /account 라우트가 있는 파일
+    const mod = await import('./src/routes/manager.js');
+    const authRouter = mod.default || mod;  // default export 또는 모듈 자체
+
+    // express.Router 인스턴스면 그대로 마운트
+    if (authRouter && authRouter.use && authRouter.handle) {
+      app.use(authRouter);
+      console.log('[worker] mounted /auth routes from ./src/routes/manager.js');
+      return;
+    }
+    // 함수 export(register(app) 등)면 호출
+    if (typeof authRouter === 'function') {
+      authRouter(app);
+      console.log('[worker] mounted /auth routes (function export)');
+      return;
+    }
+
+    console.warn('[worker] ./src/routes/manager.js loaded but not a router/function');
+  } catch (e) {
+    if (e && (e.code === 'ERR_MODULE_NOT_FOUND' || /Cannot find module/.test(String(e)))) {
+      console.log('[worker] ./src/routes/manager.js not found; skip /auth routes');
+    } else {
+      console.error('[worker] failed to mount ./src/routes/manager.js', e);
+    }
+  }
+})();
+
 // ---------- [ADDED] /auth, /account 라우터 마운트 (ESM 라우터) ----------
 (async () => {
   try {
@@ -258,6 +298,9 @@ app.post('/ingest/auto', async (req, res) => {
     }
   }
 })();
+
+// --- Optional mounts (있으면 사용, 없으면 스킵) ---
+try { const visionApp = require('./server.vision'); app.use(visionApp); } catch {}
 
 // --- Optional mounts (있으면 사용, 없으면 스킵) ---
 try { const visionApp = require('./server.vision'); app.use(visionApp); } catch {}

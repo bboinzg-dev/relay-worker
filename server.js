@@ -13,7 +13,7 @@ const authzGlobal = require('./src/mw/authzGlobal');
 
 const { requestLogger, patchDbLogging, logError } = (() => {
   try { return require('./src/utils/logger'); }
-  catch { return { requestLogger: () => ((req, res, next) => next()), patchDbLogging: () => {}, logError: () => {} }; }
+  catch { return { requestLogger: () => ((req,res,next)=>next()), patchDbLogging: () => {}, logError: () => {} }; }
 })();
 const { parseActor } = (() => {
   try { return require('./src/utils/auth'); }
@@ -25,24 +25,24 @@ const { notify, findFamilyForBrandCode } = (() => {
 })();
 
 const app = express();
+app.disable('x-powered-by');
+
 app.use(requestLogger());
 app.use(cors());
-// JSON / x-www-form-urlencoded
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// (필요시) 파일 업로드
 const upload = multer({ storage: multer.memoryStorage() });
 
-// 글로벌 권한/테넌시 가드
+// Global authorization/tenancy guard
 app.use(authzGlobal);
 
-// DB 로깅 패치 (있을 때만)
+// DB logging
 try { const { patchDbLogging } = require('./src/utils/logger'); patchDbLogging(require('./src/utils/db')); } catch {}
 
 const PORT = process.env.PORT || 8080;
 const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
-const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://') ? GCS_BUCKET_URI.replace(/^gs:\/\//, '').split('/')[0] : '';
+const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://') ? GCS_BUCKET_URI.replace(/^gs:\/\//,'').split('/')[0] : '';
 
 // --- health/env ---
 app.get('/_healthz', (req, res) => res.type('text/plain').send('ok'));
@@ -84,7 +84,6 @@ app.get('/catalog/blueprint/:family', async (req, res) => {
 });
 
 // --- (추가) catalog tree 최소 구현 ---
-// homepage의 /api/catalog/tree 가 worker의 /catalog/tree로 프록시되므로 404 방지
 app.get('/catalog/tree', async (req, res) => {
   try {
     const r = await db.query(`SELECT family_slug FROM public.component_registry ORDER BY family_slug`);
@@ -195,8 +194,8 @@ app.post('/ingest', async (req, res) => {
     const {
       family_slug,
       specs_table, brand, code, series, display_name,
-      datasheet_url, cover, source_gcs_uri, raw_json = null,
-      fields = {}, values = {}, tenant_id = null, owner_id = null, created_by = null, updated_by = null
+      datasheet_url, cover, source_gcs_uri, raw_json=null,
+      fields = {}, values = {}, tenant_id=null, owner_id=null, created_by=null, updated_by=null
     } = req.body || {};
 
     const table = (specs_table || `${family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
@@ -239,7 +238,7 @@ app.post('/ingest/bulk', async (req, res) => {
 
 app.post('/ingest/auto', async (req, res) => {
   try {
-    const { gcsUri, family_slug = null, brand = null, code = null, series = null, display_name = null } = req.body || {};
+    const { gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null } = req.body || {};
     const result = await runAutoIngest({ gcsUri, family_slug, brand, code, series, display_name });
     res.json(result);
   } catch (e) {
@@ -248,13 +247,13 @@ app.post('/ingest/auto', async (req, res) => {
   }
 });
 
-/* ---------- [여기에 추가] /auth 라우터 마운트 (manager.js) ---------- */
+/* ---------- [여기에 추가] /auth 라우터 마운트 ---------- */
 (async () => {
   try {
     const mod = await import('./src/routes/manager.js');
-    const authRouter = mod.default || mod;
+    const authRouter = mod.default || mod;  // default 또는 CJS
     if (authRouter && authRouter.use && authRouter.handle) {
-      app.use(authRouter); // 라우터 내부가 '/auth/...' 절대 경로
+      app.use(authRouter); // 라우터 내부 절대경로 '/auth/...'
       console.log('[worker] mounted /auth routes from ./src/routes/manager.js');
     } else if (typeof authRouter === 'function') {
       authRouter(app);

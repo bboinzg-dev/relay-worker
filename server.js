@@ -252,52 +252,58 @@ app.post('/ingest/auto', async (req, res) => {
     console.error(e);
     res.status(400).json({ error: String(e.message || e) });
   }
-});
-// ---------- /auth, /account 라우터 (ESM) 마운트 [ADD] ----------
+});// ---------- /auth, /account 라우터 (ESM/CJS 둘다 허용) 마운트 ----------
 (async () => {
   try {
-    // 실제 /auth/signup, /auth/login, /account 라우트가 있는 파일
-    const mod = await import('./src/routes/manager.js');
-    const authRouter = mod.default || mod;  // default export 또는 모듈 자체
+    // 1) 실제 /auth/signup, /auth/login 라우트가 들어있는 파일 경로를 맞춰준다.
+    //    기본값은 ./src/routes/manager.js 로 가정.
+    //    만약 네 레포에서 파일명이 다르면(예: ./src/routes/index.js, ./src/routes/auth/index.js 등)
+    //    아래 import 경로만 실제 파일로 바꿔주면 됨.
+    const mod = await import('./src/routes/manager.js').catch(async (e) => {
+      // 경로가 다를 수 있으니, 가장 흔한 대안 경로들도 순차적으로 시도
+      if (e?.code !== 'ERR_MODULE_NOT_FOUND' && !/Cannot find module/.test(String(e))) throw e;
+      try { return await import('./src/routes/index.js'); } catch {}
+      try { return await import('./src/routes/auth/index.js'); } catch {}
+      throw e;
+    });
 
-    // express.Router 인스턴스면 그대로 마운트
-    if (authRouter && authRouter.use && authRouter.handle) {
-      app.use(authRouter);
-      console.log('[worker] mounted /auth routes from ./src/routes/manager.js');
+    // default export Router, 혹은 { router }, 혹은 app을 인자로 받는 함수 등
+    const cand = mod?.default ?? mod?.router ?? mod;
+
+    // 1) express.Router 인스턴스를 export 하는 경우 (router.use/handle 이 있음)
+    if (cand && cand.use && cand.handle) {
+      // 라우터 안에 경로가 'router.post("/auth/signup")' 식으로 **절대경로**면 그냥 마운트
+      app.use(cand);
+      console.log('[worker] mounted router (absolute paths inside router)');
       return;
     }
-    // 함수 export(register(app) 등)면 호출
-    if (typeof authRouter === 'function') {
-      authRouter(app);
-      console.log('[worker] mounted /auth routes (function export)');
+
+    // 2) '/signup' 형태 상대 경로만 있는 라우터라면 '/auth' 베이스로 마운트
+    //    (cand.routesHint 같은 힌트가 없으니, 둘 다 시도해보고 성공한 쪽만 남기는게 베스트)
+    if (cand && cand.stack && Array.isArray(cand.stack)) {
+      // 라우터 안의 path가 '/signup' 같은 상대경로라면 아래 줄로 교체
+      app.use('/auth', cand);
+      console.log('[worker] mounted router at /auth (router has relative paths)');
       return;
     }
 
-    console.warn('[worker] ./src/routes/manager.js loaded but not a router/function');
+    // 3) 함수를 export해서 내부에서 app.use를 등록하는 스타일
+    if (typeof cand === 'function') {
+      cand(app);
+      console.log('[worker] mounted routes via function(app)');
+      return;
+    }
+
+    console.warn('[worker] routes module loaded but not a router/function:', Object.keys(mod || {}));
   } catch (e) {
     if (e && (e.code === 'ERR_MODULE_NOT_FOUND' || /Cannot find module/.test(String(e)))) {
-      console.log('[worker] ./src/routes/manager.js not found; skip /auth routes');
+      console.error('[worker] routes module not found. Make sure ./src/routes/manager.js (or index.js) exists');
     } else {
-      console.error('[worker] failed to mount ./src/routes/manager.js', e);
+      console.error('[worker] failed to mount routes:', e);
     }
   }
 })();
 
-// ---------- [ADDED] /auth, /account 라우터 마운트 (ESM 라우터) ----------
-(async () => {
-  try {
-    const mod = await import('./src/routes/manager.js'); // default export Router
-    const authRouter = mod.default || mod;
-    app.use(authRouter);
-    console.log('[worker] mounted auth/account routes from ./src/routes/manager.js');
-  } catch (e) {
-    if (e && (e.code === 'ERR_MODULE_NOT_FOUND' || /Cannot find module/.test(String(e)))) {
-      console.log('[worker] ./src/routes/manager.js not found; skip /auth routes');
-    } else {
-      console.error('[worker] failed to mount ./src/routes/manager.js', e);
-    }
-  }
-})();
 
 // --- Optional mounts (있으면 사용, 없으면 스킵) ---
 try { const visionApp = require('./server.vision'); app.use(visionApp); } catch {}

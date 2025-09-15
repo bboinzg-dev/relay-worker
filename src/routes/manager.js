@@ -1,41 +1,54 @@
-// src/routes/manager.js
-'use strict';
-
+// relay-worker/src/routes/manager.js (요약 복구안)
 const express = require('express');
-const { v4: uuidv4 } = require('uuid');
+const { Pool } = require('pg');
+const argon2 = require('argon2');
+const jwt = require('jsonwebtoken');
 
 const router = express.Router();
-router.get('/auth/health', (_req, res) => res.json({ ok: true }));
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSLMODE==='require' ? { rejectUnauthorized:false } : false });
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
-// 마운트 확인용
-router.get('/auth/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+router.post('/auth/signup', async (req, res) => {
+  const { username, email, phone, password, is_seller_requested, profile } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: 'username & password required' });
 
-// 회원가입
-router.post('/auth/signup', express.json({ limit: '5mb' }), async (req, res) => {
+  const client = await pool.connect();
   try {
-    const p = req.body || {};
-    // TODO: 실제 검증/중복체크/DB 저장 추가
-    const token = uuidv4();
-    res.json({ ok: true, token, user: { username: p.username, email: p.email } });
-  } catch (e) {
-    console.error('[signup] error:', e);
-    res.status(400).json({ error: 'signup failed', detail: String(e.message || e) });
-  }
-});
+    await client.query('BEGIN');
 
-// 로그인
-router.post('/auth/login', express.json({ limit: '2mb' }), async (req, res) => {
-  try {
-    const { usernameOrEmail } = req.body || {};
-    // TODO: 실제 인증 로직 추가
-    const token = uuidv4();
-    res.json({ ok: true, token, user: { id: usernameOrEmail } });
+    const dup = await client.query('select 1 from users where lower(username)=lower($1)', [username]);
+    if (dup.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'USERNAME_TAKEN' }); }
+
+    const hash = await argon2.hash(password);
+    const u = await client.query(
+      `insert into users (username,email,phone,password_hash,is_seller_requested)
+       values ($1,$2,$3,$4,$5)
+       returning id,username,email,is_seller,is_seller_requested,seller_status`,
+      [username, email || null, phone || null, hash, !!is_seller_requested]
+    );
+
+    const uid = u.rows[0].id;
+    const p = profile || {};
+    await client.query(
+      `insert into user_profiles (user_id,company_name,phone,role,categories,website,address)
+       values ($1,$2,$3,$4,$5,$6,$7)
+       on conflict (user_id) do update set
+         company_name=excluded.company_name, phone=excluded.phone, role=excluded.role,
+         categories=excluded.categories, website=excluded.website, address=excluded.address`,
+      [uid, p.company_name || null, p.phone || null, p.role || null, p.categories || null, p.website || null, p.address || null]
+    );
+
+    await client.query('COMMIT');
+    const token = jwt.sign({ uid, username }, JWT_SECRET, { expiresIn: '7d' });
+    return res.json({ ok: true, user: u.rows[0], token });
   } catch (e) {
-    console.error('[login] error:', e);
-    res.status(400).json({ error: 'login failed', detail: String(e.message || e) });
+    await client.query('ROLLBACK');
+    console.error('[auth/signup] error:', e);
+    return res.status(500).json({ ok:false, error: 'signup_failed' });
+  } finally {
+    client.release();
   }
 });
 
 module.exports = router;
-module.exports.default = router; // ESM import 호환
-module.exports.router = router;
+module.exports.default = router;

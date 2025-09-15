@@ -1,54 +1,38 @@
-// relay-worker/src/routes/manager.js
+// CommonJS 버전: export default 대신 module.exports 사용
 const express = require('express');
-const crypto  = require('node:crypto');
-
 const router = express.Router();
 
-// 간단한 HS256 토큰 (homepage가 token만 받아 세션쿠키로 바꿉니다)
-function issueToken(payload = {}) {
-  const secret = process.env.JWT_SECRET || 'dev-secret';
-  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-  const body   = Buffer.from(JSON.stringify({ ...payload, iat: Math.floor(Date.now() / 1000) })).toString('base64url');
-  const sig    = crypto.createHmac('sha256', secret).update(`${header}.${body}`).digest('base64url');
-  return `${header}.${body}.${sig}`;
-}
-function jsonBody(req) {
-  if (req.body && typeof req.body === 'object') return req.body;
-  try { return JSON.parse(req.body || '{}'); } catch { return {}; }
-}
+// 간단한 건강 체크(선택)
+router.get('/auth/_health', (req, res) => res.json({ ok: true }));
 
-/** POST /auth/signup */
+// 회원가입
 router.post('/auth/signup', async (req, res) => {
-  try {
-    const b = jsonBody(req);
-    const userId = b.username || b.email || `u_${Date.now()}`;
-    const user   = {
-      id: userId,
-      email: b.email || '',
-      roles: b.is_seller_requested ? ['seller'] : ['buyer'],
-      profile: b.profile ?? null,
-    };
-    const token = issueToken({ sub: user.id, email: user.email, roles: user.roles });
-    return res.json({ ok: true, user, token });
-  } catch (e) {
-    console.error('[auth/signup]', e);
-    return res.status(400).json({ ok:false, error: String(e.message || e) });
-  }
+  const p = req.body || {};
+  // 실제 구현 전까지는 정상 200만 보장 (프론트가 404만 아니면 됨)
+  res.json({
+    ok: true,
+    user: {
+      id: 'tmp',
+      username: p.username || p.email || '',
+      email: p.email || '',
+      is_seller_requested: !!p.is_seller_requested,
+      profile: p.profile || null,
+    },
+    token: 'stub-token',
+  });
 });
 
-/** POST /auth/login */
+// 로그인
 router.post('/auth/login', async (req, res) => {
-  try {
-    const b = jsonBody(req);
-    const userId = b.username || b.email || 'user';
-    const user   = { id: userId, email: b.email || '', roles: ['buyer'] };
-    const token  = issueToken({ sub: user.id, email: user.email, roles: user.roles });
-    return res.json({ ok: true, user, token });
-  } catch (e) {
-    console.error('[auth/login]', e);
-    return res.status(400).json({ ok:false, error: String(e.message || e) });
-  }
+  const p = req.body || {};
+  res.json({
+    ok: true,
+    user: { id: 'tmp', username: p.username || '', email: p.email || '' },
+    token: 'stub-token',
+  });
 });
+
+// (선택) 계정 조회
+router.get('/account', (req, res) => res.json({ ok: true }));
 
 module.exports = router;
-module.exports.default = router; // 동적 import() 호환

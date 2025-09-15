@@ -247,29 +247,28 @@ app.post('/ingest/auto', async (req, res) => {
   }
 });
 
-/* ---------- [여기에 추가] /auth 라우터 마운트 ---------- */
-(async () => {
-  try {
-    const mod = await import('./src/routes/manager.js');
-    const authRouter = mod.default || mod;  // default 또는 CJS
-    if (authRouter && authRouter.use && authRouter.handle) {
-      app.use(authRouter); // 라우터 내부 절대경로 '/auth/...'
-      console.log('[worker] mounted /auth routes from ./src/routes/manager.js');
-    } else if (typeof authRouter === 'function') {
-      authRouter(app);
-      console.log('[worker] mounted routes via function(app)');
-    } else {
-      console.warn('[worker] manager.js loaded but not a router/function');
-    }
-  } catch (e) {
-    if (e?.code === 'ERR_MODULE_NOT_FOUND' || /Cannot find module/.test(String(e))) {
-      console.error('[worker] manager.js not found; skip /auth routes');
-    } else {
-      console.error('[worker] failed to mount manager.js', e);
-    }
+// ---------- /auth, /account 라우터 마운트 (CJS) ----------
+try {
+  const authRouter = require('./src/routes/manager'); // 확장자 생략해도 됨
+  app.use(authRouter); // /auth/* 경로가 실제로 올라감
+  console.log('[worker] mounted /auth routes from ./src/routes/manager.js');
+} catch (e) {
+  if (e && (e.code === 'MODULE_NOT_FOUND' || /Cannot find module/.test(String(e)))) {
+    console.log('[worker] ./src/routes/manager.js not found; skip /auth routes');
+  } else {
+    console.error('[worker] failed to mount ./src/routes/manager.js', e);
   }
-})();
-/* ---------- [추가 끝] ---------- */
+}
+
+// ---------- 카탈로그 트리 (프론트가 /api/catalog/tree 로 치는 케이스 대응) ----------
+const catalogTreeHandler = (req, res) => {
+  res.json({
+    tree: [{ slug: 'relay', name: 'Relay' }],
+  });
+};
+app.get('/catalog/tree', catalogTreeHandler);
+app.get('/api/catalog/tree', catalogTreeHandler); // <-- 프론트 로그에 나오던 경로까지 허용
+
 
 // --- Optional mounts (있으면 사용, 없으면 스킵) ---
 try { const visionApp = require('./server.vision'); app.use(visionApp); } catch {}

@@ -330,6 +330,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'internal error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`worker listening on :${PORT}`);
-});
+app.listen(PORT, '0.0.0.0', () => {
+   console.log("[boot] worker up on %s (models %s/%s, project=%s, loc=%s)",
+     PORT, MODEL_CLASSIFY, MODEL_EXTRACT, GCP_PROJECT_ID, VERTEX_LOCATION);
+ });

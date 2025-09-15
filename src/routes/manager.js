@@ -5,6 +5,7 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 
 const router = express.Router();
+router.get('/auth/health', (_req, res) => res.json({ ok: true }));
 
 // 마운트 확인용
 router.get('/auth/health', (req, res) => res.json({ ok: true, ts: Date.now() }));

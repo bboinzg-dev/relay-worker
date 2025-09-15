@@ -243,16 +243,7 @@ app.post('/ingest/auto', async (req, res) => {
   }
 });
 
-app.post('/ingest/auto', async (req, res) => {
-  try {
-    const { gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null } = req.body || {};
-    const result = await runAutoIngest({ gcsUri, family_slug, brand, code, series, display_name });
-    res.json(result);
-  } catch (e) {
-    console.error(e);
-    res.status(400).json({ error: String(e.message || e) });
-  }
-});// ---------- /auth, /account 라우터 (ESM/CJS 둘다 허용) 마운트 ----------
+// ---------- /auth, /account 라우터 (ESM/CJS 둘다 허용) 마운트 ----------
 (async () => {
   try {
     // 1) 실제 /auth/signup, /auth/login 라우트가 들어있는 파일 경로를 맞춰준다.

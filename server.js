@@ -263,14 +263,14 @@ app.post('/ingest/auto', async (req, res) => {
 /* ===== DEBUG/BOOT MARKS (반드시 한 번만) ===== */
 console.log('[BOOT] server.js loaded, will mount /auth and catalog stubs');
 
-+/* ===== (1) 카탈로그/검색 404 방지 — 프론트가 계속 치는 엔드포인트 ===== */
-+(() => {
-+  const h = (_req, res) => res.json({ ok: true, nodes: [] }); // TODO: 실제 구현으로 교체
-+  app.get('/catalog/tree', h);
-+  app.get('/api/catalog/tree', h);      // 프록시 경로도 허용
-+  app.get('/search/facets',  (_req, res) => res.json({ ok: true, facets: {} }));
-+  app.get('/api/search/facets', (_req, res) => res.json({ ok: true, facets: {} }));
-+})();
+/* ===== (1) 카탈로그/검색 404 방지 — 프론트가 계속 치는 엔드포인트 ===== */
+(() => {
+  const h = (_req, res) => res.json({ ok: true, nodes: [] }); // TODO: 실제 구현으로 교체
+  app.get('/catalog/tree', h);
+  app.get('/api/catalog/tree', h);      // 프록시 경로도 허용
+  app.get('/search/facets',  (_req, res) => res.json({ ok: true, facets: {} }));
+  app.get('/api/search/facets', (_req, res) => res.json({ ok: true, facets: {} }));
+})();
 
 /* ===== (2) /auth 라우터 마운트 (성공/실패 로그 + 실패시 폴백) ===== */
 try {

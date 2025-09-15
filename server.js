@@ -1,5 +1,4 @@
-// server.js  (Cloud Run 엔트리, CommonJS)
-
+// relay-worker/server.js
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -14,43 +13,36 @@ const authzGlobal = require('./src/mw/authzGlobal');
 
 const { requestLogger, patchDbLogging, logError } = (() => {
   try { return require('./src/utils/logger'); }
-  catch { return { requestLogger: () => ((req,res,next)=>next()), patchDbLogging: () => {}, logError: () => {} }; }
+  catch { return { requestLogger: () => ((req, res, next) => next()), patchDbLogging: () => {}, logError: () => {} }; }
 })();
-
 const { parseActor } = (() => {
   try { return require('./src/utils/auth'); }
   catch { return { parseActor: () => ({}) }; }
 })();
-
 const { notify, findFamilyForBrandCode } = (() => {
   try { return require('./src/utils/notify'); }
   catch { return { notify: async () => ({}), findFamilyForBrandCode: async () => null }; }
 })();
 
 const app = express();
-app.disable('x-powered-by');
-
 app.use(requestLogger());
 app.use(cors());
+// JSON / x-www-form-urlencoded
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
+
+// (필요시) 파일 업로드
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Global authorization/tenancy guard
+// 글로벌 권한/테넌시 가드
 app.use(authzGlobal);
 
-// DB logging
-try {
-  const { patchDbLogging } = require('./src/utils/logger');
-  patchDbLogging(require('./src/utils/db'));
-} catch {}
+// DB 로깅 패치 (있을 때만)
+try { const { patchDbLogging } = require('./src/utils/logger'); patchDbLogging(require('./src/utils/db')); } catch {}
 
-// ---- env/ports ----
 const PORT = process.env.PORT || 8080;
 const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
-const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
-  ? GCS_BUCKET_URI.replace(/^gs:\/\//, '').split('/')[0]
-  : '';
+const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://') ? GCS_BUCKET_URI.replace(/^gs:\/\//, '').split('/')[0] : '';
 
 // --- health/env ---
 app.get('/_healthz', (req, res) => res.type('text/plain').send('ok'));
@@ -88,6 +80,19 @@ app.get('/catalog/blueprint/:family', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'blueprint failed' });
+  }
+});
+
+// --- (추가) catalog tree 최소 구현 ---
+// homepage의 /api/catalog/tree 가 worker의 /catalog/tree로 프록시되므로 404 방지
+app.get('/catalog/tree', async (req, res) => {
+  try {
+    const r = await db.query(`SELECT family_slug FROM public.component_registry ORDER BY family_slug`);
+    const items = r.rows.map(x => ({ slug: x.family_slug, name: x.family_slug }));
+    res.json({ items });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'catalog_tree_failed' });
   }
 });
 
@@ -171,10 +176,10 @@ app.get('/parts/alternatives', async (req, res) => {
       `SELECT *,
         (CASE WHEN family_slug IS NOT NULL AND family_slug = $1 THEN 0 ELSE 1 END) * 1.0 +
         COALESCE(ABS(COALESCE(coil_voltage_vdc,0) - COALESCE($2::numeric,0)) / 100.0, 1.0) AS score
-      FROM public.relay_specs
-      WHERE NOT (brand_norm=lower($3) AND code_norm=lower($4))
-      ORDER BY score ASC
-      LIMIT $5`,
+       FROM public.relay_specs
+       WHERE NOT (brand_norm=lower($3) AND code_norm=lower($4))
+       ORDER BY score ASC
+       LIMIT $5`,
       [b.family_slug || null, b.coil_voltage_vdc || null, brand, code, limit]
     );
     res.json({ base: b, items: rows.rows });
@@ -190,8 +195,8 @@ app.post('/ingest', async (req, res) => {
     const {
       family_slug,
       specs_table, brand, code, series, display_name,
-      datasheet_url, cover, source_gcs_uri, raw_json=null,
-      fields = {}, values = {}, tenant_id=null, owner_id=null, created_by=null, updated_by=null
+      datasheet_url, cover, source_gcs_uri, raw_json = null,
+      fields = {}, values = {}, tenant_id = null, owner_id = null, created_by = null, updated_by = null
     } = req.body || {};
 
     const table = (specs_table || `${family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
@@ -234,7 +239,7 @@ app.post('/ingest/bulk', async (req, res) => {
 
 app.post('/ingest/auto', async (req, res) => {
   try {
-    const { gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null } = req.body || {};
+    const { gcsUri, family_slug = null, brand = null, code = null, series = null, display_name = null } = req.body || {};
     const result = await runAutoIngest({ gcsUri, family_slug, brand, code, series, display_name });
     res.json(result);
   } catch (e) {
@@ -243,31 +248,29 @@ app.post('/ingest/auto', async (req, res) => {
   }
 });
 
-// ---------- /auth 라우터 마운트 ----------
+/* ---------- [여기에 추가] /auth 라우터 마운트 (manager.js) ---------- */
 (async () => {
   try {
     const mod = await import('./src/routes/manager.js');
     const authRouter = mod.default || mod;
     if (authRouter && authRouter.use && authRouter.handle) {
-      app.use(authRouter);          // 라우터 내부 경로가 '/auth/signup' 절대경로면 이 방식
+      app.use(authRouter); // 라우터 내부가 '/auth/...' 절대 경로
+      console.log('[worker] mounted /auth routes from ./src/routes/manager.js');
     } else if (typeof authRouter === 'function') {
-      authRouter(app);              // 함수형 export면 호출
+      authRouter(app);
+      console.log('[worker] mounted routes via function(app)');
     } else {
       console.warn('[worker] manager.js loaded but not a router/function');
     }
   } catch (e) {
     if (e?.code === 'ERR_MODULE_NOT_FOUND' || /Cannot find module/.test(String(e))) {
-      console.log('[worker] manager.js not found; skip /auth routes');
+      console.error('[worker] manager.js not found; skip /auth routes');
     } else {
       console.error('[worker] failed to mount manager.js', e);
     }
   }
 })();
-
-
-
-// --- Optional mounts (있으면 사용, 없으면 스킵) ---
-try { const visionApp = require('./server.vision'); app.use(visionApp); } catch {}
+/* ---------- [추가 끝] ---------- */
 
 // --- Optional mounts (있으면 사용, 없으면 스킵) ---
 try { const visionApp = require('./server.vision'); app.use(visionApp); } catch {}

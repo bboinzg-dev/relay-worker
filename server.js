@@ -69,6 +69,12 @@ app.get('/api/health', async (_req, res) => {
   }
 });
 
+app.get('/api/health', async (_req, res) => {
+  try { await require('./src/utils/db').query('SELECT 1'); return res.json({ ok: true }); }
+  catch (e) { return res.status(500).json({ ok: false, error: String(e?.message || e) }); }
+});
+
+
 // ------------------------------------------------------------------
 // catalog tree (최소 구현: 테이블 없으면 빈 배열)
 // homepage의 /api/catalog/tree → worker의 /catalog/tree 로 프록시됨

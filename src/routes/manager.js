@@ -6,6 +6,7 @@ import argon2 from "argon2";
 import crypto from "node:crypto";
 
 const router = express.Router();
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   // Cloud SQL/Neon/Supabase 등 대부분 호환. 필요시 PGSSLMODE=require 설정과 함께 사용.
@@ -60,6 +61,7 @@ function getJsonBody(req) {
   catch { return {}; }
 }
 
+// (간단 HS256) 필요 시 jsonwebtoken으로 교체 가능하지만 여기선 수동 구현
 function issueToken(payload = {}) {
   const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
   const body   = Buffer.from(JSON.stringify({ ...payload, iat: Math.floor(Date.now() / 1000) })).toString("base64url");

@@ -10,6 +10,9 @@
 const express = require('express');
 const pg = require('pg');
 const crypto = require('node:crypto');
+// server.js
+const cors = require('cors');
+app.use(cors({ origin: [/^https:\/\/(www\.)?your-prod-domain\.com$/], credentials: true }));
 
 const app = express();
 app.disable('x-powered-by');

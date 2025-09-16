@@ -1,203 +1,341 @@
+/* server.js */
 'use strict';
 
-/**
- * relay-worker/server.js  (CJS)
- * - 동적 import로 ./src/routes/manager.js 마운트 (ESM/CJS 모두 수용)
- * - Cloud Run에서 바로 동작하도록 헬스/환경/DB 체크/기본 라우트 포함
- * - /catalog/tree, /api/worker/ingest, /_tasks/notify 등 최소 엔드포인트 구현
- */
-
 const express = require('express');
-const pg = require('pg');
-const crypto = require('node:crypto');
-// server.js
 const cors = require('cors');
-app.use(cors({ origin: [/^https:\/\/(www\.)?your-prod-domain\.com$/], credentials: true }));
+const bodyParser = require('body-parser');
+const multer = require('multer');
+const { v4: uuidv4 } = require('uuid');
+const jwt = require('jsonwebtoken'); // [ADD] 폴백 JWT 발급용
 
-const app = express();
-app.disable('x-powered-by');
-app.use(express.json({ limit: '20mb' }));
-// server.js 에서 마운트 (상단 app/use들 아래 아무 곳)
-try { app.use(require('./server.health')); } catch {}
+// --- utils / services ---
+const db = require('./src/utils/db');
+const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/utils/gcs');
+const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
+const { runAutoIngest } = require('./src/pipeline/ingestAuto');
+const authzGlobal = require('./src/mw/authzGlobal');
 
-// ------------------------------------------------------------------
-// DB Pool
-// ------------------------------------------------------------------
-const { Pool } = pg;
-const useSsl =
-  (String(process.env.DB_SSL || '').toLowerCase() === 'true') ||
-  (String(process.env.PGSSLMODE || '').toLowerCase() === 'require');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: useSsl ? { rejectUnauthorized: false } : false,
-});
-
-// 간단한 요청 ID 및 로깅
-app.use((req, res, next) => {
-  const reqId =
-    req.headers['x-request-id'] ||
-    (crypto.randomUUID && crypto.randomUUID()) ||
-    String(Date.now());
-  res.locals.reqId = reqId;
-  res.setHeader('x-request-id', reqId);
-  next();
-});
-
-// ------------------------------------------------------------------
-// Health / Env
-// ------------------------------------------------------------------
-app.get('/_healthz', (_req, res) => res.type('text/plain').send('ok'));
-
-app.get('/_env', async (_req, res) => {
-  try {
-    const r = await pool.query('SELECT 1');
-    res.json({
-      node: process.version,
-      has_db: r?.rowCount === 1,
-      gcs_bucket: process.env.GCS_BUCKET || null,
-    });
-  } catch {
-    res.json({ node: process.version, has_db: false, gcs_bucket: null });
-  }
-});
-
-// DB 연결 실제 체크(+ 500 핸들링)
-app.get('/api/health', async (_req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-app.get('/api/health', async (_req, res) => {
-  try { await require('./src/utils/db').query('SELECT 1'); return res.json({ ok: true }); }
-  catch (e) { return res.status(500).json({ ok: false, error: String(e?.message || e) }); }
-});
-
-
-// ------------------------------------------------------------------
-// catalog tree (최소 구현: 테이블 없으면 빈 배열)
-// homepage의 /api/catalog/tree → worker의 /catalog/tree 로 프록시됨
-// ------------------------------------------------------------------
-app.get('/catalog/tree', async (_req, res) => {
-  try {
-    const r = await pool.query(
-      `SELECT family_slug FROM public.component_registry ORDER BY family_slug`
-    );
-    const items = r.rows.map((x) => x.family_slug);
-    res.json({ items });
-  } catch (e) {
-    console.warn('[/catalog/tree] fallback:', e?.message || e);
-    res.json({ items: [] });
-  }
-});
-
-// ------------------------------------------------------------------
-// ingest & notify (필요 시 Cloud Tasks에서 호출하는 엔드포인트)
-// ------------------------------------------------------------------
-app.post('/api/worker/ingest', async (req, res) => {
-  try {
-    const payload = req.body;
-    // TODO: 실제 ingest 로직(큐 적재/DB 반영 등)
-    res.json({ ok: true, received: Array.isArray(payload) ? payload.length : 1 });
-  } catch (e) {
-    console.error('[/api/worker/ingest] error:', e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-app.post('/_tasks/notify', async (req, res) => {
-  try {
-    // TODO: 작업 완료/실패 등의 알림 처리
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[/_tasks/notify] error:', e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// ------------------------------------------------------------------
-// /auth 라우터 동적 마운트 (ESM/CJS 모두 수용). 실패 시 폴백 등록.
-// ------------------------------------------------------------------
-(async () => {
-  try {
-    const mod = await import('./src/routes/manager.js'); // ESM default 또는 CJS module.exports
-    const authRouter = mod?.default || mod;
-
-    if (authRouter && authRouter.use && authRouter.handle) {
-      // Express Router
-      app.use(authRouter);
-      console.log('[worker] mounted /auth routes from ./src/routes/manager.js');
-    } else if (typeof authRouter === 'function') {
-      // 함수형 등록도 허용 (router(app))
-      authRouter(app);
-      console.log('[worker] mounted /auth routes via function signature');
-    } else {
-      console.warn('[worker] manager.js found but not a router/function');
-    }
-  } catch (e) {
-    // 폴백(개발용): JWT 서명하여 /auth/* 제공 → manager.js 부팅 실패해도 로그인 스텁은 동작
-    console.error('[worker] failed to mount ./src/routes/manager.js:', e?.message || e);
-
-    const jwt = require('jsonwebtoken');
-    const secret = process.env.JWT_SECRET || 'dev-secret';
-    const sign = (p) => jwt.sign(p, secret, { expiresIn: '7d' });
-
-    app.get('/auth/health', (_req, res) => res.json({ ok: true, stub: true }));
-
-    app.post('/auth/signup', express.json({ limit: '5mb' }), (req, res) => {
-      const p = req.body || {};
-      const token = sign({
-        uid: String(p.username || p.email || 'user'),
-        username: p.username || '',
-        email: p.email || '',
-      });
-      res.json({
-        ok: true,
-        token,
-        user: { username: p.username || '', email: p.email || '' },
-      });
-    });
-
-    app.post('/auth/login', express.json({ limit: '2mb' }), (req, res) => {
-      const p = req.body || {};
-      const login = p.login || p.username || p.email || 'user';
-      const token = sign({
-        uid: String(login),
-        username: String(login),
-        email: p.email || '',
-      });
-      res.json({
-        ok: true,
-        token,
-        user: { id: login, username: String(login), email: p.email || '' },
-      });
-    });
-
-    console.log('[worker] fallback /auth routes registered (no manager.js)');
-  }
+// optional utils (존재 안해도 동작하도록)
+const {
+  requestLogger, patchDbLogging, logError
+} = (() => {
+  try { return require('./src/utils/logger'); }
+  catch { return { requestLogger: () => (req, res, next) => next(), patchDbLogging: () => {}, logError: () => {} }; }
 })();
 
-// ------------------------------------------------------------------
-// 에러 핸들러(최후)
-// ------------------------------------------------------------------
-app.use((err, _req, res, _next) => {
-  console.error('[error]', err);
-  res.status(500).json({ ok: false, error: 'INTERNAL' });
+const { parseActor } = (() => {
+  try { return require('./src/utils/auth'); }
+  catch { return { parseActor: () => ({}) }; }
+})();
+
+const { notify, findFamilyForBrandCode } = (() => {
+  try { return require('./src/utils/notify'); }
+  catch { return { notify: async () => ({}), findFamilyForBrandCode: async () => null }; }
+})();
+
+// --- app bootstrap ---
+const app = express();
+app.use(requestLogger());
+app.use(cors()); // 운영 전환 시 origin 제한 권장
+app.use(bodyParser.json({ limit: '25mb' }));
+app.use(bodyParser.urlencoded({ extended: true }));
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Global authorization / tenancy guard
+app.use(authzGlobal);
+
+// DB logging patch (optional)
+try { const { patchDbLogging } = require('./src/utils/logger'); patchDbLogging(require('./src/utils/db')); } catch {}
+
+// envs
+const PORT = process.env.PORT || 8080;
+
+const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
+const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
+  ? GCS_BUCKET_URI.replace(/^gs:\/\//, '').split('/')[0]
+  : '';
+
+// ---------------- health & env ----------------
+app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));
+app.get('/_healthz', (req, res) => res.type('text/plain').send('ok'));
+app.get('/_env', (req, res) => {
+  res.json({
+    node: process.version,
+    gcs_bucket: GCS_BUCKET ? `gs://${GCS_BUCKET}` : null,
+    has_db: !!process.env.DATABASE_URL,
+  });
 });
-// server.js 에서 마운트 (상단 app/use들 아래 아무 곳)
-try { app.use(require('./server.health')); } catch {}
+// 실제 DB 핑
+app.get('/api/health', async (_req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 
-// ------------------------------------------------------------------
-// Export & Run
-// ------------------------------------------------------------------
-module.exports = app;
+// --------------- catalog registry / blueprint ---------------
+app.get('/catalog/registry', async (req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT family_slug, specs_table
+      FROM public.component_registry
+      ORDER BY family_slug
+    `);
+    res.json({ items: r.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'registry failed' });
+  }
+});
 
-// Cloud Run에서 단독 실행 시 포트 리스닝
-if (require.main === module) {
-  const PORT = Number(process.env.PORT || 8080);
-  app.listen(PORT, () => console.log(`[worker] listening on :${PORT}`));
+app.get('/catalog/blueprint/:family', async (req, res) => {
+  const family = req.params.family;
+  try {
+    const r = await db.query(`
+      SELECT b.family_slug, r.specs_table, b.fields_json, b.prompt_template
+      FROM public.component_spec_blueprint b
+      JOIN public.component_registry r USING (family_slug)
+      WHERE b.family_slug = $1
+      LIMIT 1
+    `, [family]);
+    if (!r.rows.length) return res.status(404).json({ error: 'blueprint not found' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'blueprint failed' });
+  }
+});
+
+// ---------------- files: signed URL / move ----------------
+app.get('/api/files/signed-url', async (req, res) => {
+  try {
+    const gcsUri = req.query.gcsUri;
+    const minutes = Number(req.query.minutes || 15);
+    const url = await getSignedUrl(gcsUri, minutes, 'read');
+    res.json({ url });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ error: String(e.message || e) });
+  }
+});
+
+app.post('/api/files/move', async (req, res) => {
+  try {
+    const { srcGcsUri, family_slug, brand, code, dstGcsUri } = req.body || {};
+    if (!srcGcsUri) return res.status(400).json({ error: 'srcGcsUri required' });
+    const dst = dstGcsUri || canonicalDatasheetPath(GCS_BUCKET, family_slug, brand, code);
+    const moved = await moveObject(srcGcsUri, dst);
+    res.json({ ok: true, dstGcsUri: moved });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ error: String(e.message || e) });
+  }
+});
+
+// ---------------- parts: search / detail / alternatives ----------------
+app.get('/parts/search', async (req, res) => {
+  const q = (req.query.q || '').toString().trim();
+  const limit = Math.min(Number(req.query.limit || 20), 100);
+  try {
+    const text = q ? `%${q.toLowerCase()}%` : '%';
+    const rows = await db.query(
+      `SELECT * FROM public.relay_specs
+       WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
+       ORDER BY updated_at DESC
+       LIMIT $2`,
+      [text, limit],
+    );
+    res.json({ items: rows.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'search failed' });
+  }
+});
+
+app.get('/parts/detail', async (req, res) => {
+  const brand = (req.query.brand || '').toString();
+  const code  = (req.query.code  || '').toString();
+  if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
+  try {
+    const row = await db.query(
+      `SELECT * FROM public.relay_specs
+       WHERE brand_norm = lower($1) AND code_norm = lower($2)
+       LIMIT 1`,
+      [brand, code],
+    );
+    if (!row.rows.length) return res.status(404).json({ error: 'not found' });
+    res.json(row.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'detail failed' });
+  }
+});
+
+app.get('/parts/alternatives', async (req, res) => {
+  const brand = (req.query.brand || '').toString();
+  const code  = (req.query.code  || '').toString();
+  const limit = Math.min(Number(req.query.limit || 10), 50);
+  if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
+  try {
+    const base = await db.query(
+      `SELECT * FROM public.relay_specs
+       WHERE brand_norm = lower($1) AND code_norm = lower($2)
+       LIMIT 1`,
+      [brand, code],
+    );
+    if (!base.rows.length) return res.status(404).json({ error: 'base not found' });
+
+    const b = base.rows[0];
+    const rows = await db.query(
+      `SELECT *,
+        (CASE WHEN family_slug IS NOT NULL AND family_slug = $1 THEN 0 ELSE 1 END) * 1.0 +
+        COALESCE(ABS(COALESCE(coil_voltage_vdc,0) - COALESCE($2::numeric,0)) / 100.0, 1.0) AS score
+       FROM public.relay_specs
+       WHERE NOT (brand_norm = lower($3) AND code_norm = lower($4))
+       ORDER BY score ASC
+       LIMIT $5`,
+      [b.family_slug || null, b.coil_voltage_vdc || null, brand, code, limit],
+    );
+    res.json({ base: b, items: rows.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'alternatives failed' });
+  }
+});
+
+// ---------------- ingest: manual / bulk / auto ----------------
+app.post('/ingest', async (req, res) => {
+  try {
+    const {
+      family_slug,
+      specs_table, brand, code, series, display_name,
+      datasheet_url, cover, source_gcs_uri, raw_json = null,
+      fields = {}, values = {},
+      tenant_id = null, owner_id = null, created_by = null, updated_by = null,
+    } = req.body || {};
+
+    const table = (specs_table || `${family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
+    if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });
+
+    await ensureSpecsTable(table, fields);
+    const row = await upsertByBrandCode(table, {
+      brand, code, series, display_name, family_slug, datasheet_url, cover, source_gcs_uri, raw_json,
+      tenant_id, owner_id, created_by, updated_by, ...values,
+    });
+
+    res.json({ ok: true, table, row });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'ingest failed', detail: String(e.message || e) });
+  }
+});
+
+app.post('/ingest/bulk', async (req, res) => {
+  try {
+    const { items = [] } = req.body || {};
+    if (!Array.isArray(items) || !items.length)
+      return res.status(400).json({ error: 'items[] required' });
+
+    const out = [];
+    for (const it of items) {
+      const table = (it.specs_table || `${it.family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
+      await ensureSpecsTable(table, it.fields || {});
+      const row = await upsertByBrandCode(table, {
+        brand: it.brand, code: it.code, series: it.series, display_name: it.display_name,
+        family_slug: it.family_slug, datasheet_url: it.datasheet_url, cover: it.cover,
+        source_gcs_uri: it.source_gcs_uri, raw_json: it.raw_json || null,
+        tenant_id: it.tenant_id || null, owner_id: it.owner_id || null,
+        created_by: it.created_by || null, updated_by: it.updated_by || null,
+        ...(it.values || {}),
+      });
+      out.push({ table, row });
+    }
+    res.json({ ok: true, count: out.length, items: out });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'bulk ingest failed', detail: String(e.message || e) });
+  }
+});
+
+app.post('/ingest/auto', async (req, res) => {
+  try {
+    const { gcsUri, family_slug = null, brand = null, code = null, series = null, display_name = null } = req.body || {};
+    const result = await runAutoIngest({ gcsUri, family_slug, brand, code, series, display_name });
+    res.json(result);
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ error: String(e.message || e) });
+  }
+});
+
+/* ===== DEBUG/BOOT MARKS (반드시 한 번만) ===== */
+console.log('[BOOT] server.js loaded, will mount /auth and catalog stubs');
+
+/* ===== (1) 카탈로그/검색 404 방지 — 프론트가 계속 치는 엔드포인트 ===== */
+(() => {
+  const h = (_req, res) => res.json({ ok: true, nodes: [] }); // TODO: 실제 구현으로 교체
+  app.get('/catalog/tree', h);
+  app.get('/api/catalog/tree', h);      // 프록시 경로도 허용
+  app.get('/search/facets',  (_req, res) => res.json({ ok: true, facets: {} }));
+  app.get('/api/search/facets', (_req, res) => res.json({ ok: true, facets: {} }));
+})();
+
+/* ===== (2) /auth 라우터 마운트 (성공/실패 로그 + 실패시 폴백) ===== */
+try {
+  const authRouter = require('./src/routes/manager');  // CJS 라우터 기대(ESM default도 module.exports.default로 대응)
+  app.use(authRouter);                                 // /auth/*
+  app.use('/api/worker', authRouter);                  // 구 프리픽스도 겸용 허용
+  console.log('[BOOT] mounted /auth routes from ./src/routes/manager.js');
+} catch (e) {
+  console.error('[BOOT] FAILED to mount ./src/routes/manager.js:', e && e.code ? e.code : e);
+
+  // --- 폴백: JWT 서명(7d 만료)으로 /auth/* 제공 — manager 없을 때도 로그인 가능 ---
+  const SECRET = process.env.JWT_SECRET || 'dev-secret';
+  const sign = (p) => jwt.sign(p, SECRET, { expiresIn: '7d' });
+
+  app.get('/auth/health', (req,res)=>res.json({ ok:true, stub:true }));
+
+  app.post('/auth/signup', express.json({limit:'5mb'}), (req,res)=>{
+    const p = req.body || {};
+    const token = sign({
+      uid: String(p.username || p.email || 'user'),
+      username: p.username || '',
+      email: p.email || '',
+    });
+    res.json({ ok:true, token, user: { username: p.username || '', email: p.email || '' }});
+  });
+
+  app.post('/auth/login', express.json({limit:'2mb'}), (req,res)=>{
+    const p = req.body || {};
+    const login = p.login || p.username || p.email || 'user';
+    const token = sign({
+      uid: String(login),
+      username: String(login),
+      email: p.email || '',
+    });
+    res.json({ ok:true, token, user: { id: login, username: String(login), email: p.email || '' }});
+  });
+
+  console.log('[BOOT] fallback /auth routes registered (no manager.js)');
 }
+
+// ---------------- Optional mounts (있으면 사용, 없으면 스킵) ----------------
+try { const visionApp  = require('./server.vision');       app.use(visionApp); }  catch {}
+try { const embApp     = require('./server.embedding');    app.use(embApp); }     catch {}
+try { const tenApp     = require('./server.tenancy');      app.use(tenApp); }     catch {}
+try { const notifyApp  = require('./server.notify');       app.use(notifyApp); }  catch {}
+try { const bomApp     = require('./server.bom');          app.use(bomApp); }     catch {}
+try { const optApp     = require('./server.optimize');     app.use(optApp); }     catch {}
+try { const tasksApp   = require('./server.notifyTasks');  app.use(tasksApp); }   catch {}
+try { const opsApp     = require('./server.ops');          app.use(opsApp); }     catch {}
+try { const schemaApp  = require('./server.schema');       app.use(schemaApp); }  catch {}
+
+// ---------------- 404 & error ----------------
+app.use((req, res) => res.status(404).json({ error: 'not found' }));
+
+app.use((err, req, res, next) => {
+  try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
+  res.status(500).json({ error: 'internal error' });
+});

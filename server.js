@@ -14,6 +14,8 @@ const crypto = require('node:crypto');
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '20mb' }));
+// server.js 에서 마운트 (상단 app/use들 아래 아무 곳)
+try { app.use(require('./server.health')); } catch {}
 
 // ------------------------------------------------------------------
 // DB Pool
@@ -177,6 +179,8 @@ app.use((err, _req, res, _next) => {
   console.error('[error]', err);
   res.status(500).json({ ok: false, error: 'INTERNAL' });
 });
+// server.js 에서 마운트 (상단 app/use들 아래 아무 곳)
+try { app.use(require('./server.health')); } catch {}
 
 // ------------------------------------------------------------------
 // Export & Run

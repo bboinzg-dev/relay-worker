@@ -9,6 +9,38 @@ const { v4: uuidv4 } = require('uuid');
 const jwt = require('jsonwebtoken'); // [ADD] 쿠키 세션 검증 & 폴백 JWT 발급
 const { normalizeFamilySlug } = require('./src/utils/family');
 
+// === Add: upload endpoint (multipart/form-data; field name = "file") ===
+const crypto = require('crypto');
+const { storage } = require('./src/utils/gcs'); // 이미 있는 유틸 모듈 :contentReference[oaicite:5]{index=5}
+const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
+const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
+  ? GCS_BUCKET_URI.replace(/^gs:\/\//,'').split('/')[0]
+  : GCS_BUCKET_URI || '';
+
+app.post('/api/files/upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok:false, error: 'file required' });
+    if (!GCS_BUCKET) return res.status(500).json({ ok:false, error:'GCS_BUCKET not set' });
+
+    const buf = req.file.buffer;
+    const sha = crypto.createHash('sha256').update(buf).digest('hex');
+    const safeName = (req.file.originalname || 'datasheet.pdf').replace(/\s+/g, '_');
+    const object = `incoming/${sha}_${Date.now()}_${safeName}`;
+
+    await storage.bucket(GCS_BUCKET).file(object).save(buf, {
+      contentType: req.file.mimetype || 'application/pdf',
+      resumable: false, public: false, validation: false,
+    });
+
+    const gcsUri = `gs://${GCS_BUCKET}/${object}`;
+    // 프론트가 바로 인제스트 걸고 싶으면 family/brand/code 없이도 가능 → /ingest/auto 에 gcsUri만 넘기면 됨
+    return res.json({ ok:true, gcsUri });
+  } catch (e) {
+    console.error('[upload]', e);
+    return res.status(400).json({ ok:false, error: String(e.message || e) });
+  }
+});
+
 // --- utils / services ---
 const db = require('./src/utils/db');
 const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/utils/gcs');

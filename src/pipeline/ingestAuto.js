@@ -10,6 +10,15 @@ const {
   moveObject,
 } = require('../utils/gcs');
 const { identifyFamilyBrandCode, extractByBlueprintGemini } = require('../utils/vertex');
+const famUtil = require('../utils/family');
+const normalizeFamilySlug =
+  (typeof famUtil.normalizeFamilySlug === 'function')
+    ? famUtil.normalizeFamilySlug
+    : (s) => (s || '').toString().trim().toLowerCase();
+const chooseCanonicalFamilySlug =
+  (typeof famUtil.chooseCanonicalFamilySlug === 'function')
+    ? famUtil.chooseCanonicalFamilySlug
+    : () => null;
 const { normalizeFamilySlug } = require('../utils/family');
 
 /** registry+blueprint 로드 */
@@ -73,7 +82,16 @@ async function runAutoIngest({
   if (!family_slug || !brand || !code) {
     const families = await getFamilies();
     const det = await identifyFamilyBrandCode(gcsUri, families);
+
+    // 1차: 간단 정규화(별칭 → 표준)
     family_slug = normalizeFamilySlug(family_slug || det.family_slug);
+    // 2차: 레지스트리에 실제 있는 slug 중 최적 선택(모호할 때만 보정)
+    try {
+      const families = await getFamilies(); // 이미 있는 함수
+      const picked = chooseCanonicalFamilySlug(family_slug, families);
+      if (picked) family_slug = picked;
+    } catch {}
+
     brand = brand || det.brand;
     code = code || det.code;
     series = series || det.series || null;

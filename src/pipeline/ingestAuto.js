@@ -11,16 +11,14 @@ const {
 } = require('../utils/gcs');
 const { identifyFamilyBrandCode, extractByBlueprintGemini } = require('../utils/vertex');
 
-// ✅ family 유틸(안전 가드 포함)
+// family 유틸 (안전 가드)
 const famUtil = require('../utils/family');
-const normalizeFamilySlug =
-  (typeof famUtil.normalizeFamilySlug === 'function')
-    ? famUtil.normalizeFamilySlug
-    : (s) => (s || '').toString().trim().toLowerCase();
-const chooseCanonicalFamilySlug =
-  (typeof famUtil.chooseCanonicalFamilySlug === 'function')
-    ? famUtil.chooseCanonicalFamilySlug
-    : () => null;
+const normalizeFamilySlug = (typeof famUtil.normalizeFamilySlug === 'function')
+  ? famUtil.normalizeFamilySlug
+  : (s) => (s || '').toString().trim().toLowerCase();
+const chooseCanonicalFamilySlug = (typeof famUtil.chooseCanonicalFamilySlug === 'function')
+  ? famUtil.chooseCanonicalFamilySlug
+  : () => null;
 
 /** registry+blueprint 로드 */
 async function fetchBlueprint(family_slug) {
@@ -66,8 +64,7 @@ function guessBrandCodeFromPath(gcsUri) {
 }
 function safeTempCodeFromUri(gcsUri) {
   const crypto = require('crypto');
-  const sha6 = crypto.createHash('sha256').update(String(gcsUri || '')).digest('hex').slice(0, 6);
-  return `tmp_${sha6}`;
+  return `tmp_${crypto.createHash('sha256').update(String(gcsUri || '')).digest('hex').slice(0,6)}`;
 }
 
 /**
@@ -78,26 +75,17 @@ function safeTempCodeFromUri(gcsUri) {
  * - ensureSpecsTable + safe upsert(컬럼 교집합만)
  * - Move PDF to canonical path; set datasheet_url / cover
  */
-async function runAutoIngest({
-  gcsUri,
-  family_slug,
-  brand,
-  code,
-  series = null,
-  display_name = null,
-}) {
+async function runAutoIngest({ gcsUri, family_slug, brand, code, series=null, display_name=null }) {
   if (!gcsUri) throw new Error('gcsUri required');
 
-  // 1) detection (필요 시)
+  // 1) 감지
   if (!family_slug || !brand || !code) {
     const families = await getFamilies();
     const det = await identifyFamilyBrandCode(gcsUri, families).catch(() => ({}));
 
-    // 1차: 별칭 정규화
     const rawFam = family_slug || det.family_slug || null;
     family_slug  = rawFam ? normalizeFamilySlug(rawFam) : null;
 
-    // 2차: 레지스트리 중 최적 선택(모호하면 보정)
     try {
       const picked = chooseCanonicalFamilySlug(family_slug, families);
       if (picked) family_slug = picked;
@@ -108,26 +96,18 @@ async function runAutoIngest({
     series       = series || det.series || null;
     display_name = display_name || det.display_name || null;
 
-    // 3차: 여전히 family가 없으면 휴리스틱/폴백
     if (!family_slug) {
       const fname = String(gcsUri || '').split('/').pop() || '';
       const guess = chooseCanonicalFamilySlug(fname, families);
       if (guess) family_slug = guess;
+      if (!family_slug) family_slug = families.includes('relay_power') ? 'relay_power' : (families[0] || 'relay_power');
     }
-    if (!family_slug) {
-      if (families.includes('relay_power')) family_slug = 'relay_power';
-      else if (families.length) family_slug = families[0];
-    }
-
-    // 4차: brand/code 폴백 — 파일명 힌트 → 임시코드
     if (!brand || !code) {
       const gc = guessBrandCodeFromPath(gcsUri);
       brand = brand || gc.brand || 'unknown';
       code  = code  || gc.code  || safeTempCodeFromUri(gcsUri);
     }
   }
-
-  // 👉 더 이상 brand/code 때문에 실패하지 않도록, 최소 family만 확인
   if (!family_slug) throw new Error('Unable to determine family');
 
   // 2) blueprint
@@ -136,23 +116,22 @@ async function runAutoIngest({
   const fields_json     = bp.fields_json || {};
   const prompt_template = bp.prompt_template || null;
 
-  // 3) extraction (Gemini)
+  // 3) 추출
   const ext = await extractByBlueprintGemini(gcsUri, fields_json, prompt_template);
   const extractedValues = (ext && ext.values) ? ext.values : {};
-  const raw_json        = ext && ext.raw_json ? ext.raw_json : null;
+  const raw_json        = (ext && ext.raw_json) ? ext.raw_json : null;
 
-  // 4) ensure table
+  // 4) 테이블 보장
   await ensureSpecsTable(specs_table, fields_json);
 
-  // 5) canonical paths
+  // 5) 경로
   const bucketEnv = (process.env.GCS_BUCKET || '').replace(/^gs:\/\//, '');
   const bucket    = bucketEnv.split('/')[0] || '';
   const datasheet_url = canonicalDatasheetPath(bucket, family_slug, brand, code);
   const cover         = canonicalCoverPath(bucket, family_slug, brand, code); // TODO: 썸네일 생성
 
-  // 6) 안전 업서트(실제 존재 컬럼에 한해) — ✅ brand_norm/code_norm을 항상 채워 DB 제약 충족
+  // 6) 업서트 — ✅ brand_norm/code_norm을 항상 채워 DB 제약 충족
   const allowed = await getTableColumnsQualified(specs_table);
-
   const normBrand = String(brand || 'unknown').trim();
   const normCode  = String(code  || safeTempCodeFromUri(gcsUri)).trim();
 
@@ -161,12 +140,8 @@ async function runAutoIngest({
     code:  normCode,
     brand_norm: normBrand.toLowerCase(),
     code_norm:  normCode.toLowerCase(),
-
-    series,
-    display_name,
-    family_slug,
-    datasheet_url,
-    cover,
+    series, display_name, family_slug,
+    datasheet_url, cover,
     source_gcs_uri: gcsUri,
     raw_json,
   };
@@ -175,6 +150,7 @@ async function runAutoIngest({
   for (const [k, v] of Object.entries({ ...base, ...extractedValues })) {
     if (allowed.has(k)) filtered[k] = v;
   }
+
   const row = await upsertByBrandCode(specs_table, filtered);
 
   // 7) 파일 이동 (원본 → canonical)
@@ -187,14 +163,17 @@ async function runAutoIngest({
     console.warn('[ingest] moveObject failed:', e?.message || e);
   }
 
-  // (선택) 서명 URL (읽기 편의)
+  // (선택) 서명 URL
   let signed_pdf = null;
   try { signed_pdf = await getSignedUrl(datasheet_url, { minutes: 30 }); } catch {}
 
   return {
     ok: true,
-    family_slug, specs_table, brand: normBrand, code: normCode, series, display_name,
-    datasheet_url, cover, signed_pdf, row,
+    family_slug, specs_table,
+    brand: normBrand, code: normCode,
+    series, display_name,
+    datasheet_url, cover, signed_pdf,
+    row,
   };
 }
 

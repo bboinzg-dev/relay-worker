@@ -2,8 +2,11 @@ const { VertexAI } = require('@google-cloud/vertexai');
 const { readText } = require('./gcs');
 
 const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
-const LOCATION = process.env.VERTEX_LOCATION || 'us-central1';
-const MODEL_ID = process.env.VERTEX_MODEL_ID || 'gemini-1.5-pro';
+const LOCATION = process.env.VERTEX_LOCATION || 'asia-northeast3'; // 또는 운영 리전에 맞춤
+const MODEL_ID =
+  process.env.GEMINI_MODEL_EXTRACT   // 홈페이지와 키 통일(있으면 우선)
+  || process.env.VERTEX_MODEL_ID     // 기존 환경변수 호환
+  || 'gemini-2.5-flash';
 const EMBED_TEXT = process.env.VERTEX_EMBED_TEXT || 'text-embedding-004';
 const EMBED_IMAGE = process.env.VERTEX_EMBED_IMAGE || 'multimodalembedding@001';
 

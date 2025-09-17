@@ -53,6 +53,29 @@ async function getTableColumnsQualified(targetTable) {
   return new Set(colsRes.rows.map(r => r.column_name));
 }
 
+/* ---------------- Fallback helpers ---------------- */
+
+/** 파일명/경로에서 브랜드·코드 힌트 추출 (아주 보수적으로) */
+function guessBrandCodeFromPath(gcsUri) {
+  try {
+    const name = String(gcsUri || '').split('/').pop() || '';
+    const base = name.replace(/\.(pdf|zip|png|jpg|jpeg)$/i, '');
+    // 흔한 패턴: BRAND_CODE, BRAND-CODE, BRAND CODE
+    const m1 = /^([A-Za-z0-9]+)[_\-\s]+([A-Za-z0-9\.\-]+)$/.exec(base);
+    if (m1) return { brand: m1[1], code: m1[2] };
+    // 코드만 분리 가능한 경우
+    if (/^[A-Za-z0-9\.\-]+$/.test(base)) return { brand: null, code: base };
+  } catch {}
+  return { brand: null, code: null };
+}
+
+/** 안전 임시 코드(유니크 보장) */
+function safeTempCodeFromUri(gcsUri) {
+  const crypto = require('crypto');
+  const sha6 = crypto.createHash('sha256').update(String(gcsUri || '')).digest('hex').slice(0, 6);
+  return `tmp_${sha6}`;
+}
+
 /**
  * Auto ingest pipeline:
  * - Detect {family,brand,code,series,display_name} if missing (Gemini)
@@ -102,16 +125,18 @@ async function runAutoIngest({
       if (families.includes('relay_power')) family_slug = 'relay_power';
       else if (families.length) family_slug = families[0];
     }
+
+    // 4차: brand/code 폴백 — 파일명 힌트 → 임시코드
+    if (!brand || !code) {
+      const gc = guessBrandCodeFromPath(gcsUri);
+      brand = brand || gc.brand || 'unknown';
+      code  = code  || gc.code  || safeTempCodeFromUri(gcsUri);
+    }
   }
 
-  if (!family_slug || !brand || !code) {
-    // 최소 보호: 어떤 값이 빠졌는지 알려줌
-    const miss = [
-      !family_slug ? 'family' : null,
-      !brand ? 'brand' : null,
-      !code ? 'code' : null,
-    ].filter(Boolean).join(',');
-    throw new Error(`Unable to determine ${miss}`);
+  // 👉 더 이상 brand/code 때문에 실패하지 않도록, 최소 family만 확인
+  if (!family_slug) {
+    throw new Error('Unable to determine family');
   }
 
   // 2) blueprint

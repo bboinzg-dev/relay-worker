@@ -69,10 +69,6 @@ const { notify, findFamilyForBrandCode } = (() => {
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
-const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
-  ? GCS_BUCKET_URI.replace(/^gs:\/\//, '').split('/')[0]
-  : '';
-
 const DEFAULT_ALLOWED_BUCKETS = ['partsplan-docai-us', 'partsplan-ds'];
 const ALLOWED_BUCKETS = new Set(
   (process.env.ALLOWED_BUCKETS || DEFAULT_ALLOWED_BUCKETS.join(','))
@@ -114,15 +110,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // --- Upload endpoint (multipart/form-data; field name = "file")
 //     두 경로 모두 허용: /api/files/upload, /files/upload
-const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage() });
-const crypto = require('crypto');
-const { Storage } = require('@google-cloud/storage');
 const storage = new Storage();
-
-const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
-  ? GCS_BUCKET_URI.replace(/^gs:\/\//,'').split('/')[0]
-  : (GCS_BUCKET_URI || '');
 
 app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (req, res) => {
   try {

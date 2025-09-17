@@ -1,6 +1,16 @@
 /* server.js */
 'use strict';
 
+// === Env (MUST be above any usage) ===
+const PORT = process.env.PORT || 8080;
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+
+const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
+const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
+  ? GCS_BUCKET_URI.replace(/^gs:\/\//, '').split('/')[0]
+  : (GCS_BUCKET_URI || '');
+
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -69,7 +79,6 @@ app.use(requestLogger());
 // === Add: upload endpoint (multipart/form-data; field name = "file") ===
 const crypto = require('crypto');
 const { storage } = require('./src/utils/gcs'); // 이미 있는 유틸 모듈 :contentReference[oaicite:5]{index=5}
-const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
   ? GCS_BUCKET_URI.replace(/^gs:\/\//,'').split('/')[0]
   : GCS_BUCKET_URI || '';
 

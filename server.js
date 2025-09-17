@@ -1,7 +1,7 @@
 /* server.js */
 'use strict';
 
-// === Env (MUST be above any usage) ===
+/* ========== ENV (MUST BE ABOVE ANY USAGE) ========== */
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
@@ -10,24 +10,29 @@ const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
   ? GCS_BUCKET_URI.replace(/^gs:\/\//, '').split('/')[0]
   : (GCS_BUCKET_URI || '');
 
-
+/* ========== Requires ========== */
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const multer = require('multer');
-const { v4: uuidv4 } = require('uuid');
-const jwt = require('jsonwebtoken'); // [ADD] 쿠키 세션 검증 & 폴백 JWT 발급
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+
 const { normalizeFamilySlug } = require('./src/utils/family');
-
-
-// --- utils / services ---
 const db = require('./src/utils/db');
-const { getSignedUrl, canonicalDatasheetPath, moveObject } = require('./src/utils/gcs');
-const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
+const {
+  getSignedUrl,
+  canonicalDatasheetPath,
+  moveObject
+} = require('./src/utils/gcs');
+const {
+  ensureSpecsTable,
+  upsertByBrandCode
+} = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 const authzGlobal = require('./src/mw/authzGlobal');
 
-// optional utils (존재 안해도 동작하도록)
+/* optional utils (있으면 사용, 없으면 no-op) */
 const {
   requestLogger, patchDbLogging, logError
 } = (() => {
@@ -45,108 +50,49 @@ const { notify, findFamilyForBrandCode } = (() => {
   catch { return { notify: async () => ({}), findFamilyForBrandCode: async () => null }; }
 })();
 
-// ---------------- Env / Config ----------------
-const PORT = process.env.PORT || 8080;
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+/* ========== Additional Config ========== */
+const defaultBuckets = ['partsplan-docai-us', 'partsplan-ds'];
+if (GCS_BUCKET && !defaultBuckets.includes(GCS_BUCKET)) defaultBuckets.unshift(GCS_BUCKET);
 
-const DEFAULT_ALLOWED_BUCKETS = ['partsplan-docai-us', 'partsplan-ds'];
 const ALLOWED_BUCKETS = new Set(
-  (process.env.ALLOWED_BUCKETS || DEFAULT_ALLOWED_BUCKETS.join(','))
+  (process.env.ALLOWED_BUCKETS || defaultBuckets.join(','))
     .split(',').map(s => s.trim()).filter(Boolean)
 );
 
-// CORS 허용 목록(CSV 또는 /regex/ 형식). 미설정 시 기존 동작 유지(개발 편의)
+/* CORS 허용 목록(CSV 또는 /regex/) */
 function parseCorsOrigins(envStr) {
   if (!envStr) return null; // null → cors() 기본 허용
   const items = envStr.split(',').map(s => s.trim()).filter(Boolean);
   return items.map(p => {
     if (p.startsWith('/') && p.endsWith('/')) {
-      // 정규식 문자열 → RegExp
       const body = p.slice(1, -1);
       return new RegExp(body);
     }
-    return p; // 리터럴(origin 문자열)
+    return p;
   });
 }
 const CORS_ALLOW = parseCorsOrigins(process.env.CORS_ALLOW_ORIGINS);
 
-// ---------------- App bootstrap ----------------
+/* ========== App bootstrap ========== */
 const app = express();
 app.disable('x-powered-by');
-
 app.use(requestLogger());
 
-// === Add: upload endpoint (multipart/form-data; field name = "file") ===
-const crypto = require('crypto');
-const { storage } = require('./src/utils/gcs'); // 이미 있는 유틸 모듈 :contentReference[oaicite:5]{index=5}
-  ? GCS_BUCKET_URI.replace(/^gs:\/\//,'').split('/')[0]
-  : GCS_BUCKET_URI || '';
-
-app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ ok:false, error:'file required' });
-    if (!GCS_BUCKET) return res.status(500).json({ ok:false, error:'GCS_BUCKET not set' });
-
-    const buf = req.file.buffer;
-    const sha = require('crypto').createHash('sha256').update(buf).digest('hex');
-    const safe = (req.file.originalname || 'datasheet.pdf').replace(/\s+/g,'_');
-    const object = `incoming/${sha}_${Date.now()}_${safe}`;
-
-    await storage.bucket(GCS_BUCKET).file(object).save(buf, {
-      contentType: req.file.mimetype || 'application/pdf',
-      resumable: false, public: false, validation: false,
-    });
-
-    res.json({ ok:true, gcsUri: `gs://${GCS_BUCKET}/${object}` });
-  } catch (e) {
-    console.error('[upload]', e);
-    res.status(400).json({ ok:false, error:String(e.message || e) });
-  }
-});
-
-
-
-// 운영 도메인만 허용하고 싶으면 CORS_ALLOW_ORIGINS 설정(예: "https://your.app,/^https:\/\/.*-vercel\.app$/")
+/* CORS */
 if (CORS_ALLOW) {
   app.use(cors({ origin: CORS_ALLOW, credentials: true }));
 } else {
-  // 개발 편의: 기존 동작 유지
   app.use(cors());
 }
 
+/* Body parsers */
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
+
+/* Multer (한 번만 선언) */
 const upload = multer({ storage: multer.memoryStorage() });
 
-// --- Upload endpoint (multipart/form-data; field name = "file")
-//     두 경로 모두 허용: /api/files/upload, /files/upload
-
-app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ ok:false, error:'file required' });
-    if (!GCS_BUCKET) return res.status(500).json({ ok:false, error:'GCS_BUCKET not set' });
-
-    const buf = req.file.buffer;
-    const sha = crypto.createHash('sha256').update(buf).digest('hex');
-    const safe = (req.file.originalname || 'datasheet.pdf').replace(/\s+/g,'_');
-    const object = `incoming/${sha}_${Date.now()}_${safe}`;
-
-
-    return res.json({ ok:true, gcsUri: `gs://${GCS_BUCKET}/${object}` });
-  } catch (e) {
-    console.error('[upload]', e);
-    return res.status(400).json({ ok:false, error:String(e.message || e) });
-  }
-});
-
-
-// Global authorization / tenancy guard
-app.use(authzGlobal);
-
-// DB logging patch (optional)
-try { const { patchDbLogging } = require('./src/utils/logger'); patchDbLogging(require('./src/utils/db')); } catch {}
-
-// --- 공통 보안 헤더(가벼운 수준) ---
+/* 보안 헤더 */
 app.use((req, res, next) => {
   res.setHeader('x-frame-options', 'SAMEORIGIN');
   res.setHeader('x-content-type-options', 'nosniff');
@@ -154,7 +100,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------------- Helpers (Session/Auth/GCS) ----------------
+/* ========== Helpers ========== */
 function parseCookie(name, cookieHeader) {
   if (!cookieHeader) return null;
   const m = new RegExp(`(?:^|;\\s*)${name}=([^;]+)`).exec(cookieHeader);
@@ -166,21 +112,16 @@ function verifyJwtCookie(cookieHeader) {
   try { return jwt.verify(raw, JWT_SECRET); } catch { return null; }
 }
 
-// Cloud Run은 ID 토큰을 이미 경계에서 검증함(roles/run.invoker)
-// → Authorization: Bearer ... 헤더가 있으면 통과로 간주
+/* Cloud Run 경계에서 ID 토큰 검증됨 → 있으면 통과, 없으면 pp_session 검사 */
 function requireSession(req, res, next) {
   const auth = String(req.headers.authorization || '');
-  if (/^Bearer\s+.+/i.test(auth)) return next(); // ID 토큰 경계 검증 통과
-
+  if (/^Bearer\s+.+/i.test(auth)) return next();
   const claims = verifyJwtCookie(req.headers.cookie || '');
-  if (claims) {
-    req.user = claims;
-    return next();
-  }
+  if (claims) { req.user = claims; return next(); }
   return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
 }
 
-// "gs://bucket/path" 검증
+/* "gs://bucket/path" 유효성 & 화이트리스트 */
 function parseGcsUri(gcsUri) {
   const m = /^gs:\/\/([^/]+)\/(.+)$/.exec(String(gcsUri || ''));
   if (!m) throw new Error('INVALID_GCS_URI');
@@ -188,16 +129,57 @@ function parseGcsUri(gcsUri) {
 }
 function assertAllowedUri(gcsUri) {
   const { bucket } = parseGcsUri(gcsUri);
-  if (!ALLOWED_BUCKETS.has(bucket)) {
-    throw new Error('BUCKET_NOT_ALLOWED');
-  }
+  if (!ALLOWED_BUCKETS.has(bucket)) throw new Error('BUCKET_NOT_ALLOWED');
 }
 
-// ---------------- health & env ----------------
-app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));
+/* ========== Upload endpoint (worker가 GCS에 직접 저장) ========== */
+/* 두 경로 모두 허용: /api/files/upload, /files/upload */
+app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok:false, error:'file required' });
+    if (!GCS_BUCKET) return res.status(500).json({ ok:false, error:'GCS_BUCKET not set' });
 
+    const buf = req.file.buffer;
+    const sha = crypto.createHash('sha256').update(buf).digest('hex');
+    const safe = (req.file.originalname || 'datasheet.pdf').replace(/\s+/g,'_');
+    const object = `incoming/${sha}_${Date.now()}_${safe}`;
+
+    // utils/gcs의 move/signed-url은 사용 중이므로 client를 여기선 직접 쓰지 않고,
+    // 저장만 Storage SDK로 수행 (utils 내부와 충돌 없음)
+    const { Storage } = require('@google-cloud/storage');
+    const storage = new Storage(
+      process.env.GCP_SERVICE_ACCOUNT
+        ? { credentials: JSON.parse(process.env.GCP_SERVICE_ACCOUNT) }
+        : {}
+    );
+
+    await storage.bucket(GCS_BUCKET).file(object).save(buf, {
+      contentType: req.file.mimetype || 'application/pdf',
+      resumable: false, public: false, validation: false,
+    });
+
+    return res.json({ ok:true, gcsUri: `gs://${GCS_BUCKET}/${object}` });
+  } catch (e) {
+    console.error('[upload]', e);
+    return res.status(400).json({ ok:false, error:String(e.message || e) });
+  }
+});
+
+/* ========== Global auth/tenancy guard (쓰기계열 보호) ========== */
+app.use(authzGlobal);
+
+/* DB logging patch (optional) */
+try {
+  const { patchDbLogging } = require('./src/utils/logger');
+  patchDbLogging(require('./src/utils/db'));
+} catch {}
+
+/* ========== Health & env ========== */
 app.get('/_healthz', (_req, res) => res.type('text/plain').send('ok'));
-
+app.get('/api/health', async (_req, res) => {
+  try { await db.query('SELECT 1'); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ ok: false, error: String(e?.message || e) }); }
+});
 app.get('/_env', (_req, res) => {
   res.json({
     node: process.version,
@@ -206,17 +188,7 @@ app.get('/_env', (_req, res) => {
   });
 });
 
-// 실제 DB 핑
-app.get('/api/health', async (_req, res) => {
-  try {
-    await db.query('SELECT 1');
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// --------------- catalog registry / blueprint ---------------
+/* ========== Catalog (registry/blueprint) ========== */
 app.get('/catalog/registry', async (_req, res) => {
   try {
     const r = await db.query(`
@@ -249,13 +221,11 @@ app.get('/catalog/blueprint/:family', async (req, res) => {
   }
 });
 
-// ---------------- files: signed URL / move ----------------
-// 읽기라도 외부 버킷 악용 방지 위해 화이트리스트 체크 + 세션 보호
+/* ========== Files: signed-url / move (세션 + 화이트리스트) ========== */
 app.get('/api/files/signed-url', requireSession, async (req, res) => {
   try {
     const gcsUri = req.query.gcsUri;
     const minutes = Number(req.query.minutes || 15);
-
     assertAllowedUri(gcsUri);
     const url = await getSignedUrl(gcsUri, minutes, 'read');
     res.json({ url });
@@ -283,7 +253,7 @@ app.post('/api/files/move', requireSession, async (req, res) => {
   }
 });
 
-// ---------------- parts: search / detail / alternatives ----------------
+/* ========== Parts: search / detail / alternatives ========== */
 app.get('/parts/search', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const limit = Math.min(Number(req.query.limit || 20), 100);
@@ -354,8 +324,7 @@ app.get('/parts/alternatives', async (req, res) => {
   }
 });
 
-// ---------------- ingest: manual / bulk / auto ----------------
-// 쓰기 계열은 세션 보호
+/* ========== Ingest: manual / bulk / auto ========== */
 app.post('/ingest', requireSession, async (req, res) => {
   try {
     const {
@@ -410,6 +379,7 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
   }
 });
 
+/* 자동 인제스트 (신규) */
 app.post('/ingest/auto', requireSession, async (req, res) => {
   try {
     const { gcsUri, family_slug = null, brand = null, code = null, series = null, display_name = null } = req.body || {};
@@ -421,34 +391,44 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
   }
 });
 
-/* ===== DEBUG/BOOT MARKS (반드시 한 번만) ===== */
+/* 호환용: 프론트가 /api/worker/ingest 로 호출하던 경로 */
+app.post('/api/worker/ingest', requireSession, async (req, res) => {
+  try {
+    const { gcsPdfUri, gcsUri, family_slug = null, brand = null, code = null, series = null, display_name = null } = req.body || {};
+    const uri = gcsUri || gcsPdfUri; // 두 키 모두 지원
+    if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
+    const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
+    res.json(result);
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok:false, error: String(e.message || e) });
+  }
+});
+
+/* ===== DEBUG/BOOT MARKS ===== */
 console.log('[BOOT] server.js loaded, will mount /auth and catalog stubs');
 
-/* ===== (1) 카탈로그/검색 404 방지 — 프론트가 계속 치는 엔드포인트 ===== */
+/* ===== (1) 카탈로그/검색 404 방지 (프론트 프록시 경로 포함) ===== */
 (() => {
   const h = (_req, res) => res.json({ ok: true, nodes: [] }); // TODO: 실제 구현으로 교체
   app.get('/catalog/tree', h);
-  app.get('/api/catalog/tree', h);      // 프록시 경로도 허용
+  app.get('/api/catalog/tree', h);
   app.get('/search/facets',  (_req, res) => res.json({ ok: true, facets: {} }));
   app.get('/api/search/facets', (_req, res) => res.json({ ok: true, facets: {} }));
 })();
 
-/* ===== (2) /auth 라우터 마운트 (성공/실패 로그 + 실패시 폴백) ===== */
+/* ===== (2) /auth 라우터 마운트 (없으면 폴백 스텁) ===== */
 try {
-  // CJS/ESM 호환
-  const m = require('./src/routes/manager');
+  const m = require('./src/routes/manager'); // CJS/ESM 호환
   const authRouter = m.default || m;
-  app.use(authRouter);                    // /auth/*
-  app.use('/api/worker', authRouter);     // 구 프리픽스도 겸용 허용
+  app.use(authRouter);                // /auth/*
+  app.use('/api/worker', authRouter); // 구 프리픽스도 허용
   console.log('[BOOT] mounted /auth routes from ./src/routes/manager.js');
 } catch (e) {
   console.error('[BOOT] FAILED to mount ./src/routes/manager.js:', e && e.code ? e.code : e);
-
-  // --- 폴백: JWT 서명(7d 만료)으로 /auth/* 제공 — manager 없을 때도 로그인 가능 ---
   const sign = (p) => jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
 
   app.get('/auth/health', (_req,res)=>res.json({ ok:true, stub:true }));
-
   app.post('/auth/signup', express.json({limit:'5mb'}), (req,res)=>{
     const p = req.body || {};
     const token = sign({
@@ -458,22 +438,16 @@ try {
     });
     res.json({ ok:true, token, user: { username: p.username || '', email: p.email || '' }});
   });
-
   app.post('/auth/login', express.json({limit:'2mb'}), (req,res)=>{
     const p = req.body || {};
     const login = p.login || p.username || p.email || 'user';
-    const token = sign({
-      uid: String(login),
-      username: String(login),
-      email: p.email || '',
-    });
+    const token = sign({ uid: String(login), username: String(login), email: p.email || '' });
     res.json({ ok:true, token, user: { id: login, username: String(login), email: p.email || '' }});
   });
-
   console.log('[BOOT] fallback /auth routes registered (no manager.js)');
 }
 
-// ---------------- Optional mounts (있으면 사용, 없으면 스킵) ----------------
+/* ========== Optional mounts (있으면 사용) ========== */
 try { const visionApp  = require('./server.vision');       app.use(visionApp); }  catch {}
 try { const embApp     = require('./server.embedding');    app.use(embApp); }     catch {}
 try { const tenApp     = require('./server.tenancy');      app.use(tenApp); }     catch {}
@@ -484,10 +458,12 @@ try { const tasksApp   = require('./server.notifyTasks');  app.use(tasksApp); } 
 try { const opsApp     = require('./server.ops');          app.use(opsApp); }     catch {}
 try { const schemaApp  = require('./server.schema');       app.use(schemaApp); }  catch {}
 
-// ---------------- 404 & error ----------------
+/* ========== 404 & error handlers ========== */
 app.use((req, res) => res.status(404).json({ error: 'not found' }));
-
 app.use((err, req, res, next) => {
   try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
   res.status(500).json({ error: 'internal error' });
 });
+
+/* ========== Listen ========== */
+app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));

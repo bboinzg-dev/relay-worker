@@ -63,8 +63,10 @@ function getJsonBody(req) {
 
 // 간단 HS256 JWT (수동 서명)
 function issueToken(payload = {}) {
+  const now = Math.floor(Date.now() / 1000);
+  const exp = now + 7 * 24 * 60 * 60; // 7일
   const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
-  const body   = Buffer.from(JSON.stringify({ ...payload, iat: Math.floor(Date.now() / 1000) })).toString("base64url");
+  const body   = Buffer.from(JSON.stringify({ ...payload, iat: now, exp })).toString("base64url");
   const sig    = crypto.createHmac("sha256", JWT_SECRET).update(`${header}.${body}`).digest("base64url");
   return `${header}.${body}.${sig}`;
 }

@@ -110,7 +110,6 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // --- Upload endpoint (multipart/form-data; field name = "file")
 //     두 경로 모두 허용: /api/files/upload, /files/upload
-const storage = new Storage();
 
 app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (req, res) => {
   try {
@@ -122,10 +121,6 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
     const safe = (req.file.originalname || 'datasheet.pdf').replace(/\s+/g,'_');
     const object = `incoming/${sha}_${Date.now()}_${safe}`;
 
-    await storage.bucket(GCS_BUCKET).file(object).save(buf, {
-      contentType: req.file.mimetype || 'application/pdf',
-      resumable: false, public: false, validation: false,
-    });
 
     return res.json({ ok:true, gcsUri: `gs://${GCS_BUCKET}/${object}` });
   } catch (e) {

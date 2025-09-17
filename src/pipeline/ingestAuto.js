@@ -41,6 +41,19 @@ async function runAutoIngest({ gcsUri, family_slug, brand, code, series=null, di
   }
   if (!family_slug || !brand || !code) throw new Error('Unable to determine family/brand/code');
 
+   const { identifyFamilyBrandCode, extractByBlueprintGemini } = require('../utils/vertex');
++const { normalizeFamilySlug } = require('../utils/family');
+@@
+   // 1) detection if needed
+   if (!family_slug || !brand || !code) {
+     const families = await getFamilies();
+     const det = await identifyFamilyBrandCode(gcsUri, families);
+-    family_slug = family_slug || det.family_slug;
++    family_slug = normalizeFamilySlug(family_slug || det.family_slug);
+     brand = brand || det.brand;
+     code = code || det.code;
+
+
   // 2) blueprint
   const bp = await fetchBlueprint(family_slug);
   const specs_table = bp.specs_table;

@@ -1,5 +1,6 @@
 // relay-worker/src/utils/family.js
-// ✅ CommonJS, 함수 내보내기 명확히
+// ✅ CommonJS export. family slug 정규화 + 휴리스틱 선택
+
 function normalizeFamilySlug(s) {
   const k = (s || '').toString().trim().toLowerCase();
   const map = {
@@ -12,7 +13,8 @@ function normalizeFamilySlug(s) {
     'solid state relay': 'relay_ssr',
     'ssr': 'relay_ssr',
     'signal relay': 'relay_signal',
-    // 수동소자
+
+    // 수동/반도체 (필요시 계속 확장)
     'mlcc': 'capacitor_mlcc',
     'ceramic': 'capacitor_mlcc',
   };
@@ -21,11 +23,13 @@ function normalizeFamilySlug(s) {
 
 function chooseCanonicalFamilySlug(raw, families = []) {
   const k = (raw || '').toString().trim().toLowerCase();
-  const set = new Set(families.map(f => f.family_slug || f)); // 레지스트리 배열/문자열 둘 다 허용
+  const list = families.map(f => (typeof f === 'string' ? f : f.family_slug));
+  const set  = new Set(list.filter(Boolean));
   if (set.has(k)) return k;
-  // 키워드 휴리스틱(등록된 가족 중에서만 선택)
-  const has = (re) => new RegExp(re, 'i').test(k);
+
+  const has  = (re) => new RegExp(re, 'i').test(k);
   const pick = (...cands) => cands.find(c => set.has(c)) || null;
+
   if (has('\\brelay\\b')) {
     if (has('signal|telecom')) return pick('relay_signal','relay_reed','relay_power');
     if (has('\\breed\\b'))     return pick('relay_reed','relay_signal','relay_power');
@@ -40,7 +44,8 @@ function chooseCanonicalFamilySlug(raw, families = []) {
   if (has('mosfet'))             return pick('mosfet');
   if (has('diode|rectifier|schottky')) return pick('diode_rectifier');
   if (has('\\bigbt\\b|igbt module'))   return pick('igbt_module');
-  return null; // 모호하면 선택 안 함
+
+  return null;
 }
 
 module.exports = { normalizeFamilySlug, chooseCanonicalFamilySlug };

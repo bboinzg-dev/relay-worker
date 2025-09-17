@@ -10,6 +10,8 @@ const {
   moveObject,
 } = require('../utils/gcs');
 const { identifyFamilyBrandCode, extractByBlueprintGemini } = require('../utils/vertex');
+
+// ✅ family 유틸은 “단 한 번” 이렇게만 가져온다(안전 가드 포함)
 const famUtil = require('../utils/family');
 const normalizeFamilySlug =
   (typeof famUtil.normalizeFamilySlug === 'function')
@@ -19,7 +21,6 @@ const chooseCanonicalFamilySlug =
   (typeof famUtil.chooseCanonicalFamilySlug === 'function')
     ? famUtil.chooseCanonicalFamilySlug
     : () => null;
-const { normalizeFamilySlug } = require('../utils/family');
 
 /** registry+blueprint 로드 */
 async function fetchBlueprint(family_slug) {
@@ -85,9 +86,9 @@ async function runAutoIngest({
 
     // 1차: 간단 정규화(별칭 → 표준)
     family_slug = normalizeFamilySlug(family_slug || det.family_slug);
+
     // 2차: 레지스트리에 실제 있는 slug 중 최적 선택(모호할 때만 보정)
     try {
-      const families = await getFamilies(); // 이미 있는 함수
       const picked = chooseCanonicalFamilySlug(family_slug, families);
       if (picked) family_slug = picked;
     } catch {}
@@ -119,7 +120,7 @@ async function runAutoIngest({
   const bucketEnv = (process.env.GCS_BUCKET || '').replace(/^gs:\/\//, '');
   const bucket = bucketEnv.split('/')[0] || '';
   const datasheet_url = canonicalDatasheetPath(bucket, family_slug, brand, code);
-  const cover = canonicalCoverPath(bucket, family_slug, brand, code); // 썸네일 생성은 TODO
+  const cover = canonicalCoverPath(bucket, family_slug, brand, code); // TODO: 썸네일 생성
 
   // 6) 안전 업서트(실제 존재 컬럼에 한해)
   const allowed = await getTableColumnsQualified(specs_table);

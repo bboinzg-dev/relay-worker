@@ -7,6 +7,7 @@ const bodyParser = require('body-parser');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const jwt = require('jsonwebtoken'); // [ADD] 쿠키 세션 검증 & 폴백 JWT 발급
+const { normalizeFamilySlug } = require('./src/utils/family');
 
 // --- utils / services ---
 const db = require('./src/utils/db');
@@ -300,12 +301,13 @@ app.get('/parts/alternatives', async (req, res) => {
 app.post('/ingest', requireSession, async (req, res) => {
   try {
     const {
-      family_slug,
+      family_slug: _family_slug,
       specs_table, brand, code, series, display_name,
       datasheet_url, cover, source_gcs_uri, raw_json = null,
       fields = {}, values = {},
       tenant_id = null, owner_id = null, created_by = null, updated_by = null,
     } = req.body || {};
+    const family_slug = normalizeFamilySlug(_family_slug);
 
     const table = (specs_table || `${family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
     if (!brand || !code) return res.status(400).json({ error: 'brand & code required' });

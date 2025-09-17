@@ -114,6 +114,42 @@ app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 const upload = multer({ storage: multer.memoryStorage() });
 
+// --- Upload endpoint (multipart/form-data; field name = "file")
+//     두 경로 모두 허용: /api/files/upload, /files/upload
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+const crypto = require('crypto');
+const { Storage } = require('@google-cloud/storage');
+const storage = new Storage();
+
+const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
+const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
+  ? GCS_BUCKET_URI.replace(/^gs:\/\//,'').split('/')[0]
+  : (GCS_BUCKET_URI || '');
+
+app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok:false, error:'file required' });
+    if (!GCS_BUCKET) return res.status(500).json({ ok:false, error:'GCS_BUCKET not set' });
+
+    const buf = req.file.buffer;
+    const sha = crypto.createHash('sha256').update(buf).digest('hex');
+    const safe = (req.file.originalname || 'datasheet.pdf').replace(/\s+/g,'_');
+    const object = `incoming/${sha}_${Date.now()}_${safe}`;
+
+    await storage.bucket(GCS_BUCKET).file(object).save(buf, {
+      contentType: req.file.mimetype || 'application/pdf',
+      resumable: false, public: false, validation: false,
+    });
+
+    return res.json({ ok:true, gcsUri: `gs://${GCS_BUCKET}/${object}` });
+  } catch (e) {
+    console.error('[upload]', e);
+    return res.status(400).json({ ok:false, error:String(e.message || e) });
+  }
+});
+
+
 // Global authorization / tenancy guard
 app.use(authzGlobal);
 

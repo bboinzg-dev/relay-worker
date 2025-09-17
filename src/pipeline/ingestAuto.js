@@ -54,22 +54,16 @@ async function getTableColumnsQualified(targetTable) {
 }
 
 /* ---------------- Fallback helpers ---------------- */
-
-/** 파일명/경로에서 브랜드·코드 힌트 추출 (아주 보수적으로) */
 function guessBrandCodeFromPath(gcsUri) {
   try {
     const name = String(gcsUri || '').split('/').pop() || '';
     const base = name.replace(/\.(pdf|zip|png|jpg|jpeg)$/i, '');
-    // 흔한 패턴: BRAND_CODE, BRAND-CODE, BRAND CODE
     const m1 = /^([A-Za-z0-9]+)[_\-\s]+([A-Za-z0-9\.\-]+)$/.exec(base);
     if (m1) return { brand: m1[1], code: m1[2] };
-    // 코드만 분리 가능한 경우
     if (/^[A-Za-z0-9\.\-]+$/.test(base)) return { brand: null, code: base };
   } catch {}
   return { brand: null, code: null };
 }
-
-/** 안전 임시 코드(유니크 보장) */
 function safeTempCodeFromUri(gcsUri) {
   const crypto = require('crypto');
   const sha6 = crypto.createHash('sha256').update(String(gcsUri || '')).digest('hex').slice(0, 6);
@@ -121,7 +115,6 @@ async function runAutoIngest({
       if (guess) family_slug = guess;
     }
     if (!family_slug) {
-      // 레지스트리에 있는 기본값 우선: relay_power → 없으면 첫 가족
       if (families.includes('relay_power')) family_slug = 'relay_power';
       else if (families.length) family_slug = families[0];
     }
@@ -135,9 +128,7 @@ async function runAutoIngest({
   }
 
   // 👉 더 이상 brand/code 때문에 실패하지 않도록, 최소 family만 확인
-  if (!family_slug) {
-    throw new Error('Unable to determine family');
-  }
+  if (!family_slug) throw new Error('Unable to determine family');
 
   // 2) blueprint
   const bp = await fetchBlueprint(family_slug);
@@ -159,13 +150,27 @@ async function runAutoIngest({
   const datasheet_url = canonicalDatasheetPath(bucket, family_slug, brand, code);
   const cover         = canonicalCoverPath(bucket, family_slug, brand, code); // TODO: 썸네일 생성
 
-  // 6) 안전 업서트(실제 존재 컬럼에 한해)
+  // 6) 안전 업서트(실제 존재 컬럼에 한해) — ✅ brand_norm/code_norm을 항상 채워 DB 제약 충족
   const allowed = await getTableColumnsQualified(specs_table);
+
+  const normBrand = String(brand || 'unknown').trim();
+  const normCode  = String(code  || safeTempCodeFromUri(gcsUri)).trim();
+
   const base = {
-    brand, code, series, display_name,
-    family_slug, datasheet_url, cover,
-    source_gcs_uri: gcsUri, raw_json,
+    brand: normBrand,
+    code:  normCode,
+    brand_norm: normBrand.toLowerCase(),
+    code_norm:  normCode.toLowerCase(),
+
+    series,
+    display_name,
+    family_slug,
+    datasheet_url,
+    cover,
+    source_gcs_uri: gcsUri,
+    raw_json,
   };
+
   const filtered = {};
   for (const [k, v] of Object.entries({ ...base, ...extractedValues })) {
     if (allowed.has(k)) filtered[k] = v;
@@ -188,7 +193,7 @@ async function runAutoIngest({
 
   return {
     ok: true,
-    family_slug, specs_table, brand, code, series, display_name,
+    family_slug, specs_table, brand: normBrand, code: normCode, series, display_name,
     datasheet_url, cover, signed_pdf, row,
   };
 }

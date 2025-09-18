@@ -1,68 +1,80 @@
-const { VertexAI } = require('@google-cloud/vertexai');
-const { readText } = require('./gcs');
+'use strict';
 
-const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
-const LOCATION = process.env.VERTEX_LOCATION || 'asia-northeast3'; // 또는 운영 리전에 맞춤
-const MODEL_ID =
-  process.env.GEMINI_MODEL_EXTRACT   // 홈페이지와 키 통일(있으면 우선)
-  || process.env.VERTEX_MODEL_ID     // 기존 환경변수 호환
-  || 'gemini-2.5-flash';
-const EMBED_TEXT = process.env.VERTEX_EMBED_TEXT || 'text-embedding-004';
-const EMBED_IMAGE = process.env.VERTEX_EMBED_IMAGE || 'multimodalembedding@001';
+const LOCATION = process.env.VERTEX_LOCATION || 'asia-northeast3';
+const MODEL_ID = process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
 
-const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+// Vertex 호출 공통 JSON 반환 헬퍼
+async function callModelJson(systemText, userText, options = {}) {
+  // 구현체는 기존 레포의 Vertex 호출 방식 그대로 사용하세요.
+  // 아래는 의사 코드 형태(레포에 맞게 연결):
+  //
+  // const { VertexAI } = require('@google-cloud/vertexai');
+  // const client = new VertexAI({ location: LOCATION, model: MODEL_ID });
+  // const r = await client.generateContent({ contents: [...], ... });
+  // const json = JSON.parse(r.candidates[0].outputText);
+  // return json;
 
-function fillPrompt(template, fields) {
-  const keys = Object.keys(fields || {});
-  return template.replace(/\{\{FIELDS\}\}/g, JSON.stringify(keys));
+  // 레포에 이미 같은 함수가 있다면 이 파일을 그 구현으로 덮어쓰거나 재사용하세요.
+  throw new Error('callModelJson not implemented – wire to your Vertex client.');
 }
 
-async function identifyFamilyBrandCode(gcsUri, families = []) {
-  const gen = vertex.getGenerativeModel({ model: MODEL_ID });
-  const prompt = [
-    'You are a component classifier. Return a compact JSON with keys: family_slug, brand, code, series, display_name.',
-    families.length ? `Families candidates: ${families.join(', ')}` : '',
-    'If unsure, pick the closest family. Only JSON.',
-  ].filter(Boolean).join('\n');
+async function chooseBrandCode(corpus, brandCandidates = [], codeCandidates = []) {
+  // 환각 방지: 후보 리스트만 허용
+  const sys = [
+    'You are a product catalog analyzer.',
+    'Return strict JSON with shape {"brand": "...", "code": "...", "series": ""}.',
+    'Choose brand only from provided candidates list; if none fits, return empty string.',
+    'Choose code only from provided candidates list; prefer tokens that look like orderable part numbers.',
+    'Do not fabricate values.'
+  ].join('\n');
 
-  const req = {
-    contents: [{
-      role: 'user',
-      parts: [
-        { text: prompt },
-        { fileData: { fileUri: gcsUri, mimeType: 'application/pdf' } }
-      ]
-    }]
+  const usr = JSON.stringify({
+    text: corpus.slice(0, 9000),
+    candidates: {
+      brands: brandCandidates.slice(0, 30),
+      codes: codeCandidates.slice(0, 60),
+    }
+  });
+
+  const out = await callModelJson(sys, usr);
+  return {
+    brand: String(out?.brand || '').trim(),
+    code:  String(out?.code  || '').trim(),
+    series: String(out?.series || '').trim(),
   };
-  const resp = await gen.generateContent(req);
-  const txt = resp?.response?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '{}';
-  try { return JSON.parse(txt); } catch { return {}; }
 }
 
-async function extractByBlueprintGemini(gcsUri, fieldsJson = {}, promptTemplate) {
-  const gen = vertex.getGenerativeModel({ model: MODEL_ID });
-  const prompt = fillPrompt(promptTemplate || 'Return ONLY JSON for keys: {{FIELDS}}', fieldsJson);
-  const req = {
-    contents: [{
-      role: 'user',
-      parts: [
-        { text: prompt },
-        { fileData: { fileUri: gcsUri, mimeType: 'application/pdf' } }
-      ]
-    }]
-  };
-  const resp = await gen.generateContent(req);
-  const txt = resp?.response?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '{}';
-  let values = {};
-  try { values = JSON.parse(txt); } catch (e) { values = {}; }
-  return { fields: fieldsJson, values, raw_json: { model: MODEL_ID, output: txt } };
+async function classifyFamily(corpus, allowedFamilies = []) {
+  const sys = [
+    'Classify the product family from the text.',
+    'Return JSON {"family_slug": "<one_of_allowed>"}',
+    'If unsure, return empty string.'
+  ].join('\n');
+
+  const usr = JSON.stringify({
+    allowed_families: allowedFamilies,
+    text: corpus.slice(0, 9000),
+  });
+
+  const out = await callModelJson(sys, usr);
+  return String(out?.family_slug || '').trim();
 }
 
-async function embedText(text) {
-  const model = vertex.getEmbeddingModel({ model: EMBED_TEXT });
-  const resp = await model.embedContent({ content: { parts: [{ text }] } });
-  const vec = resp?.embeddings?.[0]?.values || [];
-  return vec;
+async function extractByBlueprint(corpus, fieldsJson = {}, prompt = '') {
+  const sys = [
+    'Extract specifications.',
+    'Return JSON: {"values": {...}} matching field names, with minimal normalization.',
+    'Omit fields not present. Do not invent.'
+  ].join('\n');
+  const usr = JSON.stringify({ fields: fieldsJson, hint: prompt, text: corpus.slice(0, 12000) });
+  const out = await callModelJson(sys, usr);
+  return out?.values || {};
 }
 
-module.exports = { identifyFamilyBrandCode, extractByBlueprintGemini, embedText, fillPrompt };
+module.exports = {
+  LOCATION, MODEL_ID,
+  callModelJson,
+  chooseBrandCode,
+  classifyFamily,
+  extractByBlueprint,
+};

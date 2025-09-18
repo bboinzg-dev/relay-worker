@@ -394,18 +394,28 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
 });
 
 /* 호환용: 프론트가 /api/worker/ingest 로 호출하던 경로 */
+// /api/worker/ingest : Cloud Tasks/직접 호출 공용 엔드포인트
 app.post('/api/worker/ingest', requireSession, async (req, res) => {
   try {
-    const { gcsPdfUri, gcsUri, family_slug = null, brand = null, code = null, series = null, display_name = null } = req.body || {};
-    const uri = gcsUri || gcsPdfUri; // 두 키 모두 지원
-    if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
-    const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
-    res.json(result);
+    // ✅ 둘 다 허용
+    const { gcsUri, gcsPdfUri, brand, code, series, display_name } = req.body || {};
+    const uri = gcsUri || gcsPdfUri;
+    if (!uri || !/^gs:\/\//i.test(uri)) {
+      // 디버그: 현재 받은 바디를 로그로 남김
+      console.warn('[ingest] 400 gcsUri required — body=', req.body);
+      return res.status(400).json({ ok:false, error:'gcsUri required (gs://...)' });
+    }
+
+    const out = await runAutoIngest({
+      gcsUri: uri, brand, code, series, display_name
+    });
+    return res.json(out);
   } catch (e) {
-    console.error(e);
-    res.status(400).json({ ok:false, error: String(e.message || e) });
+    console.error('[ingest] 500', e);
+    return res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });
+
 
 /* ===== DEBUG/BOOT MARKS ===== */
 console.log('[BOOT] server.js loaded, will mount /auth and catalog stubs');

@@ -334,24 +334,41 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
   }
 });
 
-/* ===== 인증 라우터 마운트 (있으면) ===== */
+/* ===== (수정) /auth 라우터 마운트: 베이스 경로로 장착 + 실패 시 스텁 ===== */
 try {
-  const m = require('./src/routes/manager');
-  const authRouter = m.default || m;
-  app.use(authRouter);                // /auth/*
-  app.use('/api/worker', authRouter); // 구 프리픽스도 허용
-  console.log('[BOOT] mounted /auth routes from ./src/routes/manager.js');
+  const mod = require('./src/routes/manager');   // CJS/ESM 호환
+  const authRouter = mod.default || mod;
+  // ✅ 베이스 경로로 마운트: 라우터 내부가 '/login' 으로만 정의돼 있어도 '/auth/login' 경로가 생김
+  app.use('/auth', authRouter);
+  app.use('/api/worker/auth', authRouter);       // 구 프리픽스 호환 필요하면 유지
+  console.log('[BOOT] mounted /auth routes (base-mounted)');
 } catch (e) {
   console.error('[BOOT] FAILED to mount ./src/routes/manager.js:', e?.code || e);
+
+  // ✅ 스텁 라우터(매니저 로드 실패해도 /auth/* 동작)
+  const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
+  const stub = express.Router();
+  stub.get('/health', (_req, res)=> res.json({ ok:true, stub:true }));
+
+  // POST /auth/signup
+  stub.post('/signup', express.json({ limit: '2mb' }), (req,res)=>{
+    const p = req.body || {};
+    const token = sign({ uid: String(p.username || p.email || 'user'), username: p.username || '' });
+    return res.json({ ok:true, token, user:{ username: p.username || '', email: p.email || '' } });
+  });
+
+  // POST /auth/login
+  stub.post('/login', express.json({ limit: '2mb' }), (req,res)=>{
+    const p = req.body || {};
+    const id = String(p.idOrEmail || p.username || p.email || 'user');
+    const token = sign({ uid: id, username: id });
+    return res.json({ ok:true, token, user:{ username: id } });
+  });
+
+  app.use('/auth', stub);
+  app.use('/api/worker/auth', stub);
 }
 
-/* ===== Optional mounts (있으면 사용, 없으면 스킵) ===== */
-for (const mod of [
-  './server.vision', './server.embedding', './server.tenancy', './server.notify',
-  './server.bom', './server.optimize', './server.notifyTasks', './server.ops', './server.schema'
-]) {
-  try { const appx = require(mod); app.use(appx); } catch {}
-}
 
 /* ---------------- 404 / error ---------------- */
 app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));

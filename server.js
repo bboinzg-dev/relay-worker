@@ -299,40 +299,82 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
 });
 
-/* ---------------- Cloud Tasks / Direct: 공용 인제스트 엔드포인트 ---------------- */
-// ✅ gcsUri || gcsPdfUri 모두 허용 + 풍부한 진단 로그
 app.post('/api/worker/ingest', requireSession, async (req, res) => {
   const startedAt = Date.now();
+  const taskName  = req.get('X-Cloud-Tasks-TaskName') || null;
+  const retryCnt  = Number(req.get('X-Cloud-Tasks-TaskRetryCount') || 0);
   try {
-    const taskName  = req.get('X-Cloud-Tasks-TaskName') || null;
-    const retryCnt  = req.get('X-Cloud-Tasks-TaskRetryCount') || null;
-    const traceId   = req.get('X-Cloud-Trace-Context') || null;
-
     const { gcsUri, gcsPdfUri, brand, code, series, display_name } = req.body || {};
     const uri = gcsUri || gcsPdfUri;
-
     if (!uri || !/^gs:\/\//i.test(uri)) {
-      console.warn('[ingest 400] invalid body', { taskName, retryCnt, traceId, body: req.body });
+      // 시작 로그(FAILED)
+      await db.query(
+        `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
+         VALUES ($1,$2,$3,'FAILED',$4)`,
+        [taskName, retryCnt, uri || '', 'gcsUri required (gs://...)']
+      );
       return res.status(400).json({ ok:false, error:'gcsUri required (gs://...)' });
     }
 
+    // 시작 로그(PROCESSING)
+    const { rows:logRows } = await db.query(
+      `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
+       VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
+      [taskName, retryCnt, uri]
+    );
+    const runId = logRows[0]?.id;
+
     const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name });
 
-    console.log('[ingest 200]', {
-      taskName, retryCnt, traceId,
-      ms: Date.now() - startedAt,
-      family: out?.family_slug, table: out?.specs_table, brand: out?.brand, code: out?.code
-    });
+    // 종료 로그(SUCCEEDED)
+    await db.query(
+      `UPDATE public.ingest_run_logs
+         SET finished_at = now(),
+             duration_ms = $2,
+             pred_family_slug = COALESCE(pred_family_slug, $3),
+             pred_brand = COALESCE(pred_brand, $4),
+             pred_code  = COALESCE(pred_code,  $5),
+             final_table = $6,
+             final_family= $7,
+             final_brand = $8,
+             final_code  = $9,
+             final_datasheet = $10,
+             status = 'SUCCEEDED'
+       WHERE id = $1`,
+      [ runId, Date.now()-startedAt,
+        out?.family_slug || null, out?.brand || null, out?.code || null,
+        out?.specs_table || null,
+        out?.family_slug || null, out?.brand || null, out?.code || null,
+        out?.datasheet_uri || null
+      ]
+    );
+
+    console.log('[ingest 200]', { taskName, retryCnt, ms: Date.now()-startedAt,
+      family: out?.family_slug, table: out?.specs_table, brand: out?.brand, code: out?.code });
     return res.json(out);
+
   } catch (e) {
-    console.error('[ingest 500]', {
-      ms: Date.now() - startedAt,
-      error: e?.message || String(e),
-      stack: e?.stack
-    });
+    // 종료 로그(FAILED)
+    try {
+      await db.query(
+        `UPDATE public.ingest_run_logs
+           SET finished_at = now(),
+               duration_ms = $2,
+               status = 'FAILED',
+               error_message = $3
+         WHERE task_name = $1
+           AND status = 'PROCESSING'
+         ORDER BY started_at DESC
+         LIMIT 1`,
+        [ taskName, Date.now()-startedAt, String(e?.message || e) ]
+      );
+    } catch (_) { /* 로그 실패는 무시 */ }
+
+    console.error('[ingest 500]', { error: e?.message || e, stack: e?.stack });
     return res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });
+
 
 /* ===== (수정) /auth 라우터 마운트: 베이스 경로로 장착 + 실패 시 스텁 ===== */
 try {

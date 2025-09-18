@@ -118,12 +118,17 @@ async function runAutoIngest({ gcsUri, family_slug=null, brand=null, code=null, 
   // 5) 경로 계산
   const bucketEnv = (process.env.GCS_BUCKET || '').replace(/^gs:\/\//, '');
   const bucket    = bucketEnv.split('/')[0] || '';
-  const datasheet_uri = bucket ? canonicalDatasheetPath(bucket, family_slug, brand, code) : null;
-  const cover         = bucket ? canonicalCoverPath(bucket, family_slug, brand, code) : null;
 
   // 6) 정상화 + 최소 제약 충족 (항상 채움)
   const normBrand = String(brand || 'unknown').trim();
   const normCode  = String(code  || safeTempCode(gcsUri)).trim();
+   // ✅ 경로는 정규화된 brand/code로 계산해야 // 빈 경로 방지
+ const datasheet_uri = bucket
+   ? canonicalDatasheetPath(bucket, family_slug, normBrand, normCode)
+   : null;
+ const cover = bucket
+   ? canonicalCoverPath(bucket, family_slug, normBrand, normCode)
+   : null;
   const base = {
     brand      : normBrand,
     code       : normCode,

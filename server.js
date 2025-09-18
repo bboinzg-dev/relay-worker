@@ -376,53 +376,40 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
 });
 
 
-/* ===== (수정) /auth 라우터 마운트: ESM/CJS 모두 지원 + 실패 시 스텁 ===== */
+/* ===== /auth 라우터 마운트: ESM만 동적 import + 실패시 스텁 ===== */
 (async () => {
   try {
-    let authRouter;
+    // manager.mjs는 ESM. require를 시도하지 않고 곧바로 import.
+    const mod = await import('./src/routes/manager.mjs');   // ← 확장자 .mjs
+    const authRouter = mod.default || mod;
 
-    // 1) CJS(require) 우선 시도
-    try {
-      const modCjs = require('./src/routes/manager');
-      authRouter = modCjs.default || modCjs;
-    } catch (e) {
-      // 2) ESM(동적 import)로 재시도
-      if (e.code === 'ERR_REQUIRE_ESM' || /Cannot use import|load the ES module/i.test(String(e))) {
-        const modEsm = await import('./src/routes/manager.js');   // .js or .mjs 모두 허용
-        authRouter = modEsm.default || modEsm;
-      } else {
-        throw e;
-      }
-    }
-
-    // ✅ 베이스 경로로 마운트: 라우터 내부가 '/login'만 있어도 '/auth/login'이 생김
+    // 베이스 경로로 장착 (라우터 내부가 '/login'만 있어도 '/auth/login'가 생김)
     app.use('/auth', authRouter);
-    app.use('/api/worker/auth', authRouter); // 구 프리픽스 필요시 유지
-    console.log('[BOOT] mounted /auth routes (ESM/CJS compatible)');
+    app.use('/api/worker/auth', authRouter); // (구 프리픽스 겸용 필요 시 유지)
+    console.log('[BOOT] mounted /auth routes (ESM ok)');
   } catch (e) {
-    console.error('[BOOT] FAILED to mount ./src/routes/manager.js:', e?.code || e);
+    console.error('[BOOT] FAILED to import /src/routes/manager.mjs:', e?.message || e);
 
-    // ✅ 스텁 라우터(매니저 로드 실패해도 /auth/* 동작)
+    // 스텁: 매니저 로드 실패해도 로그인 경로가 살아있게 함
     const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
     const stub = express.Router();
-
-    stub.get('/health', (_req, res)=> res.json({ ok:true, stub:true }));
-    stub.post('/signup', express.json({ limit: '2mb' }), (req,res)=>{
+    stub.get('/health', (_req,res)=> res.json({ ok:true, stub:true }));
+    stub.post('/signup', express.json({limit:'2mb'}), (req,res)=>{
       const p = req.body || {};
       const token = sign({ uid: String(p.username || p.email || 'user'), username: p.username || '' });
-      return res.json({ ok:true, token, user:{ username: p.username || '', email: p.email || '' } });
+      return res.json({ ok:true, token, user:{ username: p.username || '', email: p.email || '' }});
     });
-    stub.post('/login', express.json({ limit: '2mb' }), (req,res)=>{
+    stub.post('/login', express.json({limit:'2mb'}), (req,res)=>{
       const p = req.body || {};
       const id = String(p.idOrEmail || p.username || p.email || 'user');
       const token = sign({ uid: id, username: id });
-      return res.json({ ok:true, token, user:{ username: id } });
+      return res.json({ ok:true, token, user:{ username: id }});
     });
-
     app.use('/auth', stub);
     app.use('/api/worker/auth', stub);
   }
 })();
+
 
 
 

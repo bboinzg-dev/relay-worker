@@ -13,8 +13,7 @@ function normalizeFamilySlug(s) {
     'solid state relay': 'relay_ssr',
     'ssr': 'relay_ssr',
     'signal relay': 'relay_signal',
-
-    // 수동/반도체 (필요시 계속 확장)
+    // 수동/반도체(필요시 확장)
     'mlcc': 'capacitor_mlcc',
     'ceramic': 'capacitor_mlcc',
   };

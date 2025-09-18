@@ -376,40 +376,54 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
 });
 
 
-/* ===== (수정) /auth 라우터 마운트: 베이스 경로로 장착 + 실패 시 스텁 ===== */
-try {
-  const mod = require('./src/routes/manager');   // CJS/ESM 호환
-  const authRouter = mod.default || mod;
-  // ✅ 베이스 경로로 마운트: 라우터 내부가 '/login' 으로만 정의돼 있어도 '/auth/login' 경로가 생김
-  app.use('/auth', authRouter);
-  app.use('/api/worker/auth', authRouter);       // 구 프리픽스 호환 필요하면 유지
-  console.log('[BOOT] mounted /auth routes (base-mounted)');
-} catch (e) {
-  console.error('[BOOT] FAILED to mount ./src/routes/manager.js:', e?.code || e);
+/* ===== (수정) /auth 라우터 마운트: ESM/CJS 모두 지원 + 실패 시 스텁 ===== */
+(async () => {
+  try {
+    let authRouter;
 
-  // ✅ 스텁 라우터(매니저 로드 실패해도 /auth/* 동작)
-  const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
-  const stub = express.Router();
-  stub.get('/health', (_req, res)=> res.json({ ok:true, stub:true }));
+    // 1) CJS(require) 우선 시도
+    try {
+      const modCjs = require('./src/routes/manager');
+      authRouter = modCjs.default || modCjs;
+    } catch (e) {
+      // 2) ESM(동적 import)로 재시도
+      if (e.code === 'ERR_REQUIRE_ESM' || /Cannot use import|load the ES module/i.test(String(e))) {
+        const modEsm = await import('./src/routes/manager.js');   // .js or .mjs 모두 허용
+        authRouter = modEsm.default || modEsm;
+      } else {
+        throw e;
+      }
+    }
 
-  // POST /auth/signup
-  stub.post('/signup', express.json({ limit: '2mb' }), (req,res)=>{
-    const p = req.body || {};
-    const token = sign({ uid: String(p.username || p.email || 'user'), username: p.username || '' });
-    return res.json({ ok:true, token, user:{ username: p.username || '', email: p.email || '' } });
-  });
+    // ✅ 베이스 경로로 마운트: 라우터 내부가 '/login'만 있어도 '/auth/login'이 생김
+    app.use('/auth', authRouter);
+    app.use('/api/worker/auth', authRouter); // 구 프리픽스 필요시 유지
+    console.log('[BOOT] mounted /auth routes (ESM/CJS compatible)');
+  } catch (e) {
+    console.error('[BOOT] FAILED to mount ./src/routes/manager.js:', e?.code || e);
 
-  // POST /auth/login
-  stub.post('/login', express.json({ limit: '2mb' }), (req,res)=>{
-    const p = req.body || {};
-    const id = String(p.idOrEmail || p.username || p.email || 'user');
-    const token = sign({ uid: id, username: id });
-    return res.json({ ok:true, token, user:{ username: id } });
-  });
+    // ✅ 스텁 라우터(매니저 로드 실패해도 /auth/* 동작)
+    const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
+    const stub = express.Router();
 
-  app.use('/auth', stub);
-  app.use('/api/worker/auth', stub);
-}
+    stub.get('/health', (_req, res)=> res.json({ ok:true, stub:true }));
+    stub.post('/signup', express.json({ limit: '2mb' }), (req,res)=>{
+      const p = req.body || {};
+      const token = sign({ uid: String(p.username || p.email || 'user'), username: p.username || '' });
+      return res.json({ ok:true, token, user:{ username: p.username || '', email: p.email || '' } });
+    });
+    stub.post('/login', express.json({ limit: '2mb' }), (req,res)=>{
+      const p = req.body || {};
+      const id = String(p.idOrEmail || p.username || p.email || 'user');
+      const token = sign({ uid: id, username: id });
+      return res.json({ ok:true, token, user:{ username: id } });
+    });
+
+    app.use('/auth', stub);
+    app.use('/api/worker/auth', stub);
+  }
+})();
+
 
 
 /* ---------------- 404 / error ---------------- */

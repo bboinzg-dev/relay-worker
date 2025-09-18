@@ -376,21 +376,40 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
 });
 
 
-/* ===== /auth 라우터 마운트: ESM만 동적 import + 실패시 스텁 ===== */
+/* ===== /auth 라우터 마운트: ESM/CJS 모두 지원 + root & /auth 동시 마운트 + 실패 시 스텁 ===== */
 (async () => {
   try {
-    // manager.mjs는 ESM. require를 시도하지 않고 곧바로 import.
-    const mod = await import('./src/routes/manager.mjs');   // ← 확장자 .mjs
-    const authRouter = mod.default || mod;
+    let authRouter;
 
-    // 베이스 경로로 장착 (라우터 내부가 '/login'만 있어도 '/auth/login'가 생김)
+    // 1) ESM(.mjs) 우선 시도
+    try {
+      const modEsm = await import('./src/routes/manager.mjs'); // 있으면 ESM로
+      authRouter = modEsm.default || modEsm;
+    } catch (e1) {
+      // 2) CJS(.js) 시도
+      try {
+        const modCjs = require('./src/routes/manager');        // CJS or hybrid
+        authRouter = modCjs.default || modCjs;
+      } catch (e2) {
+        // 3) ESM(.js) 동적 import (일부 브랜치가 .js ESM일 수 있음)
+        const modEsmJs = await import('./src/routes/manager.js');
+        authRouter = modEsmJs.default || modEsmJs;
+      }
+    }
+
+    // ✅ 라우터 내부가 '/auth/login' 처럼 절대경로면 root에 마운트해야 '/auth/login'이 살아남
+    app.use(authRouter);
+    // ✅ 라우터 내부가 '/login' 같은 상대경로면 /auth 베이스에도 마운트해야 '/auth/login'이 생김
     app.use('/auth', authRouter);
-    app.use('/api/worker/auth', authRouter); // (구 프리픽스 겸용 필요 시 유지)
-    console.log('[BOOT] mounted /auth routes (ESM ok)');
-  } catch (e) {
-    console.error('[BOOT] FAILED to import /src/routes/manager.mjs:', e?.message || e);
 
-    // 스텁: 매니저 로드 실패해도 로그인 경로가 살아있게 함
+    // (과거 프리픽스 호환)
+    app.use('/api/worker/auth', authRouter);
+
+    console.log('[BOOT] mounted /auth routes (root + /auth)');
+  } catch (e) {
+    console.error('[BOOT] FAILED to mount manager router:', e?.message || e);
+
+    // ── 스텁(항상 /auth/* 로 동작 보장) ───────────────────────────────
     const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
     const stub = express.Router();
     stub.get('/health', (_req,res)=> res.json({ ok:true, stub:true }));
@@ -405,10 +424,14 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       const token = sign({ uid: id, username: id });
       return res.json({ ok:true, token, user:{ username: id }});
     });
-    app.use('/auth', stub);
+
+    // 스텁도 두 형태를 모두 제공
+    app.use(stub);           // → /auth/login (stub이 절대경로 /auth/login으로 선언되어 있음)
+    app.use('/auth', stub);  // → /auth/login (상대경로 선언일 때도 대응)
     app.use('/api/worker/auth', stub);
   }
 })();
+
 
 
 

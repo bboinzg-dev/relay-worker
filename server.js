@@ -76,6 +76,8 @@ const CORS_ALLOW = parseCorsOrigins(process.env.CORS_ALLOW_ORIGINS);
 /* ========== App bootstrap ========== */
 const app = express();
 app.disable('x-powered-by');
+// JSON body parser MUST come before routes
+app.use(bodyParser.json({ limit: '25mb' }));
 app.use(requestLogger());
 
 /* CORS */

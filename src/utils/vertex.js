@@ -2,13 +2,13 @@
 'use strict';
 
 /**
- * Vertex AI (Gemini) 유틸
- * - systemInstruction 사용 (❌ system role in contents)
- * - 공통 JSON 호출 헬퍼 + 감지/분류/추출 함수 제공
+ * Vertex AI (Gemini) helpers
+ * - Use systemInstruction (❌ do not put system role in contents)
+ * - Provide JSON helpers and high-level extractors
  *
  * ENV:
  *   VERTEX_LOCATION=asia-northeast3
- *   VERTEX_MODEL_ID=gemini-2.5-flash  (또는 운영 모델)
+ *   VERTEX_MODEL_ID=gemini-2.5-flash
  */
 
 const { VertexAI } = require('@google-cloud/vertexai');
@@ -19,26 +19,23 @@ const MODEL_ID = process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
 const vertex = new VertexAI({ location: LOCATION });
 
 function getModel(systemText) {
-  // ✅ systemInstruction 로 장착
   const systemInstruction = systemText
     ? { role: 'user', parts: [{ text: String(systemText) }] }
     : undefined;
 
   return vertex.getGenerativeModel({
     model: MODEL_ID,
-    // generation config는 호출 시 지정 (필요시 여기에 기본값 둬도 됨)
     systemInstruction,
   });
 }
 
-/** 공통 JSON 호출 (systemText: 지시문, userText: 입력) */
+/** low-level JSON caller */
 async function callModelJson(systemText, userText, genCfg = {}) {
   const model = getModel(systemText);
 
   const res = await model.generateContent({
     contents: [
-      // ❗ contents에는 user 만 넣는다 (system role 금지)
-      { role: 'user', parts: [{ text: String(userText || '') }] },
+      { role: 'user', parts: [{ text: String(userText || '') }] }, // ✅ user only
     ],
     generationConfig: {
       temperature: genCfg.temperature ?? 0.2,
@@ -47,41 +44,30 @@ async function callModelJson(systemText, userText, genCfg = {}) {
     },
   });
 
-  // Vertex Node SDK 응답에서 텍스트 추출
   const txt =
     res?.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
     res?.response?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data ||
     '';
 
-  let out;
-  try {
-    out = JSON.parse(txt);
-  } catch (e) {
-    throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`);
-  }
-  return out;
+  try { return JSON.parse(txt); }
+  catch { throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`); }
 }
 
-/* ───────────────────────────── */
-/*      감지 / 분류 / 추출       */
-/* ───────────────────────────── */
+/* ──────────────── high-level extractors ──────────────── */
 
-/** 가족/브랜드/코드 1차 감지 */
 async function identifyFamilyBrandCode(gcsUri, families = []) {
   const sys = [
     'You analyze electronic component catalogs.',
     'Return strict JSON with keys: family_slug, brand, code, series, display_name.',
     'family_slug must be one of: ' + families.join(', '),
-    'Do not fabricate. Empty string if unknown.',
+    'Do not fabricate. Empty string if unknown.'
   ].join('\n');
 
   const usr = JSON.stringify({
     gcs_uri: gcsUri,
-    instructions: [
-      'Use the first pages (cover/ordering/types) as primary signal.',
-      'brand: manufacturer (e.g., Panasonic, OMRON, TE Connectivity, ...)',
-      'code: one concrete orderable part number (if many exist, choose the most representative).',
-      'series/display_name: series name or catalog title if apparent.'
+    hint: [
+      'Use cover/first pages (title, TYPES, ORDERING) primarily.',
+      'brand: manufacturer name; code: one concrete orderable part number (if present).'
     ]
   });
 
@@ -95,7 +81,6 @@ async function identifyFamilyBrandCode(gcsUri, families = []) {
   };
 }
 
-/** 가족 분류 (폐쇄 라벨 셋) */
 async function classifyFamily(corpus, allowedFamilies = []) {
   const sys = [
     'Classify a component family from text.',
@@ -112,15 +97,13 @@ async function classifyFamily(corpus, allowedFamilies = []) {
   return String(out?.family_slug || '').trim();
 }
 
-/** 블루프린트 필드 추출 */
 async function extractByBlueprint(gcsUriOrText, fieldsJson = {}, promptTemplate = '') {
   const sys = [
     'Extract specifications from the catalog.',
-    'Return JSON: {"values": {...}} where keys match the provided fields.',
-    'Numbers must be plain numbers; omit fields that are not present. No fabrication.',
+    'Return JSON: {"values": {...}} matching the provided field names.',
+    'Numbers must be plain numbers. Omit fields not present; no fabrication.'
   ].join('\n');
 
-  // gcs_uri 를 주거나, 이미 전처리된 text 를 줄 수도 있게 유연하게 작성
   const usr = JSON.stringify({
     source: typeof gcsUriOrText === 'string' && /^gs:\/\//i.test(gcsUriOrText)
       ? { gcs_uri: gcsUriOrText }
@@ -133,6 +116,40 @@ async function extractByBlueprint(gcsUriOrText, fieldsJson = {}, promptTemplate 
   return { values: (out && out.values) ? out.values : {}, raw_text: out?.raw_text || '' };
 }
 
+/**
+ * ✅ 타입 표 우선 품번 추출
+ * - "TYPES", "TYPE", "TYPES TABLE" 이름의 표에서 **명시적으로 나열된** 품번만 반환
+ * - "Ordering Information" 등 조합식만 있는 경우에는 **빈 배열**(조합으로 생성하지 않음)
+ * - 반환: { parts: ["ALDP105W","ALDP106W",...], table_hint: "TYPES"|"ORDERING_INFO"|"" }
+ */
+async function extractPartNumbersFromTypes(gcsUriOrText) {
+  const sys = [
+    'Find explicit part numbers listed in a catalog TABLE named TYPES / TYPE / TYPES TABLE.',
+    'Return strict JSON: {"parts": ["PN1","PN2",...], "table_hint": "<TYPES|ORDERING_INFO|>"}',
+    'Only include part numbers that are explicitly enumerated in a table row/column.',
+    'If only combinational rules are shown (e.g., placeholders X/Y/Z), return an empty list.',
+    'Do NOT expand combinations. Ignore examples with variables.'
+  ].join('\n');
+
+  const usr = JSON.stringify({
+    source: typeof gcsUriOrText === 'string' && /^gs:\/\//i.test(gcsUriOrText)
+      ? { gcs_uri: gcsUriOrText, prefer_pages: [1,2,3,4] }  // initial pages usually contain TYPES
+      : { text: String(gcsUriOrText || '') },
+    patterns: ["TYPES", "TYPE", "TYPES TABLE", "ORDERING INFORMATION", "ORDERING"]
+  });
+
+  const out = await callModelJson(sys, usr, { maxOutputTokens: 2048 });
+
+  const list = Array.isArray(out?.parts) ? out.parts : [];
+  const norm = list
+    .map(x => String(x || '').trim().toUpperCase())
+    .filter(x => x && /^[A-Z0-9][A-Z0-9._/-]{2,}$/.test(x));        // 간단 토큰 검증
+  const uniq = [...new Set(norm)];
+
+  const hint = String(out?.table_hint || '').toUpperCase();
+  return { parts: uniq.slice(0, 200), table_hint: hint };            // 안전상 상한 200
+}
+
 module.exports = {
   LOCATION,
   MODEL_ID,
@@ -140,4 +157,5 @@ module.exports = {
   identifyFamilyBrandCode,
   classifyFamily,
   extractByBlueprint,
+  extractPartNumbersFromTypes,
 };

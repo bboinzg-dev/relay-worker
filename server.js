@@ -338,14 +338,14 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
   rows: Array.isArray(out?.row) ? 1 : (typeof out?.rows === 'number' ? out.rows : undefined),
 });
 
-    // runAutoIngest 리턴 표준화 보정
-    const fam   = out.family || out.family_slug || null;
-    const codes = Array.isArray(out.codes) ? out.codes : [];
-    const first = codes[0] || out.code || null;
-    const table = out.specs_table || 'public.relay_power_specs';
-    const dsUri = out.datasheet_uri || uri;
 
-    // 종료 로그(SUCCEEDED)
+    // ---- runAutoIngest() 결과 키 표준화 (가급적 out의 실제 키에 맞추어 저장/로그) ----
+    const fam   = out?.family || out?.family_slug || null;
+    const codes = Array.isArray(out?.codes) ? out.codes : [];
+    const code0 = codes[0] || out?.code || null;
+    const table = out?.specs_table || 'public.relay_power_specs';
+    const dsUri = out?.datasheet_uri || uri;   // 기존 업로드 gcsUri(=uri)를 폴백
+
     await db.query(
       `UPDATE public.ingest_run_logs
          SET finished_at = now(),
@@ -360,17 +360,29 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
              final_datasheet = $10,
              status = 'SUCCEEDED'
        WHERE id = $1`,
-      [ runId, Date.now()-startedAt,
-        fam, out?.brand || null, first,
+      [
+        runId,
+        Date.now() - startedAt,
+        fam,
+        out?.brand || null,
+        code0,
         table,
-        fam, out?.brand || null, first,
+        fam,
+        out?.brand || null,
+        code0,
         dsUri
       ]
     );
 
     console.log('[ingest 200]', {
-      taskName, retryCnt, ms: Date.now()-startedAt,
-      family: fam, table, brand: out?.brand, code: first, rows: out?.rows
+      taskName,
+      retryCnt,
+      ms: out?.ms ?? (Date.now() - startedAt),
+      family: fam,
+      table,
+      brand: out?.brand ?? 'unknown',
+      code: code0,
+      rows: (typeof out?.rows === 'number' ? out.rows : undefined),
     });
     return res.json(out);
 

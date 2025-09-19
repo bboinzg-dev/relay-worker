@@ -67,4 +67,10 @@ async function chooseBrandCode(corpus) {
   };
 }
 
+// 텍스트에서 브랜드를 직관적으로 보정(사전 미스시)
+if (!brand && /panasonic/i.test(corpus)) brand = 'Panasonic';
+if (!brand && /omron/i.test(corpus))     brand = 'OMRON';
+// … 필요 시 manufacturer_alias 테이블을 채우면 여기 보정은 최소화 가능
+
+
 module.exports = { chooseBrandCode };

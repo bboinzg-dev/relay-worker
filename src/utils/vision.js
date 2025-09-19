@@ -44,11 +44,18 @@ async function getPdfText(gcsUri, { limit = MAX_INLINE_DEFAULT } = {}) {
     });
   } catch (e) {
     console.warn('[vision.getPdfText] page selector failed → fallback whole doc:', e?.message || e);
-    // 개별 페이지 선택이 거부되면 전체 문서를 한 번에 처리
-    [result] = await client.processDocument({
-      name,
-      rawDocument: { content: buf, mimeType: 'application/pdf' }
-    });
+
+      try {
+          // 개별 페이지 선택이 거부되면 전체 문서를 한 번에 처리하되 imageless 모드로 시도
+          [result] = await client.processDocument({
+            name,
+            rawDocument: { content: buf, mimeType: 'application/pdf' },
+            processOptions: { ocrConfig: { enableNativePdfParsing: true } },
+          });
+        } catch (fallbackErr) {
+          console.warn('[vision.getPdfText] imageless fallback failed:', fallbackErr?.message || fallbackErr);
+          throw fallbackErr;
+        }
   }
 
   const doc = result.document;
@@ -83,10 +90,17 @@ async function callDocAI(gcsUri, { pageNumbers = [] } = {}) {
     [result] = await client.processDocument(req);
   } catch (e) {
     console.warn('[vision.callDocAI] page selector failed → fallback whole doc:', e?.message || e);
-    [result] = await client.processDocument({
-      name,
-      rawDocument: { content: buf, mimeType: 'application/pdf' }
-    });
+
+      try {
+          [result] = await client.processDocument({
+            name,
+            rawDocument: { content: buf, mimeType: 'application/pdf' },
+            processOptions: { ocrConfig: { enableNativePdfParsing: true } },
+          });
+        } catch (fallbackErr) {
+          console.warn('[vision.callDocAI] imageless fallback failed:', fallbackErr?.message || fallbackErr);
+          throw fallbackErr;
+        }
   }
   return result.document || result;
 }

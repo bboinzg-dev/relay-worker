@@ -123,22 +123,45 @@ function guessFamilyByBrand(brand = '') {
 
 async function ensureRelayPowerTable() {
   await db.query(`
-    create table if not exists public.relay_power_specs (
-      id uuid default gen_random_uuid() primary key,
-      brand text,
-      brand_norm text not null,
-      code text,
-      code_norm text not null,
-      family_slug text not null,
-      series text,
-      displayname text,
-      datasheet_uri text,
-      verified_in_doc jsonb default '[]'::jsonb,
-      created_at timestamptz default now()
+    -- 테이블이 없으면 생성
+    CREATE TABLE IF NOT EXISTS public.relay_power_specs (
+      id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+      brand           text,
+      brand_norm      text,
+      code            text,
+      code_norm       text,
+      family_slug     text,
+      series          text,
+      displayname     text,
+      datasheet_uri   text,
+      verified_in_doc jsonb DEFAULT '[]'::jsonb,
+      created_at      timestamptz DEFAULT now()
     );
-    create unique index if not exists ux_rps_bcn
-      on public.relay_power_specs(brand_norm, code_norm, family_slug);
+
+    -- 기존 테이블에도 누락 컬럼을 보강
+    ALTER TABLE public.relay_power_specs ADD COLUMN IF NOT EXISTS brand           text;
+    ALTER TABLE public.relay_power_specs ADD COLUMN IF NOT EXISTS brand_norm      text;
+    ALTER TABLE public.relay_power_specs ADD COLUMN IF NOT EXISTS code            text;
+    ALTER TABLE public.relay_power_specs ADD COLUMN IF NOT EXISTS code_norm       text;
+    ALTER TABLE public.relay_power_specs ADD COLUMN IF NOT EXISTS family_slug     text;
+    ALTER TABLE public.relay_power_specs ADD COLUMN IF NOT EXISTS series          text;
+    ALTER TABLE public.relay_power_specs ADD COLUMN IF NOT EXISTS displayname     text;
+    ALTER TABLE public.relay_power_specs ADD COLUMN IF NOT EXISTS datasheet_uri   text;
+    ALTER TABLE public.relay_power_specs ADD COLUMN IF NOT EXISTS verified_in_doc jsonb DEFAULT '[]'::jsonb;
+    ALTER TABLE public.relay_power_specs ADD COLUMN IF NOT EXISTS created_at      timestamptz DEFAULT now();
+
+    -- 중복 방지 인덱스
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname = 'public' AND indexname = 'ux_rps_bcn'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX ux_rps_bcn ON public.relay_power_specs (brand_norm, code_norm, family_slug)';
+      END IF;
+    END $$;
   `);
 }
+
 
 module.exports = { runAutoIngest };

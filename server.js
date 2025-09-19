@@ -326,6 +326,18 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
 
     const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name });
 
+    console.log('[ingest 200]', {
+  taskName: taskName ?? null,
+  retryCnt: retryCnt ?? 0,
+  ms: out?.ms ?? (Date.now() - startedAt),
+  // ↓ 반환 키에 맞게 조정
+  family: out?.family || out?.family_slug || null,
+  table: out?.specs_table || null,
+  brand: out?.brand ?? 'unknown',
+  code: out?.code ?? null,
+  rows: Array.isArray(out?.row) ? 1 : (typeof out?.rows === 'number' ? out.rows : undefined),
+});
+
     // runAutoIngest 리턴 표준화 보정
     const fam   = out.family || out.family_slug || null;
     const codes = Array.isArray(out.codes) ? out.codes : [];

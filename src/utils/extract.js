@@ -7,8 +7,11 @@ const { chooseBrandCode } = require('./brandcode');
 
 async function extractDataset({ gcsUri, filename = '', maxInlinePages = Number(process.env.MAX_DOC_PAGES_INLINE || 15) }) {
   // 1) 앞쪽 일부 페이지 텍스트 확보
-  const meta = await getPdfText(gcsUri, { limit: maxInlinePages + 2 });
-  const pageCountApprox = meta.pages?.length || 0;
+    const inlineBudget = Number(process.env.MAX_DOC_PAGES_INLINE || 15);
+    const headroom = Math.min(2, Math.max(0, inlineBudget - maxInlinePages));
+    const metaLimit = Math.min(maxInlinePages + headroom, inlineBudget);
+    const meta = await getPdfText(gcsUri, { limit: metaLimit });
+    const pageCountApprox = meta.pages?.length || 0;
 
   let rows = [];
   let verifiedPages = [];

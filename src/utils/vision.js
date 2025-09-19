@@ -31,9 +31,17 @@ async function getPdfText(gcsUri, { limit = MAX_INLINE_DEFAULT } = {}) {
   const { bucket, object } = parseGs(gcsUri);
   const [buf] = await storage.bucket(bucket).file(object).download();
 
-  const pagesReq = Array.from({length: Math.max(1, Number(limit)||MAX_INLINE_DEFAULT)}, (_,i)=> String(i+1));
+  const requestedPages = Math.max(1, Number(limit) || MAX_INLINE_DEFAULT);
+  const perCallBudget = Math.max(1, Math.min(MAX_INLINE_DEFAULT, requestedPages));
 
+  if (requestedPages > perCallBudget) {
+    console.warn('[vision.getPdfText] requested pages exceed inline limit → clamped', {
+      requested: requestedPages,
+      limit: perCallBudget,
+    });
+  }
 
+  const pagesReq = Array.from({ length: perCallBudget }, (_, i) => String(i + 1));
   let result;
   try {
     // v1에서 개별 페이지 선택이 지원되는 경우

@@ -33,11 +33,23 @@ async function getPdfText(gcsUri, { limit = MAX_INLINE_DEFAULT } = {}) {
 
   const pagesReq = Array.from({length: Math.max(1, Number(limit)||MAX_INLINE_DEFAULT)}, (_,i)=> String(i+1));
 
-  const [result] = await client.processDocument({
-    name,
-    rawDocument: { content: buf, mimeType: 'application/pdf' },
-    processOptions: { individualPageSelector: { pages: pagesReq } },
-  });
+
+  let result;
+  try {
+    // v1에서 개별 페이지 선택이 지원되는 경우
+    [result] = await client.processDocument({
+      name,
+      rawDocument: { content: buf, mimeType: 'application/pdf' },
+      processOptions: { individualPageSelector: { pages: pagesReq } },
+    });
+  } catch (e) {
+    console.warn('[vision.getPdfText] page selector failed → fallback whole doc:', e?.message || e);
+    // 개별 페이지 선택이 거부되면 전체 문서를 한 번에 처리
+    [result] = await client.processDocument({
+      name,
+      rawDocument: { content: buf, mimeType: 'application/pdf' }
+    });
+  }
 
   const doc = result.document;
   const outPages = (doc?.pages||[]).map((p,i)=>({
@@ -59,15 +71,23 @@ async function callDocAI(gcsUri, { pageNumbers = [] } = {}) {
   const { bucket, object } = parseGs(gcsUri);
   const [buf] = await storage.bucket(bucket).file(object).download();
 
-  const req = {
-    name,
-    rawDocument: { content: buf, mimeType: 'application/pdf' },
-  };
-  if (Array.isArray(pageNumbers) && pageNumbers.length) {
-    req.processOptions = { individualPageSelector: { pages: pageNumbers.map(String) } };
+  let result;
+  try {
+    const req = {
+      name,
+      rawDocument: { content: buf, mimeType: 'application/pdf' },
+      ...(Array.isArray(pageNumbers) && pageNumbers.length
+        ? { processOptions: { individualPageSelector: { pages: pageNumbers.map(String) } } }
+        : {})
+    };
+    [result] = await client.processDocument(req);
+  } catch (e) {
+    console.warn('[vision.callDocAI] page selector failed → fallback whole doc:', e?.message || e);
+    [result] = await client.processDocument({
+      name,
+      rawDocument: { content: buf, mimeType: 'application/pdf' }
+    });
   }
-
-  const [result] = await client.processDocument(req);
   return result.document || result;
 }
 

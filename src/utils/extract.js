@@ -16,20 +16,25 @@ async function extractDataset({ gcsUri, filename = '', maxInlinePages = Number(p
   // 2) 키워드 기반 페이지 후보 → DocAI 표 파싱
   const pick = pickPagesByVertex(meta);
   for (const p of pick.pages) {
-    const doc = await callDocAI(gcsUri, { pageNumbers: [p] });
-    const r = parseDocAiTables(doc);
-    if (r.length) {
-      rows.push(...r);
-      verifiedPages.push(p);
+    try {
+      const doc = await callDocAI(gcsUri, { pageNumbers: [p] });
+      const r = parseDocAiTables(doc);
+      if (r.length) {
+        rows.push(...r);
+        verifiedPages.push(p);
+      }
+    } catch (e) {
+      console.warn('[extractDataset] callDocAI/parse failed on page', p, e?.message || e);
+      continue; // 다음 페이지 시도
     }
   }
 
   // 3) 그래도 행이 없으면 키워드 윈도우에서 최소 1개 보조
   if (rows.length === 0) {
-    const windows = (meta.pages||[]).map(x => x.text).join('\n').slice(0, 8000);
-    const { brand, code, series } = await chooseBrandCode(windows, filenameHints(filename));
-    if (code) rows.push({ code, series, desc:'', raw:[] });
-  }
+     const windows = (meta.pages||[]).map(x => x.text).join('\n').slice(0, 8000);
+     const { brand, code, series } = await chooseBrandCode(windows, filenameHints(filename));
+     if (code) rows.push({ code, series, desc:'', raw:[] });
+   }
 
   // 4) 브랜드 확정(문서 전체 텍스트 + 파일명 힌트)
   const { brand } = await chooseBrandCode(meta.text, filenameHints(filename));

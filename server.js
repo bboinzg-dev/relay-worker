@@ -384,10 +384,18 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
   try {
     let authRouter = null;
 
-    // 1) 후보 경로를 순서대로 시도 (절대/상대, .mjs/.js 모두)
+    // 1) 후보 경로(절대/상대 + mjs/js + dist/build/src)를 순서대로 시도
     const candidates = [
+      path.join(__dirname, 'dist/routes/manager.mjs'),
+      path.join(__dirname, 'dist/routes/manager.js'),
+      path.join(__dirname, 'build/routes/manager.mjs'),
+      path.join(__dirname, 'build/routes/manager.js'),
       path.join(__dirname, 'src/routes/manager.mjs'),
       path.join(__dirname, 'src/routes/manager.js'),
+      './dist/routes/manager.mjs',
+      './dist/routes/manager.js',
+      './build/routes/manager.mjs',
+      './build/routes/manager.js',
       './src/routes/manager.mjs',
       './src/routes/manager.js',
     ];
@@ -395,52 +403,44 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     let lastErr;
     for (const p of candidates) {
       try {
-        // 존재하지 않는 파일은 스킵
+        // 존재하는 파일만 시도 (절대경로만 검사)
         if (p.startsWith('/')) {
           try { fs.accessSync(p, fs.constants.R_OK); } catch { continue; }
         }
 
         if (p.endsWith('.mjs')) {
-          const mod = await import(p);
+          const mod = await import(p);            // ESM
           authRouter = mod.default || mod;
           console.log('[BOOT] mounted auth from', p);
           break;
         } else {
-          const mod = require(p);
+          const mod = require(p);                 // CJS or hybrid
           authRouter = mod.default || mod;
           console.log('[BOOT] mounted auth from', p);
           break;
         }
-      } catch (e) {
-        lastErr = e;
-      }
+      } catch (e) { lastErr = e; }
     }
     if (!authRouter) throw lastErr || new Error('manager router not found');
 
-    // ✅ 라우터 내부가 '/auth/login' 처럼 절대경로인 경우를 위해 root에 마운트
-    app.use(authRouter);
-    // ✅ 라우터 내부가 '/login' 같은 상대경로인 경우를 위해 /auth 베이스에도 마운트
-    app.use('/auth', authRouter);
-    // 과거 프리픽스 호환
-    app.use('/api/worker/auth', authRouter);
+    // 라우터 내부가 '/auth/login'(절대)일 수도, '/login'(상대)일 수도 있어 둘 다 마운트
+    app.use(authRouter);          // 절대경로 스타일을 위해
+    app.use('/auth', authRouter); // 상대경로 스타일을 위해
+    app.use('/api/worker/auth', authRouter); // 구 프리픽스 호환
 
   } catch (e) {
     console.error('[BOOT] FAILED to load manager router:', e && (e.message || e));
 
-    // ── 스텁: 매니저 로드 실패해도 /auth/* 경로는 반드시 동작 ──
+    // ── 스텁: 매니저 로드 실패해도 /auth/* 를 살린다 ──
     const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
-    const stub = express.Router();
 
-    // 절대경로(/auth/login) 스타일과 상대경로(/login) 스타일 둘 다 지원
-    const attach = r => {
+    const mountStub = (r) => {
       r.get('/health', (_req,res)=> res.json({ ok:true, stub:true }));
-
       r.post('/signup', express.json({limit:'2mb'}), (req,res)=>{
         const p = req.body || {};
         const token = sign({ uid: String(p.username || p.email || 'user'), username: p.username || '' });
         res.json({ ok:true, token, user:{ username: p.username || '', email: p.email || '' }});
       });
-
       r.post('/login', express.json({limit:'2mb'}), (req,res)=>{
         const p = req.body || {};
         const id = String(p.idOrEmail || p.username || p.email || 'user');
@@ -449,18 +449,15 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       });
     };
 
-    // 절대경로 스타일 스텁
-    const stubAbs = express.Router();
-    attach(stubAbs);
-    app.use('/auth', stubAbs);               // /auth/login
+    const stubAbs = express.Router(); mountStub(stubAbs);
+    const stubRel = express.Router(); mountStub(stubRel);
 
-    // 상대경로 스타일 스텁
-    const stubRel = express.Router();
-    attach(stubRel);
-    app.use(stubRel);                        // /login
+    app.use('/auth', stubAbs);   // /auth/login
+    app.use(stubRel);            // /login (혹시 상대경로 스타일일 때도 대응)
     app.use('/api/worker/auth', stubAbs);
   }
 })();
+
 
 const catalogTree = (_req, res) => res.json({ ok:true, nodes: [] });
 app.get('/catalog/tree', catalogTree);

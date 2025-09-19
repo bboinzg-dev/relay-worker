@@ -10,7 +10,7 @@ const vertex = new VertexAI({ location: LOCATION });
 
 function getModel(systemText) {
   const systemInstruction = systemText
-    ? { role: 'user', parts: [{ text: String(systemText) }] }   // ✅ systemInstruction로 전달
+    ? { role: 'system', parts: [{ text: String(systemText) }] }
     : undefined;
 
   return vertex.getGenerativeModel({

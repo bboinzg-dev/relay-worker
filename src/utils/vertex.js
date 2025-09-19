@@ -31,12 +31,22 @@ async function callModelJson(systemText, userText, genCfg = {}) {
     },
   });
 
-  const txt =
+  const raw =
     res?.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
     res?.response?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || '';
 
-  try { return JSON.parse(txt); }
-  catch { throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`); }
+  const trimmed = String(raw || '').trim();
+  const fencedMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const withoutFence = fencedMatch ? fencedMatch[1] : trimmed;
+  const jsonSlice = (() => {
+    const firstBrace = withoutFence.indexOf('{');
+    const lastBrace = withoutFence.lastIndexOf('}');
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) return withoutFence;
+    return withoutFence.slice(firstBrace, lastBrace + 1);
+  })();
+
+  try { return JSON.parse(jsonSlice); }
+  catch { throw new Error(`Vertex output is not JSON: ${String(raw).slice(0, 300)}`); } 
 }
 
 /** 가족/브랜드/코드 1차 감지(범용) */

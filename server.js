@@ -375,80 +375,69 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
   }
 });
 
-
-/* ===== /auth 라우터 마운트: 경로 자동탐색 + ESM/CJS 모두 지원 + root & /auth 동시 마운트 + 실패 시 스텁 ===== */
+/* ===== /auth 라우터: 스텁을 먼저, 있으면 매니저 덮어쓰기 (절대경로만 탐색) ===== */
 (async () => {
   const path = require('path');
   const fs   = require('fs');
 
-  try {
-    let authRouter = null;
+  // 0) 항상 살아있는 스텁(먼저 마운트)
+  const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
+  const mountStub = (r) => {
+    r.get('/health', (_req,res)=> res.json({ ok:true, stub:true }));
+    r.post('/signup', express.json({limit:'2mb'}), (req,res)=>{
+      const p = req.body || {};
+      const token = sign({ uid: String(p.username || p.email || 'user'), username: p.username || '' });
+      res.json({ ok:true, token, user:{ username: p.username || '', email: p.email || '' }});
+    });
+    r.post('/login', express.json({limit:'2mb'}), (req,res)=>{
+      const p = req.body || {};
+      const id = String(p.idOrEmail || p.username || p.email || 'user');
+      const token = sign({ uid: id, username: id });
+      res.json({ ok:true, token, user:{ username: id }});
+    });
+  };
+  const stubAbs = express.Router(); mountStub(stubAbs);   // /auth/login
+  const stubRel = express.Router(); mountStub(stubRel);   // /login
+  app.use('/auth', stubAbs);
+  app.use(stubRel);
+  app.use('/api/worker/auth', stubAbs);
+  console.log('[BOOT] mounted builtin auth stub (root & /auth)');
 
-    // 배포 산출물 어디든/어떤 확장자든 맞춰본다
-    const candidates = [
-      path.join(__dirname, 'dist/routes/manager.mjs'),
-      path.join(__dirname, 'dist/routes/manager.js'),
-      path.join(__dirname, 'build/routes/manager.mjs'),
-      path.join(__dirname, 'build/routes/manager.js'),
-      path.join(__dirname, 'src/routes/manager.mjs'),
-      path.join(__dirname, 'src/routes/manager.js'),
-      './dist/routes/manager.mjs',
-      './dist/routes/manager.js',
-      './build/routes/manager.mjs',
-      './build/routes/manager.js',
-      './src/routes/manager.mjs',
-      './src/routes/manager.js',
-    ];
+  // 1) 배포 산출물 절대경로 후보만 탐색(없으면 스텁만 유지)
+  const candidates = [
+    path.join(__dirname, 'dist/routes/manager.mjs'),
+    path.join(__dirname, 'dist/routes/manager.js'),
+    path.join(__dirname, 'build/routes/manager.mjs'),
+    path.join(__dirname, 'build/routes/manager.js'),
+    path.join(__dirname, 'src/routes/manager.mjs'),
+    path.join(__dirname, 'src/routes/manager.js'),
+  ];
 
-    let lastErr;
-    for (const p of candidates) {
-      try {
-        if (p.startsWith('/')) { try { fs.accessSync(p, fs.constants.R_OK); } catch { continue; } }
-        if (p.endsWith('.mjs')) {
-          const mod = await import(p);                 // ESM
-          authRouter = mod.default || mod;
-        } else {
-          const mod = require(p);                      // CJS/hybrid
-          authRouter = mod.default || mod;
-        }
-        console.log('[BOOT] mounted auth from', p);
-        break;
-      } catch (e) { lastErr = e; }
-    }
-    if (!authRouter) throw lastErr || new Error('manager router not found');
+  let loaded = false, lastErr = null;
+  for (const p of candidates) {
+    try {
+      fs.accessSync(p, fs.constants.R_OK);                 // 없으면 throw → 다음 후보
+      let mod;
+      if (p.endsWith('.mjs')) mod = await import(p);       // ESM
+      else                   mod = require(p);            // CJS/hybrid
+      const authRouter = mod.default || mod;
 
-    // 라우터 내부가 '/auth/login'(절대)일 수도, '/login'(상대)일 수도 있어 둘 다 장착
-    app.use(authRouter);          // 절대경로 스타일
-    app.use('/auth', authRouter); // 상대경로 스타일
-    app.use('/api/worker/auth', authRouter); // 구 프리픽스 호환
+      // 2) 스텁 위에 매니저 라우터 덮어쓰기(절대/상대 경로 스타일 모두 수용)
+      app.use(authRouter);
+      app.use('/auth', authRouter);
+      app.use('/api/worker/auth', authRouter);
 
-  } catch (e) {
-    console.error('[BOOT] FAILED to load manager router:', e && (e.message || e));
+      console.log('[BOOT] mounted auth manager from', p);
+      loaded = true;
+      break;
+    } catch (e) { lastErr = e; }
+  }
 
-    const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
-    const mountStub = (r) => {
-      r.get('/health', (_req,res)=> res.json({ ok:true, stub:true }));
-      r.post('/signup', express.json({limit:'2mb'}), (req,res)=>{
-        const p = req.body || {};
-        const token = sign({ uid: String(p.username || p.email || 'user'), username: p.username || '' });
-        res.json({ ok:true, token, user:{ username: p.username || '', email: p.email || '' }});
-      });
-      r.post('/login', express.json({limit:'2mb'}), (req,res)=>{
-        const p = req.body || {};
-        const id = String(p.idOrEmail || p.username || p.email || 'user');
-        const token = sign({ uid: id, username: id });
-        res.json({ ok:true, token, user:{ username: id }});
-      });
-    };
-
-    const stubAbs = express.Router(); mountStub(stubAbs);
-    const stubRel = express.Router(); mountStub(stubRel);
-
-    app.use('/auth', stubAbs);   // /auth/login
-    app.use(stubRel);            // /login (상대경로 라우터 대응)
-    app.use('/api/worker/auth', stubAbs);
+  if (!loaded && lastErr) {
+    console.warn('[BOOT] auth manager not found; using stub only:', lastErr.message || lastErr);
   }
 })();
+
 
 
 

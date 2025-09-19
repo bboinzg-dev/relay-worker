@@ -41,7 +41,17 @@ async function runAutoIngest({ gcsUri, filename, family_slug }) {
     ]
   );
 
-  return { ok: true, brand: ds.brand, family, series: ds.series, rows: ds.rows.length, ms: Date.now()-t0 };
+    return {
+    ok: true,
+    brand: ds.brand,
+    family,
+    series: ds.series,
+    rows: ds.rows.length,
+    codes: ds.rows.map(r => r.code),        // 새로 추가: 추출된 코드 목록
+    datasheet_uri: gcsUri,                  // 새로 추가
+    specs_table: 'public.relay_power_specs',// 새로 추가(본 파일에서 생성하는 테이블과 일치)
+    ms: Date.now()-t0
+  };
 }
 
 function guessFamilyByBrand(brand='') {

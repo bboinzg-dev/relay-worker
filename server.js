@@ -326,6 +326,13 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
 
     const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name });
 
+    // runAutoIngest 리턴 표준화 보정
+    const fam   = out.family || out.family_slug || null;
+    const codes = Array.isArray(out.codes) ? out.codes : [];
+    const first = codes[0] || out.code || null;
+    const table = out.specs_table || 'public.relay_power_specs';
+    const dsUri = out.datasheet_uri || uri;
+
     // 종료 로그(SUCCEEDED)
     await db.query(
       `UPDATE public.ingest_run_logs
@@ -342,15 +349,17 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
              status = 'SUCCEEDED'
        WHERE id = $1`,
       [ runId, Date.now()-startedAt,
-        out?.family_slug || null, out?.brand || null, out?.code || null,
-        out?.specs_table || null,
-        out?.family_slug || null, out?.brand || null, out?.code || null,
-        out?.datasheet_uri || null
+        fam, out?.brand || null, first,
+        table,
+        fam, out?.brand || null, first,
+        dsUri
       ]
     );
 
-    console.log('[ingest 200]', { taskName, retryCnt, ms: Date.now()-startedAt,
-      family: out?.family_slug, table: out?.specs_table, brand: out?.brand, code: out?.code });
+    console.log('[ingest 200]', {
+      taskName, retryCnt, ms: Date.now()-startedAt,
+      family: fam, table, brand: out?.brand, code: first, rows: out?.rows
+    });
     return res.json(out);
 
   } catch (e) {

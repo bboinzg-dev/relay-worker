@@ -1,133 +1,71 @@
+// relay-worker/src/pipeline/ingestAuto.js
 'use strict';
 
 const db = require('../utils/db');
-const { ensureSpecsTable, upsertByBrandCode } = require('../utils/schema');
-const { canonicalDatasheetPath, canonicalCoverPath, moveObject } = require('../utils/gcs');
-const { extractTypesPreferTable } = require('../utils/table_extractor');
-const vx = require('../utils/vertex');
-const { chooseBrandCode } = require('../utils/brandcode');
+const { extractDataset } = require('../utils/extract');
+const { normalizeFamilySlug } = require('../utils/family'); // 기존 함수 활용
 
-let extractText;
-try { ({ extractText } = require('../utils/extract')); } catch { extractText = null; }
+async function runAutoIngest({ gcsUri, filename, family_slug }) {
+  const t0 = Date.now();
+  const ds = await extractDataset({ gcsUri, filename, maxInlinePages: +(process.env.MAX_DOC_PAGES_INLINE||15) });
 
-function normSlug(s){ return String(s||'').trim().toLowerCase().replace(/[^a-z0-9_]+/g,'_'); }
-function safeTmp(uri){ const h=require('crypto').createHash('sha1').update(String(uri||Date.now())).digest('hex').slice(0,6); return `TMP_${h}`.toUpperCase(); }
-async function families(){ try{ const r=await db.query('SELECT family_slug FROM public.component_registry ORDER BY 1'); return r.rows.map(x=>x.family_slug); }catch(_){return ['relay_power','relay_signal'];} }
-async function blueprint(slug){ try{ const r=await db.query(`SELECT b.fields_json, b.prompt_template, r.specs_table FROM public.component_spec_blueprint b JOIN public.component_registry r USING(family_slug) WHERE b.family_slug=$1 LIMIT 1`,[slug]); return r.rows[0]||null; }catch(_){return null;} }
+  const family = family_slug || guessFamilyByBrand(ds.brand); // 없으면 규칙 기반 추정
+  if (!family) throw new Error('Unable to determine family');
 
-async function runAutoIngest({ gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null }){
-  if (!gcsUri) throw new Error('gcsUri required');
-  const tag = `[ingest:${Date.now()}]`;
+  // 테이블 보장(있다면 no-op)
+  await ensureRelayPowerTable();
 
-  // 0) 텍스트(있으면)
-  let corpus=''; try{ if (extractText){ const {text,pages}=await extractText(gcsUri); corpus=(text||(pages||[]).map(p=>p.text).join('\n\n')||'').toString(); } } catch(e){ console.warn(tag,'WARN extractText:',e?.message||e); }
-
-  // 1) 브랜드/코드 후보 선택(범용)
-  try{
-    if ((!brand || !code) && corpus){
-      const picked = await chooseBrandCode(corpus);
-      brand = brand || picked.brand || '';
-      code  = code  || picked.code  || '';
-      series = series || picked.series || '';
-      display_name = display_name || (series ? `${brand} ${series}`.trim() : brand);
-    }
-  }catch(e){ console.warn(tag,'WARN chooseBrandCode:',e?.message||e); }
-
-  // 2) 패밀리 분류(없으면)
-  try{
-    if (!family_slug && vx.classifyFamily && corpus){
-      family_slug = await vx.classifyFamily(corpus, await families());
-    }
-  }catch(e){ console.warn(tag,'WARN classifyFamily:',e?.message||e); }
-  family_slug = normSlug(family_slug || 'relay_power');
-
-  // 3) 블루프린트(있으면)
-  let fields={}, specs_table=`${family_slug}_specs`, prompt='';
-  try{
-    const bp = await blueprint(family_slug);
-    if (bp){ fields=bp.fields_json||{}; prompt=bp.prompt_template||''; specs_table=bp.specs_table||specs_table; }
-  }catch(e){ console.warn(tag,'WARN blueprint:',e?.message||e); }
-
-  // 4) 스펙(있으면)
-  let values={};
-  try{ if (vx.extractByBlueprint && Object.keys(fields).length){ const o=await vx.extractByBlueprint(gcsUri, fields, prompt); values=o?.values||{}; } } catch(e){ console.warn(tag,'WARN extractByBlueprint:',e?.message||e); }
-
-  // 5) 타입 표 우선 추출 (DocAI→Vertex)
-  let list=[]; try{
-    const r = await extractTypesPreferTable({
-      gcsUri,
-      projectId: process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT,
-      location: process.env.DOCAI_LOCATION || process.env.DOC_AI_LOCATION || 'us',
-      processorId: process.env.DOCAI_PROCESSOR_ID || '',
-      callModelJson: vx.callModelJson || null
-    });
-    list = r.rows || [];
-    // “ORDERING” 조합식만 있으면 list는 비게 됨 (정책)
-  }catch(e){ console.warn(tag,'WARN typesPreferTable:',e?.message||e); }
-
-  const bucket = (process.env.GCS_BUCKET||'').replace(/^gs:\/\//,'').split('/')[0] || '';
-
-  async function upsertOne(oneCode){
-    const b = String(brand||'unknown').trim();
-    const c = String(oneCode || code || safeTmp(gcsUri)).trim();
-
-    const datasheet_uri = bucket ? canonicalDatasheetPath(bucket, family_slug, b, c) : null;
-    const cover         = bucket ? canonicalCoverPath(bucket, family_slug, b, c) : null;
-
-    const base = {
-      brand: b, code: c, brand_norm: b.toLowerCase(), code_norm: c.toLowerCase(),
-      series, display_name, family_slug, datasheet_uri, cover, source_gcs_uri: gcsUri, raw_json: { values }
-    };
-
-    // ensure table
-    try{ await ensureSpecsTable(specs_table, fields); } catch(e){
-      console.warn(tag,'WARN ensureSpecsTable:',e?.message||e,'→ relay_power_specs');
-      specs_table = 'relay_power_specs'; await ensureSpecsTable(specs_table, {});
-    }
-
-    // filter columns
-    const filtered={}; try{
-      const m=/^(.+)\.(.+)$/.exec(specs_table); const schema=m?m[1]:'public', table=m?m[2]:specs_table;
-      const cols=await db.query(`SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2`,[schema,table]);
-      const allow=new Set(cols.rows.map(r=>r.column_name));
-      for(const [k,v] of Object.entries({...base,...values})) if(allow.has(k)) filtered[k]=v;
-    }catch(e){ console.warn(tag,'WARN allowed cols:',e?.message||e); Object.assign(filtered, base); }
-
-    // upsert
-    const row = await upsertByBrandCode(specs_table, filtered).catch(async e=>{
-      console.error(tag,'ERROR upsert:',e?.message||e,'→ relay_power_specs');
-      specs_table='relay_power_specs'; await ensureSpecsTable(specs_table, {});
-      return await upsertByBrandCode(specs_table,{
-        brand:base.brand, code:base.code, brand_norm:base.brand_norm, code_norm:base.code_norm,
-        family_slug:'relay_power', source_gcs_uri:gcsUri, datasheet_uri:base.datasheet_uri, cover:base.cover,
-        series:base.series||null, display_name:base.display_name||null
-      });
-    });
-
-    // move file
-    try{ if (datasheet_uri && /^gs:\/\//i.test(datasheet_uri) && datasheet_uri!==gcsUri) await moveObject(gcsUri, datasheet_uri); } catch(e){ /* warn만 */ }
-
-    return { ok:true, table:specs_table, brand:b, code:c, datasheet_uri, row };
+  let inserted = 0;
+  for (const row of ds.rows) {
+    await db.query(
+      `insert into public.relay_power_specs (brand,brand_norm,code,code_norm,family_slug,series,displayname,datasheet_uri,verified_in_doc,created_at)
+       values($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
+       on conflict (brand_norm, code_norm, family_slug) do nothing`,
+      [
+        ds.brand, ds.brand.toLowerCase(), row.code, row.code.toLowerCase(),
+        family, row.series || null,
+        row.code, // display name
+        gcsUri,   // datasheet_uri
+        JSON.stringify(ds.verifiedPages || []),
+      ]
+    );
+    inserted++;
   }
 
-  if (list.length > 0) {
-    // TYPES 표에 적힌 품번만 팬아웃
-    const seen=new Set(); const results=[];
-    for(const r of list){
-      const codeCandidate = (r.type_no || r.part_no || '').toUpperCase().trim();
-      if (!codeCandidate) continue;
-      const sig = `${(brand||'unknown').toLowerCase()}::${codeCandidate}`;
-      if (seen.has(sig)) continue; seen.add(sig);
-      results.push(await upsertOne(codeCandidate));
-    }
-    console.log(tag,'OK FANOUT',{count: results.filter(r=>r?.ok).length});
-    return { ok:true, fanout:true, count: results.length, results };
-  }
+  await db.query(
+    `insert into public.doc_ingest_log(task, gcs_uri, filename, brand, family_slug, series_hint, page_count, rows, ms, note, created_at)
+     values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())`,
+    [
+      'relay_power', gcsUri, filename, ds.brand, family, ds.series,
+      null, ds.rows.length, Date.now()-t0, ds.note || ''
+    ]
+  );
 
-  // 단건
-  const single = await upsertOne(code);
-  console.log(tag,'OK SINGLE',{ brand: single.brand, code: single.code });
-  return { ok:true, fanout:false, ...single };
+  return { ok: true, brand: ds.brand, family, series: ds.series, rows: ds.rows.length, ms: Date.now()-t0 };
+}
+
+function guessFamilyByBrand(brand='') {
+  const b = brand.toLowerCase();
+  if (b.includes('panasonic')) return 'relay_power';
+  if (b.includes('omron'))     return 'relay_power';
+  return 'relay_power'; // 기본
+}
+
+async function ensureRelayPowerTable() {
+  await db.query(`
+    create table if not exists public.relay_power_specs (
+      id uuid default gen_random_uuid() primary key,
+      brand text, brand_norm text not null,
+      code text, code_norm text not null,
+      family_slug text not null,
+      series text,
+      displayname text,
+      datasheet_uri text,
+      verified_in_doc jsonb default '[]'::jsonb,
+      created_at timestamptz default now()
+    );
+    create unique index if not exists ux_rps_bcn on public.relay_power_specs(brand_norm, code_norm, family_slug);
+  `);
 }
 
 module.exports = { runAutoIngest };

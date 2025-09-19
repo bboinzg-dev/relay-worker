@@ -1,87 +1,91 @@
+// relay-worker/src/utils/extract.js
 'use strict';
-const { Storage } = require('@google-cloud/storage');
-const storage = new Storage();
-const path = require('path');
 
-const DOCAI_PROJECT_ID   = process.env.DOCAI_PROJECT_ID || process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-const DOCAI_LOCATION     = process.env.DOCAI_LOCATION   || 'us';
-const DOCAI_PROCESSOR_ID = process.env.DOCAI_PROCESSOR_ID || '';
-const DOCAI_OUTPUT_BUCKET= (process.env.DOCAI_OUTPUT_BUCKET || '').replace(/^gs:\/\//,'');
-const MAX_INLINE         = Number(process.env.MAX_DOC_PAGES_INLINE || 15);
+const { keywordWindows, tokenize } = require('./regex');
+const { chooseBrandCode } = require('./brandcode');
+const { callDocAI, getPdfText, pickPagesByVertex } = require('./vision'); // 아래 설명
+const { parseDocAiTables } = require('./table_extractor');
 
-function isGsUri(u){ return /^gs:\/\//i.test(String(u||'')); }
-function gsParse(u){ const m=/^gs:\/\/([^/]+)\/(.+)$/.exec(String(u||'')); if(!m)throw new Error('INVALID_GCS_URI'); return {bucket:m[1],object:m[2]}; }
-const joinText = (pages=[]) => pages.map(p=>p.text||'').filter(Boolean).join('\n\n');
+/**
+ * @param {Object} args
+ * - gcsUri: 'gs://bucket/path.pdf'
+ * - filename: 원본 파일명
+ * - maxInlinePages: env MAX_DOC_PAGES_INLINE
+ */
+async function extractDataset(args) {
+  const { gcsUri, filename = '', maxInlinePages = 15 } = args;
 
-async function vertexPickPages(gcsUri){
-  try{
-    const { callModelJson } = require('./vertex');
-    const sys = 'Select up to 12 page numbers that likely contain TYPES / ORDERING / SPEC tables. Return {"pages":[1,3,...]}.';
-    const usr = JSON.stringify({ gcs_uri: gcsUri, hint: ['TYPES','ORDERING','SPECIFICATIONS'] });
-    const out = await callModelJson(sys, usr, { maxOutputTokens: 1024 });
-    return [...new Set((out?.pages||[]).map(n=>Number(n)).filter(n=>n>0))].sort((a,b)=>a-b).slice(0,12);
-  }catch(e){ console.warn('[extract] vertexPickPages WARN:', e?.message||e); return []; }
-}
+  // 1) 텍스트/페이지 후보
+  const meta = await getPdfText(gcsUri, { limit: maxInlinePages + 2 });
+  const pageCount = meta.pages?.length || 0;
 
-async function docaiOnline({ gcsUri, pages=[] }){
-  const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
-  const client = new DocumentProcessorServiceClient();
-  if(!DOCAI_PROCESSOR_ID) throw new Error('DOCAI_PROCESSOR_ID not set');
+  // 파일명/헬더 힌트
+  const hints = filenameHints(filename);
 
-  const name = client.processorPath(DOCAI_PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID);
-  const { bucket, object } = gsParse(gcsUri);
-  const [buf] = await storage.bucket(bucket).file(object).download();
+  let rows = [];
+  let verifiedPages = [];
 
-  let req;
-  try{
-    req = { name, rawDocument:{ content:buf, mimeType:'application/pdf' },
-            processOptions: pages.length ? { individualPageSelector:{ pages: pages.map(String) } } : {} };
-  }catch(_){ req = { name, rawDocument:{ content:buf, mimeType:'application/pdf' } }; }
-
-  const [result] = await client.processDocument(req);
-  const doc = result.document;
-  const outPages = (doc?.pages||[]).map((p,i)=>({ page: p.pageNumber || (pages[i]||i+1),
-                                                  text: p.layout?.textAnchor?.content || p.layout?.text || '' }));
-  return { pages: outPages, text: joinText(outPages) };
-}
-
-async function docaiBatch({ gcsUri }){
-  const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
-  const client = new DocumentProcessorServiceClient();
-  if(!DOCAI_PROCESSOR_ID) throw new Error('DOCAI_PROCESSOR_ID not set');
-  if(!DOCAI_OUTPUT_BUCKET) throw new Error('DOCAI_OUTPUT_BUCKET not set');
-
-  const name = client.processorPath(DOCAI_PROJECT_ID, DOCAI_LOCATION, DOCAI_PROCESSOR_ID);
-  const outputPrefix = path.posix.join(DOCAI_OUTPUT_BUCKET.replace(/^\//,''), Date.now().toString());
-  const [op] = await client.batchProcessDocuments({
-    name,
-    inputDocuments:{ gcsDocuments:{ documents:[{ gcsUri, mimeType:'application/pdf' }] } },
-    documentOutputConfig:{ gcsOutputConfig:{ gcsUri:`gs://${outputPrefix}/` } }
-  });
-  await op.promise();
-
-  const [files] = await storage.bucket(DOCAI_OUTPUT_BUCKET.split('/')[0])
-    .getFiles({ prefix: outputPrefix });
-  const jsons = files.filter(f=>f.name.endsWith('.json'));
-  const pagesOut=[];
-  for(const jf of jsons){
-    const [buf]=await jf.download();
-    const parsed=JSON.parse(buf.toString('utf8'));
-    const doc=parsed.document||parsed;
-    pagesOut.push(...(doc.pages||[]).map((p,i)=>({ page:p.pageNumber||i+1,
-                                                  text:p.layout?.textAnchor?.content||p.layout?.text||'' })));
+  if (pageCount > maxInlinePages) {
+    // 2-a) 페이지 선택 → DocAI 표 추출
+    const pick = await pickPagesByVertex(meta, { target: ['ordering','type','selection'] });
+    const candidates = [...new Set(pick.pages || [])].slice(0, 8);
+    for (const p of candidates) {
+      const doc = await callDocAI(gcsUri, { pageNumbers: [p] });
+      const r = parseDocAiTables(doc);
+      if (r.length) {
+        rows.push(...r);
+        verifiedPages.push(p);
+      }
+    }
+  } else {
+    // 2-b) 키워드 윈도우 기반 LLM 선택(표가 없을 때 보조)
+    const windows = keywordWindows(meta.text).slice(0, 6).join('\n---\n');
+    const { brand, code, series } = await chooseBrandCode(windows, hints);
+    if (code) rows.push({ code, series, desc:'', raw:[] });
   }
-  return { pages: pagesOut, text: joinText(pagesOut) };
+
+  // 3) 브랜드 확정 (문서 전체 텍스트 + 힌트)
+  const { brand } = await chooseBrandCode(meta.text, hints);
+
+  // 4) 결과 정리
+  rows = normalizeRows(rows, brand, hints.series);
+
+  return {
+    brand: brand || (hints.brandHints?.[0] || 'unknown'),
+    series: hints.series || '',
+    codes: rows.map(r => r.code),
+    rows,
+    verifiedPages,
+    note: rows.length ? '' : 'no_rows_extracted',
+  };
 }
 
-async function extractText(gcsUri){
-  if(!isGsUri(gcsUri)) throw new Error('gcsUri must be gs://…');
-  const picked = await vertexPickPages(gcsUri);
-  if(picked.length && picked.length<=MAX_INLINE){
-    try{ return await docaiOnline({ gcsUri, pages: picked }); } catch(e){ console.warn('[extract] online WARN:',e?.message||e); }
-  }
-  try{ return await docaiBatch({ gcsUri }); } catch(e){ console.warn('[extract] batch WARN:',e?.message||e); }
-  return { text:'', pages:[] };
+function filenameHints(name='') {
+  const low = name.toLowerCase();
+  const brandHints = [];
+  if (/(panasonic|matsushita|matsushita electric)/i.test(name)) brandHints.push('Panasonic');
+  if (/(omron)/i.test(name)) brandHints.push('OMRON');
+  // 확장 가능
+
+  let series = '';
+  // mech_eng_gn.pdf → GN, mech_eng_tq.pdf → TQ
+  const m = low.match(/mech[_-]eng[_-]([a-z0-9]+)/i);
+  if (m) series = m[1].toUpperCase();
+
+  // ALDP… 유형
+  const al = name.match(/\b(ALDP[0-9A-Z\-]+)/i);
+  const codeHints = al ? [al[1].toUpperCase()] : [];
+
+  return { brandHints, codeHints, series };
 }
 
-module.exports = { extractText };
+function normalizeRows(rows, brand, seriesHint) {
+  return rows.map(r => {
+    const code = String(r.code||'').toUpperCase().replace(/\s+/g,'');
+    const series = r.series ? r.series.trim().toUpperCase()
+                 : (seriesHint ? seriesHint.toUpperCase() : '');
+    return { code, series, desc:r.desc||'', raw:r.raw||[] };
+  }).filter(r => /^[A-Z0-9][A-Z0-9\-._/]*$/.test(r.code));
+}
+
+module.exports = { extractDataset };

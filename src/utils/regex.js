@@ -1,37 +1,34 @@
-// 공용 정규식 & 토큰 유틸
+// relay-worker/src/utils/regex.js
 'use strict';
 
-const PART_TOKEN = /[A-Z0-9](?:[A-Z0-9][A-Z0-9._/-]?){3,23}/g; // 4~24자, 대문자/숫자/._/-
-const BAD_TOKEN = /^(?:PDF|PAGE|TABLE|INDEX|FIG|SEE|HTTP|WWW|VOLT|AMP|SEC|Hz|mm|inch|DATE)$/i;
-const NEAR_KEYS = [
-  'part no', 'model', 'type', 'ordering', 'ordering information', 'types',
-  'catalog no', 'product code', 'sku'
+const ORDERING_KEYS = [
+  'ordering information','ordering','how to order','part numbering','type number',
+  'model key','selection guide','type','part number','part no','product number'
 ];
 
 function tokenize(text) {
-  if (!text) return [];
-  const uniq = new Set();
-  for (const m of text.toUpperCase().matchAll(PART_TOKEN)) {
-    const t = m[0].replace(/^[\W_]+|[\W_]+$/g, '');
-    if (t.length >= 4 && t.length <= 24 && !BAD_TOKEN.test(t)) uniq.add(t);
-  }
-  return [...uniq];
+  return String(text||'')
+    .split(/[^A-Za-z0-9\-\._\/]+/g)
+    .map(s => s.trim())
+    .filter(s => s.length >= 2 && !/^[\.\-]$/.test(s))
+    .slice(0, 5000);
 }
 
-function keywordWindows(text, window = 250) {
+function keywordWindows(text, window = 900) {
+  const t = String(text||'').toLowerCase();
   const out = [];
-  const low = (text || '').toLowerCase();
-  for (const k of NEAR_KEYS) {
+  for (const k of ORDERING_KEYS) {
     let idx = 0;
-    const needle = k.toLowerCase();
-    while ((idx = low.indexOf(needle, idx)) !== -1) {
+    while (idx >= 0) {
+      idx = t.indexOf(k, idx);
+      if (idx < 0) break;
       const s = Math.max(0, idx - window);
-      const e = Math.min(text.length, idx + needle.length + window);
+      const e = Math.min(t.length, idx + k.length + window);
       out.push(text.slice(s, e));
-      idx += needle.length;
+      idx = idx + k.length;
     }
   }
   return out;
 }
 
-module.exports = { tokenize, keywordWindows };
+module.exports = { tokenize, keywordWindows, ORDERING_KEYS };

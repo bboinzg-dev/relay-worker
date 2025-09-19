@@ -26,9 +26,10 @@ async function downloadGcs(gsUri) {
 
 // ---------- Document AI ----------
 async function docaiTextFromBuffer(buf) {
-  const project = process.env.DOCAI_PROJECT_ID || process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-  const location = process.env.DOCAI_LOCATION || process.env.DOC_AI_LOCATION || 'us';
-  const processorId = process.env.DOCAI_PROCESSOR_ID;
+ const env = require('../config/env');
+ const project = env.DOCAI_PROJECT_ID;
+ const location = env.DOCAI_LOCATION;
+ const processorId = env.DOCAI_PROCESSOR_ID;
 
   if (!project || !processorId) {
     console.warn('[extract] DocAI env not set; skipping DocAI.');
@@ -53,8 +54,9 @@ async function docaiTextFromBuffer(buf) {
 
 // ---------- Vertex (Gemini 1.5) ----------
 async function vertexTextFromBuffer(buf) {
-  const project = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-  const location = process.env.VERTEX_LOCATION || 'us-central1';
+ const env = require('../config/env');
+ const project = env.PROJECT_ID;
+ const location = env.VERTEX_LOCATION;
   if (!project) {
     console.warn('[extract] Vertex project not set; skipping Vertex.');
     return '';

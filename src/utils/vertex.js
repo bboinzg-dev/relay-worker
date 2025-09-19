@@ -3,10 +3,9 @@
 
 const { VertexAI } = require('@google-cloud/vertexai');
 
-const LOCATION = process.env.VERTEX_LOCATION || 'asia-northeast3';
-const MODEL_ID = process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
-
-const vertex = new VertexAI({ location: LOCATION });
++ const env = require('../config/env');
++ const project = env.PROJECT_ID;
++ const location = env.VERTEX_LOCATION;
 
 function getModel(systemText) {
   const systemInstruction = systemText

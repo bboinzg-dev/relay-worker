@@ -1,9 +1,10 @@
 const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
 const { parseGcsUri } = require('./gcs');
 
-const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
-const DOCAI_LOCATION = process.env.DOCAI_LOCATION || 'us';
-const PROCESSOR_ID = process.env.DOCAI_PROCESSOR_ID || null;
+ const env = require('../config/env');
+ const project = env.DOCAI_PROJECT_ID;
+ const location = env.DOCAI_LOCATION;
+ const processorId = env.DOCAI_PROCESSOR_ID;
 
 const client = new DocumentProcessorServiceClient();
 

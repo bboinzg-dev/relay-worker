@@ -1,6 +1,7 @@
 // relay-worker/src/pipeline/ingestAuto.js
 'use strict';
 
+const env = require('../config/env');
 const db = require('../utils/db');
 const { extractDataset } = require('../utils/extract'); // ← 아래 2번 파일에 구현됨
 
@@ -19,10 +20,7 @@ async function runAutoIngest({ gcsUri, filename, family_slug, brand, code, serie
   const t0 = Date.now();
 
   // 1) 데이터셋 추출 (DocAI → 부족 시 Vertex로 PDF 직접 읽기)
-  const ds = await extractDataset({
-    gcsUri,
-    filename,
-    maxInlinePages: +(process.env.MAX_DOC_PAGES_INLINE || 15),
+const ds = await extractDataset({ gcsUri, filename, maxInlinePages: env.MAX_DOC_PAGES_INLINE,
     brandHint: brand,
     codeHint: code,
     seriesHint: series,

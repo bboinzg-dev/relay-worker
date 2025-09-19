@@ -403,7 +403,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       );
     } catch (_) { /* 로그 실패는 무시 */ }
 
-    console.error('[ingest 500]', { error: e?.message || e, stack: e?.stack });
+    console.error('[ingest 500]', { error: e?.message, stack: String(e?.stack || '').split('\n').slice(0,4).join(' | ') });
     return res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });

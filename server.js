@@ -14,12 +14,12 @@ const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 
 const app = express();
-app.disable('x-powered-by');
+
 
 // ✅ Cloud Tasks/JSON 본문 파싱은 라우트보다 반드시 먼저
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
-
+app.disable('x-powered-by');
 /* ---------------- Env / Config ---------------- */
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
@@ -384,7 +384,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
   try {
     let authRouter = null;
 
-    // 1) 후보 경로(절대/상대 + mjs/js + dist/build/src)를 순서대로 시도
+    // 1) dist/build/src + .mjs/.js 모든 후보 시도 (배포 산출물 어디든 적중)
     const candidates = [
       path.join(__dirname, 'dist/routes/manager.mjs'),
       path.join(__dirname, 'dist/routes/manager.js'),
@@ -403,35 +403,32 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     let lastErr;
     for (const p of candidates) {
       try {
-        // 존재하는 파일만 시도 (절대경로만 검사)
+        // 절대경로만 존재 확인
         if (p.startsWith('/')) {
           try { fs.accessSync(p, fs.constants.R_OK); } catch { continue; }
         }
-
         if (p.endsWith('.mjs')) {
-          const mod = await import(p);            // ESM
+          const mod = await import(p);                 // ESM
           authRouter = mod.default || mod;
-          console.log('[BOOT] mounted auth from', p);
-          break;
         } else {
-          const mod = require(p);                 // CJS or hybrid
+          const mod = require(p);                      // CJS/hybrid
           authRouter = mod.default || mod;
-          console.log('[BOOT] mounted auth from', p);
-          break;
         }
+        console.log('[BOOT] mounted auth from', p);
+        break;
       } catch (e) { lastErr = e; }
     }
     if (!authRouter) throw lastErr || new Error('manager router not found');
 
-    // 라우터 내부가 '/auth/login'(절대)일 수도, '/login'(상대)일 수도 있어 둘 다 마운트
-    app.use(authRouter);          // 절대경로 스타일을 위해
-    app.use('/auth', authRouter); // 상대경로 스타일을 위해
+    // 라우터 내부가 '/auth/login'(절대)일 수도, '/login'(상대)일 수도 있으므로 둘 다 장착
+    app.use(authRouter);          // 절대 경로 스타일 대응
+    app.use('/auth', authRouter); // 상대 경로 스타일 대응
     app.use('/api/worker/auth', authRouter); // 구 프리픽스 호환
 
   } catch (e) {
     console.error('[BOOT] FAILED to load manager router:', e && (e.message || e));
 
-    // ── 스텁: 매니저 로드 실패해도 /auth/* 를 살린다 ──
+    // ── 스텁: 로드 실패해도 /auth/* 반드시 살아있게 ──
     const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
 
     const mountStub = (r) => {
@@ -453,10 +450,11 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     const stubRel = express.Router(); mountStub(stubRel);
 
     app.use('/auth', stubAbs);   // /auth/login
-    app.use(stubRel);            // /login (혹시 상대경로 스타일일 때도 대응)
+    app.use(stubRel);            // /login (상대경로 스타일 대응)
     app.use('/api/worker/auth', stubAbs);
   }
 })();
+
 
 
 const catalogTree = (_req, res) => res.json({ ok:true, nodes: [] });

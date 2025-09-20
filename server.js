@@ -17,6 +17,16 @@ const app = express();
 
 
 // ✅ Cloud Tasks/JSON 본문 파싱은 라우트보다 반드시 먼저
+/* ---------------- Mount modular routers (NEW) ---------------- */
+try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
+try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
+try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
+try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
+try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
+try { app.use(require('./routes/parts'));    console.log('[BOOT] mounted /api/parts/*'); } catch {}
+try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
+try { app.use(require('./server.vision'));   console.log('[BOOT] mounted /api/vision/*'); } catch {}
+
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.disable('x-powered-by');

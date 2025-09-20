@@ -1,4 +1,3 @@
-
 // server.vision.js
 'use strict';
 
@@ -26,141 +25,143 @@ function getModel() {
 // POST /api/vision/guess  (multipart: file)
 app.post('/api/vision/guess', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file || !req.file.buffer) return res.status(400).json({ ok:false, error:'file required' });
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ ok: false, error: 'file required' });
+    }
 
-    const model = getModel();      // ★ 여기에서 생성
-    const bytes = req.file.buffer;
-    const base64 = bytes.toString('base64');
-
+    const model = getModel(); // ★ 지연 생성
+    const base64 = req.file.buffer.toString('base64');
 
     // Ask Gemini to extract brand/code/family guess
- const prompt = `전자부품 이미지를 보고 부품군과 제조사/품명을 추정하세요.
- 반드시 JSON만 출력하세요. 키는 다음과 같습니다:
- - family_slug: 부품군 슬러그(예: relay_power, relay_signal, mosfet, igbt_module, capacitor_mlcc ...) 없으면 'other'
- - family_label_ko: 사람 친화적인 한국어 라벨(예: "전력 릴레이", "신호 릴레이", "MOSFET")
- - brand: 제조사명(예: Panasonic, OMRON)
- - code: 품명/모델명(예: TQ2-L2-12V, ALDP112)
- - confidence: 0~1 사이 숫자(신뢰도)
- - rationale: 간단한 이유 한 줄
- JSON 외 텍스트 절대 금지.`
+    const prompt = `전자부품 이미지를 보고 부품군과 제조사/품명을 추정하세요.
+반드시 JSON만 출력하세요. 키는 다음과 같습니다:
+- family_slug: 부품군 슬러그(예: relay_power, relay_signal, mosfet, igbt_module, capacitor_mlcc ...) 없으면 'other'
+- family_label_ko: 사람 친화적인 한국어 라벨(예: "전력 릴레이", "신호 릴레이", "MOSFET")
+- brand: 제조사명(예: Panasonic, OMRON)
+- code: 품명/모델명(예: TQ2-L2-12V, ALDP112)
+- confidence: 0~1 사이 숫자(신뢰도)
+- rationale: 간단한 이유 한 줄
+JSON 외 텍스트 절대 금지.`;
 
- const resp = await model.generateContent({
-   contents: [{
-     role: 'user',
-     parts: [
-       { text: prompt },
-       { inlineData: { mimeType: req.file.mimetype || 'image/png', data: base64 } }
-     ]
-   }],
+    const resp = await model.generateContent({
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: prompt },
+          { inlineData: { mimeType: req.file.mimetype || 'image/png', data: base64 } }
+        ]
+      }],
       generationConfig: {
-     responseMimeType: 'application/json',
-     responseSchema: {
-       type: 'object',
-       properties: {
-         family_slug: { type: 'string' },
-         family_label_ko: { type: 'string' },
-         brand: { type: 'string' },
-         code: { type: 'string' },
-         confidence: { type: 'number' },
-         rationale: { type: 'string' }
-       }
-     }
-   }
-  });
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'object',
+          properties: {
+            family_slug: { type: 'string' },
+            family_label_ko: { type: 'string' },
+            brand: { type: 'string' },
+            code: { type: 'string' },
+            confidence: { type: 'number' },
+            rationale: { type: 'string' }
+          }
+        }
+      }
+    });
 
- // ★ JSON 안전 파싱(코드펜스/잡텍스트 대비)
- // 안전 파싱(혹시 텍스트 섞여도 최대한 복구)
- const parts = resp?.response?.candidates?.[0]?.content?.parts || [];
- const raw = parts.map(p => p.text || '').join('\n');
- const pickJson = (s) => (s.match(/\{[\s\S]*\}/) || [])[0] || '{}';
- let guess = {};
- try { guess = JSON.parse(raw); } catch { try { guess = JSON.parse(pickJson(raw)); } catch { guess = {}; } }
+    // JSON 안전 파싱(코드펜스/잡텍스트 대비)
+    const parts = resp?.response?.candidates?.[0]?.content?.parts || [];
+    const raw = parts.map(p => p.text || '').join('\n');
+    const pickJson = s => (s.match(/\{[\s\S]*\}/) || [])[0] || '{}';
 
- // family_label 폴백: DB의 display_name 사용
- if (guess.family_slug && !guess.family_label_ko) {
-   const q = await db.query(
-     `SELECT display_name FROM public.component_registry WHERE family_slug = $1 LIMIT 1`,
-     [guess.family_slug]
-   );
-   if (q.rows[0]?.display_name) guess.family_label_ko = q.rows[0].display_name;
- }
- if (!guess.family_label_ko && /relay/i.test(guess.code || '') || /relay/i.test(guess.rationale || '')) {
-   guess.family_label_ko = '릴레이';
- }
- }
+    let guess = {};
+    try { guess = JSON.parse(raw); }
+    catch {
+      try { guess = JSON.parse(pickJson(raw)); }
+      catch { guess = {}; }
+    }
 
- // ★ 폴백 정규식(브랜드/PN을 텍스트에서 뽑기)
- if (!guess.brand || !guess.code) {
-   const all = [raw, guess.raw].filter(Boolean).join(' ');
-   const brand =
-     /panasonic/i.test(all) ? 'Panasonic' :
-     /omron/i.test(all)     ? 'Omron'     :
-     /tyco|te\s*connectivity/i.test(all) ? 'TE Connectivity' : undefined;
-   const m = all.match(/\b([A-Z]{1,5}\d[A-Z0-9\-]{2,})\b/); // 예: TQ2-L2-12V, ATQ223 등
-   guess.brand = guess.brand || brand;
-   guess.code  = guess.code  || (m ? m[1] : undefined);
-   guess.confidence = guess.confidence ?? 0.6;
- }
+    // family_label 폴백: DB display_name 사용
+    if (guess.family_slug && !guess.family_label_ko) {
+      const q = await db.query(
+        `SELECT display_name FROM public.component_registry WHERE family_slug = $1 LIMIT 1`,
+        [guess.family_slug]
+      );
+      if (q.rows[0]?.display_name) guess.family_label_ko = q.rows[0].display_name;
+    }
+    // ★ 괄호로 우선순위 교정
+    if (!guess.family_label_ko && ( /relay/i.test(guess.code || '') || /relay/i.test(guess.rationale || '') )) {
+      guess.family_label_ko = '릴레이';
+    }
 
-    // Optional: do a nearest-neighbor by (brand,code) if present
+    // 폴백 정규식(브랜드/PN 추출)
+    if (!guess.brand || !guess.code) {
+      const all = raw;
+      const brand =
+        /panasonic/i.test(all) ? 'Panasonic' :
+        /omron/i.test(all)     ? 'Omron'     :
+        /tyco|te\s*connectivity/i.test(all) ? 'TE Connectivity' : undefined;
+      const m = all.match(/\b([A-Z]{1,5}\d[A-Z0-9\-]{2,})\b/); // 예: TQ2-L2-12V, ATQ223
+      guess.brand = guess.brand || brand;
+      guess.code  = guess.code  || (m ? m[1] : undefined);
+      guess.confidence = typeof guess.confidence === 'number' ? guess.confidence : 0.6;
+    }
+
+    // Optional: (brand,code)로 근접 후보
     let nearest = [];
     const brand = (guess.brand || '').toString();
-    const code  = (guess.code || '').toString();
+    const code  = (guess.code  || '').toString();
     if (brand || code) {
       const q = `
-        WITH p AS (
-          SELECT lower($1) AS b, lower($2) AS c
-        )
+        WITH p AS ( SELECT lower($1) AS b, lower($2) AS c )
         SELECT 'relay_power_specs' AS table, brand, code, series, family_slug, datasheet_uri
           FROM public.relay_power_specs, p
          WHERE (brand_norm = p.b OR p.b = '')
-            OR (code_norm = p.c  OR p.c = '')
+            OR (code_norm  = p.c OR p.c = '')
          LIMIT 20`;
       const r = await db.query(q, [brand, code]);
       nearest = r.rows;
     }
 
-    // nearest 보강
-const out = [];
-for (const r0 of nearest) {
-  const famLabelRow = await db.query(
-    `SELECT display_name FROM public.component_registry WHERE family_slug = $1 LIMIT 1`,
-    [r0.family_slug]
-  );
-  const famLabel = famLabelRow.rows[0]?.display_name || null;
+    // nearest 보강: family_label + hero_image_url
+    if (Array.isArray(nearest) && nearest.length) {
+      const out = [];
+      for (const r0 of nearest) {
+        const famLabelRow = await db.query(
+          `SELECT display_name FROM public.component_registry WHERE family_slug = $1 LIMIT 1`,
+          [r0.family_slug]
+        );
+        const famLabel = famLabelRow.rows[0]?.display_name || null;
 
-  let hero = null;
-  if (r0.brand && r0.code) {
-    const img = await db.query(
-      `SELECT gcs_uri FROM public.image_index
-       WHERE brand_norm = lower($1) AND code_norm = lower($2)
-       ORDER BY created_at DESC LIMIT 1`,
-      [r0.brand, r0.code]
-    );
-    const gcs = img.rows[0]?.gcs_uri || null;
-    hero = gcs ? gcs.replace(/^gs:\/\//, 'https://storage.googleapis.com/') : null;
-  }
+        let hero = null;
+        if (r0.brand && r0.code) {
+          const img = await db.query(
+            `SELECT gcs_uri FROM public.image_index
+             WHERE brand_norm = lower($1) AND code_norm = lower($2)
+             ORDER BY created_at DESC LIMIT 1`,
+            [r0.brand, r0.code]
+          );
+          const gcs = img.rows[0]?.gcs_uri || null;
+          hero = gcs ? gcs.replace(/^gs:\/\//, 'https://storage.googleapis.com/') : null;
+        }
+        out.push({ ...r0, family_label: famLabel, hero_image_url: hero });
+      }
+      nearest = out;
+    }
 
-  out.push({ ...r0, family_label: famLabel, hero_image_url: hero });
-}
-nearest = out;
-
-
-     res.json({
-   ok: true,
-   guess: {
-     family_slug: guess.family_slug || null,
-     family_label: guess.family_label_ko || null,
-     brand: guess.brand || null,
-     code: guess.code || null,
-     confidence: typeof guess.confidence === 'number' ? guess.confidence : 0.6,
-     rationale: guess.rationale || null
-   },
-   nearest
-});
+    return res.json({
+      ok: true,
+      guess: {
+        family_slug: guess.family_slug || null,
+        family_label: guess.family_label_ko || null,
+        brand: guess.brand || null,
+        code: guess.code || null,
+        confidence: typeof guess.confidence === 'number' ? guess.confidence : 0.6,
+        rationale: guess.rationale || null
+      },
+      nearest
+    });
   } catch (e) {
     console.error(e);
-    res.status(400).json({ ok:false, error:String(e.message || e) });
+    return res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
 

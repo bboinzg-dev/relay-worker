@@ -33,18 +33,50 @@ app.post('/api/vision/guess', upload.single('file'), async (req, res) => {
 Return a compact JSON with keys: family_slug, brand, code, confidence (0..1), rationale (short).
 If uncertain, still provide your best single guess.`;
 
-    const resp = await model.generateContent({
-      contents: [{
-        role: 'user',
-        parts: [
-          { text: prompt },
-          { inlineData: { mimeType: req.file.mimetype || 'image/png', data: base64 } }
-        ]
-      }]
-    });
-    const text = resp?.response?.candidates?.[0]?.content?.parts?.map(p => p.text).join(' ').trim() || '';
-    let guess = {};
-    try { guess = JSON.parse(text); } catch { guess = { raw: text }; }
+ const resp = await model.generateContent({
+   contents: [{
+     role: 'user',
+     parts: [
+       { text: prompt },
+       { inlineData: { mimeType: req.file.mimetype || 'image/png', data: base64 } }
+     ]
+   }],
+   // ★ Gemini를 "순수 JSON"으로 강제
+   generationConfig: {
+     responseMimeType: 'application/json',
+     responseSchema: {
+       type: 'object',
+       properties: {
+         family_slug: { type: 'string' },
+         brand:       { type: 'string' },
+         code:        { type: 'string' },
+         confidence:  { type: 'number' },
+         rationale:   { type: 'string' }
+       }
+     }
+   }
+ });
+ // ★ JSON 안전 파싱(코드펜스/잡텍스트 대비)
+ const parts = resp?.response?.candidates?.[0]?.content?.parts || [];
+ const raw = parts.map(p => (p.text || '')).join('\n');
+ function extractJson(s){ const m = s.match(/\{[\s\S]*\}/); return m ? m[0] : ''; }
+ let guess = {};
+ try { guess = JSON.parse(raw); } catch {
+   try { guess = JSON.parse(extractJson(raw)); } catch { guess = { raw }; }
+ }
+
+ // ★ 폴백 정규식(브랜드/PN을 텍스트에서 뽑기)
+ if (!guess.brand || !guess.code) {
+   const all = [raw, guess.raw].filter(Boolean).join(' ');
+   const brand =
+     /panasonic/i.test(all) ? 'Panasonic' :
+     /omron/i.test(all)     ? 'Omron'     :
+     /tyco|te\s*connectivity/i.test(all) ? 'TE Connectivity' : undefined;
+   const m = all.match(/\b([A-Z]{1,5}\d[A-Z0-9\-]{2,})\b/); // 예: TQ2-L2-12V, ATQ223 등
+   guess.brand = guess.brand || brand;
+   guess.code  = guess.code  || (m ? m[1] : undefined);
+   guess.confidence = guess.confidence ?? 0.6;
+ }
 
     // Optional: do a nearest-neighbor by (brand,code) if present
     let nearest = [];

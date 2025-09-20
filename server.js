@@ -25,7 +25,13 @@ try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bo
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
 try { app.use(require('./routes/parts'));    console.log('[BOOT] mounted /api/parts/*'); } catch {}
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
-try { app.use(require('./server.vision'));   console.log('[BOOT] mounted /api/vision/*'); } catch {}
+try {
+  app.use(require('./server.vision'));
+  console.log('[BOOT] mounted /api/vision/*');
+} catch (e) {
+  console.error('[BOOT] failed to mount /api/vision/*', e);
+}
+
 
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));

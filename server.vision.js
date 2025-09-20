@@ -14,19 +14,24 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '15mb' }));
 const upload = multer({ storage: multer.memoryStorage() });
 
-const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
-const MODEL      = process.env.GEMINI_MODEL_CLASSIFY || 'gemini-2.5-flash';
-
-const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
-const model  = vertex.getGenerativeModel({ model: MODEL });
+function getModel() {
+  const project  = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+  if (!project) throw new Error('GCP project id not set');
+  const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
+  const modelId  = process.env.GEMINI_MODEL_CLASSIFY || 'gemini-2.5-flash';
+  const v = new VertexAI({ project, location });
+  return v.getGenerativeModel({ model: modelId });
+}
 
 // POST /api/vision/guess  (multipart: file)
 app.post('/api/vision/guess', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'file required' });
+    if (!req.file || !req.file.buffer) return res.status(400).json({ ok:false, error:'file required' });
+
+    const model = getModel();      // ★ 여기에서 생성
     const bytes = req.file.buffer;
     const base64 = bytes.toString('base64');
+
 
     // Ask Gemini to extract brand/code/family guess
  const prompt = `전자부품 이미지를 보고 부품군과 제조사/품명을 추정하세요.

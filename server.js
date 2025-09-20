@@ -32,7 +32,7 @@ try {
   console.error('[BOOT] failed to mount /api/vision/*', e);
 }
 
-
+app.use('/api/parts', require('./src/routes/parts'));   // ★ 추가
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.disable('x-powered-by');

@@ -29,9 +29,15 @@ app.post('/api/vision/guess', upload.single('file'), async (req, res) => {
     const base64 = bytes.toString('base64');
 
     // Ask Gemini to extract brand/code/family guess
-    const prompt = `You are helping identify electronic components from board or datasheet photos.
-Return a compact JSON with keys: family_slug, brand, code, confidence (0..1), rationale (short).
-If uncertain, still provide your best single guess.`;
+ const prompt = `전자부품 이미지를 보고 부품군과 제조사/품명을 추정하세요.
+ 반드시 JSON만 출력하세요. 키는 다음과 같습니다:
+ - family_slug: 부품군 슬러그(예: relay_power, relay_signal, mosfet, igbt_module, capacitor_mlcc ...) 없으면 'other'
+ - family_label_ko: 사람 친화적인 한국어 라벨(예: "전력 릴레이", "신호 릴레이", "MOSFET")
+ - brand: 제조사명(예: Panasonic, OMRON)
+ - code: 품명/모델명(예: TQ2-L2-12V, ALDP112)
+ - confidence: 0~1 사이 숫자(신뢰도)
+ - rationale: 간단한 이유 한 줄
+ JSON 외 텍스트 절대 금지.`
 
  const resp = await model.generateContent({
    contents: [{
@@ -41,28 +47,41 @@ If uncertain, still provide your best single guess.`;
        { inlineData: { mimeType: req.file.mimetype || 'image/png', data: base64 } }
      ]
    }],
-   // ★ Gemini를 "순수 JSON"으로 강제
-   generationConfig: {
+      generationConfig: {
      responseMimeType: 'application/json',
      responseSchema: {
        type: 'object',
        properties: {
          family_slug: { type: 'string' },
-         brand:       { type: 'string' },
-         code:        { type: 'string' },
-         confidence:  { type: 'number' },
-         rationale:   { type: 'string' }
+         family_label_ko: { type: 'string' },
+         brand: { type: 'string' },
+         code: { type: 'string' },
+         confidence: { type: 'number' },
+         rationale: { type: 'string' }
        }
      }
    }
- });
+  });
+
  // ★ JSON 안전 파싱(코드펜스/잡텍스트 대비)
+ // 안전 파싱(혹시 텍스트 섞여도 최대한 복구)
  const parts = resp?.response?.candidates?.[0]?.content?.parts || [];
- const raw = parts.map(p => (p.text || '')).join('\n');
- function extractJson(s){ const m = s.match(/\{[\s\S]*\}/); return m ? m[0] : ''; }
+ const raw = parts.map(p => p.text || '').join('\n');
+ const pickJson = (s) => (s.match(/\{[\s\S]*\}/) || [])[0] || '{}';
  let guess = {};
- try { guess = JSON.parse(raw); } catch {
-   try { guess = JSON.parse(extractJson(raw)); } catch { guess = { raw }; }
+ try { guess = JSON.parse(raw); } catch { try { guess = JSON.parse(pickJson(raw)); } catch { guess = {}; } }
+
+ // family_label 폴백: DB의 display_name 사용
+ if (guess.family_slug && !guess.family_label_ko) {
+   const q = await db.query(
+     `SELECT display_name FROM public.component_registry WHERE family_slug = $1 LIMIT 1`,
+     [guess.family_slug]
+   );
+   if (q.rows[0]?.display_name) guess.family_label_ko = q.rows[0].display_name;
+ }
+ if (!guess.family_label_ko && /relay/i.test(guess.code || '') || /relay/i.test(guess.rationale || '')) {
+   guess.family_label_ko = '릴레이';
+ }
  }
 
  // ★ 폴백 정규식(브랜드/PN을 텍스트에서 뽑기)
@@ -96,7 +115,18 @@ If uncertain, still provide your best single guess.`;
       nearest = r.rows;
     }
 
-    res.json({ ok: true, guess, nearest });
+    + res.json({
+   ok: true,
+   guess: {
+     family_slug: guess.family_slug || null,
+     family_label: guess.family_label_ko || null,
+     brand: guess.brand || null,
+     code: guess.code || null,
+     confidence: typeof guess.confidence === 'number' ? guess.confidence : 0.6,
+     rationale: guess.rationale || null
+   },
+   nearest
+});
   } catch (e) {
     console.error(e);
     res.status(400).json({ ok:false, error:String(e.message || e) });

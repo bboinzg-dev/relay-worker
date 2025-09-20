@@ -1,4 +1,3 @@
-// server.vision.js
 'use strict';
 
 const express = require('express');
@@ -11,32 +10,39 @@ const db = require('./src/utils/db');
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: '15mb' }));
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 function getModel() {
-  const project  = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+  const project =
+    process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
   if (!project) throw new Error('GCP project id not set');
   const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
-  const modelId  = process.env.GEMINI_MODEL_CLASSIFY || 'gemini-2.5-flash';
+  const modelId = process.env.GEMINI_MODEL_CLASSIFY || 'gemini-2.5-flash';
+
   const v = new VertexAI({ project, location });
   return v.getGenerativeModel({ model: modelId });
 }
 
-// POST /api/vision/guess  (multipart: file)
+/**
+ * POST /api/vision/guess (multipart/form-data: file)
+ * - 이미지(부품 사진)로 제조사/품명/부품군 추정
+ * - DB에 family_label 보강 + hero 이미지 찾아 부가정보 리턴
+ */
 app.post('/api/vision/guess', upload.single('file'), async (req, res) => {
   try {
     if (!req.file || !req.file.buffer) {
       return res.status(400).json({ ok: false, error: 'file required' });
     }
 
-    const model = getModel(); // ★ 지연 생성
+    const model = getModel();
     const base64 = req.file.buffer.toString('base64');
 
-    // Ask Gemini to extract brand/code/family guess
-    const prompt = `전자부품 이미지를 보고 부품군과 제조사/품명을 추정하세요.
+    const prompt = `
+전자부품 이미지를 보고 부품군과 제조사/품명을 추정하세요.
 반드시 JSON만 출력하세요. 키는 다음과 같습니다:
 - family_slug: 부품군 슬러그(예: relay_power, relay_signal, mosfet, igbt_module, capacitor_mlcc ...) 없으면 'other'
-- family_label_ko: 사람 친화적인 한국어 라벨(예: "전력 릴레이", "신호 릴레이", "MOSFET")
+- family_label_ko: 한국어 라벨(예: "전력 릴레이", "신호 릴레이", "MOSFET")
 - brand: 제조사명(예: Panasonic, OMRON)
 - code: 품명/모델명(예: TQ2-L2-12V, ALDP112)
 - confidence: 0~1 사이 숫자(신뢰도)
@@ -44,13 +50,20 @@ app.post('/api/vision/guess', upload.single('file'), async (req, res) => {
 JSON 외 텍스트 절대 금지.`;
 
     const resp = await model.generateContent({
-      contents: [{
-        role: 'user',
-        parts: [
-          { text: prompt },
-          { inlineData: { mimeType: req.file.mimetype || 'image/png', data: base64 } }
-        ]
-      }],
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: prompt },
+            {
+              inlineData: {
+                mimeType: req.file.mimetype || 'image/png',
+                data: base64,
+              },
+            },
+          ],
+        },
+      ],
       generationConfig: {
         responseMimeType: 'application/json',
         responseSchema: {
@@ -61,107 +74,128 @@ JSON 외 텍스트 절대 금지.`;
             brand: { type: 'string' },
             code: { type: 'string' },
             confidence: { type: 'number' },
-            rationale: { type: 'string' }
-          }
-        }
-      }
+            rationale: { type: 'string' },
+          },
+        },
+      },
     });
 
-    // JSON 안전 파싱(코드펜스/잡텍스트 대비)
+    // 안전 파싱
     const parts = resp?.response?.candidates?.[0]?.content?.parts || [];
-    const raw = parts.map(p => p.text || '').join('\n');
-    const pickJson = s => (s.match(/\{[\s\S]*\}/) || [])[0] || '{}';
+    const raw = parts.map((p) => p.text || '').join('\n');
+    const pickJson = (s) => (s.match(/\{[\s\S]*\}/) || [])[0] || '{}';
 
     let guess = {};
-    try { guess = JSON.parse(raw); }
-    catch {
-      try { guess = JSON.parse(pickJson(raw)); }
-      catch { guess = {}; }
+    try {
+      guess = JSON.parse(raw);
+    } catch {
+      try {
+        guess = JSON.parse(pickJson(raw));
+      } catch {
+        guess = {};
+      }
     }
 
-    // family_label 폴백: DB display_name 사용
+    // family label 보강
     if (guess.family_slug && !guess.family_label_ko) {
       const q = await db.query(
-        `SELECT display_name FROM public.component_registry WHERE family_slug = $1 LIMIT 1`,
-        [guess.family_slug]
+        `select display_name
+           from public.component_registry
+          where family_slug = $1
+          limit 1`,
+        [guess.family_slug],
       );
       if (q.rows[0]?.display_name) guess.family_label_ko = q.rows[0].display_name;
     }
-    // ★ 괄호로 우선순위 교정
-    if (!guess.family_label_ko && ( /relay/i.test(guess.code || '') || /relay/i.test(guess.rationale || '') )) {
+    if (
+      !guess.family_label_ko &&
+      (/relay/i.test(guess.code || '') || /relay/i.test(guess.rationale || ''))
+    ) {
       guess.family_label_ko = '릴레이';
     }
 
-    // 폴백 정규식(브랜드/PN 추출)
+    // 브랜드/코드 폴백 추출
     if (!guess.brand || !guess.code) {
-      const all = raw;
-      const brand =
-        /panasonic/i.test(all) ? 'Panasonic' :
-        /omron/i.test(all)     ? 'Omron'     :
-        /tyco|te\s*connectivity/i.test(all) ? 'TE Connectivity' : undefined;
-      const m = all.match(/\b([A-Z]{1,5}\d[A-Z0-9\-]{2,})\b/); // 예: TQ2-L2-12V, ATQ223
+      const all = [raw, guess.raw].filter(Boolean).join(' ');
+      const brand = /panasonic/i.test(all)
+        ? 'Panasonic'
+        : /omron/i.test(all)
+        ? 'Omron'
+        : /tyco|te\s*connectivity/i.test(all)
+        ? 'TE Connectivity'
+        : undefined;
+      const m = all.match(/\b([A-Z]{1,5}\d[A-Z0-9\-]{2,})\b/); // 예: TQ2-L2-12V
       guess.brand = guess.brand || brand;
-      guess.code  = guess.code  || (m ? m[1] : undefined);
-      guess.confidence = typeof guess.confidence === 'number' ? guess.confidence : 0.6;
+      guess.code = guess.code || (m ? m[1] : undefined);
+      if (typeof guess.confidence !== 'number') guess.confidence = 0.6;
     }
 
-    // Optional: (brand,code)로 근접 후보
+    // (선택) brand/code 있으면 근접 항목 찾아 부가정보 리턴
     let nearest = [];
-    const brand = (guess.brand || '').toString();
-    const code  = (guess.code  || '').toString();
-    if (brand || code) {
-      const q = `
-        WITH p AS ( SELECT lower($1) AS b, lower($2) AS c )
-        SELECT 'relay_power_specs' AS table, brand, code, series, family_slug, datasheet_uri
-          FROM public.relay_power_specs, p
-         WHERE (brand_norm = p.b OR p.b = '')
-            OR (code_norm  = p.c OR p.c = '')
-         LIMIT 20`;
-      const r = await db.query(q, [brand, code]);
-      nearest = r.rows;
-    }
+    const b = (guess.brand || '').toString();
+    const c = (guess.code || '').toString();
 
-    // nearest 보강: family_label + hero_image_url
-    if (Array.isArray(nearest) && nearest.length) {
+    if (b || c) {
+      const q = `
+        with p as (select lower($1) b, lower($2) c)
+        select 'relay_power_specs' as table,
+               brand, code, series, family_slug, datasheet_uri
+          from public.relay_power_specs, p
+         where (brand_norm = p.b or p.b = '')
+            or (code_norm  = p.c or p.c = '')
+         limit 20`;
+      nearest = (await db.query(q, [b, c])).rows;
+
+      // label + 대표이미지 보강
       const out = [];
       for (const r0 of nearest) {
         const famLabelRow = await db.query(
-          `SELECT display_name FROM public.component_registry WHERE family_slug = $1 LIMIT 1`,
-          [r0.family_slug]
+          `select display_name
+             from public.component_registry
+            where family_slug = $1
+            limit 1`,
+          [r0.family_slug],
         );
         const famLabel = famLabelRow.rows[0]?.display_name || null;
 
         let hero = null;
         if (r0.brand && r0.code) {
           const img = await db.query(
-            `SELECT gcs_uri FROM public.image_index
-             WHERE brand_norm = lower($1) AND code_norm = lower($2)
-             ORDER BY created_at DESC LIMIT 1`,
-            [r0.brand, r0.code]
+            `select gcs_uri
+               from public.image_index
+              where brand_norm = lower($1)
+                and code_norm  = lower($2)
+              order by created_at desc
+              limit 1`,
+            [r0.brand, r0.code],
           );
           const gcs = img.rows[0]?.gcs_uri || null;
-          hero = gcs ? gcs.replace(/^gs:\/\//, 'https://storage.googleapis.com/') : null;
+          hero = gcs
+            ? gcs.replace(/^gs:\/\//, 'https://storage.googleapis.com/')
+            : null;
         }
+
         out.push({ ...r0, family_label: famLabel, hero_image_url: hero });
       }
       nearest = out;
     }
 
-    return res.json({
+    res.json({
       ok: true,
       guess: {
         family_slug: guess.family_slug || null,
         family_label: guess.family_label_ko || null,
         brand: guess.brand || null,
         code: guess.code || null,
-        confidence: typeof guess.confidence === 'number' ? guess.confidence : 0.6,
-        rationale: guess.rationale || null
+        confidence:
+          typeof guess.confidence === 'number' ? guess.confidence : 0.6,
+        rationale: guess.rationale || null,
       },
-      nearest
+      nearest,
     });
   } catch (e) {
     console.error(e);
-    return res.status(400).json({ ok: false, error: String(e.message || e) });
+    res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
 

@@ -4,15 +4,17 @@ const db = require('../utils/db');
 const { extractDataset } = require('../utils/extract');
 
 /**
- * 자동 인제스트(데이터시트 → 스펙 DB)
- * @param {Object}  params
- * @param {string}  params.gcsUri        gs://... 원본 데이터시트 URI
- * @param {string=} params.filename      표시용 파일명
- * @param {string=} params.family_slug   부품군(미지정 시 추정)
- * @param {string=} params.brand         브랜드 힌트
- * @param {string=} params.code          모델명 힌트
- * @param {string=} params.series        시리즈 힌트
- * @param {string=} params.display_name  표기용 이름(없으면 code 사용)
+ * 문서(PDF)에서 부품군/시리즈/코드들을 추출해 relay_power_specs에 UPSERT.
+ * Cloud Tasks 없이 직접 호출해도 되고, Tasks 소비자에서 호출해도 됨.
+ *
+ * @param {Object} opts
+ * @param {string} opts.gcsUri        gs://bucket/path.pdf
+ * @param {string} [opts.filename]    원본 파일명(로그용)
+ * @param {string} [opts.family_slug] 부품군(없으면 추정)
+ * @param {string} [opts.brand]       제조사 힌트
+ * @param {string} [opts.code]        품명(모델) 힌트
+ * @param {string} [opts.series]      시리즈 힌트
+ * @param {string} [opts.display_name]리스트용 표시명 힌트
  */
 async function runAutoIngest({
   gcsUri,
@@ -23,9 +25,13 @@ async function runAutoIngest({
   series,
   display_name,
 }) {
+  if (!gcsUri || !gcsUri.startsWith('gs://')) {
+    throw new Error('gcsUri is required (gs://bucket/object.pdf)');
+  }
+
   const t0 = Date.now();
 
-  // 1) 데이터시트에서 메타/스펙 추출 (DocAI/Vertex 내부 util 사용)
+  // 1) 문서 → 구조화 추출 (DocAI/Vertex 내부 구현은 utils/extract에 캡슐화)
   const ds = await extractDataset({
     gcsUri,
     filename,
@@ -35,21 +41,22 @@ async function runAutoIngest({
     seriesHint: series,
   });
 
-  // 2) 부품군 결정(입력 > 브랜드로 대략 추정 > 기본값)
+  // 2) 부품군 확정(없으면 브랜드 기반 추정 → 기본 relay_power)
   const family = family_slug || guessFamilyByBrand(ds.brand) || 'relay_power';
 
-  // 3) 스펙 테이블 보장(없으면 생성)
+  // 3) 타깃 테이블 보장
   await ensureRelayPowerTable();
 
-  // 4) 행 중복 제거 후 UPSERT
+  // 4) 중복 제거 후 UPSERT
   const rows = dedupeRows(ds.rows);
-  let inserted = 0;
+  let upserts = 0;
 
-  for (const row of rows) {
+  for (const r of rows) {
     await db.query(
       `
       insert into public.relay_power_specs
-        (brand, brand_norm, code, code_norm, family_slug, series, displayname, datasheet_uri, verified_in_doc, created_at)
+        (brand, brand_norm, code, code_norm, family_slug,
+         series, displayname, datasheet_uri, verified_in_doc, created_at)
       values
         ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
       on conflict (brand_norm, code_norm, family_slug)
@@ -62,42 +69,26 @@ async function runAutoIngest({
       [
         ds.brand || null,
         norm(ds.brand),
-        row.code,
-        norm(row.code),
+        r.code,
+        norm(r.code),
         family,
-        row.series || ds.series || null,
-        display_name || row.displayname || row.code,
+        r.series || ds.series || null,
+        display_name || r.displayname || r.code,
         gcsUri,
-        JSON.stringify(row.verifiedPages || ds.verifiedPages || []),
-      ]
+        JSON.stringify(r.verifiedPages || ds.verifiedPages || []),
+      ],
     );
-    inserted++;
+    upserts++;
   }
 
-  // 5) 실행 로그 적재(없으면 테이블 생성)
-  await db.query(`
-    create table if not exists public.doc_ingest_log (
-      id           uuid default gen_random_uuid() primary key,
-      task         text,
-      gcs_uri      text not null,
-      filename     text,
-      brand        text,
-      family_slug  text,
-      series_hint  text,
-      page_count   integer,
-      rows         integer,
-      ms           integer,
-      note         text,
-      created_at   timestamptz default now()
-    )
-  `);
-
+  // 5) 인입 로그(트래킹)
+  await ensureIngestLogTable();
   await db.query(
     `
     insert into public.doc_ingest_log
-      (task, gcs_uri, filename, brand, family_slug, series_hint, page_count, rows, ms, note)
-    values
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      (task, gcs_uri, filename, brand, family_slug, series_hint,
+       page_count, rows, ms, note)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
     `,
     [
       'relay_power',
@@ -106,20 +97,19 @@ async function runAutoIngest({
       ds.brand || null,
       family,
       ds.series || series || null,
-      null,                 // page_count: 필요 시 extractDataset에서 넘겨서 기록
-      inserted,
+      null, // page_count (원하면 extractDataset에서 넘겨도 됨)
+      upserts,
       Date.now() - t0,
       ds.note || null,
-    ]
+    ],
   );
 
-  // 6) 응답
   return {
     ok: true,
     brand: ds.brand || null,
     family,
     series: ds.series || null,
-    rows: inserted,
+    rows: upserts,
     codes: rows.map((r) => r.code),
     datasheet_uri: gcsUri,
     specs_table: 'public.relay_power_specs',
@@ -127,9 +117,8 @@ async function runAutoIngest({
   };
 }
 
-/* ----------------------- 유틸 ----------------------- */
+/* ------------------------- helpers ------------------------- */
 
-/** 행 중복 제거(코드 기준) */
 function dedupeRows(rows = []) {
   const seen = new Set();
   const out = [];
@@ -144,51 +133,67 @@ function dedupeRows(rows = []) {
   return out;
 }
 
-/** 정규화: 소문자/trim, 빈문자열은 null */
 function norm(x) {
   const s = (x || '').toLowerCase().trim();
   return s || null;
 }
 
-/** 브랜드로 대략적인 부품군 추정(기본은 전력 릴레이) */
 function guessFamilyByBrand(brand = '') {
   const b = (brand || '').toLowerCase();
   if (!b) return 'relay_power';
-  if (b.includes('panasonic'))        return 'relay_power';
-  if (b.includes('omron'))            return 'relay_power';
-  if (b.includes('te connectivity'))  return 'relay_power';
-  if (b.includes('finder'))           return 'relay_power';
-  if (b.includes('hongfa'))           return 'relay_power';
+  if (b.includes('panasonic')) return 'relay_power';
+  if (b.includes('omron')) return 'relay_power';
+  if (b.includes('te connectivity') || b.includes('tyco')) return 'relay_power';
+  if (b.includes('finder')) return 'relay_power';
+  if (b.includes('hongfa')) return 'relay_power';
   return 'relay_power';
 }
 
-/** relay_power 스펙 테이블 보장 */
 async function ensureRelayPowerTable() {
   await db.query(`
     create table if not exists public.relay_power_specs (
-      id             uuid default gen_random_uuid() primary key,
-      brand          text,
-      brand_norm     text,
-      code           text,
-      code_norm      text,
-      family_slug    text,
-      series         text,
-      displayname    text,
-      datasheet_uri  text,
+      id uuid default gen_random_uuid() primary key,
+      brand text,
+      brand_norm text,
+      code text,
+      code_norm text,
+      family_slug text,
+      series text,
+      displayname text,
+      datasheet_uri text,
       verified_in_doc jsonb default '[]'::jsonb,
-      created_at     timestamptz default now()
+      created_at timestamptz default now()
     );
-
     do $$
     begin
       if not exists (
-        select 1
-        from pg_indexes
+        select 1 from pg_indexes
         where schemaname='public' and indexname='ux_rps_bcn'
       ) then
-        execute 'create unique index ux_rps_bcn on public.relay_power_specs (brand_norm, code_norm, family_slug)';
+        execute
+          'create unique index ux_rps_bcn
+             on public.relay_power_specs (brand_norm, code_norm, family_slug)';
       end if;
     end $$;
+  `);
+}
+
+async function ensureIngestLogTable() {
+  await db.query(`
+    create table if not exists public.doc_ingest_log (
+      id uuid default gen_random_uuid() primary key,
+      task text,
+      gcs_uri text not null,
+      filename text,
+      brand text,
+      family_slug text,
+      series_hint text,
+      page_count integer,
+      rows integer,
+      ms integer,
+      note text,
+      created_at timestamptz default now()
+    );
   `);
 }
 

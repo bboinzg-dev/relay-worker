@@ -1,4 +1,4 @@
-/* server.js */
+﻿/* server.js */
 'use strict';
 
 const express = require('express');
@@ -16,14 +16,14 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 const app = express();
 
 
-// ✅ Cloud Tasks/JSON 본문 파싱은 라우트보다 반드시 먼저
+// ??Cloud Tasks/JSON 蹂몃Ц ?뚯떛? ?쇱슦?몃낫??諛섎뱶??癒쇱?
 /* ---------------- Mount modular routers (NEW) ---------------- */
 try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
 try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
 try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
 try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
-try { app.use(require('./routes/parts'));    console.log('[BOOT] mounted /api/parts/*'); } catch {}
+// removed duplicate/broken parts mount (mounted below via './src/routes/parts')
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
 try {
   app.use(require('./server.vision'));
@@ -32,7 +32,7 @@ try {
   console.error('[BOOT] failed to mount /api/vision/*', e);
 }
 
-app.use('/api/parts', require('./src/routes/parts'));   // ★ 추가
+app.use('/api/parts', require('./src/routes/parts'));   // ??異붽?
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.disable('x-powered-by');
@@ -78,10 +78,10 @@ app.use((req, res, next) => {
   next();
 });
 
-/* ---------------- Multer (파일 업로드) ---------------- */
+/* ---------------- Multer (?뚯씪 ?낅줈?? ---------------- */
 const upload = multer({ storage: multer.memoryStorage() });
 
-/* ---------------- 세션/인증 도우미 ---------------- */
+/* ---------------- ?몄뀡/?몄쬆 ?꾩슦誘?---------------- */
 function parseCookie(name, cookieHeader) {
   if (!cookieHeader) return null;
   const m = new RegExp(`(?:^|;\\s*)${name}=([^;]+)`).exec(cookieHeader);
@@ -114,8 +114,8 @@ app.get('/_env', (_req, res) => {
   });
 });
 
-/* ---------------- 파일 업로드(워커가 GCS에 저장) ---------------- */
-// /api/files/upload 와 /files/upload 둘 다 허용
+/* ---------------- ?뚯씪 ?낅줈???뚯빱媛 GCS????? ---------------- */
+// /api/files/upload ? /files/upload ?????덉슜
 app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok:false, error:'file required' });
@@ -207,7 +207,7 @@ app.get('/catalog/blueprint/:family', async (req, res) => {
   }
 });
 
-/* ---------------- Parts (예시: relay 검색/상세/대안) ---------------- */
+/* ---------------- Parts (?덉떆: relay 寃???곸꽭/??? ---------------- */
 app.get('/parts/search', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const limit = Math.min(Number(req.query.limit || 20), 100);
@@ -323,7 +323,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     const { gcsUri, gcsPdfUri, brand, code, series, display_name } = req.body || {};
     const uri = gcsUri || gcsPdfUri;
     if (!uri || !/^gs:\/\//i.test(uri)) {
-      // 시작 로그(FAILED)
+      // ?쒖옉 濡쒓렇(FAILED)
       await db.query(
         `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
          VALUES ($1,$2,$3,'FAILED',$4)`,
@@ -332,7 +332,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       return res.status(400).json({ ok:false, error:'gcsUri required (gs://...)' });
     }
 
-    // 시작 로그(PROCESSING)
+    // ?쒖옉 濡쒓렇(PROCESSING)
     const { rows:logRows } = await db.query(
       `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
        VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
@@ -347,9 +347,9 @@ const fam   = out?.family || out?.family_slug || null;
 const codes = Array.isArray(out?.codes) ? out.codes : [];
 const code0 = codes[0] || out?.code || null;
 const table = out?.specs_table || 'public.relay_power_specs';
-const dsUri = out?.datasheet_uri || uri; // 업로드 원본 URI를 로그에 보존
+const dsUri = out?.datasheet_uri || uri; // ?낅줈???먮낯 URI瑜?濡쒓렇??蹂댁〈
 
-// (선택) 실행 로그 테이블이 있다면 '종료' 레코드 적재
+// (?좏깮) ?ㅽ뻾 濡쒓렇 ?뚯씠釉붿씠 ?덈떎硫?'醫낅즺' ?덉퐫???곸옱
 try {
   await db.query(`
     create table if not exists public.ingest_run_logs (
@@ -371,7 +371,7 @@ try {
   console.warn('[ingest log skipped]', e?.message || e);
 }
 
-// 성공 로그(키 정합)
+// ?깃났 濡쒓렇(???뺥빀)
 console.log('[ingest 200]', {
   taskName: taskName ?? null,
   retryCnt: retryCnt ?? 0,
@@ -387,7 +387,7 @@ console.log('[ingest 200]', {
     return res.json(out);
 
   } catch (e) {
-    // 종료 로그(FAILED)
+    // 醫낅즺 濡쒓렇(FAILED)
     try {
       await db.query(
         `UPDATE public.ingest_run_logs
@@ -401,19 +401,19 @@ console.log('[ingest 200]', {
          LIMIT 1`,
         [ taskName, Date.now()-startedAt, String(e?.message || e) ]
       );
-    } catch (_) { /* 로그 실패는 무시 */ }
+    } catch (_) { /* 濡쒓렇 ?ㅽ뙣??臾댁떆 */ }
 
     console.error('[ingest 500]', { error: e?.message, stack: String(e?.stack || '').split('\n').slice(0,4).join(' | ') });
     return res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });
 
-/* ===== /auth 라우터: 스텁을 먼저, 있으면 매니저 덮어쓰기 (절대경로만 탐색) ===== */
+/* ===== /auth ?쇱슦?? ?ㅽ뀅??癒쇱?, ?덉쑝硫?留ㅻ땲? ??뼱?곌린 (?덈?寃쎈줈留??먯깋) ===== */
 (async () => {
   const path = require('path');
   const fs   = require('fs');
 
-  // 0) 항상 살아있는 스텁(먼저 마운트)
+  // 0) ??긽 ?댁븘?덈뒗 ?ㅽ뀅(癒쇱? 留덉슫??
   const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
   const mountStub = (r) => {
     r.get('/health', (_req,res)=> res.json({ ok:true, stub:true }));
@@ -436,7 +436,7 @@ console.log('[ingest 200]', {
   app.use('/api/worker/auth', stubAbs);
   console.log('[BOOT] mounted builtin auth stub (root & /auth)');
 
-  // 1) 배포 산출물 절대경로 후보만 탐색(없으면 스텁만 유지)
+  // 1) 諛고룷 ?곗텧臾??덈?寃쎈줈 ?꾨낫留??먯깋(?놁쑝硫??ㅽ뀅留??좎?)
   const candidates = [
     path.join(__dirname, 'dist/routes/manager.mjs'),
     path.join(__dirname, 'dist/routes/manager.js'),
@@ -449,13 +449,13 @@ console.log('[ingest 200]', {
   let loaded = false, lastErr = null;
   for (const p of candidates) {
     try {
-      fs.accessSync(p, fs.constants.R_OK);                 // 없으면 throw → 다음 후보
+      fs.accessSync(p, fs.constants.R_OK);                 // ?놁쑝硫?throw ???ㅼ쓬 ?꾨낫
       let mod;
       if (p.endsWith('.mjs')) mod = await import(p);       // ESM
       else                   mod = require(p);            // CJS/hybrid
       const authRouter = mod.default || mod;
 
-      // 2) 스텁 위에 매니저 라우터 덮어쓰기(절대/상대 경로 스타일 모두 수용)
+      // 2) ?ㅽ뀅 ?꾩뿉 留ㅻ땲? ?쇱슦????뼱?곌린(?덈?/?곷? 寃쎈줈 ?ㅽ???紐⑤몢 ?섏슜)
       app.use(authRouter);
       app.use('/auth', authRouter);
       app.use('/api/worker/auth', authRouter);
@@ -493,3 +493,4 @@ app.use((err, req, res, next) => {
 
 /* ---------------- Listen ---------------- */
 app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));
+

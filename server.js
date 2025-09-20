@@ -326,64 +326,48 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
 
     const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name });
 
-    console.log('[ingest 200]', {
+   // === BEGIN: ingest result mapping (drop-in) ===
+const fam   = out?.family || out?.family_slug || null;
+const codes = Array.isArray(out?.codes) ? out.codes : [];
+const code0 = codes[0] || out?.code || null;
+const table = out?.specs_table || 'public.relay_power_specs';
+const dsUri = out?.datasheet_uri || uri; // 업로드 원본 URI를 로그에 보존
+
+// (선택) 실행 로그 테이블이 있다면 '종료' 레코드 적재
+try {
+  await db.query(`
+    create table if not exists public.ingest_run_logs (
+      id uuid default gen_random_uuid() primary key,
+      task_name text, retry_count integer, gcs_uri text not null,
+      status text check (status in ('PROCESSING','SUCCEEDED','FAILED')),
+      pred_family_slug text, pred_brand text, pred_code text,
+      final_table text, final_family text, final_brand text, final_code text,
+      final_datasheet text, duration_ms integer, error_message text,
+      started_at timestamptz default now(), finished_at timestamptz
+    )`);
+  await db.query(
+    `insert into public.ingest_run_logs
+       (task_name,retry_count,gcs_uri,status,final_table,final_family,final_brand,final_code,final_datasheet,duration_ms,finished_at)
+     values ($1,$2,$3,'SUCCEEDED',$4,$5,$6,$7,$8,$9, now())`,
+    [taskName ?? null, retryCnt ?? 0, uri, table, fam, out?.brand ?? null, code0, dsUri, out?.ms ?? (Date.now() - startedAt)]
+  );
+} catch (e) {
+  console.warn('[ingest log skipped]', e?.message || e);
+}
+
+// 성공 로그(키 정합)
+console.log('[ingest 200]', {
   taskName: taskName ?? null,
   retryCnt: retryCnt ?? 0,
   ms: out?.ms ?? (Date.now() - startedAt),
-  // ↓ 반환 키에 맞게 조정
-  family: out?.family || out?.family_slug || null,
-  table: out?.specs_table || null,
+  family: fam,
+  table,
   brand: out?.brand ?? 'unknown',
-  code: out?.code ?? null,
-  rows: Array.isArray(out?.row) ? 1 : (typeof out?.rows === 'number' ? out.rows : undefined),
+  code: code0,
+  rows: (typeof out?.rows === 'number' ? out.rows : undefined),
 });
+// === END: ingest result mapping (drop-in) ===
 
-
-    // ---- runAutoIngest() 결과 키 표준화 (가급적 out의 실제 키에 맞추어 저장/로그) ----
-    const fam   = out?.family || out?.family_slug || null;
-    const codes = Array.isArray(out?.codes) ? out.codes : [];
-    const code0 = codes[0] || out?.code || null;
-    const table = out?.specs_table || 'public.relay_power_specs';
-    const dsUri = out?.datasheet_uri || uri;   // 기존 업로드 gcsUri(=uri)를 폴백
-
-    await db.query(
-      `UPDATE public.ingest_run_logs
-         SET finished_at = now(),
-             duration_ms = $2,
-             pred_family_slug = COALESCE(pred_family_slug, $3),
-             pred_brand = COALESCE(pred_brand, $4),
-             pred_code  = COALESCE(pred_code,  $5),
-             final_table = $6,
-             final_family= $7,
-             final_brand = $8,
-             final_code  = $9,
-             final_datasheet = $10,
-             status = 'SUCCEEDED'
-       WHERE id = $1`,
-      [
-        runId,
-        Date.now() - startedAt,
-        fam,
-        out?.brand || null,
-        code0,
-        table,
-        fam,
-        out?.brand || null,
-        code0,
-        dsUri
-      ]
-    );
-
-    console.log('[ingest 200]', {
-      taskName,
-      retryCnt,
-      ms: out?.ms ?? (Date.now() - startedAt),
-      family: fam,
-      table,
-      brand: out?.brand ?? 'unknown',
-      code: code0,
-      rows: (typeof out?.rows === 'number' ? out.rows : undefined),
-    });
     return res.json(out);
 
   } catch (e) {

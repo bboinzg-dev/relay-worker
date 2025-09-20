@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 const db = require('../utils/db');
 const { extractDataset } = require('../utils/extract');
@@ -6,7 +6,7 @@ const { extractDataset } = require('../utils/extract');
 async function runAutoIngest({ gcsUri, filename, family_slug, brand, code, series, display_name }) {
   const t0 = Date.now();
 
-  // 1) ?곗씠?곗뀑 異붿텧 (DocAI ??遺議???Vertex)
+  // 1) 데이터셋 추출 (DocAI → 부족 시 Vertex)
   const ds = await extractDataset({
     gcsUri,
     filename,
@@ -16,13 +16,13 @@ async function runAutoIngest({ gcsUri, filename, family_slug, brand, code, serie
     seriesHint: series,
   });
 
-  // 2) ?⑤?由?寃곗젙
+  // 2) 패밀리 결정
   const family = family_slug || guessFamilyByBrand(ds.brand) || 'relay_power';
 
-  // 3) ?ㅽ럺 ?뚯씠釉?蹂댁옣
+  // 3) 스펙 테이블 보장
   await ensureRelayPowerTable();
 
-  // 4) ?낆꽌??(以묐났 ?쒓굅)
+  // 4) 업서트 (중복 제거)
   const rows = dedupeRows(ds.rows);
   let inserted = 0;
   for (const row of rows) {
@@ -30,7 +30,7 @@ async function runAutoIngest({ gcsUri, filename, family_slug, brand, code, serie
       `insert into public.relay_power_specs
          (brand, brand_norm, code, code_norm, family_slug, series, displayname, datasheet_uri, verified_in_doc, created_at)
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
-       on conflict (brand_norm, code_norm, family_slug) do update set datasheet_uri=excluded.datasheet_uri, series=excluded.series, displayname=excluded.displayname, verified_in_doc=excluded.verified_in_doc`,
+       on conflict (brand_norm, code_norm, family_slug) do nothing`,
       [
         ds.brand || null,
         norm(ds.brand),
@@ -46,7 +46,7 @@ async function runAutoIngest({ gcsUri, filename, family_slug, brand, code, serie
     inserted++;
   }
 
-  // 5) ?붿빟 濡쒓렇(?좏깮)
+  // 5) 요약 로그(선택)
   await db.query(
     `create table if not exists public.doc_ingest_log (
       id uuid default gen_random_uuid() primary key,
@@ -119,4 +119,3 @@ async function ensureRelayPowerTable() {
 }
 
 module.exports = { runAutoIngest };
-

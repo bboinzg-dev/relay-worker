@@ -115,7 +115,33 @@ app.post('/api/vision/guess', upload.single('file'), async (req, res) => {
       nearest = r.rows;
     }
 
-    + res.json({
+    // nearest 보강
+const out = [];
+for (const r0 of nearest) {
+  const famLabelRow = await db.query(
+    `SELECT display_name FROM public.component_registry WHERE family_slug = $1 LIMIT 1`,
+    [r0.family_slug]
+  );
+  const famLabel = famLabelRow.rows[0]?.display_name || null;
+
+  let hero = null;
+  if (r0.brand && r0.code) {
+    const img = await db.query(
+      `SELECT gcs_uri FROM public.image_index
+       WHERE brand_norm = lower($1) AND code_norm = lower($2)
+       ORDER BY created_at DESC LIMIT 1`,
+      [r0.brand, r0.code]
+    );
+    const gcs = img.rows[0]?.gcs_uri || null;
+    hero = gcs ? gcs.replace(/^gs:\/\//, 'https://storage.googleapis.com/') : null;
+  }
+
+  out.push({ ...r0, family_label: famLabel, hero_image_url: hero });
+}
+nearest = out;
+
+
+     res.json({
    ok: true,
    guess: {
      family_slug: guess.family_slug || null,

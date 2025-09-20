@@ -1,0 +1,199 @@
+
+// server.market.js
+'use strict';
+
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const db = require('./src/utils/db');
+const { parseActor, hasRole } = require('./src/utils/auth');
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json({ limit: '10mb' }));
+
+function pick(h, k) { return h[k] || h[k.toLowerCase()] || h[k.toUpperCase()] || undefined; }
+function getTenant(req) {
+  // tenant via header (can be empty for single-tenant)
+  const t = pick(req.headers || {}, 'x-actor-tenant') || null;
+  return t;
+}
+
+/* ---------------- Listings (정찰제/재고) ---------------- */
+
+// GET /api/listings?brand=&code=&status=active
+app.get('/api/listings', async (req, res) => {
+  try {
+    const brand = (req.query.brand || '').toString();
+    const code  = (req.query.code  || '').toString();
+    const status = (req.query.status || 'active').toString();
+    const where = [];
+    const args = [];
+    if (brand) { args.push(brand); where.push(`brand_norm = lower($${args.length})`); }
+    if (code)  { args.push(code);  where.push(`code_norm  = lower($${args.length})`); }
+    if (status) { args.push(status); where.push(`status = $${args.length}`); }
+    const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents, currency, lead_time_days, moq, mpq, location, condition, packaging, note, status, created_at
+                 FROM public.listings
+                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                 ORDER BY created_at DESC
+                 LIMIT 200`;
+    const r = await db.query(sql, args);
+    res.json({ ok: true, items: r.rows });
+  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+});
+
+// POST /api/listings  (seller 전용)
+app.post('/api/listings', async (req, res) => {
+  try {
+    const actor = parseActor(req);
+    if (!hasRole(actor, 'seller', 'admin')) return res.status(403).json({ error: 'seller role required' });
+    const t = getTenant(req);
+    const b = req.body || {};
+    const sql = `INSERT INTO public.listings
+      (tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,'USD'),$10,$11,$12,$13,$14,COALESCE($15,'pending'))
+      RETURNING *`;
+    const r = await db.query(sql, [
+      t, actor.id || null, b.brand, b.code, Number(b.qty_available||0),
+      b.moq || null, b.mpq || null,
+      Number(b.unit_price_cents||0), b.currency || 'USD',
+      b.lead_time_days || null, b.location || null, b.condition || null, b.packaging || null, b.note || null,
+      b.status || 'pending',
+    ]);
+    res.json({ ok: true, item: r.rows[0] });
+  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+});
+
+// POST /api/listings/:id/purchase  → 주문 생성(간이)
+app.post('/api/listings/:id/purchase', async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const actor = parseActor(req);
+    if (!actor?.id) return res.status(401).json({ error: 'auth required' });
+    const id = (req.params.id || '').toString();
+    const qty = Number(req.body?.qty || 0);
+    if (!id || qty <= 0) return res.status(400).json({ error: 'id & qty required' });
+
+    await client.query('BEGIN');
+    const L = (await client.query(`SELECT * FROM public.listings WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+    if (!L) throw new Error('listing not found');
+    if (L.status !== 'active') throw new Error('listing not active');
+    if (Number(L.qty_available) < qty) throw new Error('insufficient qty');
+
+    const subtotal = qty * Number(L.unit_price_cents);
+    const ord = await client.query(`
+      INSERT INTO public.orders (order_no, tenant_id, buyer_id, status, currency, subtotal_cents, tax_cents, shipping_cents, total_cents, notes)
+      VALUES ('O'||nextval('seq_order_no')::text, $1,$2,'awaiting_payment',$3,$4,0,0,$4,$5)
+      RETURNING *`, [L.tenant_id || null, actor.id || null, L.currency || 'USD', subtotal, req.body?.notes || null]);
+    const O = ord.rows[0];
+    await client.query(`
+      INSERT INTO public.order_items (order_id, brand, code, qty, unit_price_cents, currency, listing_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)`, [O.id, L.brand, L.code, qty, L.unit_price_cents, L.currency || 'USD', L.id]);
+    const remain = Number(L.qty_available) - qty;
+    await client.query(`UPDATE public.listings SET qty_available=$2, status=CASE WHEN $2=0 THEN 'soldout' ELSE status END, updated_at=now() WHERE id=$1`, [L.id, remain]);
+    await client.query('COMMIT');
+    res.json({ ok: true, order: O, remaining: remain });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) });
+  } finally { client.release(); }
+});
+
+/* ---------------- Purchase Requests (경매/RFQ) ---------------- */
+
+app.get('/api/purchase-requests', async (req, res) => {
+  try {
+    const brand = (req.query.brand || '').toString();
+    const code  = (req.query.code  || '').toString();
+    const where = [];
+    const args = [];
+    if (brand) { args.push(brand); where.push(`brand_norm = lower($${args.length})`); }
+    if (code)  { args.push(code);  where.push(`code_norm  = lower($${args.length})`); }
+    const sql = `SELECT * FROM public.purchase_requests
+                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                 ORDER BY created_at DESC LIMIT 200`;
+    const r = await db.query(sql, args);
+    res.json({ ok: true, items: r.rows });
+  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+});
+
+app.post('/api/purchase-requests', async (req, res) => {
+  try {
+    const actor = parseActor(req);
+    const t = getTenant(req);
+    const b = req.body || {};
+    const sql = `INSERT INTO public.purchase_requests
+      (tenant_id, buyer_id, brand, code, qty_required, need_by_date, target_unit_price_cents, allow_substitutes, notes, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,true),$9,'open')
+      RETURNING *`;
+    const r = await db.query(sql, [
+      t, actor.id || null, b.brand, b.code, Number(b.qty || b.qty_required || 0),
+      b.need_by_date || null, b.target_unit_price_cents || null, b.allow_substitutes !== false,
+      b.notes || b.note || null
+    ]);
+    res.json({ ok: true, item: r.rows[0] });
+  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+});
+
+// Confirm a bid; reduce outstanding qty in PR
+app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const prId = (req.params.id || '').toString();
+    const bidId = (req.body?.bid_id || '').toString();
+    const confirmQty = Number(req.body?.confirm_qty || 0);
+    if (!prId || !bidId || confirmQty <= 0) return res.status(400).json({ error: 'prId, bid_id, confirm_qty required' });
+
+    await client.query('BEGIN');
+    const PR = (await client.query(`SELECT * FROM public.purchase_requests WHERE id=$1 FOR UPDATE`, [prId])).rows[0];
+    if (!PR) throw new Error('PR not found');
+    const BID = (await client.query(`SELECT * FROM public.bids WHERE id=$1 AND purchase_request_id=$2 FOR UPDATE`, [bidId, prId])).rows[0];
+    if (!BID) throw new Error('bid not found');
+    const remaining = Number(PR.qty_required) - Number(PR.qty_confirmed);
+    if (confirmQty > remaining) throw new Error('confirm exceeds remaining');
+
+    await client.query(`UPDATE public.bids SET status='accepted', updated_at=now() WHERE id=$1`, [bidId]);
+    const newConfirmed = Number(PR.qty_confirmed) + confirmQty;
+    const newStatus = newConfirmed >= Number(PR.qty_required) ? 'fulfilled' : 'partial';
+    await client.query(`UPDATE public.purchase_requests SET qty_confirmed=$2, status=$3 WHERE id=$1`, [prId, newConfirmed, newStatus]);
+    await client.query('COMMIT');
+    res.json({ ok: true, qty_confirmed: newConfirmed, status: newStatus });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) });
+  } finally { client.release(); }
+});
+
+/* ---------------- Bids ---------------- */
+
+app.get('/api/bids', async (req, res) => {
+  try {
+    const prId = (req.query.pr || req.query.purchase_request_id || '').toString();
+    const args = []; let where = '';
+    if (prId) { args.push(prId); where = 'WHERE purchase_request_id = $1'; }
+    const r = await db.query(`SELECT * FROM public.bids ${where} ORDER BY created_at DESC LIMIT 200`, args);
+    res.json({ ok: true, items: r.rows });
+  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+});
+
+app.post('/api/bids', async (req, res) => {
+  try {
+    const actor = parseActor(req);
+    if (!hasRole(actor, 'seller', 'admin')) return res.status(403).json({ error: 'seller role required' });
+    const t = getTenant(req);
+    const b = req.body || {};
+    const sql = `INSERT INTO public.bids
+      (tenant_id, purchase_request_id, seller_id, offer_brand, offer_code, offer_is_substitute, offer_qty, unit_price_cents, currency, lead_time_days, note, status)
+      VALUES ($1,$2,$3,$4,$5,COALESCE($6,false),$7,$8,COALESCE($9,'USD'),$10,$11,'offered')
+      RETURNING *`;
+    const r = await db.query(sql, [
+      t, b.purchase_request_id, actor.id || null,
+      b.offer_brand || null, b.offer_code || null, !!b.offer_is_substitute,
+      Number(b.offer_qty || 0), Number(b.unit_price_cents || 0),
+      b.currency || 'USD', b.lead_time_days || null, b.note || null
+    ]);
+    res.json({ ok: true, item: r.rows[0] });
+  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+});
+
+module.exports = app;

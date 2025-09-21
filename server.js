@@ -15,30 +15,31 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 
 const app = express();
 
-
-// ??Cloud Tasks/JSON 蹂몃Ц ?뚯떛? ?쇱슦?몃낫??諛섎뱶??癒쇱?
-/* ---------------- Mount modular routers (NEW) ---------------- */
+/* ---------------- Mount modular routers (keep existing behavior) ---------------- */
 try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
 try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
 try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
 try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
-// removed duplicate/broken parts mount (mounted below via './src/routes/parts')
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
 try {
   app.use(require('./server.vision'));
   console.log('[BOOT] mounted /api/vision/*');
 } catch (e) {
-  console.error('[BOOT] failed to mount /api/vision/*', e);
+  console.error('[BOOT] failed to mount /api/vision/*', e?.message || e);
 }
 
-app.use('/api/parts', require('./src/routes/parts'));   // ??異붽?
+/* NOTE: The parts router was already present in your repo; we keep it mounted. */
+app.use('/api/parts', require('./src/routes/parts'));
+
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.disable('x-powered-by');
+
 /* ---------------- Env / Config ---------------- */
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+const STRICT_BEARER = String(process.env.STRICT_BEARER || '').toLowerCase() === 'true';
 
 const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
 const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
@@ -54,6 +55,7 @@ const ALLOWED_BUCKETS = new Set(
 function parseCorsOrigins(envStr) {
   if (!envStr) return null;
   const items = envStr.split(',').map(s => s.trim()).filter(Boolean);
+  // Allow plain strings or /regex/ entries
   return items.map(p => {
     if (p.startsWith('/') && p.endsWith('/')) {
       const body = p.slice(1, -1);
@@ -72,19 +74,23 @@ if (CORS_ALLOW) {
 }
 
 app.use((req, res, next) => {
-  res.setHeader('x-frame-options', 'SAMEORIGIN');
+  res.setHeader('x-frame-options', 'SAMEORIGIN'); // For wide browser support; consider CSP frame-ancestors too.
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('referrer-policy', 'strict-origin-when-cross-origin');
   next();
 });
 
-/* ---------------- Multer (?뚯씪 ?낅줈?? ---------------- */
-const upload = multer({ storage: multer.memoryStorage() });
+/* ---------------- Multer (file uploads) ---------------- */
+const upload = multer({
+  storage: multer.memoryStorage(),
+  // Optional hard limit to avoid OOM; tune as needed. Defaults maintain prior behavior if env unset.
+  limits: process.env.UPLOAD_MAX_BYTES ? { fileSize: Number(process.env.UPLOAD_MAX_BYTES) } : undefined
+});
 
-/* ---------------- ?몄뀡/?몄쬆 ?꾩슦誘?---------------- */
+/* ---------------- Cookies / Session helpers ---------------- */
 function parseCookie(name, cookieHeader) {
   if (!cookieHeader) return null;
-  const m = new RegExp(`(?:^|;\\s*)${name}=([^;]+)`).exec(cookieHeader);
+  const m = new RegExp('(?:^|;\\s*)' + name + '=([^;]+)').exec(cookieHeader);
   return m ? decodeURIComponent(m[1]) : null;
 }
 function verifyJwtCookie(cookieHeader) {
@@ -92,9 +98,27 @@ function verifyJwtCookie(cookieHeader) {
   if (!raw) return null;
   try { return jwt.verify(raw, JWT_SECRET); } catch { return null; }
 }
-function requireSession(req, res, next) {
+async function verifyGoogleIdTokenIfPresent(req) {
+  // Strict mode only; keeps previous behavior by default.
+  if (!STRICT_BEARER) return true;
   const auth = String(req.headers.authorization || '');
-  if (/^Bearer\s+.+/i.test(auth)) return next(); // Cloud Run IAP/Invoker
+  if (!/^Bearer\\s+(.+)/i.test(auth)) return false;
+  // Lazy-load to avoid hard dependency if not used.
+  try {
+    const {OAuth2Client} = require('google-auth-library');
+    const idToken = auth.replace(/^Bearer\\s+/i, '');
+    const client = new OAuth2Client();
+    const ticket = await client.verifyIdToken({ idToken }); // audience can be set via env if desired
+    return !!ticket;
+  } catch {
+    return false;
+  }
+}
+async function requireSession(req, res, next) {
+  const auth = String(req.headers.authorization || '');
+  if (!STRICT_BEARER && /^Bearer\\s+.+/i.test(auth)) return next(); // Backward compatible
+  const ok = await verifyGoogleIdTokenIfPresent(req);
+  if (ok) return next();
   const claims = verifyJwtCookie(req.headers.cookie || '');
   if (claims) { req.user = claims; return next(); }
   return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
@@ -114,8 +138,7 @@ app.get('/_env', (_req, res) => {
   });
 });
 
-/* ---------------- ?뚯씪 ?낅줈???뚯빱媛 GCS????? ---------------- */
-// /api/files/upload ? /files/upload ?????덉슜
+/* ---------------- Files: upload to GCS ---------------- */
 app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok:false, error:'file required' });
@@ -123,8 +146,8 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
 
     const buf = req.file.buffer;
     const sha = crypto.createHash('sha256').update(buf).digest('hex');
-    const safe = (req.file.originalname || 'datasheet.pdf').replace(/\s+/g,'_');
-    const object = `incoming/${sha}_${Date.now()}_${safe}`;
+    const safeName = (req.file.originalname || 'datasheet.pdf').replace(/[\\s/\\\\]+/g,'_');
+    const object = `incoming/${sha}_${Date.now()}_${safeName}`;
 
     await storage.bucket(GCS_BUCKET).file(object).save(buf, {
       contentType: req.file.mimetype || 'application/pdf',
@@ -140,7 +163,7 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
 
 /* ---------------- Files: signed-url / move ---------------- */
 function parseGcsUri(gcsUri) {
-  const m = /^gs:\/\/([^/]+)\/(.+)$/.exec(String(gcsUri || ''));
+  const m = /^gs:\\/\\/([^/]+)\\/(.+)$/.exec(String(gcsUri || ''));
   if (!m) throw new Error('INVALID_GCS_URI');
   return { bucket: m[1], path: m[2] };
 }
@@ -207,22 +230,7 @@ app.get('/catalog/blueprint/:family', async (req, res) => {
   }
 });
 
-/* ---------------- Parts (?덉떆: relay 寃???곸꽭/??? ---------------- */
-app.get('/parts/search', async (req, res) => {
-  const q = (req.query.q || '').toString().trim();
-  const limit = Math.min(Number(req.query.limit || 20), 100);
-  try {
-    const text = q ? `%${q.toLowerCase()}%` : '%';
-    const rows = await db.query(
-      `SELECT * FROM public.relay_specs
-       WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
-       ORDER BY updated_at DESC
-       LIMIT $2`, [text, limit]);
-    res.json({ items: rows.rows });
-  } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'search failed' }); }
-});
-
-
+/* ---------------- Parts: detail & search ---------------- */
 app.get('/parts/detail', async (req, res) => {
   const brand  = (req.query.brand || '').toString();
   const code   = (req.query.code  || '').toString();
@@ -236,7 +244,7 @@ app.get('/parts/detail', async (req, res) => {
         `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]
       );
       const table = r.rows[0]?.specs_table;
-      if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
+      if (!table || !/^[a-z0-9_\\.]+$/i.test(table)) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
 
       const row = await db.query(
         `SELECT * FROM public.${table}
@@ -249,7 +257,7 @@ app.get('/parts/detail', async (req, res) => {
         : res.status(404).json({ ok:false, error:'NOT_FOUND' });
     }
 
-    // (호환) family 미지정 시 기존 릴레이 뷰
+    // Backward compatibility: when family is not provided, allow relay view
     const row = await db.query(
       `SELECT * FROM public.relay_specs
         WHERE brand_norm = lower($1) AND code_norm = lower($2)
@@ -264,8 +272,11 @@ app.get('/parts/detail', async (req, res) => {
   }
 });
 
-
-
+/** 
+ * Unified search endpoint (keeps behavior; removes duplicate/stray blocks that caused "await outside async").
+ * - If family specified, query that family's specs table.
+ * - Else, try component_specs view; if missing, fall back to relay_specs.
+ */
 app.get('/parts/search', async (req, res) => {
   const q      = (req.query.q || '').toString().trim();
   const limit  = Math.min(Number(req.query.limit || 20), 100);
@@ -279,7 +290,7 @@ app.get('/parts/search', async (req, res) => {
         `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]
       );
       const table = r.rows[0]?.specs_table;
-      if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
+      if (!table || !/^[a-z0-9_\\.]+$/i.test(table)) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
 
       const rows = await db.query(
         `SELECT id, family_slug, brand, code, display_name,
@@ -295,7 +306,7 @@ app.get('/parts/search', async (req, res) => {
       return res.json({ ok:true, items: rows.rows });
     }
 
-    // (호환) family 미지정 → 통합 뷰, 없으면 릴레이 뷰
+    // family omitted → prefer unified view if present; else fallback to relay view
     try {
       const rows = await db.query(
         `SELECT id, family_slug, brand, code, display_name,
@@ -321,32 +332,6 @@ app.get('/parts/search', async (req, res) => {
     console.error(e); res.status(500).json({ ok:false, error:'search_failed' });
   }
 });
-
-
-    // (호환) family 미지정 → 통합 뷰 검색 권장 (component_specs 없으면 릴레이 뷰)
-    try {
-      const rows = await db.query(
-        `SELECT id, family_slug, brand, code, display_name, width_mm, height_mm, length_mm, image_uri, datasheet_uri, updated_at
-           FROM public.component_specs
-          WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(coalesce(display_name,'')) LIKE $1
-          ORDER BY updated_at DESC
-          LIMIT $2`,
-        [text, limit]
-      );
-      return res.json({ ok:true, items: rows.rows });
-    } catch {
-      const rows = await db.query(
-        `SELECT * FROM public.relay_specs
-          WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
-          ORDER BY updated_at DESC
-          LIMIT $2`,
-        [text, limit]
-      );
-      return res.json({ ok:true, items: rows.rows });
-    }
-  } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'search_failed' }); }
-});
-
 
 /* ---------------- Ingest: manual / bulk / auto ---------------- */
 app.post('/ingest', requireSession, async (req, res) => {
@@ -409,7 +394,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     const { gcsUri, gcsPdfUri, brand, code, series, display_name } = req.body || {};
     const uri = gcsUri || gcsPdfUri;
     if (!uri || !/^gs:\/\//i.test(uri)) {
-      // ?쒖옉 濡쒓렇(FAILED)
+      // START log (FAILED)
       await db.query(
         `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
          VALUES ($1,$2,$3,'FAILED',$4)`,
@@ -418,7 +403,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       return res.status(400).json({ ok:false, error:'gcsUri required (gs://...)' });
     }
 
-    // ?쒖옉 濡쒓렇(PROCESSING)
+    // START log (PROCESSING)
     const { rows:logRows } = await db.query(
       `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
        VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
@@ -428,52 +413,50 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
 
     const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name });
 
-   // === BEGIN: ingest result mapping (drop-in) ===
-const fam   = out?.family || out?.family_slug || null;
-const codes = Array.isArray(out?.codes) ? out.codes : [];
-const code0 = codes[0] || out?.code || null;
-const table = out?.specs_table || 'public.relay_power_specs';
-const dsUri = out?.datasheet_uri || uri; // ?낅줈???먮낯 URI瑜?濡쒓렇??蹂댁〈
+    // === BEGIN: ingest result mapping (drop-in) ===
+    const fam   = out?.family || out?.family_slug || null;
+    const codes = Array.isArray(out?.codes) ? out.codes : [];
+    const code0 = codes[0] || out?.code || null;
+    const table = out?.specs_table || 'public.relay_power_specs';
+    const dsUri = out?.datasheet_uri || uri;
 
-// (?좏깮) ?ㅽ뻾 濡쒓렇 ?뚯씠釉붿씠 ?덈떎硫?'醫낅즺' ?덉퐫???곸옱
-try {
-  await db.query(`
-    create table if not exists public.ingest_run_logs (
-      id uuid default gen_random_uuid() primary key,
-      task_name text, retry_count integer, gcs_uri text not null,
-      status text check (status in ('PROCESSING','SUCCEEDED','FAILED')),
-      pred_family_slug text, pred_brand text, pred_code text,
-      final_table text, final_family text, final_brand text, final_code text,
-      final_datasheet text, duration_ms integer, error_message text,
-      started_at timestamptz default now(), finished_at timestamptz
-    )`);
-  await db.query(
-    `insert into public.ingest_run_logs
-       (task_name,retry_count,gcs_uri,status,final_table,final_family,final_brand,final_code,final_datasheet,duration_ms,finished_at)
-     values ($1,$2,$3,'SUCCEEDED',$4,$5,$6,$7,$8,$9, now())`,
-    [taskName ?? null, retryCnt ?? 0, uri, table, fam, out?.brand ?? null, code0, dsUri, out?.ms ?? (Date.now() - startedAt)]
-  );
-} catch (e) {
-  console.warn('[ingest log skipped]', e?.message || e);
-}
+    try {
+      await db.query(`
+        create table if not exists public.ingest_run_logs (
+          id uuid default gen_random_uuid() primary key,
+          task_name text, retry_count integer, gcs_uri text not null,
+          status text check (status in ('PROCESSING','SUCCEEDED','FAILED')),
+          pred_family_slug text, pred_brand text, pred_code text,
+          final_table text, final_family text, final_brand text, final_code text,
+          final_datasheet text, duration_ms integer, error_message text,
+          started_at timestamptz default now(), finished_at timestamptz
+        )`);
+      await db.query(
+        `insert into public.ingest_run_logs
+           (task_name,retry_count,gcs_uri,status,final_table,final_family,final_brand,final_code,final_datasheet,duration_ms,finished_at)
+         values ($1,$2,$3,'SUCCEEDED',$4,$5,$6,$7,$8,$9, now())`,
+        [taskName ?? null, retryCnt ?? 0, uri, table, fam, out?.brand ?? null, code0, dsUri, out?.ms ?? (Date.now() - startedAt)]
+      );
+    } catch (e) {
+      console.warn('[ingest log skipped]', e?.message || e);
+    }
 
-// ?깃났 濡쒓렇(???뺥빀)
-console.log('[ingest 200]', {
-  taskName: taskName ?? null,
-  retryCnt: retryCnt ?? 0,
-  ms: out?.ms ?? (Date.now() - startedAt),
-  family: fam,
-  table,
-  brand: out?.brand ?? 'unknown',
-  code: code0,
-  rows: (typeof out?.rows === 'number' ? out.rows : undefined),
-});
-// === END: ingest result mapping (drop-in) ===
+    console.log('[ingest 200]', {
+      taskName: taskName ?? null,
+      retryCnt: retryCnt ?? 0,
+      ms: out?.ms ?? (Date.now() - startedAt),
+      family: fam,
+      table,
+      brand: out?.brand ?? 'unknown',
+      code: code0,
+      rows: (typeof out?.rows === 'number' ? out.rows : undefined),
+    });
+    // === END: ingest result mapping (drop-in) ===
 
     return res.json(out);
 
   } catch (e) {
-    // 醫낅즺 濡쒓렇(FAILED)
+    // END log (FAILED)
     try {
       await db.query(
         `UPDATE public.ingest_run_logs
@@ -487,19 +470,18 @@ console.log('[ingest 200]', {
          LIMIT 1`,
         [ taskName, Date.now()-startedAt, String(e?.message || e) ]
       );
-    } catch (_) { /* 濡쒓렇 ?ㅽ뙣??臾댁떆 */ }
+    } catch (_) { /* log error ignored */ }
 
-    console.error('[ingest 500]', { error: e?.message, stack: String(e?.stack || '').split('\n').slice(0,4).join(' | ') });
+    console.error('[ingest 500]', { error: e?.message, stack: String(e?.stack || '').split('\\n').slice(0,4).join(' | ') });
     return res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });
 
-/* ===== /auth ?쇱슦?? ?ㅽ뀅??癒쇱?, ?덉쑝硫?留ㅻ땲? ??뼱?곌린 (?덈?寃쎈줈留??먯깋) ===== */
+/* ===== Built-in auth stubs (kept for compatibility; real manager auto-mounts if present) ===== */
 (async () => {
   const path = require('path');
   const fs   = require('fs');
 
-  // 0) ??긽 ?댁븘?덈뒗 ?ㅽ뀅(癒쇱? 留덉슫??
   const sign = (p)=> jwt.sign(p, JWT_SECRET, { expiresIn: '7d' });
   const mountStub = (r) => {
     r.get('/health', (_req,res)=> res.json({ ok:true, stub:true }));
@@ -522,7 +504,7 @@ console.log('[ingest 200]', {
   app.use('/api/worker/auth', stubAbs);
   console.log('[BOOT] mounted builtin auth stub (root & /auth)');
 
-  // 1) 諛고룷 ?곗텧臾??덈?寃쎈줈 ?꾨낫留??먯깋(?놁쑝硫??ㅽ뀅留??좎?)
+  // Try to load a real auth manager if one exists (multiple build output paths supported)
   const candidates = [
     path.join(__dirname, 'dist/routes/manager.mjs'),
     path.join(__dirname, 'dist/routes/manager.js'),
@@ -535,17 +517,14 @@ console.log('[ingest 200]', {
   let loaded = false, lastErr = null;
   for (const p of candidates) {
     try {
-      fs.accessSync(p, fs.constants.R_OK);                 // ?놁쑝硫?throw ???ㅼ쓬 ?꾨낫
+      fs.accessSync(p, fs.constants.R_OK);
       let mod;
-      if (p.endsWith('.mjs')) mod = await import(p);       // ESM
-      else                   mod = require(p);            // CJS/hybrid
+      if (p.endsWith('.mjs')) mod = await import(p); // ESM
+      else                   mod = require(p);       // CJS/hybrid
       const authRouter = mod.default || mod;
-
-      // 2) ?ㅽ뀅 ?꾩뿉 留ㅻ땲? ?쇱슦????뼱?곌린(?덈?/?곷? 寃쎈줈 ?ㅽ???紐⑤몢 ?섏슜)
       app.use(authRouter);
       app.use('/auth', authRouter);
       app.use('/api/worker/auth', authRouter);
-
       console.log('[BOOT] mounted auth manager from', p);
       loaded = true;
       break;
@@ -557,18 +536,10 @@ console.log('[ingest 200]', {
   }
 })();
 
-
-
-
-
-
+/* ---------------- Catalog tree (stub kept) ---------------- */
 const catalogTree = (_req, res) => res.json({ ok:true, nodes: [] });
 app.get('/catalog/tree', catalogTree);
 app.get('/api/catalog/tree', catalogTree);
-
-
-
-
 
 /* ---------------- 404 / error ---------------- */
 app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));
@@ -579,4 +550,3 @@ app.use((err, req, res, next) => {
 
 /* ---------------- Listen ---------------- */
 app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));
-

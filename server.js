@@ -9,13 +9,19 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
 const db = require('./src/utils/db');
-const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage } = require('./src/utils/gcs');
+const {
+  getSignedUrl,
+  canonicalDatasheetPath,
+  canonicalCoverPath,
+  moveObject,
+  storage
+} = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 
 const app = express();
 
-/* ---------------- Mount modular routers (keep existing behavior) ---------------- */
+/* ---------------- Mount modular routers (keep existing) ---------------- */
 try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
 try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
 try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
@@ -29,9 +35,9 @@ try {
   console.error('[BOOT] failed to mount /api/vision/*', e?.message || e);
 }
 
-/* NOTE: The parts router was already present in your repo; we keep it mounted. */
-app.use('/api/parts', require('./src/routes/parts'));
+try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
 
+/* ---------------- Core middleware ---------------- */
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.disable('x-powered-by');
@@ -39,7 +45,6 @@ app.disable('x-powered-by');
 /* ---------------- Env / Config ---------------- */
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
-const STRICT_BEARER = String(process.env.STRICT_BEARER || '').toLowerCase() === 'true';
 
 const GCS_BUCKET_URI = process.env.GCS_BUCKET || '';
 const GCS_BUCKET = GCS_BUCKET_URI.startsWith('gs://')
@@ -55,42 +60,28 @@ const ALLOWED_BUCKETS = new Set(
 function parseCorsOrigins(envStr) {
   if (!envStr) return null;
   const items = envStr.split(',').map(s => s.trim()).filter(Boolean);
-  // Allow plain strings or /regex/ entries
-  return items.map(p => {
-    if (p.startsWith('/') && p.endsWith('/')) {
-      const body = p.slice(1, -1);
-      return new RegExp(body);
-    }
-    return p;
-  });
+  return items.map(p => (p.startsWith('/') && p.endsWith('/')) ? new RegExp(p.slice(1, -1)) : p);
 }
 const CORS_ALLOW = parseCorsOrigins(process.env.CORS_ALLOW_ORIGINS);
 
-/* ---------------- CORS / Security ---------------- */
-if (CORS_ALLOW) {
-  app.use(cors({ origin: CORS_ALLOW, credentials: true }));
-} else {
-  app.use(cors());
-}
+/* ---------------- CORS / Security headers ---------------- */
+if (CORS_ALLOW) app.use(cors({ origin: CORS_ALLOW, credentials: true }));
+else app.use(cors());
 
 app.use((req, res, next) => {
-  res.setHeader('x-frame-options', 'SAMEORIGIN'); // For wide browser support; consider CSP frame-ancestors too.
+  res.setHeader('x-frame-options', 'SAMEORIGIN');
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('referrer-policy', 'strict-origin-when-cross-origin');
   next();
 });
 
-/* ---------------- Multer (file uploads) ---------------- */
-const upload = multer({
-  storage: multer.memoryStorage(),
-  // Optional hard limit to avoid OOM; tune as needed. Defaults maintain prior behavior if env unset.
-  limits: process.env.UPLOAD_MAX_BYTES ? { fileSize: Number(process.env.UPLOAD_MAX_BYTES) } : undefined
-});
+/* ---------------- Multer (file upload) ---------------- */
+const upload = multer({ storage: multer.memoryStorage() });
 
-/* ---------------- Cookies / Session helpers ---------------- */
+/* ---------------- Cookie/JWT helpers ---------------- */
 function parseCookie(name, cookieHeader) {
   if (!cookieHeader) return null;
-  const m = new RegExp('(?:^|;\\s*)' + name + '=([^;]+)').exec(cookieHeader);
+  const m = new RegExp(`(?:^|;\\s*)${name}=([^;]+)`).exec(cookieHeader);
   return m ? decodeURIComponent(m[1]) : null;
 }
 function verifyJwtCookie(cookieHeader) {
@@ -98,27 +89,9 @@ function verifyJwtCookie(cookieHeader) {
   if (!raw) return null;
   try { return jwt.verify(raw, JWT_SECRET); } catch { return null; }
 }
-async function verifyGoogleIdTokenIfPresent(req) {
-  // Strict mode only; keeps previous behavior by default.
-  if (!STRICT_BEARER) return true;
+function requireSession(req, res, next) {
   const auth = String(req.headers.authorization || '');
-  if (!/^Bearer\\s+(.+)/i.test(auth)) return false;
-  // Lazy-load to avoid hard dependency if not used.
-  try {
-    const {OAuth2Client} = require('google-auth-library');
-    const idToken = auth.replace(/^Bearer\\s+/i, '');
-    const client = new OAuth2Client();
-    const ticket = await client.verifyIdToken({ idToken }); // audience can be set via env if desired
-    return !!ticket;
-  } catch {
-    return false;
-  }
-}
-async function requireSession(req, res, next) {
-  const auth = String(req.headers.authorization || '');
-  if (!STRICT_BEARER && /^Bearer\\s+.+/i.test(auth)) return next(); // Backward compatible
-  const ok = await verifyGoogleIdTokenIfPresent(req);
-  if (ok) return next();
+  if (/^Bearer\s+.+/i.test(auth)) return next(); // Cloud Run invoker/IAP
   const claims = verifyJwtCookie(req.headers.cookie || '');
   if (claims) { req.user = claims; return next(); }
   return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
@@ -138,7 +111,28 @@ app.get('/_env', (_req, res) => {
   });
 });
 
-/* ---------------- Files: upload to GCS ---------------- */
+/* ---------------- GCS helpers: safe parser (FIX) ---------------- */
+/** 안전한 GCS URI 파서: WHATWG URL 사용 (정규식 X) */
+function parseGcsUri(gcsUri) {
+  const s = String(gcsUri || '').trim();
+  if (!s.startsWith('gs://')) throw new Error('INVALID_GCS_URI: must start with gs://');
+  let u;
+  try {
+    u = new URL(s); // Node의 WHATWG URL은 커스텀 프로토콜도 파싱합니다.
+  } catch {
+    throw new Error(`INVALID_GCS_URI: ${s}`);
+  }
+  const bucket = u.hostname || u.host;
+  const path = (u.pathname || '').replace(/^\/+/, '');
+  if (!bucket || !path) throw new Error(`INVALID_GCS_URI (bucket/object missing): ${s}`);
+  return { bucket, path };
+}
+function assertAllowedUri(gcsUri) {
+  const { bucket } = parseGcsUri(gcsUri);
+  if (!ALLOWED_BUCKETS.has(bucket)) throw new Error('BUCKET_NOT_ALLOWED');
+}
+
+/* ---------------- Files: upload / signed-url / move ---------------- */
 app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok:false, error:'file required' });
@@ -146,8 +140,8 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
 
     const buf = req.file.buffer;
     const sha = crypto.createHash('sha256').update(buf).digest('hex');
-    const safeName = (req.file.originalname || 'datasheet.pdf').replace(/[\\s/\\\\]+/g,'_');
-    const object = `incoming/${sha}_${Date.now()}_${safeName}`;
+    const safe = (req.file.originalname || 'datasheet.pdf').replace(/\s+/g,'_');
+    const object = `incoming/${sha}_${Date.now()}_${safe}`;
 
     await storage.bucket(GCS_BUCKET).file(object).save(buf, {
       contentType: req.file.mimetype || 'application/pdf',
@@ -160,17 +154,6 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
     return res.status(400).json({ ok:false, error:String(e?.message || e) });
   }
 });
-
-/* ---------------- Files: signed-url / move ---------------- */
-function parseGcsUri(gcsUri) {
-  const m = /^gs:\/\/([^/]+)\/(.+)$/.exec(String(gcsUri || ''));
-  if (!m) throw new Error('INVALID_GCS_URI');
-  return { bucket: m[1], path: m[2] };
-}
-function assertAllowedUri(gcsUri) {
-  const { bucket } = parseGcsUri(gcsUri);
-  if (!ALLOWED_BUCKETS.has(bucket)) throw new Error('BUCKET_NOT_ALLOWED');
-}
 
 app.get('/api/files/signed-url', requireSession, async (req, res) => {
   try {
@@ -230,7 +213,7 @@ app.get('/catalog/blueprint/:family', async (req, res) => {
   }
 });
 
-/* ---------------- Parts: detail & search ---------------- */
+/* ---------------- Parts: detail/search (backward-compatible) ---------------- */
 app.get('/parts/detail', async (req, res) => {
   const brand  = (req.query.brand || '').toString();
   const code   = (req.query.code  || '').toString();
@@ -244,7 +227,7 @@ app.get('/parts/detail', async (req, res) => {
         `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]
       );
       const table = r.rows[0]?.specs_table;
-      if (!table || !/^[a-z0-9_\\.]+$/i.test(table)) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
+      if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
 
       const row = await db.query(
         `SELECT * FROM public.${table}
@@ -257,7 +240,7 @@ app.get('/parts/detail', async (req, res) => {
         : res.status(404).json({ ok:false, error:'NOT_FOUND' });
     }
 
-    // Backward compatibility: when family is not provided, allow relay view
+    // (호환) family 미지정 시 기존 릴레이 뷰
     const row = await db.query(
       `SELECT * FROM public.relay_specs
         WHERE brand_norm = lower($1) AND code_norm = lower($2)
@@ -272,11 +255,6 @@ app.get('/parts/detail', async (req, res) => {
   }
 });
 
-/** 
- * Unified search endpoint (keeps behavior; removes duplicate/stray blocks that caused "await outside async").
- * - If family specified, query that family's specs table.
- * - Else, try component_specs view; if missing, fall back to relay_specs.
- */
 app.get('/parts/search', async (req, res) => {
   const q      = (req.query.q || '').toString().trim();
   const limit  = Math.min(Number(req.query.limit || 20), 100);
@@ -290,7 +268,7 @@ app.get('/parts/search', async (req, res) => {
         `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]
       );
       const table = r.rows[0]?.specs_table;
-      if (!table || !/^[a-z0-9_\\.]+$/i.test(table)) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
+      if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
 
       const rows = await db.query(
         `SELECT id, family_slug, brand, code, display_name,
@@ -306,7 +284,7 @@ app.get('/parts/search', async (req, res) => {
       return res.json({ ok:true, items: rows.rows });
     }
 
-    // family omitted → prefer unified view if present; else fallback to relay view
+    // (호환) family 미지정 → 통합 뷰가 있으면 우선 사용, 없으면 릴레이 뷰
     try {
       const rows = await db.query(
         `SELECT id, family_slug, brand, code, display_name,
@@ -351,7 +329,10 @@ app.post('/ingest', requireSession, async (req, res) => {
     });
 
     res.json({ ok:true, table, row });
-  } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'ingest failed', detail:String(e?.message || e) }); }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error:'ingest failed', detail:String(e?.message || e) });
+  }
 });
 
 app.post('/ingest/bulk', requireSession, async (req, res) => {
@@ -373,7 +354,10 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
       out.push({ table, row });
     }
     res.json({ ok:true, count: out.length, items: out });
-  } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'bulk ingest failed', detail:String(e?.message || e) }); }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error:'bulk ingest failed', detail:String(e?.message || e) });
+  }
 });
 
 app.post('/ingest/auto', requireSession, async (req, res) => {
@@ -383,9 +367,12 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
     const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
     res.json(result);
-  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
+  } catch (e) {
+    console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) });
+  }
 });
 
+/* ---------------- Cloud Tasks worker endpoint (kept) ---------------- */
 app.post('/api/worker/ingest', requireSession, async (req, res) => {
   const startedAt = Date.now();
   const taskName  = req.get('X-Cloud-Tasks-TaskName') || null;
@@ -394,7 +381,6 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     const { gcsUri, gcsPdfUri, brand, code, series, display_name } = req.body || {};
     const uri = gcsUri || gcsPdfUri;
     if (!uri || !/^gs:\/\//i.test(uri)) {
-      // START log (FAILED)
       await db.query(
         `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
          VALUES ($1,$2,$3,'FAILED',$4)`,
@@ -403,7 +389,6 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       return res.status(400).json({ ok:false, error:'gcsUri required (gs://...)' });
     }
 
-    // START log (PROCESSING)
     const { rows:logRows } = await db.query(
       `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
        VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
@@ -413,13 +398,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
 
     const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name });
 
-    // === BEGIN: ingest result mapping (drop-in) ===
-    const fam   = out?.family || out?.family_slug || null;
-    const codes = Array.isArray(out?.codes) ? out.codes : [];
-    const code0 = codes[0] || out?.code || null;
-    const table = out?.specs_table || 'public.relay_power_specs';
-    const dsUri = out?.datasheet_uri || uri;
-
+    // map result to log (best-effort; ignore errors)
     try {
       await db.query(`
         create table if not exists public.ingest_run_logs (
@@ -435,7 +414,15 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
         `insert into public.ingest_run_logs
            (task_name,retry_count,gcs_uri,status,final_table,final_family,final_brand,final_code,final_datasheet,duration_ms,finished_at)
          values ($1,$2,$3,'SUCCEEDED',$4,$5,$6,$7,$8,$9, now())`,
-        [taskName ?? null, retryCnt ?? 0, uri, table, fam, out?.brand ?? null, code0, dsUri, out?.ms ?? (Date.now() - startedAt)]
+        [
+          taskName ?? null, retryCnt ?? 0, uri,
+          out?.specs_table || null,
+          out?.family || out?.family_slug || null,
+          out?.brand ?? null,
+          (Array.isArray(out?.codes) ? out.codes[0] : out?.code) ?? null,
+          out?.datasheet_uri || uri,
+          out?.ms ?? (Date.now() - startedAt)
+        ]
       );
     } catch (e) {
       console.warn('[ingest log skipped]', e?.message || e);
@@ -445,18 +432,16 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       taskName: taskName ?? null,
       retryCnt: retryCnt ?? 0,
       ms: out?.ms ?? (Date.now() - startedAt),
-      family: fam,
-      table,
+      family: out?.family || out?.family_slug,
+      table: out?.specs_table,
       brand: out?.brand ?? 'unknown',
-      code: code0,
+      code: (Array.isArray(out?.codes) ? out.codes[0] : out?.code) ?? null,
       rows: (typeof out?.rows === 'number' ? out.rows : undefined),
     });
-    // === END: ingest result mapping (drop-in) ===
 
     return res.json(out);
 
   } catch (e) {
-    // END log (FAILED)
     try {
       await db.query(
         `UPDATE public.ingest_run_logs
@@ -470,14 +455,13 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
          LIMIT 1`,
         [ taskName, Date.now()-startedAt, String(e?.message || e) ]
       );
-    } catch (_) { /* log error ignored */ }
-
-    console.error('[ingest 500]', { error: e?.message, stack: String(e?.stack || '').split('\\n').slice(0,4).join(' | ') });
+    } catch (_) {}
+    console.error('[ingest 500]', { error: e?.message, stack: String(e?.stack || '').split('\n').slice(0,4).join(' | ') });
     return res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });
 
-/* ===== Built-in auth stubs (kept for compatibility; real manager auto-mounts if present) ===== */
+/* ---------------- Built-in auth stub (kept; non-breaking) ---------------- */
 (async () => {
   const path = require('path');
   const fs   = require('fs');
@@ -497,14 +481,13 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       res.json({ ok:true, token, user:{ username: id }});
     });
   };
-  const stubAbs = express.Router(); mountStub(stubAbs);   // /auth/login
-  const stubRel = express.Router(); mountStub(stubRel);   // /login
+  const stubAbs = express.Router(); mountStub(stubAbs);
+  const stubRel = express.Router(); mountStub(stubRel);
   app.use('/auth', stubAbs);
   app.use(stubRel);
   app.use('/api/worker/auth', stubAbs);
   console.log('[BOOT] mounted builtin auth stub (root & /auth)');
 
-  // Try to load a real auth manager if one exists (multiple build output paths supported)
   const candidates = [
     path.join(__dirname, 'dist/routes/manager.mjs'),
     path.join(__dirname, 'dist/routes/manager.js'),
@@ -519,8 +502,8 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     try {
       fs.accessSync(p, fs.constants.R_OK);
       let mod;
-      if (p.endsWith('.mjs')) mod = await import(p); // ESM
-      else                   mod = require(p);       // CJS/hybrid
+      if (p.endsWith('.mjs')) mod = await import(p);  // ESM 지원
+      else                   mod = require(p);        // CJS
       const authRouter = mod.default || mod;
       app.use(authRouter);
       app.use('/auth', authRouter);
@@ -536,7 +519,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
   }
 })();
 
-/* ---------------- Catalog tree (stub kept) ---------------- */
+/* ---------------- Catalog tree placeholders (kept) ---------------- */
 const catalogTree = (_req, res) => res.json({ ok:true, nodes: [] });
 app.get('/catalog/tree', catalogTree);
 app.get('/api/catalog/tree', catalogTree);
@@ -548,5 +531,5 @@ app.use((err, req, res, next) => {
   res.status(500).json({ ok:false, error:'internal error' });
 });
 
-/* ---------------- Listen ---------------- */
+/* ---------------- Listen (Cloud Run PORT) ---------------- */
 app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));

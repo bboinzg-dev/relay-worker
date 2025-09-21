@@ -222,13 +222,14 @@ app.get('/parts/search', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'search failed' }); }
 });
 
-// 기존 app.get('/parts/detail', ...) 전체를 아래로 교체
+
 app.get('/parts/detail', async (req, res) => {
   const brand  = (req.query.brand || '').toString();
   const code   = (req.query.code  || '').toString();
   const family = (req.query.family || '').toString().toLowerCase();
 
   if (!brand || !code) return res.status(400).json({ ok:false, error:'brand & code required' });
+
   try {
     if (family) {
       const r = await db.query(
@@ -238,7 +239,9 @@ app.get('/parts/detail', async (req, res) => {
       if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
 
       const row = await db.query(
-        `SELECT * FROM public.${table} WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
+        `SELECT * FROM public.${table}
+          WHERE brand_norm = lower($1) AND code_norm = lower($2)
+          LIMIT 1`,
         [brand, code]
       );
       return row.rows[0]
@@ -249,18 +252,20 @@ app.get('/parts/detail', async (req, res) => {
     // (호환) family 미지정 시 기존 릴레이 뷰
     const row = await db.query(
       `SELECT * FROM public.relay_specs
-       WHERE brand_norm = lower($1) AND code_norm = lower($2)
-       LIMIT 1`,
+        WHERE brand_norm = lower($1) AND code_norm = lower($2)
+        LIMIT 1`,
       [brand, code]
     );
     return row.rows[0]
       ? res.json({ ok:true, item: row.rows[0] })
       : res.status(404).json({ ok:false, error:'NOT_FOUND' });
-  } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'detail_failed' }); }
+  } catch (e) {
+    console.error(e); res.status(500).json({ ok:false, error:'detail_failed' });
+  }
 });
 
 
-// 기존 app.get('/parts/search', ...) 전체 교체
+
 app.get('/parts/search', async (req, res) => {
   const q      = (req.query.q || '').toString().trim();
   const limit  = Math.min(Number(req.query.limit || 20), 100);
@@ -277,15 +282,46 @@ app.get('/parts/search', async (req, res) => {
       if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
 
       const rows = await db.query(
-        `SELECT id, family_slug, brand, code, display_name, width_mm, height_mm, length_mm, image_uri, datasheet_uri, updated_at
+        `SELECT id, family_slug, brand, code, display_name,
+                width_mm, height_mm, length_mm, image_uri, datasheet_uri, updated_at
            FROM public.${table}
-          WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(coalesce(series,'')) LIKE $1 OR lower(coalesce(display_name,'')) LIKE $1
+          WHERE brand_norm LIKE $1 OR code_norm LIKE $1
+             OR lower(coalesce(series,'')) LIKE $1
+             OR lower(coalesce(display_name,'')) LIKE $1
           ORDER BY updated_at DESC
           LIMIT $2`,
         [text, limit]
       );
       return res.json({ ok:true, items: rows.rows });
     }
+
+    // (호환) family 미지정 → 통합 뷰, 없으면 릴레이 뷰
+    try {
+      const rows = await db.query(
+        `SELECT id, family_slug, brand, code, display_name,
+                width_mm, height_mm, length_mm, image_uri, datasheet_uri, updated_at
+           FROM public.component_specs
+          WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(coalesce(display_name,'')) LIKE $1
+          ORDER BY updated_at DESC
+          LIMIT $2`,
+        [text, limit]
+      );
+      return res.json({ ok:true, items: rows.rows });
+    } catch {
+      const rows = await db.query(
+        `SELECT * FROM public.relay_specs
+          WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
+          ORDER BY updated_at DESC
+          LIMIT $2`,
+        [text, limit]
+      );
+      return res.json({ ok:true, items: rows.rows });
+    }
+  } catch (e) {
+    console.error(e); res.status(500).json({ ok:false, error:'search_failed' });
+  }
+});
+
 
     // (호환) family 미지정 → 통합 뷰 검색 권장 (component_specs 없으면 릴레이 뷰)
     try {

@@ -98,7 +98,7 @@ async function getConflictColumns(qualifiedTable) {
 async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
   try {
     const { bucket, name } = parseGcsUri(gcsPdfUri);
-    const tmpDir  = path.join('/tmp', 'pdf-'+Date.now());
+    const tmpDir  = path.join('/tmp', 'pdf-' + Date.now());
     const pdfPath = path.join(tmpDir, 'doc.pdf');
     await fs.mkdir(tmpDir, { recursive: true });
 
@@ -106,8 +106,8 @@ async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
     const [buf] = await storage.bucket(bucket).file(name).download();
     await fs.writeFile(pdfPath, buf);
 
-    // pdfimages 설치가 없으면 throw → catch에서 null 반환
-    await execFileP('pdfimages', ['-f','1','-l','2','-png', pdfPath, path.join(tmpDir,'img')]); // :contentReference[oaicite:3]{index=3}
+    // ✅ 깨진 줄 교체: pdfimages 실행
+    await execFileP('pdfimages', ['-f','1','-l','2','-png', pdfPath, path.join(tmpDir, 'img')]);
 
     // 가장 큰 PNG 선택
     const files = (await fs.readdir(tmpDir)).filter(f => /^img-\d+-\d+\.png$/i.test(f));
@@ -118,6 +118,23 @@ async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
       if (stat.size > size) { pick = f; size = stat.size; }
     }
     if (!pick) return null;
+
+    // GCS 업로드 (Node SDK의 표준 upload 사용)
+    const dest = canonicalCoverPath(process.env.ASSET_BUCKET || process.env.GCS_BUCKET, family, brand, code);
+    const { bucket: dbkt, name: dname } = parseGcsUri(dest);
+
+    // ✅ 깨진 줄 교체: pick 파일 업로드
+    await storage.bucket(dbkt).upload(path.join(tmpDir, pick), {
+      destination: dname,
+      resumable: false
+    });
+
+    return dest;
+  } catch {
+    return null; // 설치/이미지 없음 등 모든 실패는 조용히 무시
+  }
+}
+
 
     // GCS 업로드
     const dest = canonicalCoverPath(

@@ -151,12 +151,40 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
       resumable: false, public: false, validation: false,
     });
 
-    return res.json({ ok:true, gcsUri:`gs://${defaultBucket}/${object}` });
+     const gcsUri = `gs://${defaultBucket}/${object}`;
+
+ // ✅ 여기부터: 옵션 자동 인제스트 (multer가 form 필드를 req.body로 넣어줌)
+    const ingestWanted =
+      String(req.body?.ingest || req.query?.ingest || '').trim() === '1';
+
+    if (!ingestWanted) {
+      // 평소처럼 업로드 결과만 반환
+      return res.json({ ok:true, gcsUri });
+    }
+
+    // 폼으로 넘어온 메타(있으면 사용, 없으면 추정)
+    const family_slug = req.body?.family_slug || null;
+    const brand       = req.body?.brand || null;
+    const code        = req.body?.code  || null;
+    const series      = req.body?.series || null;
+    const displayName = req.body?.display_name || null;
+
+    try {
+      const out = await runAutoIngest({
+        gcsUri, family_slug, brand, code, series, display_name: displayName,
+      });
+      // 인제스트까지 완료한 결과 반환
+      return res.json({ ok:true, gcsUri, ingest: out });
+    } catch (e) {
+      // 인제스트 실패해도 업로드는 성공 → 본문에 결과만 첨부
+      return res.json({ ok:true, gcsUri, ingest: { ok:false, error: String(e?.message || e) }});
+    }
   } catch (e) {
     console.error('[upload]', e);
     return res.status(400).json({ ok:false, error:String(e?.message || e) });
   }
 });
+
 
 app.get('/api/files/signed-url', requireSession, async (req, res) => {
   try {

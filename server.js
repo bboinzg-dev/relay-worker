@@ -60,6 +60,41 @@ app.use((req, res, next) => {
   res.setHeader('referrer-policy', 'strict-origin-when-cross-origin');
   next();
 });
+// ---------------- Always-on Auth Router (최상단 고정) ----------------
+// 프리뷰/개발용 간단 로그인: 어떤 값이든 username/email/id 중 하나만 있으면 JWT 발급
+// 프런트는 이 응답의 token을 쿠키(pp_session)로 저장해서 사용합니다.
+function issueToken(payload) {
+  const id = String(
+    payload.username || payload.email || payload.id || payload.idOrEmail || 'user'
+  );
+  return {
+    id,
+    token: jwt.sign({ uid: id, username: id }, JWT_SECRET, { expiresIn: '7d' }),
+  };
+}
+
+function loginHandler(req, res) {
+  try {
+    const { id, token } = issueToken(req.body || {});
+    return res.json({ ok: true, token, user: { username: id } });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: String(e?.message || e) });
+  }
+}
+
+const authRouter = express.Router();
+// 헬스(선택)
+authRouter.get('/health', (_req, res) => res.json({ ok: true, stub: true }));
+// 로그인/로그아웃
+authRouter.post('/login', loginHandler);
+authRouter.post('/logout', (_req, res) => res.json({ ok: true }));
+
+// ✅ /auth/* 경로로 확정 마운트 (항상 가장 먼저 잡히게)
+app.use('/auth', authRouter);
+
+// (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
+app.post('/login', loginHandler);
+
 
 /* ---------------- Upload ---------------- */
 const upload = multer({ storage: multer.memoryStorage() });

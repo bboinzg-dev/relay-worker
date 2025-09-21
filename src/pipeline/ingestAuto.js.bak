@@ -1,121 +1,159 @@
+// src/pipeline/ingestAuto.js
 'use strict';
 
+const path = require('node:path');
+const os = require('node:os');
+const fs = require('node:fs/promises');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
+const execFileP = promisify(execFile);
+
 const db = require('../utils/db');
-const { extractDataset } = require('../utils/extract');
+const { storage, parseGcsUri, canonicalCoverPath } = require('../utils/gcs');
+const { ensureSpecsTable, upsertByBrandCode } = require('../utils/schema');
+const { chooseCanonicalFamilySlug } = require('../utils/family');
 
-async function runAutoIngest({ gcsUri, filename, family_slug, brand, code, series, display_name }) {
-  const t0 = Date.now();
+// extractDataset 관대한 로딩 (export 형태가 달라도 동작)
+let extractDataset = null;
+try {
+  const ex = require('../utils/extract');
+  extractDataset =
+    ex?.extractDataset ||
+    ex?.default?.extractDataset ||
+    (typeof ex === 'function' ? ex : null);
+} catch (_) {}
+if (typeof extractDataset !== 'function') {
+  throw new Error('extractDataset loader failed: ../utils/extract 에서 함수를 찾지 못했습니다.');
+}
 
-  // 1) 데이터셋 추출 (DocAI → 부족 시 Vertex)
+// 문자열 정리
+const lc = (s) => (s || '').toString().trim().toLowerCase();
+
+// ===== 대표 이미지(cover) 추출: pdfimages → GCS 업로드 =====
+// - pdfimages 는 poppler-utils 에 포함 (Dockerfile에서 설치 필요)
+// - 1~2페이지의 가장 큰 PNG를 추출하여 GCS에 업로드
+async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
+  try {
+    const { bucket, name } = parseGcsUri(gcsPdfUri);
+
+    const tmpDir  = path.join(os.tmpdir(), 'pdf-' + Date.now());
+    const pdfPath = path.join(tmpDir, 'doc.pdf');
+    await fs.mkdir(tmpDir, { recursive: true });
+
+    // PDF 다운로드
+    const [buf] = await storage.bucket(bucket).file(name).download();
+    await fs.writeFile(pdfPath, buf);
+
+    // 첫 1~2페이지 이미지 추출 (없으면 건너뜀)
+    await execFileP('pdfimages', ['-f','1','-l','2','-png', pdfPath, path.join(tmpDir, 'img')]);
+
+    // 가장 큰 PNG 선택
+    const files = (await fs.readdir(tmpDir)).filter(f => /^img-\d+-\d+\.png$/i.test(f));
+    if (!files.length) return null;
+
+    let pick = null, size = -1;
+    for (const f of files) {
+      const st = await fs.stat(path.join(tmpDir, f));
+      if (st.size > size) { pick = f; size = st.size; }
+    }
+    if (!pick) return null;
+
+    // 업로드 경로: gs://<bucket>/images/<family>/<brand_norm>/<code_norm>/cover.png
+    const dest = canonicalCoverPath(
+      process.env.ASSET_BUCKET || process.env.GCS_BUCKET,
+      family, brand, code
+    );
+    const { bucket: dbkt, name: dname } = parseGcsUri(dest);
+
+    await storage.bucket(dbkt).upload(path.join(tmpDir, pick), {
+      destination: dname,
+      resumable: false
+    });
+
+    return dest;
+  } catch {
+    // 설치/이미지 없음/권한 문제 등은 조용히 스킵
+    return null;
+  }
+}
+
+// ===== 메인: 자동 인제스트 =====
+// opts: { gcsUri, family_slug?, brand?, code?, series?, display_name? }
+async function runAutoIngest(opts = {}) {
+  const started = Date.now();
+
+  const gcsUri = opts.gcsUri || opts.gcsPdfUri;
+  if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
+    throw new Error('gcsUri required (gs://...)');
+  }
+  const filename = opts.filename || gcsUri.split('/').pop() || 'doc.pdf';
+
+  // 1) 데이터셋 추출 (브랜드/코드/시리즈/텍스트 등)
   const ds = await extractDataset({
     gcsUri,
     filename,
-    maxInlinePages: +(process.env.MAX_DOC_PAGES_INLINE || 15),
-    brandHint: brand,
-    codeHint: code,
-    seriesHint: series,
+    brandHint: opts.brand,
+    codeHint:  opts.code,
+    seriesHint: opts.series
   });
 
-  // 2) 패밀리 결정
-  const fam = family_slug || ds.family || 'relay_power';
+  const brand = (ds.brand || opts.brand || 'unknown').toString();
+  const code  = (Array.isArray(ds.rows) && ds.rows[0]?.code)
+                  || opts.code
+                  || ('TMP_' + Math.random().toString(16).slice(2).toUpperCase());
+  const series = ds.series || opts.series || null;
+  const displayName = (Array.isArray(ds.rows) && ds.rows[0]?.displayname) || opts.display_name || null;
+  const rawText = ds.text || '';
 
-  // 3) 스펙 테이블 보장
-  await ensureRelayPowerTable();
+  // 2) family 결정 (명시 > 휴리스틱 > 기본 relay_power)
+  const family = lc(opts.family_slug) ||
+                 chooseCanonicalFamilySlug({ text: rawText }) ||
+                 'relay_power';
 
-  // 4) 업서트 (중복 제거)
-  const rows = dedupeRows(ds.rows);
-  let inserted = 0;
-  for (const row of rows) {
-    await db.query(
-      `insert into public.relay_power_specs
-         (brand, brand_norm, code, code_norm, family_slug, series, displayname, datasheet_uri, verified_in_doc, created_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
-       on conflict (brand_norm, code_norm, family_slug) do nothing`,
-      [
-        ds.brand || null,
-        norm(ds.brand),
-        row.code,
-        norm(row.code),
-        family,
-        row.series || ds.series || null,
-        display_name || row.displayname || row.code,
-        gcsUri,
-        JSON.stringify(row.verifiedPages || ds.verifiedPages || []),
-      ]
-    );
-    inserted++;
-  }
-
-  // 5) 요약 로그(선택)
-  await db.query(
-    `create table if not exists public.doc_ingest_log (
-      id uuid default gen_random_uuid() primary key,
-      task text, gcs_uri text not null, filename text, brand text, family_slug text,
-      series_hint text, page_count integer, rows integer, ms integer, note text,
-      created_at timestamptz default now()
-    )`
+  // 3) component_registry에서 스펙 테이블 확인 + 보장
+  const reg = await db.query(
+    `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+    [family]
   );
-  await db.query(
-    `insert into public.doc_ingest_log (task,gcs_uri,filename,brand,family_slug,series_hint,page_count,rows,ms,note)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-    ['relay_power', gcsUri, filename || null, ds.brand || null, family, ds.series || series || null, null, inserted, Date.now()-t0, ds.note || null]
-  );
+  const tableName = (reg.rows[0]?.specs_table || `${family}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
+  await ensureSpecsTable(tableName, {}); // 필요 시 컬럼/테이블 보장
 
+  // 4) 대표 이미지(cover) 추출 (실패해도 인제스트는 계속)
+  const coverUri = await extractCoverToGcs(gcsUri, { family, brand, code });
+
+  // 5) UPSERT (존재하는 컬럼만 schema util이 처리)
+  const payload = {
+    family_slug: family,
+    brand, code,
+    brand_norm: lc(brand),
+    code_norm:  lc(code),
+    series,
+    display_name: displayName,
+    datasheet_uri: gcsUri,
+    // 공통 필드 (테이블에 없으면 무시됨)
+    image_url: coverUri,
+    cover: coverUri,
+    width_mm:  null,
+    height_mm: null,
+    length_mm: null,
+    // 원하면 원문 추적/검증용 필드들도 추가 가능(verified_in_doc 등)
+  };
+
+  const row = await upsertByBrandCode(tableName, payload);
+
+  const ms = Date.now() - started;
   return {
     ok: true,
-    brand: ds.brand || null,
-    family,
-    series: ds.series || null,
-    rows: inserted,
-    codes: rows.map(r => r.code),
+    ms,
+    family_slug: family,
+    specs_table: `public.${tableName}`,
+    brand,
+    code,
     datasheet_uri: gcsUri,
-    specs_table: 'public.relay_power_specs',
-    ms: Date.now() - t0,
+    image_url: coverUri,
+    // 필요 시 반환 확장
+    row,
   };
-}
-
-function dedupeRows(rows = []) {
-  const seen = new Set();
-  const out = [];
-  for (const r of rows) {
-    const c = String(r?.code || '').trim();
-    if (!c) continue;
-    const key = c.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ ...r, code: c });
-  }
-  return out;
-}
-function norm(x) { return (x || '').toLowerCase().trim() || null; }
-function guessFamilyByBrand(brand='') {
-  const b = (brand || '').toLowerCase();
-  if (!b) return 'relay_power';
-  if (b.includes('panasonic')) return 'relay_power';
-  if (b.includes('omron'))     return 'relay_power';
-  if (b.includes('te connectivity')) return 'relay_power';
-  if (b.includes('finder'))    return 'relay_power';
-  if (b.includes('hongfa'))    return 'relay_power';
-  return 'relay_power';
-}
-async function ensureRelayPowerTable() {
-  await db.query(`
-    create table if not exists public.relay_power_specs (
-      id uuid default gen_random_uuid() primary key,
-      brand text, brand_norm text, code text, code_norm text,
-      family_slug text, series text, displayname text,
-      datasheet_uri text, verified_in_doc jsonb default '[]'::jsonb,
-      created_at timestamptz default now()
-    );
-    do $$
-    begin
-      if not exists (
-        select 1 from pg_indexes where schemaname='public' and indexname='ux_rps_bcn'
-      ) then
-        execute 'create unique index ux_rps_bcn on public.relay_power_specs (brand_norm, code_norm, family_slug)';
-      end if;
-    end $$;
-  `);
 }
 
 module.exports = { runAutoIngest };

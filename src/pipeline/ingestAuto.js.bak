@@ -17,7 +17,7 @@ async function runAutoIngest({ gcsUri, filename, family_slug, brand, code, serie
   });
 
   // 2) 패밀리 결정
-  const family = family_slug || guessFamilyByBrand(ds.brand) || 'relay_power';
+  const fam = family_slug || ds.family || 'relay_power';
 
   // 3) 스펙 테이블 보장
   await ensureRelayPowerTable();

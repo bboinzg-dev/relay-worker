@@ -41,8 +41,14 @@ async function runAutoIngest({
     seriesHint: series,
   });
 
-  // 2) 부품군 확정(없으면 브랜드 기반 추정 → 기본 relay_power)
-  const family = family_slug || guessFamilyByBrand(ds.brand) || 'relay_power';
+  // 2) 패밀리 결정 (문서 내부 키워드 기반 폴백 추가)
+  let family = family_slug || ds.family_slug || guessFamilyByBrand(ds.brand) || 'relay_power';
+  const docText = (ds.raw_text || '').toLowerCase();
+  if (!family_slug && !ds.family_slug) {
+    if (docText.includes('signal relays') || /signal\s+relay/i.test(docText)) {
+      family = 'relay_signal';
+    }
+  }
 
   // 3) 타깃 테이블 보장
   await ensureRelayPowerTable();

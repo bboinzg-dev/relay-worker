@@ -7,6 +7,8 @@ const os = require('node:os');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const execFileP = promisify(execFile);
+const { tryExtractCover } = require('./cover');
+
 
 const db = require('../utils/db');
 const { storage, parseGcsUri, canonicalCoverPath } = require('../utils/gcs');
@@ -78,6 +80,41 @@ async function runAutoIngest({ gcsUri, family_slug, brand, code, series=null, di
     brand, code, series, display_name,
     datasheet_uri: gcsUri,
   });
+
+  const assetBucket =
+  process.env.ASSET_BUCKET?.replace(/^gs:\/\//, '') ||
+  process.env.GCS_BUCKET?.replace(/^gs:\/\//, '') ||
+  null;
+
+if (assetBucket && result?.datasheet_uri) {
+  const coverUri = await tryExtractCover(result.datasheet_uri, {
+    family: result.family || result.family_slug || family,
+    brand:  result.brand  || brand,
+    code:   result.code   || code,
+    targetBucket: assetBucket,
+  });
+
+  if (coverUri) {
+    // 테이블 스키마가 서로 다른 경우를 모두 안전하게 처리 (있으면만 업데이트)
+    try {
+      await db.query(
+        `UPDATE public.${table}
+           SET cover = COALESCE($1, cover)
+         WHERE brand_norm = lower($2) AND code_norm = lower($3)`,
+        [coverUri, brand, code]
+      );
+    } catch {}
+    try {
+      await db.query(
+        `UPDATE public.${table}
+           SET image_url = COALESCE($1, image_url)
+         WHERE brand_norm = lower($2) AND code_norm = lower($3)`,
+        [coverUri, brand, code]
+      );
+    } catch {}
+  }
+}
+
 
   // 3) 대표 이미지 추출(실패/미설치 무시)
   try {

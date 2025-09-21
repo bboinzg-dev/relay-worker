@@ -22,6 +22,8 @@ try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/ch
 try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
+try { app.use(require('./server.vision.alias')); console.log('[BOOT] mounted /api/vision/guess (alias)'); } catch {}
+
 
 /* NOTE: The parts router already exists in your repo; keep it mounted. */
 try { app.use('/api/parts', require('./src/routes/parts')); } catch {}

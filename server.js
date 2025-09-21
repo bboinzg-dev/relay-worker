@@ -163,7 +163,7 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
 
 /* ---------------- Files: signed-url / move ---------------- */
 function parseGcsUri(gcsUri) {
-  const m = /^gs:\\/\\/([^/]+)\\/(.+)$/.exec(String(gcsUri || ''));
+  const m = /^gs:\/\/([^/]+)\/(.+)$/.exec(String(gcsUri || ''));
   if (!m) throw new Error('INVALID_GCS_URI');
   return { bucket: m[1], path: m[2] };
 }

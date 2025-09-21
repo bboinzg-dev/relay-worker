@@ -1,158 +1,223 @@
-// src/pipeline/ingestAuto.js
+/* src/pipeline/ingestAuto.js */
 'use strict';
+
+/**
+ * CommonJS( require ) 환경에서 안전하게 동작하도록
+ * 모든 await는 async 함수 내부로만 배치했습니다.
+ * pdfimages( poppler-utils )가 없으면 cover 추출은 건너뜁니다.
+ */
 
 const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs/promises');
-const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
+const { execFile } = require('node:child_process');
 const execFileP = promisify(execFile);
 
 const db = require('../utils/db');
-const { storage, parseGcsUri, canonicalCoverPath } = require('../utils/gcs');
-const { ensureSpecsTable, upsertByBrandCode } = require('../utils/schema');
-const { chooseCanonicalFamilySlug } = require('../utils/family');
+const {
+  storage,
+  canonicalDatasheetPath,
+  canonicalCoverPath,
+  moveObject,
+} = require('../utils/gcs');
 
-// extractDataset 관대한 로딩 (export 형태가 달라도 동작)
-let extractDataset = null;
-try {
-  const ex = require('../utils/extract');
-  extractDataset =
-    ex?.extractDataset ||
-    ex?.default?.extractDataset ||
-    (typeof ex === 'function' ? ex : null);
-} catch (_) {}
-if (typeof extractDataset !== 'function') {
-  throw new Error('extractDataset loader failed: ../utils/extract 에서 함수를 찾지 못했습니다.');
+const { ensureSpecsTable, upsertByBrandCode } = require('../utils/schema');
+
+/* ---------------- helpers ---------------- */
+
+// gs://bucket/path → { bucket, name }
+function parseGcsUri(gcsUri) {
+  const m = /^gs:\/\/([^/]+)\/(.+)$/.exec(String(gcsUri || ''));
+  if (!m) throw new Error('INVALID_GCS_URI');
+  return { bucket: m[1], name: m[2] };
 }
 
-// 문자열 정리
-const lc = (s) => (s || '').toString().trim().toLowerCase();
+function trimLower(x) { return String(x || '').trim(); }
+function safeLower(x) { return trimLower(x).toLowerCase(); }
 
-// ===== 대표 이미지(cover) 추출: pdfimages → GCS 업로드 =====
-// - pdfimages 는 poppler-utils 에 포함 (Dockerfile에서 설치 필요)
-// - 1~2페이지의 가장 큰 PNG를 추출하여 GCS에 업로드
-async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
+function randomTempCode() {
+  return 'TMP_' + Math.random().toString(16).slice(2, 8).toUpperCase();
+}
+
+async function guessSpecsTable(familySlug) {
+  if (!familySlug) return null;
   try {
-    const { bucket, name } = parseGcsUri(gcsPdfUri);
-
-    const tmpDir  = path.join(os.tmpdir(), 'pdf-' + Date.now());
-    const pdfPath = path.join(tmpDir, 'doc.pdf');
-    await fs.mkdir(tmpDir, { recursive: true });
-
-    // PDF 다운로드
-    const [buf] = await storage.bucket(bucket).file(name).download();
-    await fs.writeFile(pdfPath, buf);
-
-    // 첫 1~2페이지 이미지 추출 (없으면 건너뜀)
-    await execFileP('pdfimages', ['-f','1','-l','2','-png', pdfPath, path.join(tmpDir, 'img')]);
-
-    // 가장 큰 PNG 선택
-    const files = (await fs.readdir(tmpDir)).filter(f => /^img-\d+-\d+\.png$/i.test(f));
-    if (!files.length) return null;
-
-    let pick = null, size = -1;
-    for (const f of files) {
-      const st = await fs.stat(path.join(tmpDir, f));
-      if (st.size > size) { pick = f; size = st.size; }
-    }
-    if (!pick) return null;
-
-    // 업로드 경로: gs://<bucket>/images/<family>/<brand_norm>/<code_norm>/cover.png
-    const dest = canonicalCoverPath(
-      process.env.ASSET_BUCKET || process.env.GCS_BUCKET,
-      family, brand, code
+    const { rows } = await db.query(
+      `SELECT specs_table
+         FROM public.component_registry
+        WHERE family_slug = $1
+        LIMIT 1`,
+      [familySlug]
     );
-    const { bucket: dbkt, name: dname } = parseGcsUri(dest);
-
-    await storage.bucket(dbkt).upload(path.join(tmpDir, pick), {
-      destination: dname,
-      resumable: false
-    });
-
-    return dest;
+    return rows[0]?.specs_table || null;
   } catch {
-    // 설치/이미지 없음/권한 문제 등은 조용히 스킵
     return null;
   }
 }
 
-// ===== 메인: 자동 인제스트 =====
-// opts: { gcsUri, family_slug?, brand?, code?, series?, display_name? }
-async function runAutoIngest(opts = {}) {
-  const started = Date.now();
+/**
+ * pdfimages로 1~2페이지에서 가장 큰 PNG를 뽑아 GCS 업로드
+ * - 실패(미설치/이미지 없음/권한 문제)는 조용히 null 반환
+ */
+async function tryExtractCover(gcsPdfUri, { family, brand, code }) {
+  try {
+    const { bucket, name } = parseGcsUri(gcsPdfUri);
 
-  const gcsUri = opts.gcsUri || opts.gcsPdfUri;
-  if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
+    // GCS → 로컬 임시 PDF 저장
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pp-ds-'));
+    const localPdf = path.join(tmpDir, 'doc.pdf');
+    const [buf] = await storage.bucket(bucket).file(name).download();
+    await fs.writeFile(localPdf, buf);
+
+    // 1~2페이지 이미지 추출
+    // pdfimages가 없으면 ENOENT 발생 → catch에서 null
+    await execFileP('pdfimages', ['-f', '1', '-l', '2', '-png', localPdf, path.join(tmpDir, 'img')]);
+
+    // 추출된 파일 중 가장 큰 PNG 고르기
+    const files = await fs.readdir(tmpDir);
+    const pngs = files.filter(f => /^img-\d+-\d+\.png$/i.test(f));
+    if (!pngs.length) return null;
+
+    let pick = null, maxSize = -1;
+    for (const f of pngs) {
+      const st = await fs.stat(path.join(tmpDir, f));
+      if (st.size > maxSize) { pick = f; maxSize = st.size; }
+    }
+    if (!pick) return null;
+
+    // 결과 업로드 경로 구성 (자산 버킷 우선: ASSET_BUCKET → GCS_BUCKET)
+    const assetBucket = (process.env.ASSET_BUCKET || process.env.GCS_BUCKET || '').replace(/^gs:\/\//, '');
+    if (!assetBucket) return null;
+
+    const coverGsUri = canonicalCoverPath(assetBucket, family, brand, code); // "gs://bucket/..." 형태 반환 가정
+    const dst = parseGcsUri(coverGsUri);
+    await storage.bucket(dst.bucket).upload(path.join(tmpDir, pick), {
+      destination: dst.name, resumable: false, validation: false,
+      metadata: { contentType: 'image/png', cacheControl: 'public, max-age=31536000' },
+    });
+
+    return coverGsUri;
+  } catch {
+    return null; // 어떤 실패든 조용히 무시
+  }
+}
+
+/**
+ * family가 주어지지 않았을 때의 폴백:
+ *  1) component_registry의 아무거나 쓰지 않고,
+ *  2) 안전하게 기존 릴레이 테이블로 폴백
+ */
+function fallbackFamilyAndTable() {
+  return { family: 'relay_power', table: 'public.relay_power_specs' };
+}
+
+/* ---------------- main ---------------- */
+
+/**
+ * @param {Object} opts
+ * @param {string} opts.gcsUri         gs://... 입력 (필수)
+ * @param {string} [opts.family_slug]  부품군
+ * @param {string} [opts.brand]
+ * @param {string} [opts.code]
+ * @param {string} [opts.series]
+ * @param {string} [opts.display_name]
+ */
+async function runAutoIngest(opts = {}) {
+  const t0 = Date.now();
+
+  const srcUri = String(opts.gcsUri || opts.gcsPdfUri || '');
+  if (!/^gs:\/\//i.test(srcUri)) {
     throw new Error('gcsUri required (gs://...)');
   }
-  const filename = opts.filename || gcsUri.split('/').pop() || 'doc.pdf';
 
-  // 1) 데이터셋 추출 (브랜드/코드/시리즈/텍스트 등)
-  const ds = await extractDataset({
-    gcsUri,
-    filename,
-    brandHint: opts.brand,
-    codeHint:  opts.code,
-    seriesHint: opts.series
+  // 입력 정규화
+  const familyIn = safeLower(opts.family_slug || '');
+  const brandIn  = trimLower(opts.brand || '');
+  const codeIn   = trimLower(opts.code || '');
+
+  // family / table 결정
+  let family = familyIn || null;
+  let table  = null;
+
+  if (family) {
+    table = await guessSpecsTable(family);
+  }
+  if (!table) {
+    const fb = fallbackFamilyAndTable();
+    family = family || fb.family;
+    table  = table  || fb.table;
+  }
+
+  // 브랜드/코드 기본값
+  const brand = brandIn || 'UNKNOWN';
+  const code  = codeIn  || randomTempCode();
+
+  // 데이터시트 정규 경로로 이동(또는 복사)
+  let finalDsUri = srcUri;
+  try {
+    const bucketForDs = (process.env.GCS_BUCKET || process.env.ASSET_BUCKET || '').replace(/^gs:\/\//, '');
+    if (bucketForDs) {
+      const canonical = canonicalDatasheetPath(bucketForDs, family, brand, code); // "gs://bucket/..." 가정
+      finalDsUri = await moveObject(srcUri, canonical); // move 실패해도 catch에서 finalDsUri를 src로 유지
+    }
+  } catch {
+    finalDsUri = srcUri;
+  }
+
+  // 테이블 보장 + 업서트
+  await ensureSpecsTable(table, {}); // 컬럼 자동 확장 로직이 있다면 {}로 호출 (기존 호환)
+  const upsertRow = await upsertByBrandCode(table, {
+    brand, code,
+    series: opts.series || null,
+    display_name: opts.display_name || null,
+    family_slug: family,
+    datasheet_uri: finalDsUri,
+    source_gcs_uri: srcUri,
+    raw_json: null, // 나중에 DocAI 연결 시 채움
   });
 
-  const brand = (ds.brand || opts.brand || 'unknown').toString();
-  const code  = (Array.isArray(ds.rows) && ds.rows[0]?.code)
-                  || opts.code
-                  || ('TMP_' + Math.random().toString(16).slice(2).toUpperCase());
-  const series = ds.series || opts.series || null;
-  const displayName = (Array.isArray(ds.rows) && ds.rows[0]?.displayname) || opts.display_name || null;
-  const rawText = ds.text || '';
+  // 대표 이미지 시도 (있으면 image_uri / cover 중 존재하는 컬럼만 갱신)
+  const coverUri = await tryExtractCover(finalDsUri, { family, brand, code });
+  if (coverUri) {
+    // 동적 테이블명은 식별자를 안전하게 보장된 값만 사용 (component_registry에서 온 값 + 폴백만 허용)
+    // 컬럼 존재 유무에는 의존하지 않도록 개별 try로 감쌈
+    const whereArgs = [brand, code, family];
+    try {
+      await db.query(
+        `UPDATE ${table}
+            SET image_uri = COALESCE($1, image_uri)
+          WHERE brand_norm = lower($2) AND code_norm = lower($3) AND family_slug = $4`,
+        [coverUri, ...whereArgs]
+      );
+    } catch (_) {}
+    try {
+      await db.query(
+        `UPDATE ${table}
+            SET cover = COALESCE($1, cover)
+          WHERE brand_norm = lower($2) AND code_norm = lower($3) AND family_slug = $4`,
+        [coverUri, ...whereArgs]
+      );
+    } catch (_) {}
+  }
 
-  // 2) family 결정 (명시 > 휴리스틱 > 기본 relay_power)
-  const family = lc(opts.family_slug) ||
-                 chooseCanonicalFamilySlug({ text: rawText }) ||
-                 'relay_power';
+  const ms = Date.now() - t0;
 
-  // 3) component_registry에서 스펙 테이블 확인 + 보장
-  const reg = await db.query(
-    `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
-    [family]
-  );
-  const tableName = (reg.rows[0]?.specs_table || `${family}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
-  await ensureSpecsTable(tableName, {}); // 필요 시 컬럼/테이블 보장
-
-  // 4) 대표 이미지(cover) 추출 (실패해도 인제스트는 계속)
-  const coverUri = await extractCoverToGcs(gcsUri, { family, brand, code });
-
-  // 5) UPSERT (존재하는 컬럼만 schema util이 처리)
-  const payload = {
-    family_slug: family,
-    brand, code,
-    brand_norm: lc(brand),
-    code_norm:  lc(code),
-    series,
-    display_name: displayName,
-    datasheet_uri: gcsUri,
-    // 공통 필드 (테이블에 없으면 무시됨)
-    image_url: coverUri,
-    cover: coverUri,
-    width_mm:  null,
-    height_mm: null,
-    length_mm: null,
-    // 원하면 원문 추적/검증용 필드들도 추가 가능(verified_in_doc 등)
-  };
-
-  const row = await upsertByBrandCode(tableName, payload);
-
-  const ms = Date.now() - started;
+  // server.js가 기대하는 키들(호환용) 그대로 반환
   return {
     ok: true,
     ms,
+    family,
     family_slug: family,
-    specs_table: `public.${tableName}`,
+    specs_table: table,
     brand,
     code,
-    datasheet_uri: gcsUri,
-    image_url: coverUri,
-    // 필요 시 반환 확장
-    row,
+    codes: [code],
+    datasheet_uri: finalDsUri,
+    // 디버깅/호환
+    rows: 1,
+    cover_uri: coverUri || null,
+    upsert_row: upsertRow || null,
   };
 }
 

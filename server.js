@@ -380,8 +380,8 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
 
 app.post('/ingest/auto', requireSession, async (req, res) => {
   try {
-    const { gcsUri, gcsPdfUri, family_slug = null, brand = null, code = null, series = null, display_name = null } = req.body || {};
-    const uri = gcsUri || gcsPdfUri;
+   const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name } = req.body || {};
+   const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
     const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
     res.json(result);

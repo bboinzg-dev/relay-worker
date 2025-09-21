@@ -1,5 +1,14 @@
-﻿/* relay-worker/src/pipeline/ingestAuto.js */
+﻿// src/pipeline/ingestAuto.js
 'use strict';
+
+/**
+ * Generic ingestion pipeline (keeps legacy behaviour).
+ * - If family_slug is provided, use it.
+ * - Otherwise, try a light-weight heuristic to guess family from file name/text.
+ * - Looks up specs_table in component_registry and ensures the table exists.
+ * - Tries to extract a cover image using `pdfimages` (if present); failure is ignored.
+ * - Upserts only columns that actually exist on the destination table.
+ */
 
 const path = require('node:path');
 const fs = require('node:fs/promises');
@@ -8,32 +17,67 @@ const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const execFileP = promisify(execFile);
 
-
 const db = require('../utils/db');
-const { storage, parseGcsUri, canonicalCoverPath } = require('../utils/gcs');
+const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('../utils/schema');
 
-// 첫 1~2페이지에서 가장 큰 이미지를 골라 GCS 업로드
-// pdfimages가 없거나 실패하면 null 반환 (완전 무시)
-async function tryExtractCover(gcsPdfUri, { family, brand, code }) {
+// ---- helpers ---------------------------------------------------------------
+
+function sanitizeId(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9._-]/g, '-');
+}
+
+async function getTableColumns(qualifiedTable /* e.g. public.relay_power_specs */) {
+  const [schema, table] = qualifiedTable.includes('.') ? qualifiedTable.split('.') : ['public', qualifiedTable];
+  const q = `
+    SELECT a.attname AS col
+      FROM pg_attribute a
+      JOIN pg_class c ON a.attrelid = c.oid
+      JOIN pg_namespace n ON c.relnamespace = n.oid
+     WHERE n.nspname = $1
+       AND c.relname = $2
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+  `;
+  const r = await db.query(q, [schema, table]);
+  return new Set(r.rows.map(x => x.col));
+}
+
+async function getUpsertColumns(qualifiedTable) {
+  const [schema, table] = qualifiedTable.includes('.') ? qualifiedTable.split('.') : ['public', qualifiedTable];
+  const q = `
+    SELECT array_agg(a.attname ORDER BY a.attnum) AS cols
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+     WHERE n.nspname = $1 AND c.relname = $2 AND i.indisunique`;
+  const r = await db.query(q, [schema, table]);
+  const first = r.rows[0]?.cols || [];
+  const hasBrand = first.includes('brand_norm');
+  const hasCode  = first.includes('code_norm');
+  if (hasBrand && hasCode) return first;
+  return ['brand_norm','code_norm'];
+}
+
+// Extract the largest image from page 1~2 using `pdfimages`, upload to GCS.
+async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
   try {
     const { bucket, name } = parseGcsUri(gcsPdfUri);
-    const tmpDir = path.join(os.tmpdir(), 'pdf-' + Date.now());
+    const tmpDir  = path.join(os.tmpdir(), 'pdf-' + Date.now());
+    const pdfPath = path.join(tmpDir, 'doc.pdf');
     await fs.mkdir(tmpDir, { recursive: true });
-    const localPdf = path.join(tmpDir, 'doc.pdf');
+
+    // Download PDF
     const [buf] = await storage.bucket(bucket).file(name).download();
-    await fs.writeFile(localPdf, buf);
+    await fs.writeFile(pdfPath, buf);
 
-    // pdfimages 호출 (미설치/실패 시 조용히 무시)
-    try {
-      await execFileP('pdfimages', ['-f','1','-l','2','-png', localPdf, path.join(tmpDir, 'img')]);
-    } catch {
-      return null;
-    }
+    // Try to extract images from page 1~2; if pdfimages isn't installed, this throws.
+    await execFileP('pdfimages', ['-f','1','-l','2','-png', pdfPath, path.join(tmpDir,'img')]);
 
+    // Pick the largest PNG
     const files = (await fs.readdir(tmpDir)).filter(f => /^img-\d+-\d+\.png$/i.test(f));
     if (!files.length) return null;
-
     let pick = null, size = -1;
     for (const f of files) {
       const st = await fs.stat(path.join(tmpDir, f));
@@ -41,97 +85,116 @@ async function tryExtractCover(gcsPdfUri, { family, brand, code }) {
     }
     if (!pick) return null;
 
-    const dst = canonicalCoverPath(process.env.ASSET_BUCKET || process.env.GCS_BUCKET, family, brand, code);
-    const { bucket: dbkt, name: dname } = parseGcsUri(dst);
-    await storage.bucket(dbkt).upload(path.join(tmpDir, pick), { destination: dname, resumable: false });
+    const dst = canonicalCoverPath(
+      (process.env.ASSET_BUCKET || process.env.GCS_BUCKET || '').replace(/^gs:\/\//,''),
+      family, brand, code
+    );
+    const { bucket: outBkt, name: outName } = parseGcsUri(dst);
+    await storage.bucket(outBkt).upload(path.join(tmpDir, pick), {
+      destination: outName, resumable: false,
+    });
     return dst;
-  } catch {
-    return null;
+  } catch (e) {
+    return null; // best-effort
   }
 }
 
-// family가 없을 때 최소 탐색(기존 데이터에서 찾아보고 없으면 relay_power)
-async function detectFamily({ family_slug, brand, code }) {
-  if (family_slug) return family_slug;
-  try {
-    const r = await db.query(`
-      select family_slug from public.component_specs
-       where brand_norm = lower($1) and code_norm = lower($2)
-       limit 1`, [brand || '', code || '']);
-    if (r.rows[0]?.family_slug) return r.rows[0].family_slug;
-  } catch {}
-  return 'relay_power';
+function guessFamilySlug({ fileName = '', previewText = '' }) {
+  const s = (fileName + ' ' + previewText).toLowerCase();
+  if (/\b(resistor|r-clamp|ohm)\b/.test(s)) return 'resistor';
+  if (/\b(capacitor|mlcc|electrolytic|tantalum)\b/.test(s)) return 'capacitor_mlcc';
+  if (/\b(inductor|choke)\b/.test(s)) return 'inductor';
+  if (/\b(bridge|rectifier|diode)\b/.test(s)) return 'bridge_rectifier';
+  if (/\b(relay|coil|omron|finder)\b/.test(s)) return 'relay_power';
+  return null;
 }
 
-async function runAutoIngest({ gcsUri, family_slug, brand, code, series=null, display_name=null }) {
-  const started = Date.now();
+// ---- main ------------------------------------------------------------------
 
-  // 1) family / table 결정
-  const family = await detectFamily({ family_slug, brand, code });
-  const reg = await db.query(`select specs_table from public.component_registry where family_slug=$1 limit 1`, [family]);
+async function runAutoIngest({
+  gcsUri,
+  family_slug = null,
+  brand = null,
+  code = null,
+  series = null,
+  display_name = null,
+}) {
+  const started = Date.now();
+  if (!gcsUri) throw new Error('gcsUri required');
+
+  // 0) Quick peek for family guess if not provided
+  let fileName = '';
+  try {
+    const { name } = parseGcsUri(gcsUri);
+    fileName = path.basename(name);
+  } catch {}
+  let family = (family_slug || '').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
+
+  // Read a tiny piece of the document to help guessing (best-effort)
+  if (!family) {
+    try {
+      const text = await readText(gcsUri, 256 * 1024);
+      family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
+    } catch {
+      family = 'relay_power';
+    }
+  }
+
+  // 1) Resolve destination table from registry
+  const reg = await db.query(
+    `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+    [family]
+  );
   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
 
-  await ensureSpecsTable(table, {}); // 테이블 보장
-
-  // 2) 최소 행 upsert (추후 추출 프로세스가 갱신)
-  const row = await upsertByBrandCode(table, {
-    family_slug: family,
-    brand, code, series, display_name,
-    datasheet_uri: gcsUri,
+  // 2) Ensure the table exists (keep base columns compatible with your DB)
+  await ensureSpecsTable(table, {
+    datasheet_uri: 'text',
+    image_uri: 'text',
+    width_mm: 'numeric',
+    height_mm: 'numeric',
+    length_mm: 'numeric',
   });
 
-  const assetBucket =
-  process.env.ASSET_BUCKET?.replace(/^gs:\/\//, '') ||
-  process.env.GCS_BUCKET?.replace(/^gs:\/\//, '') ||
-  null;
-
-if (assetBucket && result?.datasheet_uri) {
-  const coverUri = await tryExtractCover(result.datasheet_uri, {
-    family: result.family || result.family_slug || family,
-    brand:  result.brand  || brand,
-    code:   result.code   || code,
-    targetBucket: assetBucket,
-  });
-
-  if (coverUri) {
-    // 테이블 스키마가 서로 다른 경우를 모두 안전하게 처리 (있으면만 업데이트)
-    try {
-      await db.query(
-        `UPDATE public.${table}
-           SET cover = COALESCE($1, cover)
-         WHERE brand_norm = lower($2) AND code_norm = lower($3)`,
-        [coverUri, brand, code]
-      );
-    } catch {}
-    try {
-      await db.query(
-        `UPDATE public.${table}
-           SET image_url = COALESCE($1, image_url)
-         WHERE brand_norm = lower($2) AND code_norm = lower($3)`,
-        [coverUri, brand, code]
-      );
-    } catch {}
-  }
-}
-
-
-  // 3) 대표 이미지 추출(실패/미설치 무시)
+  // 3) Best-effort cover extraction
+  let coverUri = null;
   try {
-    const coverUri = await tryExtractCover(gcsUri, { family, brand, code });
-    if (coverUri) {
-      await db.query(`update public.${table}
-                        set image_uri = coalesce(image_uri, $1), updated_at = now()
-                      where brand_norm = lower($2) and code_norm = lower($3)`,
-        [coverUri, brand, code]);
-    }
+    coverUri = await extractCoverToGcs(gcsUri, {
+      family,
+      brand: brand || '',
+      code:  code || '',
+    });
   } catch {}
+
+  // 4) Build payload (only safe keys; upsert is by (brand_norm, code_norm))
+  const payload = {
+    family_slug: family,
+    brand: brand || 'unknown',
+    code:  code  || path.parse(fileName).name,
+    series: series || null,
+    display_name: display_name || null,
+    datasheet_uri: gcsUri,
+    image_uri: coverUri || null,
+    updated_at: new Date(), // ignored if column doesn't exist
+  };
+
+  // 5) Upsert (uses only existing columns)
+  const colsSet = await getTableColumns(table.startsWith('public.') ? table : `public.${table}`);
+  const safePayload = {};
+  for (const [k, v] of Object.entries(payload)) {
+    if (colsSet.has(k)) safePayload[k] = v;
+  }
+  const row = await upsertByBrandCode(table, safePayload);
 
   return {
     ok: true,
     ms: Date.now() - started,
-    family, specs_table: `public.${table}`,
-    brand, code,
+    family,
+    specs_table: table,
+    brand: row?.brand || payload.brand,
+    code: row?.code || payload.code,
     datasheet_uri: gcsUri,
+    cover: coverUri,
     rows: 1,
   };
 }

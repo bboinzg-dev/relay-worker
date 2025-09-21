@@ -3,33 +3,41 @@
 const express = require('express');
 const multer  = require('multer');
 const upload  = multer({ storage: multer.memoryStorage() });
+const { VertexAI } = require('@google-cloud/vertexai');
 
 const router = express.Router();
 
-/**
- * 기존 비전 모듈을 최대한 활용합니다.
- * - server.vision가 export한 라우터가 있을 경우, 그 핸들러를 직접 부르거나
- * - 내부에 구현된 similarity 함수로 위임합니다.
- *
- * 아래 handler는 "이미 구현되어 있는" search/similar 엔드포인트가 있을 때
- * 그쪽으로 안전히 위임하는 형태의 예시입니다.
- */
-
-// 1) POST /api/vision/guess  (이미지 바이너리 업로드)
-router.post('/api/vision/guess', upload.single('file'), async (req, res, next) => {
+/** 폴백: /api/vision/guess */
+router.post('/api/vision/guess', upload.single('file'), async (req, res) => {
   try {
-    // 1-A) 만약 기존에 /api/vision/search 가 있다면 같은 형식으로 호출
-    req.url  = '/api/vision/search';
-    req.body = req.body || {};
-    if (req.file) {
-      // 기존 핸들러가 buffer를 받는 경우: req.body.imageBuffer, 혹은 그대로 req.file 사용
-      req.body.imageBuffer = req.file.buffer;
-      req.body.filename = req.file.originalname || 'upload.png';
-    }
-    return next(); // server.vision 라우터가 mount되어 있으면 이 경로로 흘러감
+    const buf  = req.file?.buffer;
+    const mime = req.file?.mimetype || 'image/jpeg';
+    if (!buf) return res.status(400).json({ ok:false, error:'file required' });
+
+    const project  = process.env.GCP_PROJECT_ID;
+    const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
+    const modelId  = process.env.GEMINI_MODEL_CLASSIFY || 'gemini-2.5-flash';
+
+    const v = new VertexAI({ project, location });
+    const model = v.getGenerativeModel({ model: modelId });
+
+    const prompt = '사진 속 전자부품의 (family_slug, family_label, brand, code, confidence)만 JSON으로 반환. 불확실하면 null과 낮은 confidence.';
+    const resp = await model.generateContent({
+      contents: [{ role:'user', parts:[
+        { inlineData: { data: buf.toString('base64'), mimeType: mime } },
+        { text: prompt }
+      ]}],
+      generationConfig: { responseMimeType: 'application/json' }
+    });
+
+    const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
+    const raw   = parts.map(p => p.text ?? '').join('');
+    const guess = JSON.parse(raw || '{}');
+
+    return res.json({ ok:true, guess });
   } catch (e) {
-    console.error('[vision/guess alias]', e);
-    return res.status(500).json({ ok:false, error:'vision alias failed' });
+    console.error('[vision/guess]', e);
+    return res.status(500).json({ ok:false, error:String(e?.message||e) });
   }
 });
 

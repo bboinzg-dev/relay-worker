@@ -30,16 +30,21 @@ const BASE_COLUMNS = [
  */
 async function ensureSpecsTable(tableName, extraCols = {}) {
   const safe = tableName.replace(/[^a-zA-Z0-9_]/g, '');
+
+  // ensure required extensions for uuid_generate_v4()
+  await db.query('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";');
+
   await db.query(`
-    DO $$
+    DO $do$
     BEGIN
       IF NOT EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=$$${safe}$$
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema='public' AND table_name='${safe}'
       ) THEN
         EXECUTE 'CREATE TABLE public.${safe} ( ${BASE_COLUMNS.join(', ')} )';
         EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS ix_${safe}_brand_code ON public.${safe}(brand_norm, code_norm)';
       END IF;
-    END$$;`);
+    END $do$;`);
 
   // Add missing columns (type mapping)
   const mapType = (t) => {
@@ -71,7 +76,7 @@ async function upsertByBrandCode(tableName, values) {
   const safe = tableName.replace(/[^a-zA-Z0-9_]/g, '');
   const cols = Object.keys(values).map(c => c.replace(/[^a-zA-Z0-9_]/g, ''));
   if (!cols.length) return null;
-  const params = cols.map((_, i) => `$${i+1}`);
+  const params = cols.map((_, i) => `$${i + 1}`);
   const updates = cols.map(c => `${c}=EXCLUDED.${c}`);
   const sql = `
     INSERT INTO public.${safe} (${cols.join(',')})

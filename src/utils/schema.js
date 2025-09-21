@@ -10,8 +10,8 @@ const BASE_COLUMNS = [
   `display_name text`,
   `family_slug text`,
   `datasheet_url text`,
-  `image_url text`,         -- 대표 이미지(GCS)
-  `cover text`,             -- (하위호환) 있으면 유지
+  `image_url text`, // 대표 이미지(GCS)
+  `cover text`,     // (하위호환)
   `length_mm numeric`,
   `width_mm  numeric`,
   `height_mm numeric`,

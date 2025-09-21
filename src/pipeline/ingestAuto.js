@@ -7,7 +7,6 @@ const os = require('node:os');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const execFileP = promisify(execFile);
-const { tryExtractCover } = require('./cover');
 
 
 const db = require('../utils/db');

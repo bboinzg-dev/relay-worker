@@ -1,88 +1,83 @@
+/* relay-worker/src/utils/schema.js */
+'use strict';
+
 const db = require('./db');
 
-const BASE_COLUMNS = [
-  `id uuid PRIMARY KEY DEFAULT uuid_generate_v4()`,
-  `brand text NOT NULL`,
-  `code text NOT NULL`,
-  `brand_norm text GENERATED ALWAYS AS (lower(brand)) STORED`,
-  `code_norm text GENERATED ALWAYS AS (lower(code)) STORED`,
-  `series text`,
-  `display_name text`,
-  `family_slug text`,
-  `datasheet_url text`,
-  `image_url text`, // 대표 이미지(GCS)
-  `cover text`,     // (하위호환)
-  `length_mm numeric`,
-  `width_mm  numeric`,
-  `height_mm numeric`,
-  `raw_json jsonb`,
-  `source_gcs_uri text`,
-  `embedding vector(768) NULL`,
-  `created_at timestamptz NOT NULL DEFAULT now()`,
-  `updated_at timestamptz NOT NULL DEFAULT now()`
-];
+const COMMON_COLS_SQL = `
+  -- 공통 스펙 컬럼
+  id bigserial primary key,
+  family_slug text not null,
+  brand text not null,
+  code  text not null,
+  brand_norm text generated always as (lower(brand)) stored,
+  code_norm  text generated always as (lower(code)) stored,
+  series text,
+  display_name text,
 
-async function ensureExtensions() {
-  await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
-  try { await db.query(`CREATE EXTENSION IF NOT EXISTS vector;`); } catch {}
-}
+  -- 크기(mm)
+  width_mm  text,
+  height_mm text,
+  length_mm text,
 
-async function ensureSpecsTable(tableName, fields = {}) {
-  await ensureExtensions();
-  const safe = tableName.replace(/[^a-zA-Z0-9_]/g, '');
-  const baseCols = BASE_COLUMNS.join(',\n      ');
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS public.${safe} (
-      ${baseCols}
+  -- URL
+  image_uri     text, -- 대표 이미지(GCS)
+  datasheet_uri text, -- 데이터시트(GCS)
+
+  -- 원본/추출
+  source_gcs_uri text,
+  raw_json jsonb,
+
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+`;
+
+async function ensureSpecsTable(table, extraFields = {}) {
+  const safe = String(table).replace(/[^a-zA-Z0-9_]/g, '');
+  const createSql = `
+    create table if not exists public.${safe} (
+      ${COMMON_COLS_SQL}
     );
-  `);
+    do $$
+    begin
+      if not exists (select 1 from pg_indexes where schemaname='public' and indexname='${safe}_brand_code_idx') then
+        execute 'create unique index ${safe}_brand_code_idx on public.${safe}(brand_norm, code_norm)';
+      end if;
+    end
+    $$;
+  `;
+  await db.query(createSql);
 
-  await db.query(`
-    DO $$ BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'uq_${safe}_brand_norm_code_norm'
-      ) THEN
-        ALTER TABLE public.${safe}
-        ADD CONSTRAINT uq_${safe}_brand_norm_code_norm UNIQUE (brand_norm, code_norm);
-      END IF;
-    END $$;
-  `);
-
-  for (const [col, typ] of Object.entries(fields)) {
-    const colSafe = col.replace(/[^a-zA-Z0-9_]/g, '');
-    const mapType = (t) => {
-      switch ((t || '').toLowerCase()) {
-        case 'numeric': return 'numeric';
-        case 'int':
-        case 'integer': return 'integer';
-        case 'bool':
-        case 'boolean': return 'boolean';
-        case 'timestamp':
-        case 'timestamptz': return 'timestamptz';
-        case 'json':
-        case 'jsonb': return 'jsonb';
-        case 'text':
-        default: return 'text';
-      }
-    };
-    await db.query(`ALTER TABLE public.${safe} ADD COLUMN IF NOT EXISTS ${colSafe} ${mapType(typ)};`);
+  // 추가 family 전용 필드(있다면 텍스트로 생성)
+  for (const k of Object.keys(extraFields || {})) {
+    const col = k.replace(/[^a-zA-Z0-9_]/g, '');
+    try {
+      await db.query(`alter table public.${safe} add column if not exists ${col} text`);
+    } catch {}
   }
+  return safe;
 }
 
-async function upsertByBrandCode(tableName, values) {
-  const safe = tableName.replace(/[^a-zA-Z0-9_]/g, '');
-  const cols = Object.keys(values).map(c => c.replace(/[^a-zA-Z0-9_]/g, ''));
-  const params = cols.map((_, i) => `$${i+1}`);
-  const updates = cols.map(c => `${c}=EXCLUDED.${c}`);
+async function upsertByBrandCode(table, row) {
+  const safe = String(table).replace(/[^a-zA-Z0-9_]/g, '');
+  const cols = [
+    'family_slug','brand','code','series','display_name',
+    'width_mm','height_mm','length_mm',
+    'image_uri','datasheet_uri','source_gcs_uri','raw_json'
+  ];
+  const vals = cols.map(c => row[c] ?? null);
+
+  const placeholders = vals.map((_,i)=>'$'+(i+1)).join(',');
+  const updates = cols.map(c => `${c}=EXCLUDED.${c}`).join(', ');
+
   const sql = `
-    INSERT INTO public.${safe} (${cols.join(',')})
-    VALUES (${params.join(',')})
-    ON CONFLICT (brand_norm, code_norm)
-    DO UPDATE SET ${updates.join(',')}, updated_at = now()
-    RETURNING *;
+    insert into public.${safe} (${cols.join(', ')})
+    values (${placeholders})
+    on conflict (brand_norm, code_norm)
+    do update set ${updates}, updated_at = now()
+    returning *;
   `;
-  const res = await db.query(sql, cols.map(c => values[c]));
-  return res.rows[0];
+  const r = await db.query(sql, vals);
+  return r.rows[0];
 }
 
 module.exports = { ensureSpecsTable, upsertByBrandCode };

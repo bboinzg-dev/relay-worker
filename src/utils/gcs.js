@@ -1,54 +1,42 @@
-const { Storage } = require('@google-cloud/storage');
+/* relay-worker/src/utils/gcs.js */
+'use strict';
 
+const { Storage } = require('@google-cloud/storage');
 const storage = new Storage();
 
 function parseGcsUri(gcsUri) {
-  if (!gcsUri?.startsWith('gs://')) throw new Error('gcsUri must start with gs://');
-  const [, , bucket, ...rest] = gcsUri.split('/');
-  return { bucket, name: rest.join('/') };
+  const m = /^gs:\/\/([^/]+)\/(.+)$/.exec(String(gcsUri || ''));
+  if (!m) throw new Error('INVALID_GCS_URI');
+  return { bucket: m[1], name: m[2] };
 }
 
-async function readText(gcsUri, limitBytes=4*1024*1024) {
-  const { bucket, name } = parseGcsUri(gcsUri);
-  const [buf] = await storage.bucket(bucket).file(name).download({ start: 0, end: limitBytes });
-  return buf.toString('utf8');
+function canonicalDatasheetPath(bucket, family, brand, code) {
+  const bkt = bucket || process.env.GCS_BUCKET?.replace(/^gs:\/\//,'');
+  const norm = s => String(s || 'unknown').toLowerCase().replace(/[^a-z0-9_]+/g,'-');
+  return `gs://${bkt}/datasheets/${norm(family)}/${norm(brand)}/${norm(code)}.pdf`;
+}
+function canonicalCoverPath(bucket, family, brand, code) {
+  const bkt = bucket || process.env.GCS_BUCKET?.replace(/^gs:\/\//,'');
+  const norm = s => String(s || 'unknown').toLowerCase().replace(/[^a-z0-9_]+/g,'-');
+  return `gs://${bkt}/covers/${norm(family)}/${norm(brand)}/${norm(code)}.png`;
 }
 
-async function readBytes(gcsUri, limitBytes=10*1024*1024) {
+async function getSignedUrl(gcsUri, minutes = 15, action = 'read') {
   const { bucket, name } = parseGcsUri(gcsUri);
-  const [buf] = await storage.bucket(bucket).file(name).download({ start: 0, end: limitBytes });
-  return buf;
-}
-
-async function getSignedUrl(gcsUri, minutes=15, action='read') {
-  const { bucket, name } = parseGcsUri(gcsUri);
-  const [url] = await storage.bucket(bucket).file(name).getSignedUrl({
-    action,
+  const file = storage.bucket(bucket).file(name);
+  const [url] = await file.getSignedUrl({
     version: 'v4',
+    action,
     expires: Date.now() + minutes * 60 * 1000,
   });
   return url;
 }
-
-function canonicalDatasheetPath(bucket, family, brand, code) {
-  const b = (brand||'').toLowerCase().replace(/[^a-z0-9._-]/g, '-');
-  const c = (code||'').toLowerCase().replace(/[^a-z0-9._-]/g, '-');
-  const f = (family||'').toLowerCase().replace(/[^a-z0-9._-]/g, '-');
-  return `gs://${bucket}/datasheets/${f}/${b}/${c}.pdf`;
-}
-
-function canonicalCoverPath(bucket, family, brand, code) {
-  const b = (brand||'').toLowerCase().replace(/[^a-z0-9._-]/g, '-');
-  const c = (code||'').toLowerCase().replace(/[^a-z0-9._-]/g, '-');
-  const f = (family||'').toLowerCase().replace(/[^a-z0-9._-]/g, '-');
-  return `gs://${bucket}/images/${f}/${b}/${c}/cover.png`;
-}
-
 async function moveObject(srcGcsUri, dstGcsUri) {
-  const src = parseGcsUri(srcGcsUri);
-  const dst = parseGcsUri(dstGcsUri);
-  await storage.bucket(src.bucket).file(src.name).move(storage.bucket(dst.bucket).file(dst.name));
-  return dstGcsUri;
+  const { bucket: sb, name: sn } = parseGcsUri(srcGcsUri);
+  const { bucket: db, name: dn } = parseGcsUri(dstGcsUri);
+  await storage.bucket(sb).file(sn).copy(storage.bucket(db).file(dn));
+  await storage.bucket(sb).file(sn).delete({ ignoreNotFound: true });
+  return `gs://${db}/${dn}`;
 }
 
-module.exports = { storage, parseGcsUri, readText, readBytes, getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject };
+module.exports = { storage, parseGcsUri, canonicalDatasheetPath, canonicalCoverPath, getSignedUrl, moveObject };

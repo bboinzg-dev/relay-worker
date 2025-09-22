@@ -26,6 +26,7 @@ try { app.use(require('./server.vision.alias')); console.log('[BOOT] mounted /ap
 try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
 
 
+
 /* NOTE: The parts router already exists in your repo; keep it mounted. */
 try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
 

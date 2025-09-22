@@ -1,4 +1,3 @@
-// src/utils/extract.js
 'use strict';
 
 const { Storage } = require('@google-cloud/storage');
@@ -18,8 +17,19 @@ async function downloadGcs(gsUri) {
   return buf;
 }
 
-// DocAI online imageless: 30p까지 허용
-async function docaiProcessImageless(gsUri) {
+function samplePages(total, k) {
+  if (!Number.isFinite(total) || total <= 0) return Array.from({ length: k }, (_,i)=>i+1);
+  if (total <= k) return Array.from({ length: total }, (_,i)=>i+1);
+  const pick = new Set([1,2,3, total-1, total]);
+  while (pick.size < k) {
+    const pos = Math.max(1, Math.min(total, Math.round((pick.size/(k+1))*total)));
+    pick.add(pos);
+  }
+  return Array.from(pick).sort((a,b)=>a-b).slice(0,k);
+}
+
+// DocAI online imageless: 30p까지, 초과 에러 시 15p 샘플링
+async function docaiProcessSmart(gsUri) {
   const project   = process.env.DOCAI_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
   const location  = process.env.DOCAI_LOCATION || 'us';
   const processor = process.env.DOCAI_PROCESSOR_ID;
@@ -28,23 +38,28 @@ async function docaiProcessImageless(gsUri) {
   const client = new DocumentProcessorServiceClient({ apiEndpoint: `${location}-documentai.googleapis.com` });
   const name = `projects/${project}/locations/${location}/processors/${processor}`;
 
-  const rawDocument = { content: await downloadGcs(gsUri), mimeType: 'application/pdf' };
-  const [result] = await client.processDocument({ name, rawDocument, imagelessMode: true, skipHumanReview: true });
-  const doc = result?.document;
-  return { text: doc?.text || '', pages: doc?.pages || [] };
+  const buf = await downloadGcs(gsUri);
+  try {
+    const [r] = await client.processDocument({ name, rawDocument: { content: buf, mimeType: 'application/pdf' }, imagelessMode: true, skipHumanReview: true });
+    return { text: r?.document?.text || '', pages: r?.document?.pages || [] };
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (!/supports up to 15 pages|exceed the limit: 15/i.test(msg)) throw e;
+    let total = 0;
+    try { const pdf = require('pdf-parse'); const p = await pdf(buf); total = Number(p?.numpages || 0); } catch {}
+    const pages = samplePages(total || 30, 15);
+    const [r2] = await client.processDocument({
+      name,
+      rawDocument: { content: buf, mimeType: 'application/pdf' },
+      processOptions: { individualPageSelector: { pages } },
+      skipHumanReview: true,
+    });
+    return { text: r2?.document?.text || '', pages: r2?.document?.pages || [] };
+  }
 }
 
 async function extractText(gsUri) {
-  // 1) DocAI imageless 우선
-  try {
-    const r = await docaiProcessImageless(gsUri);
-    if (r?.text && r.text.length > 200) return r;
-  } catch (e) {
-    console.warn('[extractText] DocAI imageless failed:', e?.message || e);
-  }
-
-  // 2) 폴백: 필요 시 다른 경로 추가
-  return { text: '', pages: [] };
+  return await docaiProcessSmart(gsUri);
 }
 
 module.exports = { extractText, parseGsUri };

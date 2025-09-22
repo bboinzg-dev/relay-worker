@@ -1,9 +1,8 @@
-// src/ai/datasheetExtract.js
 'use strict';
 
 /**
  * PDF → { brand, rows: [{ code, verified_in_doc, ...values }] }
- * - 전 패밀리 공용. 블루프린트(allowedKeys)로 values 키를 제한.
+ * - 전 패밀리 공용. 블루프린트(allowedKeys)로 values 키 제한.
  * - DocAI(Form Parser) 우선(표/텍스트 확보) → 실패 시 pdf-parse 폴백.
  * - 표의 Part No/Type/Model/Ordering Code에서 실제 PN 우선 수집.
  * - Ordering 정보는 조합 폭 과다 방지. 자유텍스트는 보조(regex).
@@ -69,7 +68,23 @@ async function detectBrandFromText(fullText) {
   return best?.brand || null;
 }
 
-/* -------------------- DocAI (imagelessMode=30p) -------------------- */
+/* -------------------- DocAI (imagelessMode & 샘플링 폴백) -------------------- */
+function samplePages(total, k) {
+  if (!Number.isFinite(total) || total <= 0) return Array.from({ length: k }, (_,i)=>i+1);
+  if (total <= k) return Array.from({ length: total }, (_,i)=>i+1);
+  const pick = new Set();
+  const first = Math.min(5, Math.floor(k/3));
+  const last  = Math.min(5, Math.floor(k/3));
+  for (let i=1; i<=first; i++) pick.add(i);
+  for (let i=total-last+1; i<=total; i++) pick.add(i);
+  while (pick.size < k) {
+    const t = pick.size + 1;
+    const pos = Math.max(1, Math.min(total, Math.round((t/(k+1))*total)));
+    pick.add(pos);
+  }
+  return Array.from(pick).sort((a,b)=>a-b).slice(0,k);
+}
+
 async function processWithDocAI(gcsUri) {
   const { projectId, location, processorId } = resolveDocAI();
   if (!DocumentProcessorServiceClient || !projectId || !processorId) return null;
@@ -81,12 +96,32 @@ async function processWithDocAI(gcsUri) {
   const { bucket, name: obj } = parseGcsUri(gcsUri);
   const [buf] = await storage.bucket(bucket).file(obj).download();
 
-  const [res] = await client.processDocument({
-    name,
-    rawDocument: { content: buf, mimeType: 'application/pdf' },
-    imagelessMode: true,     // ★ 15p → 30p
-    skipHumanReview: true,
-  });
+  let res;
+  try {
+    // 1차: imagelessMode (최대 30p)
+    [res] = await client.processDocument({
+      name,
+      rawDocument: { content: buf, mimeType: 'application/pdf' },
+      imagelessMode: true,
+      skipHumanReview: true,
+    });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (/supports up to 15 pages/i.test(msg) || /exceed the limit: 15/i.test(msg)) {
+      let total = 0;
+      try { if (pdfParse) { const parsed = await pdfParse(buf); total = Number(parsed?.numpages || 0); } } catch {}
+      const pages = samplePages(total || 30, 15);
+      const request = {
+        name,
+        rawDocument: { content: buf, mimeType: 'application/pdf' },
+        processOptions: { individualPageSelector: { pages } },
+        skipHumanReview: true,
+      };
+      [res] = await client.processDocument(request);
+    } else {
+      throw e;
+    }
+  }
 
   const doc = res?.document;
   if (!doc) return null;
@@ -197,7 +232,7 @@ async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText,
 async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint = null }) {
   let docai = await processWithDocAI(gcsUri);
   let fullText = docai?.fullText || '';
-  if (!fullText) fullText = await parseTextWithPdfParse(gcsUri); // 폴백 텍스트
+  if (!fullText) fullText = await parseTextWithPdfParse(gcsUri);
 
   const brand = brandHint || (await detectBrandFromText(fullText)) || 'unknown';
 
@@ -240,7 +275,6 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint = nu
     out.push(row);
   }
 
-  // 최종 보장: code만이라도
   if (!out.length) for (const c of codes.slice(0, MAX_PARTS)) out.push({ code: c, verified_in_doc: true });
 
   return { brand, rows: out.slice(0, MAX_PARTS), text: fullText };

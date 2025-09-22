@@ -1,5 +1,4 @@
-﻿// src/pipeline/ingestAuto.js
-'use strict';
+﻿'use strict';
 
 const path = require('node:path');
 const fs = require('node:fs/promises');

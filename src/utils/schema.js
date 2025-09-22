@@ -1,11 +1,7 @@
-// src/utils/schema.js
 'use strict';
 const db = require('./db');
 
-/**
- * Upsert by (brand_norm, code_norm)
- * - updated_at는 최종 1회 now()만 세팅 (중복 대입 금지)
- */
+/** Upsert by (brand_norm, code_norm) — updated_at는 마지막 1회만 now() */
 async function upsertByBrandCode(tableName, values) {
   const safe = String(tableName).replace(/[^a-zA-Z0-9_.]/g, '');
   const cols = Object.keys(values).map(c => c.replace(/[^a-zA-Z0-9_]/g, ''));

@@ -1,4 +1,3 @@
-// src/utils/vertex.js
 'use strict';
 
 const { VertexAI } = require('@google-cloud/vertexai');
@@ -9,7 +8,7 @@ const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_
 
 const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
 
-// Vertex는 "role: system" 메시지를 허용하지 않는다. → systemInstruction 사용
+// Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용
 function getModel(systemText, modelId = MODEL_ID) {
   const cfg = { model: modelId };
   if (systemText && String(systemText).trim()) {

@@ -1,8 +1,5 @@
 ﻿// src/pipeline/ingestAuto.js
 'use strict';
-/**
- * 전 패밀리 공용 인입 파이프라인(블루프린트 기반 멀티 품번/표 우선)
- */
 
 const path = require('node:path');
 const fs = require('node:fs/promises');
@@ -14,15 +11,10 @@ const execFileP = promisify(execFile);
 const db = require('../utils/db');
 const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
 const { upsertByBrandCode } = require('../utils/schema');
-
 const { getBlueprint } = require('../utils/blueprint');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 
-const MAX_INLINE_TEXT = Number(process.env.MAX_DOC_PAGES_INLINE || 15);
-
-/* -------------------- helpers -------------------- */
-function norm(s){ return String(s||'').trim(); }
-function normLower(s){ return norm(s).toLowerCase(); }
+function normLower(s){ return String(s||'').trim().toLowerCase(); }
 
 async function getTableColumns(qualified) {
   const [schema, table] = qualified.includes('.') ? qualified.split('.') : ['public', qualified];
@@ -37,8 +29,8 @@ async function getTableColumns(qualified) {
   return new Set(r.rows.map(x=>x.col));
 }
 
+// DB 함수로 스키마 보장 (ensure_specs_table)
 async function ensureSpecsTableByFamily(family){
-  // 서버(플/pg) 함수가 블루프린트로 스키마 보장
   await db.query(`SELECT public.ensure_specs_table($1)`, [family]);
 }
 
@@ -50,8 +42,8 @@ async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
     await fs.mkdir(tmp, { recursive: true });
     const [buf] = await storage.bucket(bucket).file(name).download();
     await fs.writeFile(pdf, buf);
-    await execFileP('pdfimages', ['-f','1','-l','2','-png', pdf, path.join(tmp,'img')]);
 
+    await execFileP('pdfimages', ['-f','1','-l','2','-png', pdf, path.join(tmp,'img')]);
     const list = (await fs.readdir(tmp)).filter(f => /^img-\d+-\d+\.png$/i.test(f));
     if (!list.length) return null;
     let pick=null, size=-1;
@@ -78,22 +70,19 @@ function guessFamilySlug({ fileName='', previewText='' }) {
   return null;
 }
 
-/* -------------------- main -------------------- */
 async function runAutoIngest({
   gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null,
 }) {
   const started = Date.now();
   if (!gcsUri) throw new Error('gcsUri required');
-  const { name: obj } = parseGcsUri(gcsUri);
 
   // family 추정
-  let fileName = path.basename(obj);
+  let fileName = '';
+  try { const { name } = parseGcsUri(gcsUri); fileName = path.basename(name); } catch {}
   let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
   if (!family) {
-    try {
-      const text = await readText(gcsUri, 256*1024);
-      family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
-    } catch { family = 'relay_power'; }
+    try { const text = await readText(gcsUri, 256*1024); family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power'; }
+    catch { family = 'relay_power'; }
   }
 
   // 목적 테이블
@@ -104,14 +93,14 @@ async function runAutoIngest({
   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
   const qualified = table.startsWith('public.')? table : `public.${table}`;
 
-  // 스키마 보장(DB 함수)
+  // 스키마 보장 (DB 함수) + 컬럼셋 확보
   await ensureSpecsTableByFamily(family);
   const colsSet = await getTableColumns(qualified);
 
   // 블루프린트 허용 키
   const { allowedKeys } = await getBlueprint(family);
 
-  // PDF → 품번/스펙 추출(전 패밀리 공용)
+  // PDF → 품번/스펙 추출
   let extracted = { brand: brand || 'unknown', rows: [] };
   if (!brand || !code) {
     extracted = await extractPartsAndSpecsFromPdf({
@@ -119,7 +108,7 @@ async function runAutoIngest({
     });
   }
 
-  // 커버 이미지 (첫 품번 기준, best effort)
+  // 커버 이미지(첫 품번 기준)
   let coverUri = null;
   try {
     const bForCover = brand || extracted.brand || 'unknown';
@@ -132,7 +121,7 @@ async function runAutoIngest({
   const now = new Date();
 
   if (code) {
-    // 단일 강제 인입(호출자가 brand/code를 준 경우)
+    // 단일 강제 인입
     records.push({
       family_slug: family,
       brand: brand || extracted.brand || 'unknown',
@@ -162,15 +151,18 @@ async function runAutoIngest({
     }
   }
 
-  // 최후 폴백 줄이기: DocAI와 pdf-parse가 둘 다 실패했어도,
-  // 자유 텍스트에서 code를 1개라도 잡았다면 그걸 쓰므로 TMP로 거의 안 떨어짐.
+  // 최후 폴백 줄이기
   if (!records.length) {
     const tmp = 'TMP_' + (Math.random().toString(16).slice(2, 8)).toUpperCase();
     records.push({
-      family_slug: family, brand: brand || extracted.brand || 'unknown',
-      code: tmp, datasheet_uri: gcsUri, image_uri: coverUri || null,
+      family_slug: family,
+      brand: brand || extracted.brand || 'unknown',
+      code: tmp,
+      datasheet_uri: gcsUri,
+      image_uri: coverUri || null,
       display_name: `${brand || extracted.brand || 'unknown'} ${tmp}`,
-      verified_in_doc: false, updated_at: now,
+      verified_in_doc: false,
+      updated_at: now,
     });
   }
 
@@ -181,7 +173,7 @@ async function runAutoIngest({
     // 공통 키
     if (colsSet.has('family_slug')) safe.family_slug = rec.family_slug;
     if (colsSet.has('brand'))       safe.brand = rec.brand;
-    if (colsSet.has('code'))        safe.code = rec.code;
+    if (colsSet.has('code'))        safe.code  = rec.code;
     if (colsSet.has('brand_norm'))  safe.brand_norm = normLower(rec.brand);
     if (colsSet.has('code_norm'))   safe.code_norm  = normLower(rec.code);
     if (colsSet.has('datasheet_uri')) safe.datasheet_uri = rec.datasheet_uri;
@@ -192,7 +184,7 @@ async function runAutoIngest({
     if (colsSet.has('cover') && rec.image_uri) safe.cover = rec.image_uri;
     if (colsSet.has('verified_in_doc')) safe.verified_in_doc = !!rec.verified_in_doc;
 
-    // 블루프린트 value들
+    // 블루프린트 값
     for (const [k,v] of Object.entries(rec)) {
       if (['family_slug','brand','code','brand_norm','code_norm','datasheet_uri','image_uri','datasheet_url','display_name','displayname','cover','verified_in_doc','updated_at'].includes(k)) continue;
       if (colsSet.has(k)) safe[k] = v;

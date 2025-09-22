@@ -3,12 +3,14 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const db = require('./src/utils/db');
 const { sendEmail, sendWebhook } = require('./src/notify/sender');
+const { ensureEventQueue, enqueueEvent } = require('./src/utils/eventQueue');
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: '8mb' }));
 
 async function fetchBatch(limit=50){
+  await ensureEventQueue();
   const r = await db.query(`
     UPDATE public.event_queue SET status='processing', attempts=attempts+1
     WHERE id IN (
@@ -71,7 +73,7 @@ app.post('/api/tasks/process-notify', async (req, res) => {
     // 1) notifications → deliver events
     const rows = await db.query(`SELECT * FROM public.notifications WHERE status='queued' ORDER BY created_at ASC LIMIT 50`);
     for (const n of rows.rows) {
-      await db.query(`INSERT INTO public.event_queue(type, payload) VALUES ('notify_deliver', $1)`, [ { notification: n } ]);
+      await enqueueEvent('notify_deliver', { notification: n });
       await db.query(`UPDATE public.notifications SET status='sent' WHERE id=$1`, [n.id]);
     }
     // 2) deliver events + others

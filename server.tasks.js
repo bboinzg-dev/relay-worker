@@ -3,6 +3,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const db = require('./src/utils/db');
 const { getSignedUrl } = require('./src/utils/gcsSignedUrl');
+const { ensureEventQueue, enqueueEvent } = require('./src/utils/eventQueue');
 const qualityScanner = (()=>{ try { return require('./src/quality/scanner'); } catch { return null; } })();
 
 const app = express();
@@ -10,6 +11,7 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '8mb' }));
 
 async function fetchBatch(limit=20){
+  await ensureEventQueue();
   const r = await db.query(`
     UPDATE public.event_queue SET status='processing', attempts=attempts+1
     WHERE id IN (
@@ -30,10 +32,10 @@ async function handleOne(ev){
   }
   if (t === 'spec_upsert') {
     // simple fan-out
-    if (p.family_slug) await db.query(`INSERT INTO public.event_queue(type, payload) VALUES ('quality_scan_family', $1)`, [ { family_slug: p.family_slug } ]);
-    if (!p.cover && p.datasheet_url) await db.query(`INSERT INTO public.event_queue(type, payload) VALUES ('cover_regen', $1)`, [ { family_slug: p.family_slug, brand:p.brand, code:p.code, datasheet_url: p.datasheet_url } ]);
-    if (p.datasheet_url) await db.query(`INSERT INTO public.event_queue(type, payload) VALUES ('signed_url_warm', $1)`, [ { gcs: p.datasheet_url } ]);
-    if (p.cover) await db.query(`INSERT INTO public.event_queue(type, payload) VALUES ('signed_url_warm', $1)`, [ { gcs: p.cover } ]);
+    if (p.family_slug) await enqueueEvent('quality_scan_family', { family_slug: p.family_slug });
+    if (!p.cover && p.datasheet_url) await enqueueEvent('cover_regen', { family_slug: p.family_slug, brand: p.brand, code: p.code, datasheet_url: p.datasheet_url });
+    if (p.datasheet_url) await enqueueEvent('signed_url_warm', { gcs: p.datasheet_url });
+    if (p.cover) await enqueueEvent('signed_url_warm', { gcs: p.cover });
     return { ok: true };
   }
   if (t === 'cover_regen') {
@@ -82,6 +84,7 @@ app.post('/api/tasks/process-events', async (req, res) => {
 // Peek queue
 app.get('/api/tasks/queue', async (req, res) => {
   try {
+    await ensureEventQueue();
     const r = await db.query(`SELECT * FROM public.event_queue ORDER BY created_at DESC LIMIT 200`);
     res.json({ items: r.rows });
   } catch (e) { console.error(e); res.status(400).json({ error: String(e.message || e) }); }

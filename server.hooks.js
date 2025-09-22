@@ -1,8 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const db = require('./src/utils/db');
-const { parseActor, hasRole } = require('./src/utils/auth');
+const { enqueueEvent } = require('./src/utils/eventQueue');
 
 const app = express();
 app.use(cors());
@@ -16,18 +15,18 @@ app.post('/api/hooks/spec-upsert', async (req, res) => {
 
     // enqueue quality scan for the family (best-effort when family provided)
     if (family_slug) {
-      await db.query(`INSERT INTO public.event_queue(type, payload) VALUES ('quality_scan_family', $1)`, [ { family_slug } ]);
+      await enqueueEvent('quality_scan_family', { family_slug });
     }
     // enqueue cover regen if missing
     if (!cover && (datasheet_url||'').startsWith('gs://')) {
-      await db.query(`INSERT INTO public.event_queue(type, payload) VALUES ('cover_regen', $1)`, [ { family_slug, brand, code, datasheet_url } ]);
+      await enqueueEvent('cover_regen', { family_slug, brand, code, datasheet_url });
     }
     // warm signed url cache (pdf & cover)
     const warm = [];
     if (datasheet_url) warm.push(datasheet_url);
     if (cover) warm.push(cover);
     for (const gcs of warm) {
-      await db.query(`INSERT INTO public.event_queue(type, payload) VALUES ('signed_url_warm', $1)`, [ { gcs } ]);
+      await enqueueEvent('signed_url_warm', { gcs });
     }
 
     res.json({ ok: true });

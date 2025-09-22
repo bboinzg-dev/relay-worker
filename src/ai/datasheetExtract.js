@@ -1,15 +1,62 @@
 // src/ai/datasheetExtract.js
 'use strict';
-const path = require('node:path');
-const os = require('node:os');
-const fs = require('node:fs/promises');
-const { storage, parseGcsUri } = require('../utils/gcs');
-const db = require('../utils/db');
 
+/**
+ * PDF → { brand, rows: [{ code, verified_in_doc, ...values }] }
+ * - 전 패밀리 공용. 블루프린트(allowedKeys)로 values 키를 제한.
+ * - 우선 DocAI(Form Parser)로 표/텍스트 추출 → 실패 시 pdf-parse 폴백.
+ * - 표에 Part No/Model/Type/Ordering Code가 있으면 그 code들만 우선.
+ * - Ordering Information은 조합 폭 과다 방지. 자유텍스트는 보조(regex).
+ * - Gemini 2.5 Flash로 블루프린트 키에 맞춰 values만 채움(엄격 JSON).
+ */
+
+const { Storage } = require('@google-cloud/storage');
+const storage = new Storage();
+
+let DocumentProcessorServiceClient, VertexAI, pdfParse;
+try { DocumentProcessorServiceClient = require('@google-cloud/documentai').v1.DocumentProcessorServiceClient; } catch {}
+try { VertexAI = require('@google-cloud/vertexai').VertexAI; } catch {}
+try { pdfParse = require('pdf-parse'); } catch {}
+
+const db = require('../utils/db');
+const { parseGcsUri } = require('../utils/gcs');
+
+const MAX_PARTS = Number(process.env.MAX_ENUM_PARTS || 200);
+const MAX_ORDERING_ENUM = Number(process.env.MAX_ORDERING_ENUM || 120);
+
+/* -------------------- ENV helpers -------------------- */
+function resolveDocAI() {
+  const projectId =
+    process.env.DOCAI_PROJECT_ID ||
+    process.env.DOC_AI_PROJECT_ID ||
+    process.env.GCP_PROJECT_ID ||
+    process.env.GOOGLE_CLOUD_PROJECT;
+
+  const location =
+    process.env.DOCAI_LOCATION ||
+    process.env.DOC_AI_LOCATION ||
+    'us';
+
+  const processorId =
+    process.env.DOCAI_PROCESSOR_ID ||
+    process.env.DOC_AI_PROCESSOR_ID;
+
+  return { projectId, location, processorId };
+}
+
+function resolveGemini() {
+  const project =
+    process.env.GOOGLE_CLOUD_PROJECT ||
+    process.env.GCP_PROJECT_ID;
+  const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
+  const model = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
+  return { project, location, model };
+}
+
+/* -------------------- brand detection -------------------- */
 async function detectBrandFromText(fullText) {
-  // manufacturer_alias를 전부 불러와 alias/brand가 본문에 등장하는지 검사
   const r = await db.query(`SELECT brand, alias FROM public.manufacturer_alias`);
-  const hay = fullText.toLowerCase();
+  const hay = (fullText || '').toLowerCase();
   let best = null;
   for (const row of r.rows) {
     const alias = String(row.alias || '').toLowerCase();
@@ -17,204 +64,200 @@ async function detectBrandFromText(fullText) {
     if (!alias && !brand) continue;
     if ((alias && hay.includes(alias)) || (brand && hay.includes(brand))) {
       const cand = row.brand;
-      if (!best || (alias && alias.length > best.aliasLen)) {
-        best = { brand: cand, aliasLen: alias.length || 0 };
-      }
+      if (!best || (alias && alias.length > best.len)) best = { brand: cand, len: alias.length || 0 };
     }
   }
   return best?.brand || null;
 }
 
-function normalizeHeader(h) {
-  const s = h.toLowerCase().replace(/\s+/g,' ').trim();
-  return s
-    .replace(/no\./g, 'no')
-    .replace(/catalogue/g, 'catalog')
-    .replace(/ordering info(?:rmation)?/g,'ordering information');
-}
+/* -------------------- DocAI -------------------- */
+async function processWithDocAI(gcsUri) {
+  const { projectId, location, processorId } = resolveDocAI();
+  if (!DocumentProcessorServiceClient || !projectId || !processorId) return null;
 
-function isCodeLike(token) {
-  const t = (token || '').trim();
-  if (!t) return false;
-  // 대문자/숫자/하이픈/슬래시 혼합, 길이 4~24, 전형적인 단위/일반단어 제외
-  if (!/^[A-Z0-9][A-Z0-9\-_/\.]{2,23}$/.test(t)) return false;
-  if (/(VDC|VAC|V|A|W|Ω|OHM|RoHS|UL|REACH|ISO|RELAY|COIL|CONTACT|DIM|TABLE)/i.test(t)) return false;
-  return true;
-}
-
-function mapFieldName(header) {
-  const h = normalizeHeader(header);
-  if (/(^| )part( |-)?(number|no|#)\b|^model\b|^type\b|catalog( |-)?(no|number)\b|ordering code\b|ordering no\b/.test(h))
-    return 'code';
-  if (/coil (voltage|vdc)\b|^voltage\b/.test(h))
-    return 'coil_voltage_vdc';
-  if (/contact (form|arrangement)\b/.test(h))
-    return 'contact_form';
-  if (/contact rating\b|rating\b/.test(h))
-    return 'contact_rating_text';
-  if (/series\b/.test(h))
-    return 'series';
-  // 치수는 데이터시트마다 표기가 다양해서 자유 텍스트로 두고 LLM으로 정규화하는 대신 여기선 보수적으로 스킵
-  return null;
-}
-
-async function parseWithDocumentAI(gcsUri) {
-  const projectId  = process.env.DOC_AI_PROJECT_ID;
-  const location   = process.env.DOC_AI_LOCATION || 'us';
-  const processor  = process.env.DOC_AI_PROCESSOR_ID; // e.g. Form Parser
-  if (!projectId || !processor) return null;
-
-  let client;
-  try {
-    ({ v1: { DocumentProcessorServiceClient: client } } = require('@google-cloud/documentai'));
-  } catch {
-    return null; // 라이브러리 미설치 시 폴백
-  }
-
-  const name = `projects/${projectId}/locations/${location}/processors/${processor}`;
+  const apiEndpoint = `${location}-documentai.googleapis.com`;
+  const client = new DocumentProcessorServiceClient({ apiEndpoint });
+  const name = `projects/${projectId}/locations/${location}/processors/${processorId}`;
 
   const { bucket, name: obj } = parseGcsUri(gcsUri);
-  const [pdf] = await storage.bucket(bucket).file(obj).download();
+  const [buf] = await storage.bucket(bucket).file(obj).download();
 
-  const [result] = await new client().processDocument({
+  const [res] = await client.processDocument({
     name,
-    rawDocument: { content: pdf, mimeType: 'application/pdf' },
+    rawDocument: { content: buf, mimeType: 'application/pdf' },
   });
 
-  const doc = result?.document;
+  const doc = res?.document;
   if (!doc) return null;
+  const fullText = doc.text || '';
+  const pages = doc.pages || [];
 
-  const getText = (anchor) => {
-    if (!anchor?.textSegments?.length) return '';
-    const { text } = doc;
+  const getTxt = (layout) => {
+    const segs = layout?.textAnchor?.textSegments || [];
     let out = '';
-    for (const seg of anchor.textSegments) {
-      const start = Number(seg.startIndex || 0);
-      const end = Number(seg.endIndex);
-      out += text.substring(start, end);
+    for (const s of segs) {
+      out += fullText.slice(Number(s.startIndex || 0), Number(s.endIndex || 0));
     }
-    return out;
+    return out.trim();
   };
 
-  // 1) 모든 표를 행렬 문자열로 변환
   const tables = [];
-  for (const p of (doc.pages || [])) {
+  for (const p of pages) {
     for (const t of (p.tables || [])) {
-      const headers = t.headerRows?.[0]?.cells?.map(c => getText(c.layout.textAnchor).trim()) || [];
+      const headRow = t.headerRows?.[0];
+      const headers = (headRow?.cells || []).map(c => getTxt(c.layout));
       const rows = [];
-      for (const r of (t.bodyRows || [])) {
-        rows.push(r.cells.map(c => getText(c.layout.textAnchor).trim()));
+      for (const br of (t.bodyRows || [])) {
+        rows.push((br.cells || []).map(c => getTxt(c.layout)));
       }
       tables.push({ headers, rows });
     }
   }
-
-  // 2) 자유 텍스트 (브랜드 탐지 등)
-  const fullText = (doc.text || '').replace(/\u0000/g, '');
-
   return { tables, fullText };
 }
 
-async function parseWithPdfParse(gcsUri) {
-  let pdfParse;
-  try {
-    pdfParse = require('pdf-parse');
-  } catch {
-    return { fullText: '' };
-  }
+/* -------------------- pdf-parse fallback -------------------- */
+async function parseTextWithPdfParse(gcsUri) {
+  if (!pdfParse) return '';
   const { bucket, name } = parseGcsUri(gcsUri);
   const [buf] = await storage.bucket(bucket).file(name).download();
-  const r = await pdfParse(buf);
-  return { fullText: r.text || '' };
+  const out = await pdfParse(buf);
+  return out?.text || '';
 }
 
-function extractFromTables(tables, allowedKeys) {
-  const out = [];
+/* -------------------- code extraction -------------------- */
+function looksLikeCode(x) {
+  const s = String(x || '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9\-_/\.]{2,}$/.test(s)) return false; // 최소 길이/문자
+  if (!/\d/.test(s)) return false;                                // 숫자 1개 이상
+  // 흔한 단위/일반어 필터
+  if (/\b(OHM|Ω|VDC|VAC|AMP|A|V|W|HZ|MS|SEC|UL|ROHS|REACH|DATE|PAGE)\b/i.test(s)) return false;
+  return true;
+}
+
+function mapHeaderToKey(h) {
+  const s = String(h || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (/\b(part( no\.?| number)|model|type|ordering code|catalog( no\.?| number))\b/.test(s)) return 'code';
+  return null; // 나머지 스펙들은 LLM이 블루프린트로 매핑
+}
+
+function codesFromDocAiTables(tables) {
+  const set = new Set();
   for (const t of (tables || [])) {
-    const idxMap = {};
-    t.headers.forEach((h, i) => {
-      const k = mapFieldName(h);
-      if (k && (k === 'code' || allowedKeys.includes(k))) {
-        idxMap[k] = i;
-      }
+    const idx = {};
+    (t.headers || []).forEach((h, i) => {
+      const k = mapHeaderToKey(h);
+      if (k) idx[k] = i;
     });
-    if (idxMap.code == null) continue; // 코드 열이 없으면 스킵
-
-    for (const row of t.rows) {
-      const code = String(row[idxMap.code] || '').trim().toUpperCase();
-      if (!isCodeLike(code)) continue;
-
-      const rec = { code, verified_in_doc: true };
-      for (const k of Object.keys(idxMap)) {
-        if (k === 'code') continue;
-        const v = String(row[idxMap[k]] || '').trim();
-        if (!v) continue;
-        // 숫자 필드는 단위 제거 후 숫자만 보관(너무 공격적이지 않게)
-        if (k === 'coil_voltage_vdc') {
-          const m = v.match(/(\d+(?:\.\d+)?)/);
-          rec[k] = m ? Number(m[1]) : null;
-        } else {
-          rec[k] = v;
-        }
-      }
-
-      // series가 없고 코드 접두가 뚜렷하면 추정 (예: AGN21024 -> AGN 시리즈)
-      if (!rec.series) {
-        const m = code.match(/^([A-Z]{2,5})\d/);
-        if (m) rec.series = m[1];
-      }
-
-      out.push(rec);
+    if (idx.code == null) continue;
+    for (const r of (t.rows || [])) {
+      const code = String(r[idx.code] || '').trim().toUpperCase();
+      if (looksLikeCode(code)) set.add(code);
     }
   }
-  return out;
+  return Array.from(set);
 }
 
-function extractCodesFromFreeText(fullText) {
+function codesFromFreeText(txt) {
   const set = new Set();
-  // 후보: 대문자 2~5 + 숫자, 뒤에 옵션 문자가 붙을 수 있음 (예: AGN200S12, G2R-2-SN, etc.)
-  const re = /\b([A-Z]{2,6}[0-9]{2,6}[A-Z0-9\-_/]{0,8})\b/g;
+  const re = /\b([A-Z]{2,6}[A-Z0-9\-_/\.]{2,})\b/g; // 넓게 잡되 필터
   let m;
-  while ((m = re.exec(fullText)) !== null) {
+  while ((m = re.exec(txt)) !== null) {
     const cand = m[1].toUpperCase();
-    if (isCodeLike(cand)) set.add(cand);
+    if (looksLikeCode(cand)) set.add(cand);
+    if (set.size > MAX_PARTS) break;
   }
-  return Array.from(set).slice(0, 200).map(code => ({ code, verified_in_doc: false }));
+  return Array.from(set);
 }
 
+/* -------------------- Gemini mapping -------------------- */
+async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText, tablePreview }) {
+  const { project, location, model } = resolveGemini();
+  if (!VertexAI || !project) return []; // Vertex 미구성 시 values 생략
+
+  const vertex = new VertexAI({ project, location });
+  const mdl = vertex.getGenerativeModel({ model });
+
+  const sys = [
+    `You extract component specs from datasheets.`,
+    `Category (family): "${family}".`,
+    `Return ONLY strict JSON. Schema: {"parts":[{"brand":"string","code":"string","values":{...}}]}.`,
+    `Allowed "values" keys: ${allowedKeys.join(', ') || '(none)'}. Do not invent keys.`,
+    `Only include codes from the provided list (do not fabricate).`,
+    `Normalize numbers to plain numbers (no units). Omit missing.`,
+  ].join('\n');
+
+  const user = [
+    brandHint ? `brand_hint: ${brandHint}` : '',
+    `codes: ${codes.join(', ')}`,
+    tablePreview ? `TABLES:\n${tablePreview}` : '',
+    `TEXT:\n${(docText || '').slice(0, 200000)}`
+  ].filter(Boolean).join('\n\n');
+
+  const resp = await mdl.generateContent({
+    contents: [{ role: 'system', parts: [{ text: sys }] }, { role: 'user', parts: [{ text: user }] }],
+    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 8192 },
+  });
+
+  let txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  try { return JSON.parse(txt)?.parts || []; } catch { return []; }
+}
+
+/* -------------------- Public: main extractor -------------------- */
 async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint = null }) {
-  // 1) Document AI 시도
-  const docai = await parseWithDocumentAI(gcsUri);
+  let docai = await processWithDocAI(gcsUri);
+  let fullText = docai?.fullText || '';
+  if (!fullText) fullText = await parseTextWithPdfParse(gcsUri); // 폴백 텍스트
 
-  // 2) 기본 텍스트 확보
-  const fullText = docai?.fullText || (await parseWithPdfParse(gcsUri)).fullText || '';
+  // 브랜드 감지
+  const brand = brandHint || (await detectBrandFromText(fullText)) || 'unknown';
 
-  // 3) 브랜드 감지
-  const brandDetected = brandHint || (await detectBrandFromText(fullText)) || 'unknown';
+  // 코드 후보 수집
+  let codes = [];
+  if (docai?.tables?.length) codes = codesFromDocAiTables(docai.tables);
+  if (!codes.length && fullText) codes = codesFromFreeText(fullText);
 
-  // 4) 표 기반 추출
-  let rows = [];
+  // 표 프리뷰(LLM 컨텍스트) – 너무 길면 잘라서
+  let tablePreview = '';
   if (docai?.tables?.length) {
-    rows = extractFromTables(docai.tables, allowedKeys);
+    tablePreview = docai.tables.slice(0, 6).map(t => {
+      const head = (t.headers || []).join(' | ');
+      const rows = (t.rows || []).slice(0, 40).map(r => r.join(' | ')).join('\n');
+      return `HEADER: ${head}\n${rows}`;
+    }).join('\n---\n');
   }
 
-  // 5) 표에서 못 뽑았으면 자유 텍스트 패턴 기반
-  if (!rows.length && fullText) {
-    rows = extractCodesFromFreeText(fullText);
+  // Gemini로 스펙 매핑(블루프린트 키만)
+  const mapped = await geminiMapValues({
+    family: null, // LLM에 굳이 구체 패밀리 안 주는 경우 null로 둘 수도 있음
+    brandHint: brand,
+    codes: codes.slice(0, MAX_PARTS),
+    allowedKeys,
+    docText: fullText,
+    tablePreview
+  });
+
+  // 결과 병합
+  const out = [];
+  const seen = new Set();
+  for (const m of mapped) {
+    const code = String(m?.code || '').trim().toUpperCase();
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    const row = { code, verified_in_doc: true }; // 문서 기반
+    if (m?.brand) row.brand = m.brand;
+    const values = m?.values || {};
+    for (const k of allowedKeys) { if (values[k] != null) row[k] = values[k]; }
+    out.push(row);
   }
 
-  // 6) 너무 많은 조합 방지: 상한 400개
-  if (rows.length > 400) rows = rows.slice(0, 400);
-
-  // 7) 중복 제거
-  const uniq = new Map();
-  for (const r of rows) {
-    if (!r.code) continue;
-    uniq.set(r.code, r);
+  // 혹시 values가 비었더라도 code만이라도 반환(추가 추출 루프에서 보강 가능)
+  if (!out.length) {
+    for (const c of codes.slice(0, MAX_PARTS)) out.push({ code: c, verified_in_doc: true });
   }
-  rows = Array.from(uniq.values());
 
-  return { brand: brandDetected, rows };
+  // 과도한 조합 방지
+  return { brand, rows: out.slice(0, MAX_PARTS) };
 }
 
 module.exports = { extractPartsAndSpecsFromPdf };

@@ -4,52 +4,50 @@ const express = require('express');
 const multer = require('multer');
 const crypto = require('crypto');
 const { Storage } = require('@google-cloud/storage');
+const { GoogleAuth } = require('google-auth-library');
 
 const router = express.Router();
 
+// ==== ENV ====
 const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || 'partsplan';
-const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';            // :contentReference[oaicite:5]{index=5}
-const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash'; // :contentReference[oaicite:6]{index=6}
-const BUCKET     = process.env.GCS_BUCKET || 'partsplan-docai-us';              // :contentReference[oaicite:7]{index=7}
+const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
+const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
+const BUCKET     = process.env.GCS_BUCKET || 'partsplan-docai-us';
 const MAX_PHOTO  = +(process.env.MAX_PHOTO_SIZE || 12 * 1024 * 1024);
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
-const API_KEY    = process.env.INGEST_API_KEY || ''; // 있으면 x-api-key 체크
+const API_KEY    = process.env.INGEST_API_KEY || '';
 
 const storage = new Storage();
+// 🔧 어떤 필드명으로 오든 받기 위해 any() 사용
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_PHOTO } });
 
 // CORS
 router.use('/api/vision/guess', (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', ALLOW_ORIGIN);
   res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,x-api-key');
-  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
 
-// 확장자 추출
 function ext(name) {
-  const s = String(name || '');
-  const i = s.lastIndexOf('.');
-  if (i < 0) return '';
-  const e = s.slice(i + 1).toLowerCase();
-  return e && e.length <= 5 ? '.' + e : '';
+  const s = String(name || ''); const i = s.lastIndexOf('.'); if (i < 0) return '';
+  const e = s.slice(i + 1).toLowerCase(); return e && e.length <= 5 ? '.' + e : '';
 }
 
-// 업로드+분석
- // 'file' 또는 'image' 필드 둘 다 허용
- router.post('/api/vision/guess',
-   upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', maxCount: 1 }]),
-   async (req, res) => {
+// 업로드 + 분석 (⚠️ 단일 라우트만 존재하도록 보장)
+router.post('/api/vision/guess', upload.any(), async (req, res) => {
   try {
     if (API_KEY && req.get('x-api-key') !== API_KEY) {
       return res.status(401).json({ ok: false, error: 'invalid api key' });
     }
-     const f = (req.files?.file?.[0]) || (req.files?.image?.[0]);
-   if (!f) return res.status(400).json({ ok: false, error: 'file is required (fields: "file" or "image")' });
 
-    if (!BUCKET)   return res.status(500).json({ ok: false, error: 'GCS_BUCKET is not set' });
+    // file | image | 그 외 첫 번째 파일 모두 허용
+    const files = Array.isArray(req.files) ? req.files : [];
+    const f = files.find(fi => fi.fieldname === 'image' || fi.fieldname === 'file') || files[0];
+
+    if (!f) return res.status(400).json({ ok: false, error: 'multipart file field required (image or file)' });
 
     // 1) GCS 저장
     const now = new Date();
@@ -57,17 +55,16 @@ function ext(name) {
     const m = String(now.getUTCMonth() + 1).padStart(2, '0');
     const d = String(now.getUTCDate()).padStart(2, '0');
     const id = crypto.randomUUID();
-    const object = `uploads/photo/${y}/${m}/${d}/${id}${ext(req.file.originalname)}`;
+    const object = `uploads/photo/${y}/${m}/${d}/${id}${ext(f.originalname)}`;
 
- await storage.bucket(BUCKET).file(object).save(f.buffer, {
-   contentType: f.mimetype || 'application/octet-stream',
+    await storage.bucket(BUCKET).file(object).save(f.buffer, {
+      contentType: f.mimetype || 'application/octet-stream',
       resumable: false,
       metadata: { cacheControl: 'public, max-age=31536000' },
     });
     const gcsUri = `gs://${BUCKET}/${object}`;
 
-    // 2) Vertex 호출 (Cloud Run ADC로 서비스계정 자동 사용)
-    const { GoogleAuth } = require('google-auth-library');
+    // 2) Vertex 호출 (ADC)
     const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
     const client = await auth.getClient();
     const token = (await client.getAccessToken()).token;
@@ -82,26 +79,25 @@ function ext(name) {
       'Values must be short (e.g., "Uc 275V", "Imax 40kA"). Omit unknown fields.'
     ].join('\n');
 
-     const base64 = f.buffer.toString('base64');
-    const resp = await fetch(endpoint, {
+    const base64 = f.buffer.toString('base64');
+    const vr = await fetch(endpoint, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: req.file.mimetype || 'image/jpeg', data: base64 } }] }],
+        contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: f.mimetype || 'image/jpeg', data: base64 } }] }],
         generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
       }),
     });
 
-    const txt = await resp.text();
-    if (!resp.ok) return res.status(502).json({ ok: false, error: `vertex ${resp.status}: ${txt.slice(0,200)}` });
+    const vtext = await vr.text();
+    if (!vr.ok) return res.status(502).json({ ok: false, error: `vertex ${vr.status}: ${vtext.slice(0, 200)}` });
 
-    // Vertex 응답 파싱
     let out = {};
     try {
-      const body = JSON.parse(txt);
+      const body = JSON.parse(vtext);
       const payload = body?.candidates?.[0]?.content?.parts?.[0]?.text;
       out = payload ? JSON.parse(payload) : {};
-    } catch (_e) {}
+    } catch {}
 
     const brand  = out.brand  || '';
     const code   = out.code   || '';
@@ -115,7 +111,7 @@ function ext(name) {
       familySlug     : family,
       familyDisplayName: out.familyDisplay || family,
       usageShort     : out.usage || '',
-      mainSpecs      : Array.isArray(out.mainSpecs) ? out.mainSpecs.slice(0,5) : [],
+      mainSpecs      : Array.isArray(out.mainSpecs) ? out.mainSpecs.slice(0, 5) : [],
       confidence     : score,
       notes          : 'AI 추정값',
     };

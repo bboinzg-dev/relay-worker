@@ -42,6 +42,8 @@ router.post('/api/vision/guess', upload.any(), async (req, res) => {
     if (API_KEY && req.get('x-api-key') !== API_KEY) {
       return res.status(401).json({ ok: false, error: 'invalid api key' });
     }
+// 업로드 직후(파일 선택 직후)에 임시 로그 — 필요 시만
+console.log('[vision.upload] fields:', Array.isArray(req.files) ? req.files.map(f => f.fieldname) : req.files);
 
     // file | image | 그 외 첫 번째 파일 모두 허용
     const files = Array.isArray(req.files) ? req.files : [];

@@ -38,12 +38,17 @@ function ext(name) {
 }
 
 // 업로드+분석
-router.post('/api/vision/guess', upload.single('file'), async (req, res) => {
+ // 'file' 또는 'image' 필드 둘 다 허용
+ router.post('/api/vision/guess',
+   upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', maxCount: 1 }]),
+   async (req, res) => {
   try {
     if (API_KEY && req.get('x-api-key') !== API_KEY) {
       return res.status(401).json({ ok: false, error: 'invalid api key' });
     }
-    if (!req.file) return res.status(400).json({ ok: false, error: 'file is required (field "file")' });
+     const f = (req.files?.file?.[0]) || (req.files?.image?.[0]);
+   if (!f) return res.status(400).json({ ok: false, error: 'file is required (fields: "file" or "image")' });
+
     if (!BUCKET)   return res.status(500).json({ ok: false, error: 'GCS_BUCKET is not set' });
 
     // 1) GCS 저장
@@ -54,8 +59,8 @@ router.post('/api/vision/guess', upload.single('file'), async (req, res) => {
     const id = crypto.randomUUID();
     const object = `uploads/photo/${y}/${m}/${d}/${id}${ext(req.file.originalname)}`;
 
-    await storage.bucket(BUCKET).file(object).save(req.file.buffer, {
-      contentType: req.file.mimetype || 'application/octet-stream',
+ await storage.bucket(BUCKET).file(object).save(f.buffer, {
+   contentType: f.mimetype || 'application/octet-stream',
       resumable: false,
       metadata: { cacheControl: 'public, max-age=31536000' },
     });
@@ -77,7 +82,7 @@ router.post('/api/vision/guess', upload.single('file'), async (req, res) => {
       'Values must be short (e.g., "Uc 275V", "Imax 40kA"). Omit unknown fields.'
     ].join('\n');
 
-    const base64 = req.file.buffer.toString('base64');
+     const base64 = f.buffer.toString('base64');
     const resp = await fetch(endpoint, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -118,7 +123,7 @@ router.post('/api/vision/guess', upload.single('file'), async (req, res) => {
     return res.json({
       ok: true,
       mode: 'guess',
-      photo: { gcs_uri: gcsUri, bucket: BUCKET, object, mime: req.file.mimetype, size: req.file.size },
+      photo: { gcs_uri: gcsUri, bucket: BUCKET, object, mime: f.mimetype, size: f.size },
       brand, code, family, score,
       presentation,
     });

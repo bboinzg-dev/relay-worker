@@ -1,15 +1,14 @@
 ﻿// src/pipeline/ingestAuto.js
 'use strict';
-
 /**
- * Generic ingestion pipeline (keeps legacy behaviour).
- * - If family_slug is provided, use it.
- * - Otherwise, try a light-weight heuristic to guess family from file name/text.
- * - Looks up specs_table in component_registry and ensures the table exists.
- * - Tries to extract a cover image using `pdfimages` (if present); failure is ignored.
- * - Upserts only columns that actually exist on the destination table.
+ * 개선된 ingestion 파이프라인(멀티 품번/표 우선).
+ * - family_slug 지정 없으면 기존 휴리스틱으로 추정(기본 relay_power).
+ * - component_registry→blueprint를 읽어, 추출 허용 컬럼을 확정.
+ * - Document AI(있으면)→표 기반 추출, 없으면 pdf-parse 폴백.
+ * - 표의 "Part Number/Ordering Code/Type/Model" 컬럼을 우선.
+ * - 조합형 Ordering Information은 조합 폭이 과도하면 스킵.
+ * - (brand_norm, code_norm) 유니크 키로 멱등 업서트.
  */
-
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const os = require('node:os');
@@ -20,6 +19,9 @@ const execFileP = promisify(execFile);
 const db = require('../utils/db');
 const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('../utils/schema');
+
+const { getBlueprint } = require('../utils/blueprint');
+const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -101,9 +103,9 @@ async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
 
 function guessFamilySlug({ fileName = '', previewText = '' }) {
   const s = (fileName + ' ' + previewText).toLowerCase();
-  if (/\b(resistor|r-clamp|ohm)\b/.test(s)) return 'resistor';
+  if (/\b(resistor|r-clamp|ohm)\b/.test(s)) return 'resistor_chip';
   if (/\b(capacitor|mlcc|electrolytic|tantalum)\b/.test(s)) return 'capacitor_mlcc';
-  if (/\b(inductor|choke)\b/.test(s)) return 'inductor';
+  if (/\b(inductor|choke)\b/.test(s)) return 'inductor_power';
   if (/\b(bridge|rectifier|diode)\b/.test(s)) return 'bridge_rectifier';
   if (/\b(relay|coil|omron|finder)\b/.test(s)) return 'relay_power';
   return null;
@@ -115,7 +117,7 @@ async function runAutoIngest({
   gcsUri,
   family_slug = null,
   brand = null,
-  code = null,
+  code = null,         // 유지: 명시 제공 시 단일 업서트
   series = null,
   display_name = null,
 }) {
@@ -147,7 +149,7 @@ async function runAutoIngest({
   );
   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
 
-  // 2) Ensure the table exists (keep base columns compatible with your DB)
+  // 2) Ensure the table exists (DB 함수/블루프린트 기반 확장)
   await ensureSpecsTable(table, {
     datasheet_uri: 'text',
     image_uri: 'text',
@@ -156,46 +158,103 @@ async function runAutoIngest({
     length_mm: 'numeric',
   });
 
-  // 3) Best-effort cover extraction
+  // 2.5) Blueprint 로딩 (허용 키 목록 획득)
+  const { allowedKeys } = await getBlueprint(family);
+
+  // 3) 멀티 품번 추출 (문서→표 우선)
+  let extracted = { brand: brand || 'unknown', rows: [] };
+  if (!brand || !code) {
+    extracted = await extractPartsAndSpecsFromPdf({
+      gcsUri,
+      allowedKeys,
+      brandHint: brand || null,
+    });
+  }
+
+  // 4) 커버 이미지(첫 번째 품번 기준) - best effort
   let coverUri = null;
   try {
+    const brandForCover = brand || extracted.brand || 'unknown';
+    const codeForCover  = code  || extracted.rows?.[0]?.code || path.parse(fileName).name;
     coverUri = await extractCoverToGcs(gcsUri, {
-      family,
-      brand: brand || '',
-      code:  code || '',
+      family, brand: brandForCover, code: codeForCover,
     });
   } catch {}
 
-  // 4) Build payload (only safe keys; upsert is by (brand_norm, code_norm))
-  const payload = {
-    family_slug: family,
-    brand: brand || 'unknown',
-    code:  code  || path.parse(fileName).name,
-    series: series || null,
-    display_name: display_name || null,
-    datasheet_uri: gcsUri,
-    image_uri: coverUri || null,
-    updated_at: new Date(), // ignored if column doesn't exist
-  };
-
-  // 5) Upsert (uses only existing columns)
+  // 5) 업서트 대상 레코드 구성
   const colsSet = await getTableColumns(table.startsWith('public.') ? table : `public.${table}`);
-  const safePayload = {};
-  for (const [k, v] of Object.entries(payload)) {
-    if (colsSet.has(k)) safePayload[k] = v;
+
+  const records = [];
+  if (code) {
+    // 단일 업서트 요청(브랜드/코드가 API 레벨에서 명시된 경우)
+    records.push({
+      family_slug: family,
+      brand: brand || extracted.brand || 'unknown',
+      code,
+      series: series || null,
+      display_name: display_name || null,
+      datasheet_uri: gcsUri,
+      image_uri: coverUri || null,
+      updated_at: new Date(),
+      verified_in_doc: false,
+    });
+  } else {
+    // PDF에서 추출한 다수 품번
+    for (const r of extracted.rows || []) {
+      const base = {
+        family_slug: family,
+        brand: extracted.brand || 'unknown',
+        code: r.code,
+        datasheet_uri: gcsUri,
+        image_uri: coverUri || null,
+        display_name: `${extracted.brand || 'unknown'} ${r.code}`,
+        verified_in_doc: !!r.verified_in_doc,
+        updated_at: new Date(),
+      };
+      // 블루프린트 허용 키만 싹 넣기
+      for (const k of allowedKeys) {
+        if (r[k] != null) base[k] = r[k];
+      }
+      records.push(base);
+    }
   }
-  const row = await upsertByBrandCode(table, safePayload);
+
+  // 폴백: 아무것도 못 찾았으면 마지막에 한 건이라도 남기되 "TMP_xxxx"로 기록
+  if (!records.length) {
+    const tmpCode = 'TMP_' + (Math.random().toString(16).slice(2, 8)).toUpperCase();
+    records.push({
+      family_slug: family,
+      brand: brand || extracted.brand || 'unknown',
+      code: tmpCode,
+      datasheet_uri: gcsUri,
+      image_uri: coverUri || null,
+      display_name: `${brand || extracted.brand || 'unknown'} ${tmpCode}`,
+      verified_in_doc: false,
+      updated_at: new Date(),
+    });
+  }
+
+  // 6) 업서트
+  let upserted = 0;
+  for (const rec of records) {
+    const safePayload = {};
+    for (const [k, v] of Object.entries(rec)) {
+      if (colsSet.has(k)) safePayload[k] = v;
+    }
+    await upsertByBrandCode(table, safePayload);
+    upserted++;
+  }
 
   return {
     ok: true,
     ms: Date.now() - started,
     family,
     specs_table: table,
-    brand: row?.brand || payload.brand,
-    code: row?.code || payload.code,
+    brand: records[0]?.brand,
+    code: records[0]?.code,
     datasheet_uri: gcsUri,
     cover: coverUri,
-    rows: 1,
+    rows: upserted,
   };
 }
 

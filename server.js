@@ -14,6 +14,7 @@ const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 
 
+
 // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
  const { CloudTasksClient } = require('@google-cloud/tasks');
  const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;

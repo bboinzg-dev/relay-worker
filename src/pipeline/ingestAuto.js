@@ -78,7 +78,8 @@ async function runAutoIngest({
 }) {
   const started = Date.now();
   if (!gcsUri) throw new Error('gcsUri required');
-  const BUDGET = Number(process.env.INGEST_BUDGET_MS || 240000); // 4분 권장
+  // 기본 예산을 2분으로 단축 (원하면 ENV로 늘릴 수 있음)
+  const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000); // 2분
   const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
     Promise.resolve(p)
@@ -86,12 +87,13 @@ async function runAutoIngest({
       .catch((err) => { clearTimeout(timer); reject(err); });
   });
 
-  // family 추정
+  +  // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
   let fileName = '';
   try { const { name } = parseGcsUri(gcsUri); fileName = path.basename(name); } catch {}
   let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
   if (!family) {
-    try { const text = await readText(gcsUri, 256*1024); family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power'; }
+    // 미리보기 텍스트도 64KB로 축소
+    try { const text = await readText(gcsUri, 64*1024); family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power'; }
     catch { family = 'relay_power'; }
   }
 
@@ -124,18 +126,20 @@ async function runAutoIngest({
     }
   }
 
-  // 커버 이미지(첫 품번 기준)
+// 커버 이미지 추출 비활성화(기본 OFF).
+  // 필요 시만 ENABLE: COVER_CAPTURE=1 환경변수로 다시 켜기.
   let coverUri = null;
-  try {
-    const bForCover = brand || extracted.brand || 'unknown';
-    const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
-    coverUri = await withTimeout(
-      extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
-      Math.min(60000, Math.round(BUDGET * 0.20)),
-      'cover',
-    );
-  } catch (e) {
-    console.warn('[cover timeout/fail]', e?.message || e);
+  const COVER_CAPTURE = String(process.env.COVER_CAPTURE || '0').toLowerCase();
+  if (COVER_CAPTURE === '1' || COVER_CAPTURE === 'true' || COVER_CAPTURE === 'on') {
+    try {
+      const bForCover = brand || extracted.brand || 'unknown';
+      const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
+      coverUri = await withTimeout(
+        extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
+        Math.min(60000, Math.round(BUDGET * 0.20)),
+        'cover',
+      );
+    } catch (e) { console.warn('[cover disabled/fail]', e?.message || e); }
   }
 
   // 레코드 구성

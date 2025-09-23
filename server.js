@@ -15,28 +15,41 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 
 
 // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
-const { CloudTasksClient } = require('@google-cloud/tasks');
-const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
-const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
-// 새 실행 엔드포인트 (체인 호출 대상) — 환경변수에서 덮어씀
-const WORKER_TASK_URL  = process.env.WORKER_TASK_URL  || 'https://<YOUR-RUN-URL>/api/worker/ingest/run';
-const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
-const tasks = new CloudTasksClient();
-const QUEUE_PATH = tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
-async function enqueueIngestRun(payload) {
-  const task = {
-    httpRequest: {
-      httpMethod: 'POST',
-      url: WORKER_TASK_URL,
-      headers: { 'Content-Type': 'application/json' },
-      body: Buffer.from(JSON.stringify(payload)).toString('base64'),
-      ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA } } : {}),
-    },
-    // dispatchDeadline: { seconds: 540 }, // 필요 시 (Run 타임아웃보다 작게)
-  };
-  await tasks.createTask({ parent: QUEUE_PATH, task });
-}
+ const { CloudTasksClient } = require('@google-cloud/tasks');
+ const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+ const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
+ const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
+ const WORKER_TASK_URL  = process.env.WORKER_TASK_URL  || 'https://<YOUR-RUN-URL>/api/worker/ingest/run';
+ const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
+
+ // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
+ let _tasks = null;
+ let _queuePath = null;
+ function getTasks() {
+   if (!_tasks) {
+     _tasks = new CloudTasksClient({
+       apiEndpoint: `${TASKS_LOCATION}-tasks.googleapis.com`, // e.g. asia-northeast3-tasks.googleapis.com
+       fallback: true, // REST/HTTP1 전송(IPv6/gRPC 이슈 우회)
+     });
+     _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
+   }
+   return { tasks: _tasks, queuePath: _queuePath };
+ }
+
+ async function enqueueIngestRun(payload) {
+   const { tasks, queuePath } = getTasks();
+   const task = {
+     httpRequest: {
+       httpMethod: 'POST',
+       url: WORKER_TASK_URL,
+       headers: { 'Content-Type': 'application/json' },
+       body: Buffer.from(JSON.stringify(payload)).toString('base64'),
+       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA } } : {}),
+     },
+   };
+   // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
+   await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
+ }
 
 
 const app = express();

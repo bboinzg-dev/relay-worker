@@ -13,6 +13,32 @@ const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, st
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 
+
+// ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
+const { CloudTasksClient } = require('@google-cloud/tasks');
+const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
+const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
+// 새 실행 엔드포인트 (체인 호출 대상) — 환경변수에서 덮어씀
+const WORKER_TASK_URL  = process.env.WORKER_TASK_URL  || 'https://<YOUR-RUN-URL>/api/worker/ingest/run';
+const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
+const tasks = new CloudTasksClient();
+const QUEUE_PATH = tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
+async function enqueueIngestRun(payload) {
+  const task = {
+    httpRequest: {
+      httpMethod: 'POST',
+      url: WORKER_TASK_URL,
+      headers: { 'Content-Type': 'application/json' },
+      body: Buffer.from(JSON.stringify(payload)).toString('base64'),
+      ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA } } : {}),
+    },
+    // dispatchDeadline: { seconds: 540 }, // 필요 시 (Run 타임아웃보다 작게)
+  };
+  await tasks.createTask({ parent: QUEUE_PATH, task });
+}
+
+
 const app = express();
 
 /* ---------------- Mount modular routers (keep existing) ---------------- */
@@ -415,44 +441,9 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     // ✅ 1) 즉시 ACK → Cloud Tasks는 이 시점에 "완료"로 처리(재시도 루프 종료)
     res.status(202).json({ ok: true, run_id: runId });
 
-    // ▶ 2) 백그라운드에서 실제 인제스트 계속
-    setImmediate(async () => {
-      const label = `[ingest] ${taskName || uri}`;
-      console.time(label);
-      try {
-        const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name, family_slug });
-        console.timeEnd(label);
-        await db.query(
-          `UPDATE public.ingest_run_logs
-              SET finished_at = now(),
-                  duration_ms = $2,
-                  status = 'SUCCEEDED',
-                  final_table = $3,
-                  final_family = $4,
-                  final_brand = $5,
-                  final_code = $6,
-                  final_datasheet = $7
-            WHERE id = $1`,
-          [ runId, (out?.ms ?? (Date.now() - startedAt)), out?.specs_table || null,
-            out?.family || out?.family_slug || null,
-            out?.brand || null,
-            (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
-            out?.datasheet_uri || uri ]
-        );
-      } catch (e) {
-        console.timeEnd(label);
-        await db.query(
-          `UPDATE public.ingest_run_logs
-              SET finished_at = now(),
-                  duration_ms = $2,
-                  status = 'FAILED',
-                  error_message = $3
-            WHERE id = $1`,
-          [ runId, Date.now() - startedAt, String(e?.message || e) ]
-        );
-        console.error('[ingest async failed]', e?.message || e);
-      }
-    });
+    // ▶ 2) 다음 Cloud Tasks 요청으로 실행을 넘김(체인)
+    await enqueueIngestRun({ runId, gcsUri: uri, brand, code, series, display_name, family_slug });
+ 
 
   } catch (e) {
     try {
@@ -474,6 +465,51 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     return res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });
+
+// ▶ 체인 실행 엔드포인트: 여기서 runAutoIngest를 실제로 수행
+app.post('/api/worker/ingest/run', async (req, res) => {
+  const startedAt = Date.now();
+  try {
+    const { runId, gcsUri, brand, code, series, display_name, family_slug = null } = req.body || {};
+    if (!runId || !gcsUri) return res.status(400).json({ ok:false, error:'runId & gcsUri required' });
+
+    const label = `[ingest] ${runId}`;
+    console.time(label);
+    const out = await runAutoIngest({ gcsUri, brand, code, series, display_name, family_slug });
+    console.timeEnd(label);
+
+    await db.query(
+      `UPDATE public.ingest_run_logs
+          SET finished_at = now(),
+              duration_ms = $2,
+              status = 'SUCCEEDED',
+              final_table = $3,
+              final_family = $4,
+              final_brand = $5,
+              final_code  = $6,
+              final_datasheet = $7
+        WHERE id = $1`,
+      [ runId, (out?.ms ?? (Date.now() - startedAt)),
+        out?.specs_table || null,
+        out?.family || out?.family_slug || null,
+        out?.brand || null,
+        (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
+        out?.datasheet_uri || gcsUri ]
+    );
+
+    return res.json({ ok:true, run_id: runId });
+  } catch (e) {
+    await db.query(
+      `UPDATE public.ingest_run_logs
+          SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
+        WHERE id = $1`,
+      [ req.body?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
+    );
+    console.error('[ingest-run failed]', e?.message || e);
+    return res.status(500).json({ ok:false, error:String(e?.message||e) });
+  }
+});
+
 
 /* ---------------- 404 / error ---------------- */
 app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));

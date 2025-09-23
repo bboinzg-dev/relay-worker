@@ -40,15 +40,23 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
      if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
    const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
 
-   const task = {
-     httpRequest: {
-       httpMethod: 'POST',
-       url: WORKER_TASK_URL,
-       headers: { 'Content-Type': 'application/json' },
-       body: Buffer.from(JSON.stringify(payload)).toString('base64'),
-       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } } : {}),
-     },
-   };
+     // ① 디스패치 데드라인 = 인제스트 예산(기본 120초) + 15초 여유
+  const seconds = Math.ceil((Number(process.env.INGEST_BUDGET_MS || 120000) + 15000) / 1000);
+
+  const task = {
+    httpRequest: {
+      httpMethod: 'POST',
+      url: WORKER_TASK_URL,
+      headers: { 'Content-Type': 'application/json' },
+      body: Buffer.from(JSON.stringify(payload)).toString('base64'),
+      ...(TASKS_INVOKER_SA
+        ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
+        : {}),
+    },
+    // ② Cloud Tasks에 타깃 응답 대기 한도를 명시(기본 10분 → 135초 내)
+    dispatchDeadline: { seconds },
+  };
+
    // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
    await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
  }
@@ -503,7 +511,14 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
 
 // ▶ 체인 실행 엔드포인트: 여기서 runAutoIngest를 실제로 수행
 app.post('/api/worker/ingest/run', async (req, res) => {
-  const startedAt = Date.now();
+    const startedAt = Date.now();
+  // 예산(기본 120초) + 15초 여유 안에 "반드시" 2xx로 ACK
+  const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
+  const killer = setTimeout(() => {
+    if (!res.headersSent) {
+      try { res.status(202).json({ ok: true, timeout: true }); } catch {}
+    }
+  }, deadlineMs);
   try {
     const { runId, gcsUri, brand, code, series, display_name, family_slug = null } = req.body || {};
     if (!runId || !gcsUri) return res.status(400).json({ ok:false, error:'runId & gcsUri required' });
@@ -542,6 +557,8 @@ app.post('/api/worker/ingest/run', async (req, res) => {
     );
     console.error('[ingest-run failed]', e?.message || e);
     return res.status(500).json({ ok:false, error:String(e?.message||e) });
+      } finally {
+    clearTimeout(killer);
   }
 });
 

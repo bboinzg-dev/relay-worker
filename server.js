@@ -36,6 +36,9 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 
  async function enqueueIngestRun(payload) {
    const { tasks, queuePath } = getTasks();
+     if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
+   const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
+
    const task = {
      httpRequest: {
        httpMethod: 'POST',

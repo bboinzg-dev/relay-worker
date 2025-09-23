@@ -381,8 +381,8 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
 
 app.post('/ingest/auto', requireSession, async (req, res) => {
   try {
-   const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name } = req.body || {};
-   const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
+    const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name, family_slug } = req.body || {};
+    const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
     const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
     res.json(result);
@@ -412,18 +412,16 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     );
     const runId = logRows[0]?.id;
 
-    const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name, family_slug });
+    const label = `[ingest] ${taskName || uri}`;
+    console.time(label);
+    let out;
+    try {
+      out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name, family_slug });
+    } finally {
+      console.timeEnd(label);
+    }
 
     try {
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS public.ingest_run_logs (
-          id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
-          task_name text, retry_count integer, gcs_uri text not null,
-          status text CHECK (status in ('PROCESSING','SUCCEEDED','FAILED')),
-          final_table text, final_family text, final_brand text, final_code text,
-          final_datasheet text, duration_ms integer, error_message text,
-          started_at timestamptz DEFAULT now(), finished_at timestamptz
-        )`);
       await db.query(
         `UPDATE public.ingest_run_logs
             SET finished_at = now(),
@@ -471,6 +469,26 @@ app.use((err, req, res, next) => {
   try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
   res.status(500).json({ ok:false, error:'internal error' });
 });
+
+/* ---------------- Boot-time setup ---------------- */
+(async () => {
+  try {
+    await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS public.ingest_run_logs (
+        id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+        task_name text, retry_count integer, gcs_uri text not null,
+        status text CHECK (status in ('PROCESSING','SUCCEEDED','FAILED')),
+        final_table text, final_family text, final_brand text, final_code text,
+        final_datasheet text, duration_ms integer, error_message text,
+        started_at timestamptz DEFAULT now(), finished_at timestamptz
+      )
+    `);
+    console.log('[BOOT] ensured ingest_run_logs');
+  } catch (e) {
+    console.warn('[BOOT] ensure ingest_run_logs failed:', e?.message || e);
+  }
+})();
 
 /* ---------------- Listen ---------------- */
 app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));

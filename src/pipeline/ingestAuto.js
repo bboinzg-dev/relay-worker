@@ -42,7 +42,11 @@ async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
     const [buf] = await storage.bucket(bucket).file(name).download();
     await fs.writeFile(pdf, buf);
 
-    await execFileP('pdfimages', ['-f','1','-l','2','-png', pdf, path.join(tmp,'img')]);
+    // 일부 PDF에서 pdfimages가 매우 오래 걸리거나 멈추는 사례 방지
+    await execFileP('pdfimages', ['-f','1','-l','2','-png', pdf, path.join(tmp,'img')], {
+      timeout: Number(process.env.COVER_EXTRACT_TIMEOUT_MS || 45000), // 45s
+      maxBuffer: 16 * 1024 * 1024,
+    });
     const list = (await fs.readdir(tmp)).filter(f => /^img-\d+-\d+\.png$/i.test(f));
     if (!list.length) return null;
     let pick=null, size=-1;
@@ -74,6 +78,13 @@ async function runAutoIngest({
 }) {
   const started = Date.now();
   if (!gcsUri) throw new Error('gcsUri required');
+  const BUDGET = Number(process.env.INGEST_BUDGET_MS || 240000); // 4분 권장
+  const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
+    Promise.resolve(p)
+      .then((val) => { clearTimeout(timer); resolve(val); })
+      .catch((err) => { clearTimeout(timer); reject(err); });
+  });
 
   // family 추정
   let fileName = '';
@@ -102,9 +113,15 @@ async function runAutoIngest({
   // PDF → 품번/스펙 추출
   let extracted = { brand: brand || 'unknown', rows: [] };
   if (!brand || !code) {
-    extracted = await extractPartsAndSpecsFromPdf({
-      gcsUri, allowedKeys, brandHint: brand || null,
-    });
+    try {
+      extracted = await withTimeout(
+        extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
+        Math.round(BUDGET * 0.60),
+        'extract',
+      );
+    } catch (e) {
+      console.warn('[extract timeout/fail]', e?.message || e);
+    }
   }
 
   // 커버 이미지(첫 품번 기준)
@@ -112,8 +129,14 @@ async function runAutoIngest({
   try {
     const bForCover = brand || extracted.brand || 'unknown';
     const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
-    coverUri = await extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover });
-  } catch {}
+    coverUri = await withTimeout(
+      extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
+      Math.min(60000, Math.round(BUDGET * 0.20)),
+      'cover',
+    );
+  } catch (e) {
+    console.warn('[cover timeout/fail]', e?.message || e);
+  }
 
   // 레코드 구성
   const records = [];

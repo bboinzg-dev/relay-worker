@@ -12,6 +12,7 @@ const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils
 const { upsertByBrandCode } = require('../utils/schema');
 const { getBlueprint } = require('../utils/blueprint');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
+const { extractFields } = require('../ai/extractByBlueprint'); // 빠른 경로
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
 
@@ -78,8 +79,12 @@ async function runAutoIngest({
 }) {
   const started = Date.now();
   if (!gcsUri) throw new Error('gcsUri required');
-  // 기본 예산을 2분으로 단축 (원하면 ENV로 늘릴 수 있음)
-  const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000); // 2분
+   // 기본 2분로 단축 (원하면 ENV로 재조정)
+  const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
+  const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
+  const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || (FAST ? 32768 : 65536));
+  const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || (FAST ? 30000 : Math.round(BUDGET * 0.6)));
+
   const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
     Promise.resolve(p)
@@ -91,10 +96,11 @@ async function runAutoIngest({
   let fileName = '';
   try { const { name } = parseGcsUri(gcsUri); fileName = path.basename(name); } catch {}
   let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
-  if (!family) {
-    // 미리보기 텍스트도 64KB로 축소
-    try { const text = await readText(gcsUri, 64*1024); family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power'; }
-    catch { family = 'relay_power'; }
+  if (!family && !FAST) {
+    try {
+      const text = await readText(gcsUri, PREVIEW_BYTES);
+      family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
+    } catch { family = 'relay_power'; }
   }
 
   // 목적 테이블
@@ -106,7 +112,9 @@ async function runAutoIngest({
   const qualified = table.startsWith('public.')? table : `public.${table}`;
 
   // 스키마 보장 (DB 함수) + 컬럼셋 확보
-  await ensureSpecsTableByFamily(family);
+    if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
+    await ensureSpecsTableByFamily(family);
+  }
   const colsSet = await getTableColumns(qualified);
 
   // 블루프린트 허용 키
@@ -116,30 +124,46 @@ async function runAutoIngest({
   let extracted = { brand: brand || 'unknown', rows: [] };
   if (!brand || !code) {
     try {
-      extracted = await withTimeout(
-        extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
-        Math.round(BUDGET * 0.60),
-        'extract',
-      );
-    } catch (e) {
-      console.warn('[extract timeout/fail]', e?.message || e);
-    }
+      if (FAST) {
+        // 텍스트만 빠르게 읽어 블루프린트 기반 추출
+        const raw = await readText(gcsUri, PREVIEW_BYTES);
+        if (raw && raw.length > 1000) {
+          const fieldsJson = Object.fromEntries((allowedKeys||[]).map(k => [k, 'text']));
+          const vals = await extractFields(raw, code || '', fieldsJson);
+          extracted = {
+            brand: brand || 'unknown',
+            rows: [{ brand: brand || 'unknown', code: code || (path.parse(fileName).name), ...(vals||{}) }],
+          };
+        } else {
+          // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
+          extracted = await withTimeout(
+            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
+            EXTRACT_HARD_CAP_MS,
+            'extract',
+          );
+        }
+      } else {
+        extracted = await withTimeout(
+          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
+          EXTRACT_HARD_CAP_MS,
+          'extract',
+        );
+      }
+    } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
   }
 
-// 커버 이미지 추출 비활성화(기본 OFF).
-  // 필요 시만 ENABLE: COVER_CAPTURE=1 환경변수로 다시 켜기.
+  // 커버 추출 비활성(요청에 따라 완전 OFF)
   let coverUri = null;
-  const COVER_CAPTURE = String(process.env.COVER_CAPTURE || '0').toLowerCase();
-  if (COVER_CAPTURE === '1' || COVER_CAPTURE === 'true' || COVER_CAPTURE === 'on') {
+  if (/^(1|true|on)$/i.test(process.env.COVER_CAPTURE || '0')) {
     try {
       const bForCover = brand || extracted.brand || 'unknown';
       const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
       coverUri = await withTimeout(
         extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
-        Math.min(60000, Math.round(BUDGET * 0.20)),
+        Math.min(30000, Math.round(BUDGET * 0.15)),
         'cover',
       );
-    } catch (e) { console.warn('[cover disabled/fail]', e?.message || e); }
+    } catch (e) { console.warn('[cover fail]', e?.message || e); }
   }
 
   // 레코드 구성

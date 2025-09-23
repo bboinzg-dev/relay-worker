@@ -441,11 +441,27 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     // ✅ 1) 즉시 ACK → Cloud Tasks는 이 시점에 "완료"로 처리(재시도 루프 종료)
     res.status(202).json({ ok: true, run_id: runId });
 
-    // ▶ 2) 다음 Cloud Tasks 요청으로 실행을 넘김(체인)
-    await enqueueIngestRun({ runId, gcsUri: uri, brand, code, series, display_name, family_slug });
- 
+    // ▶ 2) 다음 Cloud Tasks 요청으로 실행을 넘김(체인) — 응답 보낸 뒤이므로 절대 다시 res.* 호출 금지
+    enqueueIngestRun({ runId, gcsUri: uri, brand, code, series, display_name, family_slug })
+      .catch(async (err) => {
+        // enqueue 실패 시에도 응답은 이미 보냈으므로 DB만 FAILED로 마킹
+        try {
+          await db.query(
+            `UPDATE public.ingest_run_logs
+                SET finished_at = now(),
+                    duration_ms = $2,
+                    status = 'FAILED',
+                    error_message = $3
+              WHERE id = $1`,
+            [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
+          );
+        } catch (_) {}
+        console.error('[ingest enqueue failed]', err?.message || err);
+      });
 
   } catch (e) {
+ // 여기로 들어왔다면 아직 202를 보내기 전일 수도 있으므로, 응답 전/후 모두 안전하도록 처리
+    // 1) DB 상태 갱신
     try {
       await db.query(
         `UPDATE public.ingest_run_logs
@@ -460,9 +476,13 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
         [ taskName, Date.now()-startedAt, String(e?.message || e) ]
       );
     } catch (_) {}
-
-    console.error('[ingest 500]', { error: e?.message });
-    return res.status(500).json({ ok:false, error:String(e?.message || e) });
+    // 2) 아직 응답을 보내지 않았다면 500, 이미 보냈다면 로그만
+    if (!res.headersSent) {
+      console.error('[ingest 500]', { error: e?.message });
+      return res.status(500).json({ ok:false, error:String(e?.message || e) });
+    } else {
+      console.error('[ingest post-ack error]', e?.message || e);
+    }
   }
 });
 

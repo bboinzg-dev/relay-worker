@@ -412,35 +412,47 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
     );
     const runId = logRows[0]?.id;
 
-    const label = `[ingest] ${taskName || uri}`;
-    console.time(label);
-    let out;
-    try {
-      out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name, family_slug });
-    } finally {
-      console.timeEnd(label);
-    }
+    // ✅ 1) 즉시 ACK → Cloud Tasks는 이 시점에 "완료"로 처리(재시도 루프 종료)
+    res.status(202).json({ ok: true, run_id: runId });
 
-    try {
-      await db.query(
-        `UPDATE public.ingest_run_logs
-            SET finished_at = now(),
-                duration_ms = $2,
-                status = 'SUCCEEDED',
-                final_table = $3,
-                final_family = $4,
-                final_brand = $5,
-                final_code = $6,
-                final_datasheet = $7
-          WHERE id = $1`,
-        [ runId, (out?.ms ?? (Date.now() - startedAt)), out?.specs_table || null, out?.family || out?.family_slug || null,
-          out?.brand || null, (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null, out?.datasheet_uri || uri ]
-      );
-    } catch (e) {
-      console.warn('[ingest log update skipped]', e?.message || e);
-    }
-
-    return res.json(out);
+    // ▶ 2) 백그라운드에서 실제 인제스트 계속
+    setImmediate(async () => {
+      const label = `[ingest] ${taskName || uri}`;
+      console.time(label);
+      try {
+        const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name, family_slug });
+        console.timeEnd(label);
+        await db.query(
+          `UPDATE public.ingest_run_logs
+              SET finished_at = now(),
+                  duration_ms = $2,
+                  status = 'SUCCEEDED',
+                  final_table = $3,
+                  final_family = $4,
+                  final_brand = $5,
+                  final_code = $6,
+                  final_datasheet = $7
+            WHERE id = $1`,
+          [ runId, (out?.ms ?? (Date.now() - startedAt)), out?.specs_table || null,
+            out?.family || out?.family_slug || null,
+            out?.brand || null,
+            (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
+            out?.datasheet_uri || uri ]
+        );
+      } catch (e) {
+        console.timeEnd(label);
+        await db.query(
+          `UPDATE public.ingest_run_logs
+              SET finished_at = now(),
+                  duration_ms = $2,
+                  status = 'FAILED',
+                  error_message = $3
+            WHERE id = $1`,
+          [ runId, Date.now() - startedAt, String(e?.message || e) ]
+        );
+        console.error('[ingest async failed]', e?.message || e);
+      }
+    });
 
   } catch (e) {
     try {

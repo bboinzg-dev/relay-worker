@@ -87,7 +87,7 @@ async function runAutoIngest({
       .catch((err) => { clearTimeout(timer); reject(err); });
   });
 
-  +  // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
+    // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
   let fileName = '';
   try { const { name } = parseGcsUri(gcsUri); fileName = path.basename(name); } catch {}
   let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';

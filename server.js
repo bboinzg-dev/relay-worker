@@ -54,7 +54,7 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
         : {}),
     },
     // ② Cloud Tasks에 타깃 응답 대기 한도를 명시(기본 10분 → 135초 내)
-    dispatchDeadline: { seconds },
+    dispatchDeadline: `${seconds}s`,
   };
 
    // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
@@ -519,6 +519,8 @@ app.post('/api/worker/ingest/run', async (req, res) => {
       try { res.status(202).json({ ok: true, timeout: true }); } catch {}
     }
   }, deadlineMs);
+   console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${req.body?.runId || 'n/a'}`);
+
   try {
     const { runId, gcsUri, brand, code, series, display_name, family_slug = null } = req.body || {};
     if (!runId || !gcsUri) return res.status(400).json({ ok:false, error:'runId & gcsUri required' });
@@ -556,11 +558,18 @@ app.post('/api/worker/ingest/run', async (req, res) => {
       [ req.body?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
     );
     console.error('[ingest-run failed]', e?.message || e);
-    return res.status(500).json({ ok:false, error:String(e?.message||e) });
-      } finally {
+   if (!res.headersSent) {
+     return res.status(500).json({ ok:false, error:String(e?.message||e) });
+   } else {
+     // 이미 202를 보냈다면 응답은 끝 — 로그만 남김
+     console.warn('[ingest-run post-ACK error]', String(e?.message || e));
+     return;
+   }
+  } finally {
     clearTimeout(killer);
   }
 });
+console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${req.body?.runId || 'n/a'}`);
 
 
 /* ---------------- 404 / error ---------------- */

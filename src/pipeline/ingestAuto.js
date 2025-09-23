@@ -64,20 +64,83 @@ async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
   } catch { return null; }
 }
 
-function guessFamilySlug({ fileName='', previewText='' }) {
-  const s = (fileName+' '+previewText).toLowerCase();
+function guessFamilySlug({ fileName = '', previewText = '' }) {
+  const s = (fileName + ' ' + previewText).toLowerCase();
+
+  // 1) 우선 매칭: 시그널 릴레이의 대표 키워드
+  if (/\bsignal\s+relay\b/.test(s) ||
+      /\bsubminiature\b.*\brelay\b/.test(s) ||
+      /\btelecom\b.*\brelay\b/.test(s) ||
+      /\bty\b(?![a-z0-9])/i.test(s)) {
+    return 'relay_signal';
+  }
+
+  // 2) 그 외 일반 릴레이는 power로 폴백
+  if (/\b(relay|coil|omron|finder)\b/.test(s)) return 'relay_power';
+
+  // 3) 기존 다른 부품군 규칙 유지
   if (/\b(resistor|r-clamp|ohm)\b/.test(s)) return 'resistor_chip';
   if (/\b(capacitor|mlcc|electrolytic|tantalum)\b/.test(s)) return 'capacitor_mlcc';
   if (/\b(inductor|choke)\b/.test(s)) return 'inductor_power';
   if (/\b(bridge|rectifier|diode)\b/.test(s)) return 'bridge_rectifier';
-    // ★ Signal Relay 우선 매칭: 문서 본문/제목에 흔하게 등장
-  if (/\bsignal\s+relay\b/.test(s) || /\bsubminiature\b.*\brelay\b/.test(s) || /\bty\b(?![a-z0-9])/i.test(s)) {
-    return 'relay_signal';
-  }
-  // 일반 릴레이 키워드는 power로 폴백
-  if (/\b(relay|coil|omron|finder)\b/.test(s)) return 'relay_power';
   return null;
 }
+
+function normalizeCode(str) {
+  return String(str || '')
+    .replace(/[–—]/g, '-')      // 유니코드 대시 정규화
+    .replace(/\s+/g, '')        // 내부 공백 제거
+    .replace(/-+/g, '-')        // 대시 연속 정리
+    .toUpperCase();
+}
+
+// “Ordering Information / How to Order / 주문 정보” 인접영역에서 품번 후보를 뽑아 점수화
+function extractPartNumbersFromText(full, limit = 50) {
+  const text = String(full || '');
+  if (!text) return [];
+
+  // 앵커: 다국어 포함 (영/한/중 기본)
+  const anchorRe = /(ORDER(?:ING)?\s+(INFO|INFORMATION|GUIDE|CODE|NUMBER)|HOW\s+TO\s+ORDER|주문\s*정보|주문\s*코드|订购信息|订货信息)/i;
+  let windowStart = 0, windowEnd = text.length;
+  const m = text.match(anchorRe);
+  if (m) {
+    // 앵커 앞뒤 약 8~12KB 윈도 선택(표와 주석이 보통 이 범위에 몰린다)
+    const idx = m.index || 0;
+    windowStart = Math.max(0, idx - 8000);
+    windowEnd   = Math.min(text.length, idx + 12000);
+  }
+  const windowTxt = text.slice(windowStart, windowEnd);
+
+  // 일반적 품번 패턴: 영문+숫자 조합, 하이픈 허용. (너무 짧음/너무 김/순수숫자/순수영문은 제외)
+  const candRe = /[A-Z][A-Z0-9](?:[A-Z0-9\-\.]{1,18})/g;
+  const raw = windowTxt.match(candRe) || [];
+
+  // 노이즈 필터 (규격·단위·규정 키워드 제거)
+  const blacklist = /^(ISO|RoHS|UL|VDC|VAC|A|mA|mm|Ω|OHM|PDF|PAGE|NOTE|DATE|LOT|WWW|HTTP|HTTPS)$/i;
+  const stats = new Map();
+
+  for (const r of raw) {
+    const code = normalizeCode(r);
+    if (!/[0-9]/.test(code)) continue;          // 숫자 포함 필수
+    if (code.length < 4 || code.length > 20) continue;
+    if (blacklist.test(code)) continue;
+
+    // 근접 컨텍스트로 가중치 (코일 전압/폼/패키지 등 키워드 주변의 후보를 우대)
+    const pos = windowTxt.indexOf(r);
+    const ctx = windowTxt.slice(Math.max(0, pos - 80), Math.min(windowTxt.length, pos + 80));
+    let score = 1;
+    if (/(coil|voltage|vdc|form|contact|series|type|형식|전압|코일)/i.test(ctx)) score += 2;
+    if (/(model|part\s*no\.?|ordering|주문|订购)/i.test(ctx)) score += 2;
+
+    stats.set(code, (stats.get(code) || 0) + score);
+  }
+
+  return [...stats.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([code, score]) => ({ code, score }));
+}
+
 
 async function runAutoIngest({
   gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null,
@@ -96,6 +159,7 @@ async function runAutoIngest({
       .then((val) => { clearTimeout(timer); resolve(val); })
       .catch((err) => { clearTimeout(timer); reject(err); });
   });
+
 
     // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
   let fileName = '';
@@ -158,6 +222,22 @@ async function runAutoIngest({
       }
     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
   }
+
+  if (!code) {
+  try {
+    const fullText = await readText(gcsUri, 300 * 1024); // 300KB 정도면 대부분의 'How to order' 커버
+    const picks = extractPartNumbersFromText(fullText);
+    if (picks.length && (!extracted.rows || !extracted.rows.length)) {
+      // 추출 결과가 비었을 때는 우선순위 상위 1~N개로 rows를 구성해준다.
+      extracted.rows = picks.slice(0, 10).map(p => ({ code: p.code }));
+    } else if (picks.length && extracted.rows?.length) {
+      // 이미 rows가 있다면, 상위 후보를 첫 레코드 코드로 보정
+      extracted.rows[0].code = extracted.rows[0].code || picks[0].code;
+    }
+  } catch (e) {
+    // 텍스트 읽기 실패는 무시 (DocAI/직접 추출 둘 다 실패할 수 있으니)
+  }
+}
 
   // 커버 추출 비활성(요청에 따라 완전 OFF)
   let coverUri = null;

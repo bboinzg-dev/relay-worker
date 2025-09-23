@@ -61,7 +61,13 @@ async function extractFields(rawText, code, fieldsJson) {
     return empty;
   }
 
-  const clipped = String(rawText).slice(0, TEXT_LIMIT);
+  // 변경
+  const full = String(rawText || '');
+  const win = Math.min(TEXT_LIMIT, full.length);
+  const half = Math.floor(win / 2);
+  const head = full.slice(0, half);
+  const tail = full.slice(Math.max(0, full.length - half));
+  const twoSided = head + '\n---TAIL---\n' + tail;
 
   const prompt = [
     `You are an expert extracting exact fields from an electronic component datasheet.`,
@@ -79,16 +85,17 @@ async function extractFields(rawText, code, fieldsJson) {
       temperature: 0.0,
       topP: 0.1,
       maxOutputTokens: MAX_OUT_TOKENS,
-      responseMimeType: 'application/json', // JSON만 달라고 강제
+      responseMimeType: 'application/json', // 구조화 출력 유지
     },
   });
 
   const req = {
     contents: [{
       role: 'user',
-      parts: [{ text: prompt }, { text: clipped }]
+      parts: [{ text: prompt }, { text: twoSided }]
     }]
   };
+
 
   let text = '{}';
   try {

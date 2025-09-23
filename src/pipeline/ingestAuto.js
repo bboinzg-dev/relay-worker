@@ -12,7 +12,7 @@ const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils
 const { upsertByBrandCode } = require('../utils/schema');
 const { getBlueprint } = require('../utils/blueprint');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
-const { extractFields } = require('../ai/extractByBlueprint'); // 빠른 경로
+const { extractFields } = require('./extractByBlueprint');
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
 

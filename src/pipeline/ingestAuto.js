@@ -70,6 +70,11 @@ function guessFamilySlug({ fileName='', previewText='' }) {
   if (/\b(capacitor|mlcc|electrolytic|tantalum)\b/.test(s)) return 'capacitor_mlcc';
   if (/\b(inductor|choke)\b/.test(s)) return 'inductor_power';
   if (/\b(bridge|rectifier|diode)\b/.test(s)) return 'bridge_rectifier';
+    // ★ Signal Relay 우선 매칭: 문서 본문/제목에 흔하게 등장
+  if (/\bsignal\s+relay\b/.test(s) || /\bsubminiature\b.*\brelay\b/.test(s) || /\bty\b(?![a-z0-9])/i.test(s)) {
+    return 'relay_signal';
+  }
+  // 일반 릴레이 키워드는 power로 폴백
   if (/\b(relay|coil|omron|finder)\b/.test(s)) return 'relay_power';
   return null;
 }
@@ -98,9 +103,11 @@ async function runAutoIngest({
   let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
   if (!family && !FAST) {
     try {
-      const text = await readText(gcsUri, PREVIEW_BYTES);
-      family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
-    } catch { family = 'relay_power'; }
+     const text = await readText(gcsUri, 256*1024);
+     family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
+     // ★ 강제 보정: 제목/본문에 Signal Relay가 있으면 무조건 signal로
+     if (/subminiature\s+signal\s+relay|signal\s+relay/i.test(text)) family = 'relay_signal';
+   } catch { family = 'relay_power'; }
   }
 
   // 목적 테이블

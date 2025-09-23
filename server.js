@@ -27,10 +27,8 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
  let _queuePath = null;
  function getTasks() {
    if (!_tasks) {
-     _tasks = new CloudTasksClient({
-       apiEndpoint: `${TASKS_LOCATION}-tasks.googleapis.com`, // e.g. asia-northeast3-tasks.googleapis.com
-       fallback: true, // REST/HTTP1 전송(IPv6/gRPC 이슈 우회)
-     });
+    // 글로벌 엔드포인트 + REST fallback(HTTP/1)
+    _tasks = new CloudTasksClient({ fallback: true });
      _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
    }
    return { tasks: _tasks, queuePath: _queuePath };

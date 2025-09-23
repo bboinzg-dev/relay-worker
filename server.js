@@ -45,7 +45,7 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
        url: WORKER_TASK_URL,
        headers: { 'Content-Type': 'application/json' },
        body: Buffer.from(JSON.stringify(payload)).toString('base64'),
-       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA } } : {}),
+       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } } : {}),
      },
    };
    // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹

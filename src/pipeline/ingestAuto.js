@@ -309,6 +309,14 @@ await saveExtractedSpecs(predFamily, {
   mfr_full: maybeMfr,
   datasheet_uri: finalDatasheetUrl
 }, extractedSpecsObject);
+
+// (예시) familySlug, pool, values 등 준비된 상황에서:
+if (!process.env.NO_SCHEMA_ENSURE || process.env.NO_SCHEMA_ENSURE === "0") {
+  await pool.query('SELECT public.ensure_specs_table($1)', [familySlug]);
+}
+// 이어서 UPSERT 실행...
+
+
   // 업서트
   let upserted = 0;
   for (const rec of records) {

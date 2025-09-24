@@ -142,13 +142,14 @@ function extractPartNumbersFromText(full, limit = 50) {
     .map(([code, score]) => ({ code, score }));
 }
 
-// --- NEW: doc type detector (catalog vs. single datasheet) ---
+
+
 function detectDocType(full) {
   const t = String(full || '').toLowerCase();
-  // 'HOW TO ORDER/ORDERING INFORMATION/주문 정보/订购信息' 등 존재하면 카탈로그형으로 본다
   if (/(how to order|ordering information|주문\s*정보|订购信息|订货信息)/i.test(t)) return 'catalog';
   return 'single';
 }
+
 
 
 

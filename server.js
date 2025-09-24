@@ -54,7 +54,7 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
         : {}),
     },
     // ② Cloud Tasks에 타깃 응답 대기 한도를 명시(기본 10분 → 135초 내)
-    dispatchDeadline: `${seconds}s`,
+    dispatchDeadline: { seconds },
   };
 
    // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
@@ -520,7 +520,6 @@ app.post('/api/worker/ingest/run', async (req, res) => {
       try { res.status(202).json({ ok: true, timeout: true }); } catch {}
     }
   }, deadlineMs);
-   console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${req.body?.runId || 'n/a'}`);
 
   try {
     const { runId, gcsUri, brand, code, series, display_name, family_slug = null } = req.body || {};

@@ -35,6 +35,34 @@ async function ensureSpecsTableByFamily(family){
   await db.query(`SELECT public.ensure_specs_table($1)`, [family]);
 }
 
+function allowedKeysFromBlueprint(bp) {
+  if (!bp) return [];
+  if (Array.isArray(bp.allowedKeys) && bp.allowedKeys.length) {
+    return Array.from(new Set(bp.allowedKeys));
+  }
+  const fields = bp.fields;
+  if (Array.isArray(fields)) {
+    const names = [];
+    for (const entry of fields) {
+      if (!entry) continue;
+      if (typeof entry === 'string') {
+        const name = entry.trim();
+        if (name) names.push(name);
+        continue;
+      }
+      if (typeof entry === 'object' && entry.name) {
+        const name = String(entry.name).trim();
+        if (name) names.push(name);
+      }
+    }
+    return Array.from(new Set(names));
+  }
+  if (fields && typeof fields === 'object') {
+    return Object.keys(fields);
+  }
+  return [];
+}
+
 async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
   try {
     const { bucket, name } = parseGcsUri(gcsPdfUri);
@@ -201,7 +229,8 @@ async function runAutoIngest({
   const colsSet = await getTableColumns(qualified);
 
   // 블루프린트 허용 키
-  const { allowedKeys } = await getBlueprint(family);
+  const blueprint = await getBlueprint(db.pool, family);
+  const allowedKeys = allowedKeysFromBlueprint(blueprint);
 
   // PDF → 품번/스펙 추출
   let extracted = { brand: brand || 'unknown', rows: [] };

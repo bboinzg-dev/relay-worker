@@ -1,6 +1,6 @@
 'use strict';
 
-const { pool, ensureSpecsTable } = require('../utils/db');
+const { pool } = require('../utils/db');
 const { getBlueprint } = require('../utils/blueprint');
 
 function safeColumnName(name) {
@@ -8,11 +8,18 @@ function safeColumnName(name) {
   return `"${name}"`;
 }
 
+async function ensureSpecsTableForFamily(familySlug) {
+  await pool.query('SELECT public.ensure_specs_table($1)', [familySlug]);
+}
+
 async function saveExtractedSpecs(familySlug, base, specs) {
   // 스키마 자동 보장(추가만 수행)
-  await ensureSpecsTable(familySlug);
+  await ensureSpecsTableForFamily(familySlug);
 
-  const { specs_table } = await getBlueprint(familySlug);
+  const blueprint = await getBlueprint(pool, familySlug);
+  const specsTable = blueprint?.specsTable;
+  if (!specsTable) throw new Error(`specs table not found for family ${familySlug}`);
+  const targetTable = specsTable.includes('.') ? specsTable : `public.${specsTable}`;
 
   const baseCols = ['family_slug','brand','brand_norm','code','code_norm','mfr_full','datasheet_uri','verified_in_doc'];
   const baseVals = [
@@ -35,7 +42,7 @@ async function saveExtractedSpecs(familySlug, base, specs) {
     .join(',');
 
   const sql = `
-    INSERT INTO public.${specs_table} (${colList})
+    INSERT INTO ${targetTable} (${colList})
     VALUES (${params.join(',')})
     ON CONFLICT (brand_norm, code_norm)
     DO UPDATE SET

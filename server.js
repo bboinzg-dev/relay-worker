@@ -54,7 +54,7 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
         : {}),
     },
     // ② Cloud Tasks에 타깃 응답 대기 한도를 명시(기본 10분 → 135초 내)
-    dispatchDeadline: { seconds },
+   dispatchDeadline: { seconds: Math.min(Math.ceil(seconds), 1800) },
   };
 
    // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
@@ -521,6 +521,9 @@ app.post('/api/worker/ingest/run', async (req, res) => {
     }
   }, deadlineMs);
 
+  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${req.body?.runId || 'n/a'}`);
+
+
   try {
     const { runId, gcsUri, brand, code, series, display_name, family_slug = null } = req.body || {};
     if (!runId || !gcsUri) return res.status(400).json({ ok:false, error:'runId & gcsUri required' });
@@ -569,7 +572,6 @@ app.post('/api/worker/ingest/run', async (req, res) => {
     clearTimeout(killer);
   }
 });
-console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${req.body?.runId || 'n/a'}`);
 
 
 /* ---------------- 404 / error ---------------- */

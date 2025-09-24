@@ -8,7 +8,7 @@ const multer = require('multer');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
-const { db, getPool } = require('./lib/db');
+const { getPool, query } = require('./db');
 const { getFamilies, getBlueprint } = require('./lib/blueprint');
 const { classifyFamily, extractByBlueprint } = require('./lib/llm');
 const { Storage } = require('@google-cloud/storage');
@@ -179,7 +179,7 @@ async function requireSession(req, res, next) {
 /* ---------------- Health & Env ---------------- */
 app.get('/_healthz', (_req, res) => res.type('text/plain').send('ok'));
 app.get('/api/health', async (_req, res) => {
-  try { await db.query('SELECT 1'); res.json({ ok: true }); }
+  try { await query('SELECT 1'); res.json({ ok: true }); }
   catch (e) { res.status(500).json({ ok:false, error:String(e?.message || e) }); }
 });
 app.get('/_env', (_req, res) => {
@@ -277,7 +277,7 @@ app.post('/api/files/move', requireSession, async (req, res) => {
 /* ---------------- Catalog / Blueprint ---------------- */
 app.get('/catalog/registry', async (_req, res) => {
   try {
-    const r = await db.query(
+    const r = await query(
       'SELECT family_slug, specs_table FROM public.component_registry ORDER BY family_slug'
     );
     res.json({ items: r.rows });
@@ -288,7 +288,7 @@ app.get('/catalog/registry', async (_req, res) => {
 
 app.get('/catalog/blueprint/:family', async (req, res) => {
   try {
-    const r = await db.query(`
+    const r = await query(`
       SELECT b.family_slug, r.specs_table, b.fields_json, b.prompt_template
         FROM public.component_spec_blueprint b
         JOIN public.component_registry r USING (family_slug)
@@ -310,10 +310,10 @@ app.get('/parts/detail', async (req, res) => {
 
   try {
     if (family) {
-      const r = await db.query(`SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]);
+      const r = await query(`SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]);
       const table = r.rows[0]?.specs_table;
       if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
-      const row = await db.query(`SELECT * FROM public.${table} WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`, [brand, code]);
+      const row = await query(`SELECT * FROM public.${table} WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`, [brand, code]);
       return row.rows[0]
         ? res.json({ ok:true, item: row.rows[0] })
         : res.status(404).json({ ok:false, error:'NOT_FOUND' });
@@ -321,13 +321,13 @@ app.get('/parts/detail', async (req, res) => {
 
     // fallback: unified view if present, else legacy relay view
     try {
-      const row = await db.query(
+      const row = await query(
         `SELECT * FROM public.component_specs WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
         [brand, code]
       );
       if (row.rows[0]) return res.json({ ok:true, item: row.rows[0] });
     } catch {}
-    const row = await db.query(
+    const row = await query(
       `SELECT * FROM public.relay_specs WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
       [brand, code]
     );
@@ -348,10 +348,10 @@ app.get('/parts/search', async (req, res) => {
     const text = q ? `%${q.toLowerCase()}%` : '%';
 
     if (family) {
-      const r = await db.query(`SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]);
+      const r = await query(`SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]);
       const table = r.rows[0]?.specs_table;
       if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
-      const rows = await db.query(
+      const rows = await query(
         `SELECT id, family_slug, brand, code, display_name,
                 width_mm, height_mm, length_mm, image_uri, datasheet_uri, updated_at
            FROM public.${table}
@@ -367,7 +367,7 @@ app.get('/parts/search', async (req, res) => {
 
     // (fallback) unified view if present, else relay view
     try {
-      const rows = await db.query(
+      const rows = await query(
         `SELECT id, family_slug, brand, code, display_name,
                 width_mm, height_mm, length_mm, image_uri, datasheet_uri, updated_at
            FROM public.component_specs
@@ -378,7 +378,7 @@ app.get('/parts/search', async (req, res) => {
       );
       return res.json({ ok:true, items: rows.rows });
     } catch {}
-    const rows = await db.query(
+    const rows = await query(
       `SELECT * FROM public.relay_specs
         WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
         ORDER BY updated_at DESC
@@ -448,39 +448,42 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
   const startedAt = Date.now();
   const taskName  = req.get('X-Cloud-Tasks-TaskName') || null;
   const retryCnt  = Number(req.get('X-Cloud-Tasks-TaskRetryCount') || 0);
+  const body = parseIngestBody(req);
+  const series = req.body?.series || null;
+  const displayName = req.body?.display_name || req.body?.displayName || null;
   try {
-    const { gcsUri, gcsPdfUri, brand, code, series, display_name, family_slug = null } = req.body || {};
-    const uri = gcsUri || gcsPdfUri;
+    const uri = body.gcs_uri;
     if (!uri || !/^gs:\/\//i.test(uri)) {
-      await db.query(
-        `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
-         VALUES ($1,$2,$3,'FAILED',$4)`,
-        [taskName, retryCnt, uri || '', 'gcsUri required (gs://...)']
+      await query(
+        `INSERT INTO public.ingest_run_logs (gcs_uri, status, error, task_name, retry_count, uploader_id, content_type)
+         VALUES ($1,'FAILED',$2,$3,$4,$5,$6)`,
+        [uri || 'n/a', 'gcs_uri required (gs://...)', taskName, retryCnt, body.uploader_id, body.content_type]
       );
-      return res.status(400).json({ ok:false, error:'gcsUri required (gs://...)' });
+      return res.status(202).json({ ok: true, accepted: false });
     }
 
-    const { rows:logRows } = await db.query(
-      `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
-       VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
-      [taskName, retryCnt, uri]
+    const { rows:logRows } = await query(
+      `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, uploader_id, content_type)
+       VALUES ($1,$2,$3,'PROCESSING',$4,$5) RETURNING id`,
+      [taskName, retryCnt, uri, body.uploader_id, body.content_type]
     );
     const runId = logRows[0]?.id;
 
     // ✅ 1) 즉시 ACK → Cloud Tasks는 이 시점에 "완료"로 처리(재시도 루프 종료)
-    res.status(202).json({ ok: true, run_id: runId });
+    res.status(202).json({ ok: true, run_id: runId, accepted: true });
 
     // ▶ 2) 다음 Cloud Tasks 요청으로 실행을 넘김(체인) — 응답 보낸 뒤이므로 절대 다시 res.* 호출 금지
-    enqueueIngestRun({ runId, gcsUri: uri, brand, code, series, display_name, family_slug })
+    enqueueIngestRun({ runId, gcsUri: uri, brand: body.brand, code: body.code, series, display_name: displayName, family_slug: body.family_slug })
       .catch(async (err) => {
         // enqueue 실패 시에도 응답은 이미 보냈으므로 DB만 FAILED로 마킹
         try {
-          await db.query(
+          await query(
             `UPDATE public.ingest_run_logs
                 SET finished_at = now(),
                     duration_ms = $2,
                     status = 'FAILED',
-                    error_message = $3
+                    error = $3,
+                    updated_at = now()
               WHERE id = $1`,
             [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
           );
@@ -492,12 +495,13 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
  // 여기로 들어왔다면 아직 202를 보내기 전일 수도 있으므로, 응답 전/후 모두 안전하도록 처리
     // 1) DB 상태 갱신
     try {
-      await db.query(
+      await query(
         `UPDATE public.ingest_run_logs
            SET finished_at = now(),
                duration_ms = $2,
                status = 'FAILED',
-               error_message = $3
+               error = $3,
+               updated_at = now()
          WHERE task_name = $1
            AND status = 'PROCESSING'
          ORDER BY started_at DESC
@@ -518,23 +522,46 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
 // ---- 유틸
 const norm = s => (s || '').toString().trim().toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9._-]/g, '');
 
+// 공통 바디 파서
+function parseIngestBody(req) {
+  const b = req.body || {};
+  return {
+    gcs_uri: b.gcs_uri || b.gcsUri || b.gcs_pdf_uri || b.gcsPdfUri || null,
+    uploader_id: b.uploader_id || b.uploaderId || 'anonymous',
+    content_type: b.content_type || b.mime || 'application/pdf',
+    run_id: b.run_id || b.runId || null,
+    family_slug: b.family_slug || null,
+    brand: b.brand || null,
+    code: b.code || null,
+  };
+}
+
 // ---- ingest_run_logs 테이블 필요시 보장(앱 부팅시에 1회 호출)
 async function ensureIngestRunLogs() {
-  await db.query(`
+  await query(`
     CREATE TABLE IF NOT EXISTS public.ingest_run_logs (
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-      gcs_uri text NOT NULL,
-      family_slug text,
-      specs_table text,
-      brand text, brand_norm text,
-      code text, code_norm text,
-      status text NOT NULL DEFAULT 'CREATED',
-      created_at timestamptz NOT NULL DEFAULT now(),
-      updated_at timestamptz NOT NULL DEFAULT now(),
-      error text
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      gcs_uri TEXT NOT NULL,
+      family_slug TEXT,
+      specs_table TEXT,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      started_at TIMESTAMPTZ,
+      finished_at TIMESTAMPTZ,
+      error TEXT,
+      uploader_id TEXT,
+      content_type TEXT,
+      task_name TEXT,
+      retry_count INTEGER,
+      brand TEXT,
+      brand_norm TEXT,
+      code TEXT,
+      code_norm TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      duration_ms INTEGER
     );
   `);
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_ingest_run_logs_created ON public.ingest_run_logs(created_at DESC);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_ingest_run_logs_created ON public.ingest_run_logs(created_at DESC);`);
 }
 
 // ---- GCS 다운로드
@@ -585,23 +612,34 @@ async function upsertComponent({ family, specsTable, brand, code, datasheetUri, 
 
 // ▶ 체인 실행 엔드포인트: 3-스텝 멱등 파이프라인
 app.post('/api/worker/ingest/run', async (req, res) => {
-  const killerMs = Number(process.env.INGEST_KILLER_MS || 135000);
+  const parsedDeadline = parseInt(
+    req.body?.deadline_ms || process.env.INGEST_DEADLINE_MS || '135000',
+    10
+  );
+  const deadlineMs = Number.isFinite(parsedDeadline) ? parsedDeadline : 135000;
+  const body = parseIngestBody(req);
+  const runHint = body.run_id || req.body?.runId || 'n/a';
+  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runHint}`);
   const timer = setTimeout(() => {
     console.warn(`[ingest-run] local deadline hit`);
     try { res.status(504).json({ error: 'deadline' }); } catch (e) {}
-  }, killerMs);
+  }, deadlineMs);
 
   let rid = null;
 
   try {
-    const { gcs_uri: gcsUri, runId } = req.body || {};
-    if (!gcsUri) { clearTimeout(timer); return res.status(400).json({ error: 'gcs_uri required' }); }
+    const gcsUri = body.gcs_uri;
+    const runId = body.run_id || req.body?.runId || null;
+    if (!gcsUri) {
+      clearTimeout(timer);
+      return res.status(400).json({ error: 'gcs_uri required' });
+    }
 
-    const { rows: runRows } = await db.query(`
-      INSERT INTO public.ingest_run_logs (id, gcs_uri, status, updated_at)
-      VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, 'RUNNING', now())
-      ON CONFLICT (id) DO UPDATE SET status='RUNNING', updated_at=now()
-      RETURNING id`, [runId || null, gcsUri]);
+    const { rows: runRows } = await query(`
+      INSERT INTO public.ingest_run_logs (id, gcs_uri, status, started_at, updated_at)
+      VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, 'RUNNING', now(), now())
+      ON CONFLICT (id) DO UPDATE SET status='RUNNING', started_at=COALESCE(ingest_run_logs.started_at, now()), updated_at=now()
+      RETURNING id`, [runId, gcsUri]);
     rid = runRows[0].id;
 
     const pdfBytes = await downloadBytes(gcsUri);
@@ -627,8 +665,8 @@ app.post('/api/worker/ingest/run', async (req, res) => {
       values,
     });
 
-    await db.query(`UPDATE public.ingest_run_logs
-      SET status='SUCCEEDED', family_slug=$2, specs_table=$3, brand=$4, brand_norm=$5, code=$6, code_norm=$7, updated_at=now()
+    await query(`UPDATE public.ingest_run_logs
+      SET status='SUCCEEDED', family_slug=$2, specs_table=$3, brand=$4, brand_norm=$5, code=$6, code_norm=$7, finished_at=now(), updated_at=now(), error=NULL
       WHERE id=$1`,
       [rid, family, specsTable, fam.brand || null, norm(fam.brand), fam.code || null, norm(fam.code)]
     );
@@ -638,8 +676,8 @@ app.post('/api/worker/ingest/run', async (req, res) => {
   } catch (e) {
     console.error('[ingest-run] error', e);
     try {
-      await db.query(`UPDATE public.ingest_run_logs SET status='FAILED', error=$2, updated_at=now() WHERE id=$1`,
-        [rid || req.body?.runId || null, String(e?.message || e)]);
+      await query(`UPDATE public.ingest_run_logs SET status='FAILED', error=$2, updated_at=now(), finished_at=now() WHERE id=$1`,
+        [rid || body.run_id || req.body?.runId || null, String(e?.message || e)]);
     } catch {}
     clearTimeout(timer);
     return res.status(500).json({ error: String(e?.message || e) });
@@ -657,8 +695,8 @@ app.use((err, req, res, next) => {
 /* ---------------- Boot-time setup ---------------- */
 (async () => {
   try {
-    await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
-    await db.query(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
+    await query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
+    await query(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
   } catch (e) {
     console.warn('[BOOT] ensure extensions failed:', e?.message || e);
   }

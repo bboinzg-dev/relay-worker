@@ -5,7 +5,7 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const { db, getPool } = require('./lib/db');
+const { getPool, query } = require('./db');
 const { parseActor, hasRole } = require('./src/utils/auth');
 
 const app = express();
@@ -39,7 +39,7 @@ app.get('/api/listings', async (req, res) => {
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY created_at DESC
                  LIMIT 200`;
-    const r = await db.query(sql, args);
+    const r = await query(sql, args);
     res.json({ ok: true, items: r.rows });
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
 });
@@ -55,7 +55,7 @@ app.post('/api/listings', async (req, res) => {
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,'USD'),$10,$11,$12,$13,$14,COALESCE($15,'pending'))
       RETURNING *`;
-    const r = await db.query(sql, [
+    const r = await query(sql, [
       t, actor.id || null, b.brand, b.code, Number(b.qty_available||0),
       b.moq || null, b.mpq || null,
       Number(b.unit_price_cents||0), b.currency || 'USD',
@@ -114,7 +114,7 @@ app.get('/api/purchase-requests', async (req, res) => {
     const sql = `SELECT * FROM public.purchase_requests
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY created_at DESC LIMIT 200`;
-    const r = await db.query(sql, args);
+    const r = await query(sql, args);
     res.json({ ok: true, items: r.rows });
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
 });
@@ -128,7 +128,7 @@ app.post('/api/purchase-requests', async (req, res) => {
       (tenant_id, buyer_id, brand, code, qty_required, need_by_date, target_unit_price_cents, allow_substitutes, notes, status)
       VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,true),$9,'open')
       RETURNING *`;
-    const r = await db.query(sql, [
+    const r = await query(sql, [
       t, actor.id || null, b.brand, b.code, Number(b.qty || b.qty_required || 0),
       b.need_by_date || null, b.target_unit_price_cents || null, b.allow_substitutes !== false,
       b.notes || b.note || null
@@ -173,7 +173,7 @@ app.get('/api/bids', async (req, res) => {
     const prId = (req.query.pr || req.query.purchase_request_id || '').toString();
     const args = []; let where = '';
     if (prId) { args.push(prId); where = 'WHERE purchase_request_id = $1'; }
-    const r = await db.query(`SELECT * FROM public.bids ${where} ORDER BY created_at DESC LIMIT 200`, args);
+    const r = await query(`SELECT * FROM public.bids ${where} ORDER BY created_at DESC LIMIT 200`, args);
     res.json({ ok: true, items: r.rows });
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
 });
@@ -188,7 +188,7 @@ app.post('/api/bids', async (req, res) => {
       (tenant_id, purchase_request_id, seller_id, offer_brand, offer_code, offer_is_substitute, offer_qty, unit_price_cents, currency, lead_time_days, note, status)
       VALUES ($1,$2,$3,$4,$5,COALESCE($6,false),$7,$8,COALESCE($9,'USD'),$10,$11,'offered')
       RETURNING *`;
-    const r = await db.query(sql, [
+    const r = await query(sql, [
       t, b.purchase_request_id, actor.id || null,
       b.offer_brand || null, b.offer_code || null, !!b.offer_is_substitute,
       Number(b.offer_qty || 0), Number(b.unit_price_cents || 0),

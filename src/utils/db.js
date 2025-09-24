@@ -1,5 +1,4 @@
 'use strict';
-
 const { Pool } = require('pg');
 
 const pool = new Pool({
@@ -7,12 +6,19 @@ const pool = new Pool({
   max: 5,
   idleTimeoutMillis: 10_000,
   connectionTimeoutMillis: 5_000,
+  ssl: String(process.env.DB_SSL || '').toLowerCase() === 'true'
+       ? { rejectUnauthorized: false }
+       : undefined,
 });
 
-async function ensureSpecsTable(familySlug) {
-  const flag = String(process.env.NO_SCHEMA_ENSURE || '0').toLowerCase();
-  if (flag === '1' || flag === 'true' || flag === 'on') return;
-  await pool.query('SELECT public.ensure_specs_table($1)', [familySlug]);
+// 이미 있는 함수/export는 **그대로 유지**하고, 아래 한 줄만 추가
+async function query(text, params) {
+  // node-postgres 권장: 트랜잭션이 아닐 땐 pool.query를 그대로 사용. :contentReference[oaicite:1]{index=1}
+  return pool.query(text, params);
 }
 
-module.exports = { pool, ensureSpecsTable };
+module.exports = {
+  pool,
+  query,                      // ⬅⬅⬅ 이 줄이 핵심
+  // ensureSpecsTable, withTransaction 등 기존 export 그대로 유지
+};

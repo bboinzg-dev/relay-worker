@@ -8,7 +8,7 @@ const multer = require('multer');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
-const { getPool, query } = require('./db');
+const { getPool } = require('./db');
 const { getFamilies, getBlueprint } = require('./lib/blueprint');
 const { classifyFamily, extractByBlueprint } = require('./lib/llm');
 const { Storage } = require('@google-cloud/storage');
@@ -17,7 +17,8 @@ const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
 
 const storage = new Storage();
-
+const pgPool = getPool();
+const query = (text, params) => pgPool.query(text, params);
 
 
 // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
@@ -575,7 +576,7 @@ async function downloadBytes(gcsUri) {
 
 // ---- 업서트 (specs_table 과 (brand_norm, code_norm) 기준 멱등)
 async function upsertComponent({ family, specsTable, brand, code, datasheetUri, values }) {
-  const pool = getPool();
+const pool = pgPool;
 
   if (process.env.NO_SCHEMA_ENSURE !== '1') {
     await pool.query('SELECT public.ensure_specs_table($1)', [family]);

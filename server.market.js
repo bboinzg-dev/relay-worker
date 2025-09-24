@@ -5,7 +5,7 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const { getPool, query } = require('./db');
+const { getPool } = require('./db');
 const { parseActor, hasRole } = require('./src/utils/auth');
 
 const app = express();
@@ -13,6 +13,7 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
 const pool = getPool();
+const query = (text, params) => pool.query(text, params);
 
 function pick(h, k) { return h[k] || h[k.toLowerCase()] || h[k.toUpperCase()] || undefined; }
 function getTenant(req) {

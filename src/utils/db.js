@@ -1,5 +1,5 @@
 'use strict';
-const { getPool, db } = require('../../lib/db');
+const { getPool } = require('../../lib/db');
 
 const pool = getPool();
 
@@ -11,5 +11,6 @@ module.exports = {
   pool,
   query,
   getPool,
-  db,
 };
+
+module.exports.db = pool;

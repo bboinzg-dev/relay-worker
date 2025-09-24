@@ -142,6 +142,15 @@ function extractPartNumbersFromText(full, limit = 50) {
     .map(([code, score]) => ({ code, score }));
 }
 
+// --- NEW: doc type detector (catalog vs. single datasheet) ---
+function detectDocType(full) {
+  const t = String(full || '').toLowerCase();
+  // 'HOW TO ORDER/ORDERING INFORMATION/주문 정보/订购信息' 등 존재하면 카탈로그형으로 본다
+  if (/(how to order|ordering information|주문\s*정보|订购信息|订货信息)/i.test(t)) return 'catalog';
+  return 'single';
+}
+
+
 
 async function runAutoIngest({
   gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null,
@@ -153,6 +162,7 @@ async function runAutoIngest({
   const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
   const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || (FAST ? 32768 : 65536));
   const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || (FAST ? 30000 : Math.round(BUDGET * 0.6)));
+  const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
 
   const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
@@ -224,21 +234,22 @@ async function runAutoIngest({
     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
   }
 
-  if (!code) {
-  try {
-    const fullText = await readText(gcsUri, 300 * 1024); // 300KB 정도면 대부분의 'How to order' 커버
-    const picks = extractPartNumbersFromText(fullText);
-    if (picks.length && (!extracted.rows || !extracted.rows.length)) {
-      // 추출 결과가 비었을 때는 우선순위 상위 1~N개로 rows를 구성해준다.
-      extracted.rows = picks.slice(0, 10).map(p => ({ code: p.code }));
-    } else if (picks.length && extracted.rows?.length) {
-      // 이미 rows가 있다면, 상위 후보를 첫 레코드 코드로 보정
-      extracted.rows[0].code = extracted.rows[0].code || picks[0].code;
-    }
-  } catch (e) {
-    // 텍스트 읽기 실패는 무시 (DocAI/직접 추출 둘 다 실패할 수 있으니)
+if (!code) {
+  let fullText = '';
+  try { fullText = await readText(gcsUri, 300 * 1024) || ''; } catch {}
+
+  const docType = detectDocType(fullText);
+  const picks = extractPartNumbersFromText(fullText, FIRST_PASS_CODES);
+
+  if (docType === 'catalog' && picks.length) {
+    // 카탈로그형: 상위 N개 코드만 먼저 기록 → 나머지는 후속 스텝으로
+    extracted.rows = picks.slice(0, FIRST_PASS_CODES).map(p => ({ code: p.code }));
+  } else if ((!extracted.rows || !extracted.rows.length) && picks.length) {
+    // 단일형: 1개만
+    extracted.rows = [{ code: picks[0].code }];
   }
 }
+
 
   // 커버 추출 비활성(요청에 따라 완전 OFF)
   let coverUri = null;
@@ -303,19 +314,6 @@ async function runAutoIngest({
       updated_at: now,
     });
   }
-await saveExtractedSpecs(predFamily, {
-  brand: finalBrand,
-  code: finalCode,
-  mfr_full: maybeMfr,
-  datasheet_uri: finalDatasheetUrl
-}, extractedSpecsObject);
-
-// (예시) familySlug, pool, values 등 준비된 상황에서:
-if (!process.env.NO_SCHEMA_ENSURE || process.env.NO_SCHEMA_ENSURE === "0") {
-  await pool.query('SELECT public.ensure_specs_table($1)', [familySlug]);
-}
-// 이어서 UPSERT 실행...
-
 
   // 업서트
   let upserted = 0;

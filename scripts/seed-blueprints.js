@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 'use strict';
 
-const { Pool } = require('pg');
+const { getPool } = require('../lib/db');
 // 기존에 쓰던 seed JSON이 있다면 이 경로로 옮겨두세요.
 const seeds = require('../src/boot/blueprint.seeds.json');
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = getPool();
 
 (async () => {
   for (const it of seeds) {

@@ -8,10 +8,15 @@ const multer = require('multer');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
-const db = require('./src/utils/db');
-const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
+const { db, getPool } = require('./lib/db');
+const { getFamilies, getBlueprint } = require('./lib/blueprint');
+const { classifyFamily, extractByBlueprint } = require('./lib/llm');
+const { Storage } = require('@google-cloud/storage');
+const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, parseGcsUri } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
+
+const storage = new Storage();
 
 
 
@@ -510,66 +515,134 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
   }
 });
 
-// ▶ 체인 실행 엔드포인트: 여기서 runAutoIngest를 실제로 수행
+// ---- 유틸
+const norm = s => (s || '').toString().trim().toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9._-]/g, '');
+
+// ---- ingest_run_logs 테이블 필요시 보장(앱 부팅시에 1회 호출)
+async function ensureIngestRunLogs() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS public.ingest_run_logs (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      gcs_uri text NOT NULL,
+      family_slug text,
+      specs_table text,
+      brand text, brand_norm text,
+      code text, code_norm text,
+      status text NOT NULL DEFAULT 'CREATED',
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      error text
+    );
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_ingest_run_logs_created ON public.ingest_run_logs(created_at DESC);`);
+}
+
+// ---- GCS 다운로드
+async function downloadBytes(gcsUri) {
+  const m = /^gs:\/\/([^/]+)\/(.+)$/.exec(gcsUri);
+  if (!m) throw new Error(`Bad gcs uri: ${gcsUri}`);
+  const [bucket, name] = [m[1], m[2]];
+  const [buf] = await storage.bucket(bucket).file(name).download();
+  return buf;
+}
+
+// ---- 업서트 (specs_table 과 (brand_norm, code_norm) 기준 멱등)
+async function upsertComponent({ family, specsTable, brand, code, datasheetUri, values }) {
+  const pool = getPool();
+
+  if (process.env.NO_SCHEMA_ENSURE !== '1') {
+    await pool.query('SELECT public.ensure_specs_table($1)', [family]);
+  }
+
+  const brandNorm = norm(brand);
+  const codeNorm = norm(code);
+
+  const cols = Object.keys(values || {});
+  const dbCols = cols.map(c => `"${c}"`);
+  const dbVals = cols.map((_, i) => `$${i + 7}`);
+  const insertCols = dbCols.length ? `, ${dbCols.join(',')}` : '';
+  const insertVals = dbVals.length ? `, ${dbVals.join(',')}` : '';
+  const updateCols = dbCols.length ? `${dbCols.map(c => `${c} = EXCLUDED.${c}`).join(', ')}, ` : '';
+
+  const sql = `
+    INSERT INTO public.${specsTable}
+      (id, family_slug, brand, brand_norm, code, code_norm, datasheet_uri${insertCols})
+    VALUES
+      (gen_random_uuid(), $1, $2, $3, $4, $5, $6${insertVals})
+    ON CONFLICT (brand_norm, code_norm)
+    DO UPDATE SET
+      brand = EXCLUDED.brand,
+      datasheet_uri = EXCLUDED.datasheet_uri,
+      ${updateCols}updated_at = now()
+    RETURNING id;
+  `;
+  const params = [
+    family, brand, brandNorm, code, codeNorm, datasheetUri,
+    ...cols.map(k => values[k]),
+  ];
+  await pool.query(sql, params);
+}
+
+// ▶ 체인 실행 엔드포인트: 3-스텝 멱등 파이프라인
 app.post('/api/worker/ingest/run', async (req, res) => {
-    const startedAt = Date.now();
-  // 예산(기본 120초) + 15초 여유 안에 "반드시" 2xx로 ACK
-  const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
-  const killer = setTimeout(() => {
-    if (!res.headersSent) {
-      try { res.status(202).json({ ok: true, timeout: true }); } catch {}
-    }
-  }, deadlineMs);
+  const killerMs = Number(process.env.INGEST_KILLER_MS || 135000);
+  const timer = setTimeout(() => {
+    console.warn(`[ingest-run] local deadline hit`);
+    try { res.status(504).json({ error: 'deadline' }); } catch (e) {}
+  }, killerMs);
 
-  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${req.body?.runId || 'n/a'}`);
-
+  let rid = null;
 
   try {
-    const { runId, gcsUri, brand, code, series, display_name, family_slug = null } = req.body || {};
-    if (!runId || !gcsUri) return res.status(400).json({ ok:false, error:'runId & gcsUri required' });
+    const { gcs_uri: gcsUri, runId } = req.body || {};
+    if (!gcsUri) { clearTimeout(timer); return res.status(400).json({ error: 'gcs_uri required' }); }
 
-    const label = `[ingest] ${runId}`;
-    console.time(label);
-    const out = await runAutoIngest({ gcsUri, brand, code, series, display_name, family_slug });
-    console.timeEnd(label);
+    const { rows: runRows } = await db.query(`
+      INSERT INTO public.ingest_run_logs (id, gcs_uri, status, updated_at)
+      VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, 'RUNNING', now())
+      ON CONFLICT (id) DO UPDATE SET status='RUNNING', updated_at=now()
+      RETURNING id`, [runId || null, gcsUri]);
+    rid = runRows[0].id;
 
-    await db.query(
-      `UPDATE public.ingest_run_logs
-          SET finished_at = now(),
-              duration_ms = $2,
-              status = 'SUCCEEDED',
-              final_table = $3,
-              final_family = $4,
-              final_brand = $5,
-              final_code  = $6,
-              final_datasheet = $7
-        WHERE id = $1`,
-      [ runId, (out?.ms ?? (Date.now() - startedAt)),
-        out?.specs_table || null,
-        out?.family || out?.family_slug || null,
-        out?.brand || null,
-        (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
-        out?.datasheet_uri || gcsUri ]
+    const pdfBytes = await downloadBytes(gcsUri);
+
+    const families = await getFamilies();
+    const allowed = families.map(f => f.family_slug);
+    const fam = await classifyFamily({ pdfBytes, allowedFamilies: allowed });
+    const family = fam.family_slug;
+
+    const bp = await getBlueprint(family);
+    const values = await extractByBlueprint({ pdfBytes, family, fields: bp });
+
+    const match = families.find(f => f.family_slug === family);
+    if (!match) throw new Error(`Unknown family ${family}`);
+    const specsTable = match.specs_table;
+
+    await upsertComponent({
+      family,
+      specsTable,
+      brand: fam.brand || values.brand || 'unknown',
+      code: fam.code || values.code || 'unknown',
+      datasheetUri: gcsUri,
+      values,
+    });
+
+    await db.query(`UPDATE public.ingest_run_logs
+      SET status='SUCCEEDED', family_slug=$2, specs_table=$3, brand=$4, brand_norm=$5, code=$6, code_norm=$7, updated_at=now()
+      WHERE id=$1`,
+      [rid, family, specsTable, fam.brand || null, norm(fam.brand), fam.code || null, norm(fam.code)]
     );
 
-    return res.json({ ok:true, run_id: runId });
+    clearTimeout(timer);
+    return res.status(200).json({ ok: true, runId: rid, family });
   } catch (e) {
-    await db.query(
-      `UPDATE public.ingest_run_logs
-          SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
-        WHERE id = $1`,
-      [ req.body?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
-    );
-    console.error('[ingest-run failed]', e?.message || e);
-   if (!res.headersSent) {
-     return res.status(500).json({ ok:false, error:String(e?.message||e) });
-   } else {
-     // 이미 202를 보냈다면 응답은 끝 — 로그만 남김
-     console.warn('[ingest-run post-ACK error]', String(e?.message || e));
-     return;
-   }
-  } finally {
-    clearTimeout(killer);
+    console.error('[ingest-run] error', e);
+    try {
+      await db.query(`UPDATE public.ingest_run_logs SET status='FAILED', error=$2, updated_at=now() WHERE id=$1`,
+        [rid || req.body?.runId || null, String(e?.message || e)]);
+    } catch {}
+    clearTimeout(timer);
+    return res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -585,21 +658,17 @@ app.use((err, req, res, next) => {
 (async () => {
   try {
     await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS public.ingest_run_logs (
-        id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
-        task_name text, retry_count integer, gcs_uri text not null,
-        status text CHECK (status in ('PROCESSING','SUCCEEDED','FAILED')),
-        final_table text, final_family text, final_brand text, final_code text,
-        final_datasheet text, duration_ms integer, error_message text,
-        started_at timestamptz DEFAULT now(), finished_at timestamptz
-      )
-    `);
-    console.log('[BOOT] ensured ingest_run_logs');
+    await db.query(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
   } catch (e) {
-    console.warn('[BOOT] ensure ingest_run_logs failed:', e?.message || e);
+    console.warn('[BOOT] ensure extensions failed:', e?.message || e);
   }
 })();
 
+ensureIngestRunLogs()
+  .then(() => console.log('[BOOT] ensured ingest_run_logs'))
+  .catch(e => console.warn('[BOOT] ensure ingest_run_logs failed:', e?.message || e));
+
 /* ---------------- Listen ---------------- */
 app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));
+
+module.exports = app;

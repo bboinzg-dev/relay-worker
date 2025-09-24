@@ -5,12 +5,14 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const db = require('./src/utils/db');
+const { db, getPool } = require('./lib/db');
 const { parseActor, hasRole } = require('./src/utils/auth');
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
+
+const pool = getPool();
 
 function pick(h, k) { return h[k] || h[k.toLowerCase()] || h[k.toUpperCase()] || undefined; }
 function getTenant(req) {
@@ -66,7 +68,7 @@ app.post('/api/listings', async (req, res) => {
 
 // POST /api/listings/:id/purchase  → 주문 생성(간이)
 app.post('/api/listings/:id/purchase', async (req, res) => {
-  const client = await db.pool.connect();
+  const client = await pool.connect();
   try {
     const actor = parseActor(req);
     if (!actor?.id) return res.status(401).json({ error: 'auth required' });
@@ -137,7 +139,7 @@ app.post('/api/purchase-requests', async (req, res) => {
 
 // Confirm a bid; reduce outstanding qty in PR
 app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
-  const client = await db.pool.connect();
+  const client = await pool.connect();
   try {
     const prId = (req.params.id || '').toString();
     const bidId = (req.body?.bid_id || '').toString();

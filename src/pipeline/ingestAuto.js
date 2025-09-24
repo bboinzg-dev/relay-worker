@@ -300,27 +300,33 @@ if (!code) {
   const now = new Date();
 
   if (code) {
-    // 단일 강제 인입
-    records.push({
-      family_slug: family,
-      brand: brand || extracted.brand || 'unknown',
-      code,
-      series: series || null,
-      display_name: display_name || null,
-      datasheet_uri: gcsUri,
-      image_uri: coverUri || null,
-      verified_in_doc: false,
-      updated_at: now,
-    });
+    // 단일 강제 인입 (코드 정규화 보장)
+    const normalizedCode = normalizeCode(code);
+    if (normalizedCode) {
+      const brandName = brand || extracted.brand || 'unknown';
+      records.push({
+        family_slug: family,
+        brand: brandName,
+        code: normalizedCode,
+        series: series || null,
+        display_name: display_name || null,
+        datasheet_uri: gcsUri,
+        image_uri: coverUri || null,
+        verified_in_doc: false,
+        updated_at: now,
+      });
+    }
   } else {
     for (const r of (extracted.rows || [])) {
+      const normalizedCode = normalizeCode(r.code);
+      if (!normalizedCode) continue;
       const base = {
         family_slug: family,
         brand: extracted.brand || 'unknown',
-        code: r.code,
+        code: normalizedCode,
         datasheet_uri: gcsUri,
         image_uri: coverUri || null,
-        display_name: `${extracted.brand || 'unknown'} ${r.code}`,
+        display_name: `${extracted.brand || 'unknown'} ${normalizedCode}`,
         verified_in_doc: true,
         updated_at: now,
       };

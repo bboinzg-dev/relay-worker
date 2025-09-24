@@ -1,15 +1,18 @@
+'use strict';
+
 const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
-  max: 10,
-    // 연결/유휴 타임아웃(밀리초) — VPC/라우팅 순간 장애 시 분 단위 매달림 방지
-  connectionTimeoutMillis: 8000,
-  idleTimeoutMillis: 30000,
+  max: 5,
+  idleTimeoutMillis: 10_000,
+  connectionTimeoutMillis: 5_000,
 });
 
-module.exports = {
-  query: (text, params) => pool.query(text, params),
-  pool,
-};
+async function ensureSpecsTable(familySlug) {
+  const flag = String(process.env.NO_SCHEMA_ENSURE || '0').toLowerCase();
+  if (flag === '1' || flag === 'true' || flag === 'on') return;
+  await pool.query('SELECT public.ensure_specs_table($1)', [familySlug]);
+}
+
+module.exports = { pool, ensureSpecsTable };

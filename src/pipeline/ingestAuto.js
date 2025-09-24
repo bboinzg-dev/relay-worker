@@ -13,6 +13,7 @@ const { upsertByBrandCode } = require('../utils/schema');
 const { getBlueprint } = require('../utils/blueprint');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
+const { saveExtractedSpecs } = require('./persist');
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
 
@@ -302,7 +303,12 @@ async function runAutoIngest({
       updated_at: now,
     });
   }
-
+await saveExtractedSpecs(predFamily, {
+  brand: finalBrand,
+  code: finalCode,
+  mfr_full: maybeMfr,
+  datasheet_uri: finalDatasheetUrl
+}, extractedSpecsObject);
   // 업서트
   let upserted = 0;
   for (const rec of records) {

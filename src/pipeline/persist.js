@@ -31,14 +31,27 @@ async function saveExtractedSpecs(familySlug, base, specs) {
     true
   ];
 
-  const specCols = Object.keys(specs || {});
+  const RESERVED = new Set(['id', 'brand', 'code', 'brand_norm', 'code_norm', 'created_at', 'updated_at']);
+  const specsNorm = {};
+  for (const [rawKey, value] of Object.entries(specs || {})) {
+    const key = String(rawKey || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, '');
+    if (!key || RESERVED.has(key)) continue;
+    if (!Object.prototype.hasOwnProperty.call(specsNorm, key)) {
+      specsNorm[key] = value;
+    }
+  }
+
+  const specCols = Object.keys(specsNorm);
   const allCols = baseCols.concat(specCols);
   const params = allCols.map((_, i) => `$${i + 1}`);
-  const values = baseVals.concat(specCols.map(k => specs[k]));
+  const values = baseVals.concat(specCols.map((k) => specsNorm[k]));
 
   const colList = allCols.map(safeColumnName).join(',');
   const setList = specCols
-    .map(k => `${safeColumnName(k)} = EXCLUDED.${safeColumnName(k)}`)
+    .map((k) => `${safeColumnName(k)} = EXCLUDED.${safeColumnName(k)}`)
     .join(',');
 
   const sql = `

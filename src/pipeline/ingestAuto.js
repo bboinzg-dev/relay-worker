@@ -35,6 +35,21 @@ async function ensureSpecsTableByFamily(family){
   await db.query(`SELECT public.ensure_specs_table($1)`, [family]);
 }
 
+function normalizeKeysOnce(obj = {}) {
+  const out = {};
+  for (const [rawKey, value] of Object.entries(obj || {})) {
+    const key = String(rawKey || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, '');
+    if (!key) continue;
+    if (!Object.prototype.hasOwnProperty.call(out, key)) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
 function allowedKeysFromBlueprint(bp) {
   if (!bp) return [];
   if (Array.isArray(bp.allowedKeys) && bp.allowedKeys.length) {
@@ -376,7 +391,7 @@ if (!code) {
     }
     if (colsSet.has('updated_at')) safe.updated_at = now;
 
-    await upsertByBrandCode(table, safe);
+    await upsertByBrandCode(table, normalizeKeysOnce(safe));
     upserted++;
   }
 

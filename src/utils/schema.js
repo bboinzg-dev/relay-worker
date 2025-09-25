@@ -1,75 +1,120 @@
-const db = require('./db'); // 기존과 동일 가정
+'use strict';
 
-// 식별자 안전화: 소문자 + 영문/숫자/언더스코어만
-function safeIdent(name) {
-  return String(name || '').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+const db = require('./db');
+
+function normalizeIdentifier(name) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '');
 }
 
-/**
- * 안전 업서트: (brand_norm, code_norm) 기준
- * - values의 키를 소문자로 정규화 + 중복 제거
- * - brand/code는 함수 인자만 사용하고 values에서는 제거
- * - 테이블에 "존재하는 컬럼"만 INSERT/UPDATE
- * - GENERATED ALWAYS/변경 금지 컬럼(id/created_at/updated_at/brand_norm/code_norm)은 UPDATE 제외
- */
-async function upsertByBrandCode(tableName, { brand, code, ...values }) {
-  const table = safeIdent(tableName);
+function parseTableName(tableName) {
+  const safe = String(tableName || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.]/g, '');
+  if (!safe) throw new Error('invalid table name');
 
-  // norm 자동 세팅
-  const payload = {
+  let schema = 'public';
+  let table = safe;
+  if (safe.includes('.')) {
+    const parts = safe.split('.').filter(Boolean);
+    if (!parts.length) throw new Error('invalid table name');
+    if (parts.length === 1) {
+      table = parts[0];
+    } else {
+      schema = parts[0];
+      table = parts[parts.length - 1];
+    }
+  }
+
+  schema = normalizeIdentifier(schema) || 'public';
+  table = normalizeIdentifier(table);
+  if (!table) throw new Error('invalid table name');
+
+  return {
+    schema,
+    table,
+    qualified: `${schema}.${table}`,
+  };
+}
+
+function canonKeys(obj = {}) {
+  const out = {};
+  for (const [rawKey, value] of Object.entries(obj)) {
+    const key = normalizeIdentifier(rawKey);
+    if (!key) continue;
+    if (!Object.prototype.hasOwnProperty.call(out, key)) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+const NO_UPDATE = new Set(['id', 'created_at', 'updated_at', 'brand_norm', 'code_norm']);
+
+async function upsertByBrandCode(tableName, values = {}) {
+  const { schema, table, qualified } = parseTableName(tableName);
+
+  const brand = values?.brand ?? null;
+  const code = values?.code ?? null;
+  const rest = { ...values };
+  const brandNormInput = rest.brand_norm;
+  const codeNormInput = rest.code_norm;
+  delete rest.brand;
+  delete rest.code;
+  delete rest.brand_norm;
+  delete rest.code_norm;
+
+  const payload = canonKeys({
     brand,
     code,
-    brand_norm: brand ? String(brand).toLowerCase() : null,
-    code_norm : code  ? String(code ).toLowerCase() : null,
-    ...values
-  };
+    brand_norm: brand ? String(brand).toLowerCase() : brandNormInput ?? null,
+    code_norm: code ? String(code).toLowerCase() : codeNormInput ?? null,
+    ...rest,
+  });
 
-  // 테이블 메타
+  const cols = Object.keys(payload);
+  if (!cols.length) return null;
+
   const meta = await db.query(
     `select column_name, is_generated
        from information_schema.columns
-      where table_schema='public' and table_name=$1`,
-    [table]
+      where table_schema=$1 and table_name=$2`,
+    [schema, table],
   );
-  const colsAllowed   = new Set(meta.rows.map(r => String(r.column_name).toLowerCase()));
-  const generatedCols = new Set(
+  const allowed = new Set(meta.rows.map((r) => String(r.column_name).toLowerCase()));
+  const generated = new Set(
     meta.rows
-      .filter(r => String(r.is_generated || '').toUpperCase() === 'ALWAYS')
-      .map(r => String(r.column_name).toLowerCase())
+      .filter((r) => String(r.is_generated || '').toUpperCase() === 'ALWAYS')
+      .map((r) => String(r.column_name).toLowerCase()),
   );
 
-  // values 키 정규화(소문자) + 중복 제거
-  const basePairs = Object.entries(payload).map(([k, v]) => [safeIdent(k), v]);
-
-  const seen = new Set();
   const insertCols = [];
   const insertVals = [];
-  for (const [k, v] of basePairs) {
-    if (!k) continue;
-    // brand/code는 여기서도 허용(함수 인자에서 온 값), values에 중복으로 있더라도 dedupe됨
-    if (seen.has(k)) continue;
-    if (!colsAllowed.has(k)) continue;     // 존재하지 않는 컬럼은 건너뜀
-    if (generatedCols.has(k)) continue;    // GENERATED ALWAYS 제외
-    seen.add(k);
-    insertCols.push(k);
-    insertVals.push(v);
+  for (const col of cols) {
+    if (!allowed.has(col)) continue;
+    if (generated.has(col)) continue;
+    insertCols.push(col);
+    insertVals.push(payload[col]);
   }
   if (!insertCols.length) return null;
 
-  const NO_UPDATE = new Set(['id','created_at','updated_at','brand_norm','code_norm']);
-  const params  = insertCols.map((_, i) => `$${i+1}`);
+  const params = insertCols.map((_, i) => `$${i + 1}`);
   const updates = insertCols
-    .filter(c => !NO_UPDATE.has(c))
-    .map(c => `${c}=EXCLUDED.${c}`);
+    .filter((col) => !NO_UPDATE.has(col))
+    .map((col) => `${col}=EXCLUDED.${col}`);
 
   const sql = `
-    insert into public.${table} (${insertCols.join(',')})
+    insert into ${qualified} (${insertCols.join(',')})
     values (${params.join(',')})
     on conflict (brand_norm, code_norm)
-    do update set ${[...updates,'updated_at=now()'].join(', ')}
+    do update set ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
     returning *`;
+
   const res = await db.query(sql, insertVals);
   return res.rows?.[0] || null;
 }
 
-module.exports = { upsertByBrandCode /* , ...기존 export들 */ };
+module.exports = { upsertByBrandCode };

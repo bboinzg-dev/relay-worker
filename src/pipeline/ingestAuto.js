@@ -10,21 +10,24 @@ const execFileP = promisify(execFile);
 const db = require('../utils/db');
 const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
 const { upsertByBrandCode } = require('../utils/schema');
-const { getBlueprint, computeFastKeys } = require('../utils/blueprint');
+const { getBlueprint } = require('../utils/blueprint');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
 const { saveExtractedSpecs } = require('./persist');
 
 const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
-const FAST_PAGE_COUNT = Number(process.env.FAST_PAGE_COUNT || 2);
-const FAST_INCLUDE_LAST = /^(1|true|on)$/i.test(process.env.FAST_INCLUDE_LAST_PAGE || '');
-const FAST_PAGES = (() => {
-  const picks = [];
-  const count = Number.isFinite(FAST_PAGE_COUNT) && FAST_PAGE_COUNT > 0 ? FAST_PAGE_COUNT : 2;
-  for (let i = 0; i < count; i += 1) picks.push(i);
-  if (FAST_INCLUDE_LAST) picks.push(-1);
-  return Array.from(new Set(picks));
-})();
+const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
+
+// family별 "최소 키셋" (필요 최소치만 저장)
+const MIN_KEYS = {
+  relay_power: [
+    'contact_form','contact_rating_ac','contact_rating_dc',
+    'coil_voltage_vdc','size_l_mm','size_w_mm','size_h_mm'
+  ],
+  relay_signal: [
+    'contact_form','contact_rating_ac','contact_rating_dc','coil_voltage_vdc'
+  ]
+};
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
 
@@ -163,6 +166,45 @@ function detectDocType(full) {
   return 'single';
 }
 
+// ---- NEW: "TYPES / Part No." 표에서 품번 열거 추출 ----
+function _expandAorS(code) {
+  return code.includes('*') ? [code.replace('*','A'), code.replace('*','S')] : [code];
+}
+function _looksLikePn(s) {
+  const c = s.toUpperCase();
+  if (!/[0-9]/.test(c)) return false;
+  if (c.length < 4 || c.length > 24) return false;
+  // 명백한 단위/잡토큰 제거
+  if (/^(ISO|ROHS|VDC|VAC|V|A|MA|MM|Ω|OHM|PDF|PAGE|NOTE|DATE|LOT|WWW|HTTP|HTTPS)$/i.test(c)) return false;
+  return true;
+}
+function extractPartNumbersFromTypesTables(full, limit = 200) {
+  const text = String(full || '');
+  if (!text) return [];
+  // TYPES, Part No. 주변 10~16KB 윈도우로 좁힌다
+  const idxTypes = text.search(/\bTYPES\b/i);
+  const idxPart  = text.search(/\bPart\s*No\.?\b/i);
+  const anchor   = (idxTypes >= 0 ? idxTypes : 0);
+  const start    = Math.max(0, Math.min(anchor, idxPart >= 0 ? idxPart : anchor) - 4000);
+  const end      = Math.min(text.length, (anchor || 0) + 16000);
+  const win      = text.slice(start, end);
+
+  // Part No. 패턴: 대문자+숫자 혼합(하이픈/별표 허용)
+  const raw = win.match(/[A-Z][A-Z0-9][A-Z0-9\-\*]{2,}/g) || [];
+
+  // “* = A/S” 치환 규칙 감지(있으면 확장)
+  const hasStarRule = /"\s*\*\s*"\s*:.*A\s*type\s*:\s*A.*S\s*type\s*:\s*S/i.test(win);
+
+  const set = new Set();
+  for (const r of raw) {
+    const code = normalizeCode(r);
+    if (!_looksLikePn(code)) continue;
+    const list = hasStarRule ? _expandAorS(code) : [code];
+    for (const c of list) set.add(c);
+  }
+  return Array.from(set).slice(0, limit).map(c => ({ code: c }));
+}
+
 
 
 async function runAutoIngest({
@@ -172,6 +214,7 @@ async function runAutoIngest({
   if (!gcsUri) throw new Error('gcsUri required');
    // 기본 2분로 단축 (원하면 ENV로 재조정)
   const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
+  const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
   const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || (FAST ? 32768 : 65536));
   const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || (FAST ? 30000 : Math.round(BUDGET * 0.6)));
   const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
@@ -212,10 +255,7 @@ async function runAutoIngest({
   const colsSet = await getTableColumns(qualified);
 
   // 블루프린트 허용 키
-  const blueprint = await getBlueprint(family);
-  const allowedKeys = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
-  const fastKeys = FAST ? computeFastKeys(blueprint) : allowedKeys;
-  const limitedKeys = FAST ? (fastKeys.length ? fastKeys : allowedKeys) : allowedKeys;
+  const { allowedKeys } = await getBlueprint(family);
 
   // PDF → 품번/스펙 추출
   let extracted = { brand: brand || 'unknown', rows: [] };
@@ -225,7 +265,7 @@ async function runAutoIngest({
         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
         const raw = await readText(gcsUri, PREVIEW_BYTES);
         if (raw && raw.length > 1000) {
-          const fieldsJson = Object.fromEntries((limitedKeys || []).map((k) => [k, 'text']));
+          const fieldsJson = Object.fromEntries((allowedKeys||[]).map(k => [k, 'text']));
           const vals = await extractFields(raw, code || '', fieldsJson);
           extracted = {
             brand: brand || 'unknown',
@@ -234,13 +274,7 @@ async function runAutoIngest({
         } else {
           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
           extracted = await withTimeout(
-            extractPartsAndSpecsFromPdf({
-              gcsUri,
-              allowedKeys: limitedKeys,
-              brandHint: brand || null,
-              pageIndices: FAST_PAGES,
-              maxOutputTokens: 512,
-            }),
+            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
             EXTRACT_HARD_CAP_MS,
             'extract',
           );
@@ -260,13 +294,13 @@ if (!code) {
   try { fullText = await readText(gcsUri, 300 * 1024) || ''; } catch {}
 
   const docType = detectDocType(fullText);
-  const picks = extractPartNumbersFromText(fullText, FIRST_PASS_CODES);
+  const fromTypes = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
+  const fromOrder = extractPartNumbersFromText(fullText, FIRST_PASS_CODES);
+  const picks = fromTypes.length ? fromTypes : fromOrder;
 
   if (docType === 'catalog' && picks.length) {
-    // 카탈로그형: 상위 N개 코드만 먼저 기록 → 나머지는 후속 스텝으로
     extracted.rows = picks.slice(0, FIRST_PASS_CODES).map(p => ({ code: p.code }));
   } else if ((!extracted.rows || !extracted.rows.length) && picks.length) {
-    // 단일형: 1개만
     extracted.rows = [{ code: picks[0].code }];
   }
 }
@@ -316,7 +350,7 @@ if (!code) {
         updated_at: now,
       };
       // 블루프린트 허용 값만 추가
-      for (const k of limitedKeys) { if (r[k] != null) base[k] = r[k]; }
+      for (const k of allowedKeys) { if (r[k] != null) base[k] = r[k]; }
       records.push(base);
     }
   }
@@ -363,21 +397,6 @@ if (!code) {
 
     await upsertByBrandCode(table, safe);
     upserted++;
-  }
-
-  if (FAST && upserted > 0) {
-    const first = records[0] || {};
-    return {
-      ok: true,
-      ms: Date.now() - started,
-      family,
-      final_table: table,
-      brand: first.brand,
-      code: first.code,
-      datasheet_uri: gcsUri,
-      cover: first.image_uri || null,
-      rows: upserted,
-    };
   }
 
   return {

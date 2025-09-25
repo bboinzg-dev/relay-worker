@@ -76,6 +76,56 @@ function coerceNumeric(x) {
   return Number.isFinite(n) ? n : null;
 }
 
+function pickSkuListFromTables(extracted = {}) {
+  const out = new Set();
+  const HEAD_RE = /(part\s*no\.?|ordering\s*information|part\s*number)/i;
+  for (const t of (extracted.tables || [])) {
+    if (!t) continue;
+    const headers = Array.isArray(t.headers) ? t.headers : [];
+    const head = headers.join(' ').trim();
+    if (!HEAD_RE.test(head)) continue;
+    let partIdx = 0;
+    const idx = headers.findIndex((h) => /part\s*no\.?/i.test(String(h || '')));
+    if (idx >= 0) partIdx = idx;
+    for (const row of (t.rows || [])) {
+      if (!Array.isArray(row)) continue;
+      const cand = String(row[partIdx] || '').trim();
+      if (/^[A-Z0-9][A-Z0-9\-_/\.]{3,}$/i.test(cand)) out.add(cand);
+    }
+  }
+  return [...out];
+}
+
+function expandFromCodeSystem(extracted, bp) {
+  const tpl = bp?.fields?.code_template;
+  const vars = bp?.fields?.code_vars;
+  if (!tpl || !vars) return [];
+
+  const keys = Object.keys(vars);
+  const out = [];
+  function dfs(i, ctx) {
+    if (i >= keys.length) {
+      let code = tpl;
+      for (const k of Object.keys(ctx)) {
+        const v = ctx[k];
+        code = code.replace(new RegExp(`\\{${k}(:[^}]*)?\\}`,'g'), (_, fmt) => {
+          if (!fmt) return String(v);
+          const m = fmt.match(/^:0(\d+)d$/);
+          if (m) return String(v).padStart(Number(m[1]), '0');
+          return String(v);
+        });
+      }
+      out.push(code);
+      return;
+    }
+    const k = keys[i];
+    const list = Array.isArray(vars[k]) ? vars[k] : [];
+    for (const v of list) dfs(i + 1, { ...ctx, [k]: v });
+  }
+  dfs(0, {});
+  return out;
+}
+
 function applyCodeRules(code, out, rules, colTypes) {
   if (!Array.isArray(rules)) return;
   const src = String(code || '');
@@ -420,24 +470,32 @@ async function runAutoIngest({
     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
   }
 
-if (!code) {
-  let fullText = '';
-  try { fullText = await readText(gcsUri, 300 * 1024) || ''; } catch {}
-
-  const docType = detectDocType(fullText);
-    const fromTypes  = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
-  const fromOrder  = extractPartNumbersFromText(fullText, FIRST_PASS_CODES);
-  const fromSeries = extractPartNumbersBySeriesHeuristic(fullText, FIRST_PASS_CODES * 4);
-  // 가장 신뢰 높은 순서로 병합
-  const picks = fromTypes.length ? fromTypes : (fromOrder.length ? fromOrder : fromSeries);
-
-  // 다건이면 문서 유형과 무관하게 다건 업서트, 아니면 1건만
-  if (picks.length > 1) {
-    extracted.rows = picks.slice(0, FIRST_PASS_CODES).map(p => ({ code: p.code }));
-  } else if ((!extracted.rows || !extracted.rows.length) && picks.length === 1) {
-    extracted.rows = [{ code: picks[0].code }];
+  let codes = [];
+  if (!code) {
+    const skuFromTable = pickSkuListFromTables(extracted);
+    codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, bp);
+    const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
+    const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
+    if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
   }
-}
+
+  if (!code && !codes.length) {
+    let fullText = '';
+    try { fullText = await readText(gcsUri, 300 * 1024) || ''; } catch {}
+
+    const fromTypes  = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
+    const fromOrder  = extractPartNumbersFromText(fullText, FIRST_PASS_CODES);
+    const fromSeries = extractPartNumbersBySeriesHeuristic(fullText, FIRST_PASS_CODES * 4);
+    // 가장 신뢰 높은 순서로 병합
+    const picks = fromTypes.length ? fromTypes : (fromOrder.length ? fromOrder : fromSeries);
+
+    // 다건이면 문서 유형과 무관하게 다건 업서트, 아니면 1건만
+    if (picks.length > 1) {
+      extracted.rows = picks.slice(0, FIRST_PASS_CODES).map(p => ({ code: p.code }));
+    } else if ((!extracted.rows || !extracted.rows.length) && picks.length === 1) {
+      extracted.rows = [{ code: picks[0].code }];
+    }
+  }
 
 
   // 커버 추출 비활성(요청에 따라 완전 OFF)
@@ -457,12 +515,21 @@ if (!code) {
   // 레코드 구성
   const records = [];
   const now = new Date();
+  const brandName = brand || extracted.brand || 'unknown';
+
+  const assignAllowedSpecs = (target, source) => {
+    if (!source) return;
+    for (const k of allowedKeys) {
+      if (source[k] == null) continue;
+      target[k] = coerceByType(k, source[k]);
+    }
+  };
 
   if (code) {
     // 단일 강제 인입
     records.push({
       family_slug: family,
-      brand: brand || extracted.brand || 'unknown',
+      brand: brandName,
       code,
       series: series || null,
       display_name: display_name || null,
@@ -471,15 +538,49 @@ if (!code) {
       verified_in_doc: false,
       updated_at: now,
     });
+  } else if (codes.length) {
+    const rowMap = new Map();
+    for (const row of (extracted.rows || [])) {
+      if (!row || !row.code) continue;
+      rowMap.set(normalizeCode(row.code), row);
+    }
+    const templateRow = (extracted.rows && extracted.rows[0]) || {};
+    const uniqCodes = [];
+    const seen = new Set();
+    for (const raw of codes) {
+      const trimmed = String(raw || '').trim();
+      if (!trimmed) continue;
+      const normalized = normalizeCode(trimmed);
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      uniqCodes.push({ raw: trimmed, normalized });
+    }
+    for (const { raw, normalized } of uniqCodes) {
+      const srcRow = rowMap.get(normalized) || templateRow;
+      const finalCode = normalized || raw;
+      const base = {
+        family_slug: family,
+        brand: brandName,
+        code: finalCode,
+        datasheet_uri: gcsUri,
+        image_uri: coverUri || null,
+        display_name: `${brandName} ${finalCode}`,
+        verified_in_doc: true,
+        updated_at: now,
+      };
+      assignAllowedSpecs(base, srcRow);
+      if (bp.code_rules) applyCodeRules(base.code, base, bp.code_rules, colTypes);
+      records.push(base);
+    }
   } else {
     for (const r of (extracted.rows || [])) {
       const base = {
         family_slug: family,
-        brand: extracted.brand || 'unknown',
+        brand: brandName,
         code: r.code,
         datasheet_uri: gcsUri,
         image_uri: coverUri || null,
-        display_name: `${extracted.brand || 'unknown'} ${r.code}`,
+        display_name: `${brandName} ${r.code}`,
         verified_in_doc: true,
         updated_at: now,
       };

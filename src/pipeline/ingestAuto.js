@@ -207,6 +207,40 @@ function extractPartNumbersFromTypesTables(full, limit = 200) {
   return Array.from(set).slice(0, limit).map(c => ({ code: c }));
 }
 
+// --- NEW: 표를 못 찾을 때를 위한 "시리즈 접두 기반" 보조 휴리스틱 ---
+function extractPartNumbersBySeriesHeuristic(full, limit = 200) {
+  const text = String(full || '');
+  if (!text) return [];
+  // 1) 문서 전체에서 "문자 2~5개 + 숫자 시작" 패턴으로 접두 후보 수집
+  const seed = text.match(/[A-Z]{2,5}(?=\d)/g) || [];
+  const freq = new Map();
+  for (const p of seed) freq.set(p, (freq.get(p) || 0) + 1);
+  const tops = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([p]) => p);
+  if (!tops.length) return [];
+  // 2) 각 접두에 대해 PN 후보 수집
+  const set = new Set();
+  for (const pref of tops) {
+    const re = new RegExp(`${pref}[A-Z0-9*\\-]{3,}`, 'g');
+    const raw = text.toUpperCase().match(re) || [];
+    for (const candidate of raw) {
+      // 숫자/길이/노이즈 필터
+      if (!/[0-9]/.test(candidate)) continue;
+      if (candidate.length < 4 || candidate.length > 24) continue;
+      if (/^(ISO|ROHS|VDC|VAC|V|A|MA|MM|Ω|OHM|PDF|PAGE|NOTE|DATE|LOT|WWW|HTTP|HTTPS)$/.test(candidate)) continue;
+      // A/S 확장
+      if (candidate.includes('*')) {
+        set.add(candidate.replace('*', 'A'));
+        set.add(candidate.replace('*', 'S'));
+      } else {
+        set.add(candidate);
+      }
+      if (set.size >= limit) break;
+    }
+    if (set.size >= limit) break;
+  }
+  return [...set].slice(0, limit).map(code => ({ code }));
+}
+
 
 
 async function runAutoIngest({
@@ -327,9 +361,11 @@ if (!code) {
   try { fullText = await readText(gcsUri, 300 * 1024) || ''; } catch {}
 
   const docType = detectDocType(fullText);
-  const fromTypes = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
-  const fromOrder = extractPartNumbersFromText(fullText, FIRST_PASS_CODES);
-  const picks = fromTypes.length ? fromTypes : fromOrder;
+    const fromTypes  = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
+  const fromOrder  = extractPartNumbersFromText(fullText, FIRST_PASS_CODES);
+  const fromSeries = extractPartNumbersBySeriesHeuristic(fullText, FIRST_PASS_CODES * 4);
+  // 가장 신뢰 높은 순서로 병합
+  const picks = fromTypes.length ? fromTypes : (fromOrder.length ? fromOrder : fromSeries);
 
   // 다건이면 문서 유형과 무관하게 다건 업서트, 아니면 1건만
   if (picks.length > 1) {

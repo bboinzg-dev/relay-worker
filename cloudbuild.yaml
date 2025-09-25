@@ -1,26 +1,19 @@
-steps:
-  - name: gcr.io/cloud-builders/docker
-    args: ['build','-t','gcr.io/$PROJECT_ID/relay-worker:$SHORT_SHA','.']
-
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: gcloud
-    args:
-      - run
-      - deploy
-      - ${_SERVICE}
-      - --image=gcr.io/$PROJECT_ID/relay-worker:$SHORT_SHA
-      - --region=${_REGION}
-      - --platform=managed
-      - --quiet
-      - --update-env-vars=GIT_SHA=$SHORT_SHA
-
-images:
-  - gcr.io/$PROJECT_ID/relay-worker:$SHORT_SHA
-
+# cloudbuild.yaml
 substitutions:
-  _REGION: asia-northeast3
   _SERVICE: worker
+  _REGION: asia-northeast3
+  _REPO: worker
+  _IMAGE: relay-worker
 
-options:
-  logging: CLOUD_LOGGING_ONLY
-timeout: "3600s"
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build','-t','asia-northeast3-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA','.']
+
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push','asia-northeast3-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA']
+
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
+  args: ['run','deploy','${_SERVICE}',
+         '--image=asia-northeast3-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA',
+         '--region=${_REGION}','--platform=managed','--quiet']

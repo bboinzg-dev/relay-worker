@@ -1,7 +1,7 @@
 'use strict';
 
 const { pool } = require('../utils/db');
-const { getBlueprint } = require('../utils/blueprint');
+const { getBlueprint, computeFastKeys } = require('../utils/blueprint');
 
 function safeColumnName(name) {
   if (!/^[a-z0-9_]+$/i.test(name)) throw new Error('invalid column: ' + name);
@@ -31,7 +31,16 @@ async function saveExtractedSpecs(familySlug, base, specs) {
     true
   ];
 
-  const RESERVED = new Set(['id', 'brand', 'code', 'brand_norm', 'code_norm', 'created_at', 'updated_at']);
+  const RESERVED = new Set(['id','brand','code','brand_norm','code_norm','created_at','updated_at']);
+  const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
+  const allowedKeys = Array.isArray(blueprint?.allowedKeys)
+    ? blueprint.allowedKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  const fastKeys = FAST
+    ? computeFastKeys(blueprint).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+    : allowedKeys;
+  const allowedSet = new Set(allowedKeys);
+  const fastSet = new Set(fastKeys);
   const specsNorm = {};
   for (const [rawKey, value] of Object.entries(specs || {})) {
     const key = String(rawKey || '')
@@ -39,6 +48,8 @@ async function saveExtractedSpecs(familySlug, base, specs) {
       .toLowerCase()
       .replace(/[^a-z0-9_]/g, '');
     if (!key || RESERVED.has(key)) continue;
+    if (allowedSet.size && !allowedSet.has(key)) continue;
+    if (FAST && fastSet.size && !fastSet.has(key)) continue;
     if (!Object.prototype.hasOwnProperty.call(specsNorm, key)) {
       specsNorm[key] = value;
     }

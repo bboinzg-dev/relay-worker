@@ -10,10 +10,21 @@ const execFileP = promisify(execFile);
 const db = require('../utils/db');
 const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
 const { upsertByBrandCode } = require('../utils/schema');
-const { getBlueprint } = require('../utils/blueprint');
+const { getBlueprint, computeFastKeys } = require('../utils/blueprint');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
 const { saveExtractedSpecs } = require('./persist');
+
+const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
+const FAST_PAGE_COUNT = Number(process.env.FAST_PAGE_COUNT || 2);
+const FAST_INCLUDE_LAST = /^(1|true|on)$/i.test(process.env.FAST_INCLUDE_LAST_PAGE || '');
+const FAST_PAGES = (() => {
+  const picks = [];
+  const count = Number.isFinite(FAST_PAGE_COUNT) && FAST_PAGE_COUNT > 0 ? FAST_PAGE_COUNT : 2;
+  for (let i = 0; i < count; i += 1) picks.push(i);
+  if (FAST_INCLUDE_LAST) picks.push(-1);
+  return Array.from(new Set(picks));
+})();
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
 
@@ -161,7 +172,6 @@ async function runAutoIngest({
   if (!gcsUri) throw new Error('gcsUri required');
    // 기본 2분로 단축 (원하면 ENV로 재조정)
   const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
-  const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
   const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || (FAST ? 32768 : 65536));
   const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || (FAST ? 30000 : Math.round(BUDGET * 0.6)));
   const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
@@ -202,7 +212,10 @@ async function runAutoIngest({
   const colsSet = await getTableColumns(qualified);
 
   // 블루프린트 허용 키
-  const { allowedKeys } = await getBlueprint(family);
+  const blueprint = await getBlueprint(family);
+  const allowedKeys = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
+  const fastKeys = FAST ? computeFastKeys(blueprint) : allowedKeys;
+  const limitedKeys = FAST ? (fastKeys.length ? fastKeys : allowedKeys) : allowedKeys;
 
   // PDF → 품번/스펙 추출
   let extracted = { brand: brand || 'unknown', rows: [] };
@@ -212,7 +225,7 @@ async function runAutoIngest({
         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
         const raw = await readText(gcsUri, PREVIEW_BYTES);
         if (raw && raw.length > 1000) {
-          const fieldsJson = Object.fromEntries((allowedKeys||[]).map(k => [k, 'text']));
+          const fieldsJson = Object.fromEntries((limitedKeys || []).map((k) => [k, 'text']));
           const vals = await extractFields(raw, code || '', fieldsJson);
           extracted = {
             brand: brand || 'unknown',
@@ -221,7 +234,13 @@ async function runAutoIngest({
         } else {
           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
           extracted = await withTimeout(
-            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
+            extractPartsAndSpecsFromPdf({
+              gcsUri,
+              allowedKeys: limitedKeys,
+              brandHint: brand || null,
+              pageIndices: FAST_PAGES,
+              maxOutputTokens: 512,
+            }),
             EXTRACT_HARD_CAP_MS,
             'extract',
           );
@@ -297,7 +316,7 @@ if (!code) {
         updated_at: now,
       };
       // 블루프린트 허용 값만 추가
-      for (const k of allowedKeys) { if (r[k] != null) base[k] = r[k]; }
+      for (const k of limitedKeys) { if (r[k] != null) base[k] = r[k]; }
       records.push(base);
     }
   }
@@ -344,6 +363,21 @@ if (!code) {
 
     await upsertByBrandCode(table, safe);
     upserted++;
+  }
+
+  if (FAST && upserted > 0) {
+    const first = records[0] || {};
+    return {
+      ok: true,
+      ms: Date.now() - started,
+      family,
+      final_table: table,
+      brand: first.brand,
+      code: first.code,
+      datasheet_uri: gcsUri,
+      cover: first.image_uri || null,
+      rows: upserted,
+    };
   }
 
   return {

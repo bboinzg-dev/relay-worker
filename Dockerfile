@@ -1,5 +1,5 @@
 # Dockerfile
-FROM node:20-slim
+FROM mirror.gcr.io/library/node:20-slim
 
 # pdfimages (poppler-utils) is used for cover extraction. If the package is not available,
 # the pipeline still works (cover extraction is skipped).

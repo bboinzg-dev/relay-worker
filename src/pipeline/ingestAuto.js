@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 const path = require('node:path');
 const fs = require('node:fs/promises');
@@ -33,49 +33,6 @@ async function getTableColumns(qualified) {
 // DB 함수로 스키마 보장 (ensure_specs_table)
 async function ensureSpecsTableByFamily(family){
   await db.query(`SELECT public.ensure_specs_table($1)`, [family]);
-}
-
-function normalizeKeysOnce(obj = {}) {
-  const out = {};
-  for (const [rawKey, value] of Object.entries(obj || {})) {
-    const key = String(rawKey || '')
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9_]/g, '');
-    if (!key) continue;
-    if (!Object.prototype.hasOwnProperty.call(out, key)) {
-      out[key] = value;
-    }
-  }
-  return out;
-}
-
-function allowedKeysFromBlueprint(bp) {
-  if (!bp) return [];
-  if (Array.isArray(bp.allowedKeys) && bp.allowedKeys.length) {
-    return Array.from(new Set(bp.allowedKeys));
-  }
-  const fields = bp.fields;
-  if (Array.isArray(fields)) {
-    const names = [];
-    for (const entry of fields) {
-      if (!entry) continue;
-      if (typeof entry === 'string') {
-        const name = entry.trim();
-        if (name) names.push(name);
-        continue;
-      }
-      if (typeof entry === 'object' && entry.name) {
-        const name = String(entry.name).trim();
-        if (name) names.push(name);
-      }
-    }
-    return Array.from(new Set(names));
-  }
-  if (fields && typeof fields === 'object') {
-    return Object.keys(fields);
-  }
-  return [];
 }
 
 async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
@@ -187,12 +144,13 @@ function extractPartNumbersFromText(full, limit = 50) {
 
 
 
+// --- NEW: doc type detector (catalog vs. single datasheet) ---
 function detectDocType(full) {
   const t = String(full || '').toLowerCase();
+  // 'HOW TO ORDER/ORDERING INFORMATION/주문 정보/订购信息' 등 존재하면 카탈로그형으로 본다
   if (/(how to order|ordering information|주문\s*정보|订购信息|订货信息)/i.test(t)) return 'catalog';
   return 'single';
 }
-
 
 
 
@@ -244,8 +202,7 @@ async function runAutoIngest({
   const colsSet = await getTableColumns(qualified);
 
   // 블루프린트 허용 키
-  const blueprint = await getBlueprint(db.pool, family);
-  const allowedKeys = allowedKeysFromBlueprint(blueprint);
+  const { allowedKeys } = await getBlueprint(family);
 
   // PDF → 품번/스펙 추출
   let extracted = { brand: brand || 'unknown', rows: [] };
@@ -315,33 +272,27 @@ if (!code) {
   const now = new Date();
 
   if (code) {
-    // 단일 강제 인입 (코드 정규화 보장)
-    const normalizedCode = normalizeCode(code);
-    if (normalizedCode) {
-      const brandName = brand || extracted.brand || 'unknown';
-      records.push({
-        family_slug: family,
-        brand: brandName,
-        code: normalizedCode,
-        series: series || null,
-        display_name: display_name || null,
-        datasheet_uri: gcsUri,
-        image_uri: coverUri || null,
-        verified_in_doc: false,
-        updated_at: now,
-      });
-    }
+    // 단일 강제 인입
+    records.push({
+      family_slug: family,
+      brand: brand || extracted.brand || 'unknown',
+      code,
+      series: series || null,
+      display_name: display_name || null,
+      datasheet_uri: gcsUri,
+      image_uri: coverUri || null,
+      verified_in_doc: false,
+      updated_at: now,
+    });
   } else {
     for (const r of (extracted.rows || [])) {
-      const normalizedCode = normalizeCode(r.code);
-      if (!normalizedCode) continue;
       const base = {
         family_slug: family,
         brand: extracted.brand || 'unknown',
-        code: normalizedCode,
+        code: r.code,
         datasheet_uri: gcsUri,
         image_uri: coverUri || null,
-        display_name: `${extracted.brand || 'unknown'} ${normalizedCode}`,
+        display_name: `${extracted.brand || 'unknown'} ${r.code}`,
         verified_in_doc: true,
         updated_at: now,
       };
@@ -391,7 +342,7 @@ if (!code) {
     }
     if (colsSet.has('updated_at')) safe.updated_at = now;
 
-    await upsertByBrandCode(table, normalizeKeysOnce(safe));
+    await upsertByBrandCode(table, safe);
     upserted++;
   }
 
@@ -399,7 +350,7 @@ if (!code) {
     ok: true,
     ms: Date.now() - started,
     family,
-    specs_table: table,
+    final_table: table,
     brand: records[0]?.brand,
     code:  records[0]?.code,
     datasheet_uri: gcsUri,

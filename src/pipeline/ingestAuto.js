@@ -44,6 +44,60 @@ async function getTableColumns(qualified) {
   return new Set(r.rows.map(x=>x.col));
 }
 
+// DB 컬럼 타입 조회 (fallback용)
+async function getColumnTypes(qualified) {
+  const [schema, table] = qualified.includes('.') ? qualified.split('.') : ['public', qualified];
+  const q = `
+    SELECT lower(column_name) AS col, lower(data_type) AS dt
+    FROM information_schema.columns
+    WHERE table_schema=$1 AND table_name=$2`;
+  const { rows } = await db.query(q, [schema, table]);
+  const out = new Map();
+  for (const { col, dt } of rows) {
+    if (/(integer|bigint|smallint)/.test(dt)) out.set(col, 'int');
+    else if (/(numeric|decimal|double precision|real)/.test(dt)) out.set(col, 'numeric');
+    else if (/boolean/.test(dt)) out.set(col, 'bool');
+    else out.set(col, 'text');
+  }
+  return out;
+}
+
+// 숫자 강제정규화(콤마/단위/리스트/범위 허용 → 첫 숫자만)
+function coerceNumeric(x) {
+  if (x == null || x === '') return null;
+  if (typeof x === 'number') return x;
+  let s = String(x).toLowerCase().replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
+  const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
+  if (!m) return null;
+  let n = parseFloat(m[1]);
+  const mul = (m[2] || '').toLowerCase();
+  const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
+  if (mul && scale[mul] != null) n *= scale[mul];
+  return Number.isFinite(n) ? n : null;
+}
+
+// 컬럼 타입에 맞춰 값 정리: 숫자/정수/불리언만 강제 변환, 실패하면 해당 키 제거
+function sanitizeByColTypes(obj, colTypes) {
+  for (const [k, v] of Object.entries({ ...obj })) {
+    const t = colTypes.get(k);
+    if (t === 'numeric') {
+      const n = coerceNumeric(v);
+      if (n == null) delete obj[k]; else obj[k] = n;
+    } else if (t === 'int') {
+      const n = coerceNumeric(v);
+      if (n == null) delete obj[k]; else obj[k] = Math.round(n);
+    } else if (t === 'bool') {
+      if (typeof v === 'boolean') continue;
+      const s = String(v ?? '').toLowerCase().trim();
+      if (!s) delete obj[k];
+      else obj[k] = /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
+    }
+  }
+  return obj;
+}
+
+
+
 // DB 함수로 스키마 보장 (ensure_specs_table)
 async function ensureSpecsTableByFamily(family){
   await db.query(`SELECT public.ensure_specs_table($1)`, [family]);
@@ -289,6 +343,7 @@ async function runAutoIngest({
     await ensureSpecsTableByFamily(family);
   }
   const colsSet = await getTableColumns(qualified);
+  const colTypes = await getColumnTypes(qualified);
 
   // 블루프린트 허용 키
   const bp = await getBlueprint(family);
@@ -296,21 +351,7 @@ async function runAutoIngest({
   const fieldTypes  = bp.fields || {};   // { key: 'numeric' | 'int' | 'bool' | 'text' | ... }
 
   // -------- 공용 강제정규화 유틸 --------
-  function coerceNumeric(x) {
-    if (x == null || x === '') return null;
-    if (typeof x === 'number') return x;
-    let s = String(x).toLowerCase();
-    // 천단위 콤마 제거, 공백 정리
-    s = s.replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
-    // 첫 번째 수치 + 선택적 지수/접두(k,M,m,µ/u,n,p)
-    const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
-    if (!m) return null;
-    let n = parseFloat(m[1]);
-    const mul = (m[2] || '').toLowerCase();
-    const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
-    if (mul && scale[mul] != null) n = n * scale[mul];
-    return isFinite(n) ? n : null;
-  }
+  
   function coerceByType(key, val) {
     const t = String(fieldTypes[key] || 'text').toLowerCase();
     if (t === 'numeric') return coerceNumeric(val);

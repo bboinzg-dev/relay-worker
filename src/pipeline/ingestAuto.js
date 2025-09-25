@@ -352,8 +352,9 @@ async function runAutoIngest({
 
   // -------- 공용 강제정규화 유틸 --------
   
+  // 블루프린트 타입이 없으면 DB컬럼 타입으로 보강
   function coerceByType(key, val) {
-    const t = String(fieldTypes[key] || 'text').toLowerCase();
+    const t = String(fieldTypes[key] || colTypes.get(key) || 'text').toLowerCase();
     if (t === 'numeric') return coerceNumeric(val);
     if (t === 'int')     { const n = coerceNumeric(val); return (n==null?null:Math.round(n)); }
     if (t === 'bool')    {
@@ -509,6 +510,8 @@ if (!code) {
     }
     if (colsSet.has('updated_at')) safe.updated_at = now;
 
+   // ← 업서트 전에 숫자/정수/불리언 컬럼을 타입에 맞춰 정리(실패 키는 삭제)
+    sanitizeByColTypes(safe, colTypes);
     await upsertByBrandCode(table, safe);
     upserted++;
   }

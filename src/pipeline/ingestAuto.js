@@ -161,8 +161,10 @@ function extractPartNumbersFromText(full, limit = 50) {
 // --- NEW: doc type detector (catalog vs. single datasheet) ---
 function detectDocType(full) {
   const t = String(full || '').toLowerCase();
-  // 'HOW TO ORDER/ORDERING INFORMATION/주문 정보/订购信息' 등 존재하면 카탈로그형으로 본다
-  if (/(how to order|ordering information|주문\s*정보|订购信息|订货信息)/i.test(t)) return 'catalog';
+  // HOW TO ORDER / ORDERING INFORMATION / 주문 정보 / 订购信息 / 订货信息 / TYPES / Part No.
+  if (/(how to order|ordering information|주문\s*정보|订购信息|订货信息|\btypes\b|\bpart\s*no\.?\b)/i.test(t)) {
+    return 'catalog';
+  }
   return 'single';
 }
 
@@ -298,9 +300,10 @@ if (!code) {
   const fromOrder = extractPartNumbersFromText(fullText, FIRST_PASS_CODES);
   const picks = fromTypes.length ? fromTypes : fromOrder;
 
-  if (docType === 'catalog' && picks.length) {
+  // 다건이면 문서 유형과 무관하게 다건 업서트, 아니면 1건만
+  if (picks.length > 1) {
     extracted.rows = picks.slice(0, FIRST_PASS_CODES).map(p => ({ code: p.code }));
-  } else if ((!extracted.rows || !extracted.rows.length) && picks.length) {
+  } else if ((!extracted.rows || !extracted.rows.length) && picks.length === 1) {
     extracted.rows = [{ code: picks[0].code }];
   }
 }

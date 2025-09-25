@@ -76,6 +76,28 @@ function coerceNumeric(x) {
   return Number.isFinite(n) ? n : null;
 }
 
+function applyCodeRules(code, out, rules, colTypes) {
+  if (!Array.isArray(rules)) return;
+  const src = String(code || '');
+  for (const r of rules) {
+    const re = new RegExp(r.pattern, r.flags || 'i');
+    const m = src.match(re);
+    if (!m) continue;
+    for (const [col, spec] of Object.entries(r.set || {})) {
+      if (!colTypes.has(col)) continue;
+      let v;
+      const gname = spec.from || '1';
+      v = (m.groups && m.groups[gname]) || m[gname] || m[1] || null;
+      if (v == null) continue;
+      if (spec.map) v = spec.map[v] ?? v;
+      if (spec.numeric) v = coerceNumeric(v);
+      if (v == null || v === '') continue;
+      out[col] = v;
+    }
+  }
+}
+
+
 // 컬럼 타입에 맞춰 값 정리: 숫자/정수/불리언만 강제 변환, 실패하면 해당 키 제거
 function sanitizeByColTypes(obj, colTypes) {
   for (const [k, v] of Object.entries({ ...obj })) {
@@ -462,10 +484,12 @@ if (!code) {
         updated_at: now,
       };
       // 블루프린트 허용 값만 추가
-       for (const k of allowedKeys) {
+      for (const k of allowedKeys) {
         if (r[k] == null) continue;
         base[k] = coerceByType(k, r[k]);  // 타입에 맞춰 강제정규화
       }
+           // <- DB에 저장된 code_rules 적용 (모든 family 공통)
+      if (bp.code_rules) applyCodeRules(base.code, base, bp.code_rules, colTypes);
       records.push(base);
     }
   }

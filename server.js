@@ -667,7 +667,7 @@ app.post('/api/worker/ingest/run', async (req, res) => {
     });
 
     await query(`UPDATE public.ingest_run_logs
-      SET status='SUCCEEDED', family_slug=$2, specs_table=$3, brand=$4, brand_norm=$5, code=$6, code_norm=$7, finished_at=now(), updated_at=now(), error=NULL
+      SET status='SUCCEEDED', family_slug=$2, final_table=$3, brand=$4, brand_norm=$5, code=$6, code_norm=$7, finished_at=now(), updated_at=now(), error=NULL
       WHERE id=$1`,
       [rid, family, specsTable, fam.brand || null, norm(fam.brand), fam.code || null, norm(fam.code)]
     );

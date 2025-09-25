@@ -257,7 +257,38 @@ async function runAutoIngest({
   const colsSet = await getTableColumns(qualified);
 
   // 블루프린트 허용 키
-  const { allowedKeys } = await getBlueprint(family);
+  const bp = await getBlueprint(family);
+  const allowedKeys = bp.allowedKeys || [];
+  const fieldTypes  = bp.fields || {};   // { key: 'numeric' | 'int' | 'bool' | 'text' | ... }
+
+  // -------- 공용 강제정규화 유틸 --------
+  function coerceNumeric(x) {
+    if (x == null || x === '') return null;
+    if (typeof x === 'number') return x;
+    let s = String(x).toLowerCase();
+    // 천단위 콤마 제거, 공백 정리
+    s = s.replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
+    // 첫 번째 수치 + 선택적 지수/접두(k,M,m,µ/u,n,p)
+    const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
+    if (!m) return null;
+    let n = parseFloat(m[1]);
+    const mul = (m[2] || '').toLowerCase();
+    const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
+    if (mul && scale[mul] != null) n = n * scale[mul];
+    return isFinite(n) ? n : null;
+  }
+  function coerceByType(key, val) {
+    const t = String(fieldTypes[key] || 'text').toLowerCase();
+    if (t === 'numeric') return coerceNumeric(val);
+    if (t === 'int')     { const n = coerceNumeric(val); return (n==null?null:Math.round(n)); }
+    if (t === 'bool')    {
+      if (typeof val === 'boolean') return val;
+      const s = String(val||'').toLowerCase().trim();
+      if (!s) return null;
+      return /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
+    }
+    return (val == null ? null : String(val));
+  }
 
   // PDF → 품번/스펙 추출
   let extracted = { brand: brand || 'unknown', rows: [] };
@@ -353,7 +384,10 @@ if (!code) {
         updated_at: now,
       };
       // 블루프린트 허용 값만 추가
-      for (const k of allowedKeys) { if (r[k] != null) base[k] = r[k]; }
+       for (const k of allowedKeys) {
+        if (r[k] == null) continue;
+        base[k] = coerceByType(k, r[k]);  // 타입에 맞춰 강제정규화
+      }
       records.push(base);
     }
   }

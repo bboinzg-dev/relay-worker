@@ -76,19 +76,33 @@ function coerceNumeric(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-// "5, 6, 9, 12" / "1.5 to 24" / "5/12/24" / "5 12 24" → [5,12,24]
+// "5, 6, 9, 12" / "5/12/24" / "5 12 24" → [5,12,24]
+// "1.5 to 24" 같은 범위는 "분할 금지" → [] 반환
 function parseListOrRange(s) {
   if (Array.isArray(s)) return s;
   const raw = String(s || '').trim();
   if (!raw) return [];
-  // 1) 범위: "1.5 to 24" or "1.5–24"
-  const range = raw.match(/(-?\d+(\.\d+)?)\s*(?:to|–|-)\s*(-?\d+(\.\d+)?)/i);
-  if (range) {
-    const lo = parseFloat(range[1]); const hi = parseFloat(range[3]);
-    if (Number.isFinite(lo) && Number.isFinite(hi)) return [lo, hi];
-  }
+  // 1) 범위: "1.5 to 24" or "1.5–24" → 분할 금지
+  if (/(-?\d+(?:\.\d+)?)\s*(?:to|–|-)\s*(-?\d+(?:\.\d+)?)/i.test(raw)) return [];
   // 2) 구분자 리스트
   return raw.split(/[,、\/\s]+/).map(x => parseFloat(x)).filter(n => Number.isFinite(n));
+}
+
+// 분할 여부 결정: 후보(PN/시리즈) ≥2 또는 variant 열거형 곱 ≥2 일 때만 분할
+function decideSplit({ pnCandidates = [], seriesCandidates = [], variantKeys = [], specs = {} }) {
+  if ((pnCandidates?.length || 0) >= 2) return true;
+  if ((seriesCandidates?.length || 0) >= 2) return true;
+
+  if (Array.isArray(variantKeys) && variantKeys.length) {
+    let count = 1;
+    for (const k of variantKeys) {
+      const vals = parseListOrRange(specs[k]);
+      const n = vals.length || (specs[k] != null ? 1 : 0);
+      count *= Math.max(1, n);
+    }
+    if (count >= 2) return true;
+  }
+  return false; // 기본 단일
 }
 
 // 블루프린트 기반 폭발: variant_keys 교차곱
@@ -497,7 +511,12 @@ async function runAutoIngest({
   const pnTemplate  = bp.pn_template || null;
 
   // -------- 공용 강제정규화 유틸 --------
-  
+
+  if (code && !/\d/.test(String(code))) {
+    // "AGN","TQ" 처럼 숫자 없는 시리즈는 series로 넘기고 code는 비움
+    series = code; code = null;
+  }
+
   // 블루프린트 타입이 없으면 DB컬럼 타입으로 보강
   function coerceByType(key, val) {
     const t = String(fieldTypes[key] || colTypes.get(key) || 'text').toLowerCase();
@@ -603,12 +622,8 @@ async function runAutoIngest({
       if (merged.length) candidates = merged;
     }
 
-    // 다건이면 문서 유형과 무관하게 다건 업서트, 아니면 1건만
-    if (picks.length > 1) {
-      extracted.rows = picks.slice(0, FIRST_PASS_CODES).map(p => ({ code: p.code }));
-    } else if ((!extracted.rows || !extracted.rows.length) && picks.length === 1) {
-      extracted.rows = [{ code: picks[0].code }];
-    }
+    // 분할 여부는 별도 판단. 여기서는 후보만 모아둠.
+    // extracted.rows는 건드리지 않음.
   }
 
 
@@ -664,6 +679,21 @@ async function runAutoIngest({
   }
   if (!explodedEntries.length) {
     explodedEntries.push({ base: { brand: brandName, series: baseSeries }, specs: {} });
+  }
+
+  // ---- 분할 여부 결정 ----
+  const pnCands = candidateMap.map((c) => c.raw);
+  const seriesCands = (candidates.length && series) ? candidateMap.filter((c) => /\d/.test(c.norm)).map((c) => c.raw) : [];
+  const mustSplit = decideSplit({
+    pnCandidates: pnCands,
+    seriesCandidates: seriesCands,
+    variantKeys,
+    specs: (rawRows[0] || {})
+  });
+
+  // 단일이라면 폭발 결과를 1건으로 제한
+  if (!mustSplit && explodedEntries.length > 1) {
+    explodedEntries.splice(1);
   }
 
   const seenCodes = new Set();

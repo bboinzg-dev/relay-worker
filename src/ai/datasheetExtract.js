@@ -19,6 +19,7 @@ try { pdfParse = require('pdf-parse'); } catch {}
 
 const db = require('../utils/db');
 const { parseGcsUri } = require('../utils/gcs');
+const { safeJsonParse } = require('../utils/safe-json');
 
 const MAX_PARTS = Number(process.env.MAX_ENUM_PARTS || 200);
 
@@ -225,7 +226,12 @@ async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText,
   });
 
   let txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  try { return JSON.parse(txt)?.parts || []; } catch { return []; }
+  try {
+    const parsed = safeJsonParse(txt);
+    return Array.isArray(parsed?.parts) ? parsed.parts : [];
+  } catch {
+    return [];
+  }
 }
 
 /* -------------------- Public: main extractor -------------------- */

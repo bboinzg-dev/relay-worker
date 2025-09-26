@@ -30,6 +30,16 @@ async function getColumnTypes(qualified) {
   return out;
 }
 
+// "5, 6, 9, 12" / "1.5 to 24 V" 같은 문자열을 안전하게 수용
+function toNumberOrNull(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  const s = String(v);
+  const mRange = s.match(/-?\d+(?:\.\d+)?/g);
+  if (mRange && mRange.length > 0) return Number(mRange[0]);
+  return null;
+}
+
 async function saveExtractedSpecs(familySlug, base, specs) {
   // 스키마 자동 보장(추가만 수행)
   await ensureSpecsTableForFamily(familySlug);
@@ -107,7 +117,14 @@ async function saveExtractedSpecs(familySlug, base, specs) {
   const specCols = Object.keys(specsNorm);
   const allCols = baseCols.concat(specCols);
   const params = allCols.map((_, i) => `$${i + 1}`);
-  const values = baseVals.concat(specCols.map((k) => specsNorm[k]));
+  const values = baseVals.concat(specCols.map((k) => {
+    const x = specsNorm[k];
+    if (typeof x === 'string' && /to|,|\d/.test(x)) {
+      const n = toNumberOrNull(x);
+      return n ?? null;
+    }
+    return x;
+  }));
 
   const colList = allCols.map(safeColumnName).join(',');
   const setList = specCols

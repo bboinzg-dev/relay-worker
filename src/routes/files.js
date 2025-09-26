@@ -79,14 +79,14 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       const client = new CloudTasksClient();
       const parent = client.queuePath(process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT, location, queue);
 
-      const task = {
-        httpRequest: {
-          httpMethod: 'POST',
-          url: workerUrl,
-          headers: { 'Content-Type': 'application/json' },
-          body: Buffer.from(JSON.stringify(payload)).toString('base64'),
-        },
+      const body = Buffer.from(JSON.stringify(payload));
+      const httpRequest = {
+        url: workerUrl,
+        httpMethod: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
       };
+      const task = { httpRequest };
       if (invokerSA) {
         task.httpRequest.oidcToken = { serviceAccountEmail: invokerSA, audience: workerUrl };
       }

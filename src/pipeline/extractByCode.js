@@ -1,5 +1,6 @@
 'use strict';
 const { toJsonSchema, callLLM } = require('../llm/structured');
+const { safeJsonParse } = require('../utils/safe-json');
 const { pool } = require('../utils/db'); // 기존 db 유틸
 const { getBlueprint } = require('../utils/blueprint'); // DB에서 fields_json/specs_table 읽는 함수(앞서 만들어둔 버전)
 
@@ -20,7 +21,7 @@ family=${family}, code="${code}"의 스펙만 추출하세요.
     modelEnv:'GEMINI_MODEL_EXTRACT', fallback:'gemini-2.5-flash',
     prompt, pdfBase64, responseSchema, timeoutMs:30000
   });
-  const j = JSON.parse(raw || '{}');
+  const j = safeJsonParse(raw) || {};
   const values = j.values || {};
 
   // UPSERT (brand_norm, code_norm)

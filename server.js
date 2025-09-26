@@ -49,18 +49,20 @@ const query = (text, params) => pgPool.query(text, params);
      // ① 디스패치 데드라인 = 인제스트 예산(기본 120초) + 15초 여유
   const seconds = Math.ceil((Number(process.env.INGEST_BUDGET_MS || 120000) + 15000) / 1000);
 
+  const body = Buffer.from(JSON.stringify(payload));
+  const httpRequest = {
+    url: WORKER_TASK_URL,
+    httpMethod: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    ...(TASKS_INVOKER_SA
+      ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
+      : {}),
+  };
   const task = {
-    httpRequest: {
-      httpMethod: 'POST',
-      url: WORKER_TASK_URL,
-      headers: { 'Content-Type': 'application/json' },
-      body: Buffer.from(JSON.stringify(payload)).toString('base64'),
-      ...(TASKS_INVOKER_SA
-        ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
-        : {}),
-    },
+    httpRequest,
     // ② Cloud Tasks에 타깃 응답 대기 한도를 명시(기본 10분 → 135초 내)
-   dispatchDeadline: { seconds: Math.min(Math.ceil(seconds), 1800) },
+    dispatchDeadline: { seconds: Math.min(Math.ceil(seconds), 1800) },
   };
 
    // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹

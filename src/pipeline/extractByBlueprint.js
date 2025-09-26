@@ -1,5 +1,6 @@
 'use strict';
 const { VertexAI } = require('@google-cloud/vertexai');
+const { safeJsonParse } = require('../utils/safe-json');
 
 const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
 const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
@@ -113,7 +114,7 @@ async function extractFields(rawText, code, fieldsJson) {
 
   // 파싱 & 스키마에 맞춰 정돈
   let parsed = {};
-  try { parsed = JSON.parse(text); } catch { parsed = {}; }
+  try { parsed = safeJsonParse(text) || {}; } catch { parsed = {}; }
 
   const out = {};
   for (const { name, type } of schema) {

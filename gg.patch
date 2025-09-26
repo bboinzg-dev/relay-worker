@@ -1,286 +1,67 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index cf33b02be5c1bb48a97198755b610c007124fa5d..f963c2c6be19f6c520f893459d86d5770c301f4c 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -54,65 +54,79 @@ async function getColumnTypes(qualified) {
-   const { rows } = await db.query(q, [schema, table]);
-   const out = new Map();
-   for (const { col, dt } of rows) {
-     if (/(integer|bigint|smallint)/.test(dt)) out.set(col, 'int');
-     else if (/(numeric|decimal|double precision|real)/.test(dt)) out.set(col, 'numeric');
-     else if (/boolean/.test(dt)) out.set(col, 'bool');
-     else out.set(col, 'text');
-   }
-   return out;
- }
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/src/routes/files.js b/src/routes/files.js
+index 42b3a2dcb05d06dbcc74a6bd2a92ee91f361fab7..a7a47553e69cef745d0e90b2fd9f5f789f9f3e6c 100644
+--- a/src/routes/files.js
++++ b/src/routes/files.js
+@@ -57,51 +57,51 @@ router.post('/upload', upload.single('file'), async (req, res) => {
+     });
  
- // 숫자 강제정규화(콤마/단위/리스트/범위 허용 → 첫 숫자만)
- function coerceNumeric(x) {
-   if (x == null || x === '') return null;
-   if (typeof x === 'number') return x;
-   let s = String(x).toLowerCase().replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
-   const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
-   if (!m) return null;
-   let n = parseFloat(m[1]);
-   const mul = (m[2] || '').toLowerCase();
-   const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
-   if (mul && scale[mul] != null) n *= scale[mul];
-   return Number.isFinite(n) ? n : null;
- }
+     const gcsUri = `gs://${BUCKET}/${objectName}`;
  
--// "5, 6, 9, 12" / "1.5 to 24" / "5/12/24" / "5 12 24" → [5,12,24]
-+// "5, 6, 9, 12" / "5/12/24" / "5 12 24" → [5,12,24]
-+// "1.5 to 24" 같은 범위는 "분할 금지" → [] 반환
- function parseListOrRange(s) {
-   if (Array.isArray(s)) return s;
-   const raw = String(s || '').trim();
-   if (!raw) return [];
--  // 1) 범위: "1.5 to 24" or "1.5–24"
--  const range = raw.match(/(-?\d+(\.\d+)?)\s*(?:to|–|-)\s*(-?\d+(\.\d+)?)/i);
--  if (range) {
--    const lo = parseFloat(range[1]); const hi = parseFloat(range[3]);
--    if (Number.isFinite(lo) && Number.isFinite(hi)) return [lo, hi];
--  }
-+  // 1) 범위: "1.5 to 24" or "1.5–24" → 분할 금지
-+  if (/(-?\d+(?:\.\d+)?)\s*(?:to|–|-)\s*(-?\d+(?:\.\d+)?)/i.test(raw)) return [];
-   // 2) 구분자 리스트
-   return raw.split(/[,、\/\s]+/).map(x => parseFloat(x)).filter(n => Number.isFinite(n));
- }
+     // 2) 파라미터 정리
+     const payload = {
+       gcsUri,
+       filename: originalName,
+       family_slug: req.body.family_slug || null,
+       brand: req.body.brand || null,
+       code: req.body.code || null,
+       series: req.body.series || null,
+       display_name: req.body.display_name || null,
+     };
  
-+// 분할 여부 결정: 후보(PN/시리즈) ≥2 또는 variant 열거형 곱 ≥2 일 때만 분할
-+function decideSplit({ pnCandidates = [], seriesCandidates = [], variantKeys = [], specs = {} }) {
-+  if ((pnCandidates?.length || 0) >= 2) return true;
-+  if ((seriesCandidates?.length || 0) >= 2) return true;
-+
-+  if (Array.isArray(variantKeys) && variantKeys.length) {
-+    let count = 1;
-+    for (const k of variantKeys) {
-+      const vals = parseListOrRange(specs[k]);
-+      const n = vals.length || (specs[k] != null ? 1 : 0);
-+      count *= Math.max(1, n);
-+    }
-+    if (count >= 2) return true;
-+  }
-+  return false; // 기본 단일
-+}
-+
- // 블루프린트 기반 폭발: variant_keys 교차곱
- function explodeVariants(base = {}, specs = {}, bp = {}) {
-   const keys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
-   const lists = keys.map((k) => {
-     const arr = parseListOrRange(specs[k]);
-     if (arr.length) return arr;
-     return specs[k] != null ? [specs[k]] : [];
-   });
-   if (!lists.length || lists.some((a) => !a.length)) return [{ base, specs }];
+     // 3) Cloud Tasks가 설정되어 있으면 enq, 아니면 즉시 분석
+     const queue = process.env.QUEUE_NAME;
+     const location = process.env.TASKS_LOCATION;
+     const workerUrl = process.env.WORKER_TASK_URL; // e.g. https://worker-xxxx.run.app/api/worker/ingest
+     const invokerSA = process.env.TASKS_INVOKER_SA;
  
-   const out = [];
-   const dfs = (i, cur) => {
-     if (i === keys.length) {
-       out.push({ base, specs: cur.specs });
-       return;
-     }
-     const key = keys[i];
-     for (const v of lists[i]) {
-       dfs(i + 1, {
-         base: cur.base,
-         specs: { ...cur.specs, [key]: v }
-       });
-     }
-   };
-   dfs(0, { base, specs: { ...specs } });
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index cf33b02be5c1bb48a97198755b610c007124fa5d..f963c2c6be19f6c520f893459d86d5770c301f4c 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -475,51 +489,56 @@ async function runAutoIngest({
-   }
+     if (queue && location && workerUrl) {
+       const client = new CloudTasksClient();
+       const parent = client.queuePath(process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT, location, queue);
  
-   // 목적 테이블
-   const reg = await db.query(
-     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
-     [family]
-   );
-   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
-   const qualified = table.startsWith('public.')? table : `public.${table}`;
- 
-   // 스키마 보장 (DB 함수) + 컬럼셋 확보
-     if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
-     await ensureSpecsTableByFamily(family);
-   }
-   const colsSet = await getTableColumns(qualified);
-   const colTypes = await getColumnTypes(qualified);
- 
-   // 블루프린트 허용 키
-   const bp = await getBlueprint(family);
-   const allowedKeys = bp.allowedKeys || [];
-   const fieldTypes  = bp.fields || {};   // { key: 'numeric' | 'int' | 'bool' | 'text' | ... }
-   const variantKeys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
-   const pnTemplate  = bp.pn_template || null;
- 
-   // -------- 공용 강제정규화 유틸 --------
--  
-+
-+  if (code && !/\d/.test(String(code))) {
-+    // "AGN","TQ" 처럼 숫자 없는 시리즈는 series로 넘기고 code는 비움
-+    series = code; code = null;
-+  }
-+
-   // 블루프린트 타입이 없으면 DB컬럼 타입으로 보강
-   function coerceByType(key, val) {
-     const t = String(fieldTypes[key] || colTypes.get(key) || 'text').toLowerCase();
-     if (t === 'numeric') return coerceNumeric(val);
-     if (t === 'int')     { const n = coerceNumeric(val); return (n==null?null:Math.round(n)); }
-     if (t === 'bool')    {
-       if (typeof val === 'boolean') return val;
-       const s = String(val||'').toLowerCase().trim();
-       if (!s) return null;
-       return /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
-     }
-     return (val == null ? null : String(val));
-   }
- 
-   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
-   let previewText = '';
-   try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
-   let candidates = [];
-   try {
-     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
-   } catch { candidates = []; }
- 
-   // PDF → 품번/스펙 추출
-   let extracted = { brand: brand || 'unknown', rows: [] };
-   if (!brand || !code) {
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index cf33b02be5c1bb48a97198755b610c007124fa5d..f963c2c6be19f6c520f893459d86d5770c301f4c 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -581,56 +600,52 @@ async function runAutoIngest({
-   if (!code && !codes.length) {
-     let fullText = '';
-     try { fullText = await readText(gcsUri, 300 * 1024) || ''; } catch {}
- 
-     const fromTypes  = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
-     const fromOrder  = rankPartNumbersFromOrderingSections(fullText, FIRST_PASS_CODES);
-     const fromSeries = extractPartNumbersBySeriesHeuristic(fullText, FIRST_PASS_CODES * 4);
-     // 가장 신뢰 높은 순서로 병합
-     const picks = fromTypes.length ? fromTypes : (fromOrder.length ? fromOrder : fromSeries);
- 
-     if (!candidates.length && picks.length) {
-       const merged = [];
-       const seen = new Set();
-       for (const p of picks) {
-         const raw = typeof p === 'string' ? p : p?.code;
-         const trimmed = typeof raw === 'string' ? raw.trim() : '';
-         if (!trimmed) continue;
-         const norm = normalizeCode(trimmed);
-         if (seen.has(norm)) continue;
-         seen.add(norm);
-         merged.push(trimmed);
+-      const task = {
+-        httpRequest: {
+-          httpMethod: 'POST',
+-          url: workerUrl,
+-          headers: { 'Content-Type': 'application/json' },
+-          body: Buffer.from(JSON.stringify(payload)).toString('base64'),
+-        },
++      const body = Buffer.from(JSON.stringify(payload));
++      const httpRequest = {
++        url: workerUrl,
++        httpMethod: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body,
+       };
++      const task = { httpRequest };
+       if (invokerSA) {
+         task.httpRequest.oidcToken = { serviceAccountEmail: invokerSA, audience: workerUrl };
        }
-       if (merged.length) candidates = merged;
+ 
+       const [resp] = await client.createTask({ parent, task });
+       return res.json({ ok: true, gcsUri, enqueued: true, task: resp.name });
      }
  
--    // 다건이면 문서 유형과 무관하게 다건 업서트, 아니면 1건만
--    if (picks.length > 1) {
--      extracted.rows = picks.slice(0, FIRST_PASS_CODES).map(p => ({ code: p.code }));
--    } else if ((!extracted.rows || !extracted.rows.length) && picks.length === 1) {
--      extracted.rows = [{ code: picks[0].code }];
--    }
-+    // 분할 여부는 별도 판단. 여기서는 후보만 모아둠.
-+    // extracted.rows는 건드리지 않음.
+     // fallback: 즉시 실행
+     const result = await runAutoIngest(payload);
+     return res.json({ ok: true, gcsUri, enqueued: false, result });
+   } catch (e) {
+     console.error(e);
+     res.status(400).json({ ok: false, error: String(e.message || e) });
    }
+ });
  
+ module.exports = router;
  
-   // 커버 추출 비활성(요청에 따라 완전 OFF)
-   let coverUri = null;
-   if (/^(1|true|on)$/i.test(process.env.COVER_CAPTURE || '0')) {
-     try {
-       const bForCover = brand || extracted.brand || 'unknown';
-       const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
-       coverUri = await withTimeout(
-         extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
-         Math.min(30000, Math.round(BUDGET * 0.15)),
-         'cover',
-       );
-     } catch (e) { console.warn('[cover fail]', e?.message || e); }
-   }
- 
-   if (code) {
-     const trimmedCode = String(code || '').trim();
-     if (trimmedCode) {
-       const norm = normalizeCode(trimmedCode);
-       if (!candidates.some((c) => normalizeCode(c) === norm)) {
-         candidates = [trimmedCode, ...candidates];
-       }
-     }
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index cf33b02be5c1bb48a97198755b610c007124fa5d..f963c2c6be19f6c520f893459d86d5770c301f4c 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -644,50 +659,65 @@ async function runAutoIngest({
- 
-   const candidateMap = [];
-   const candidateNormSet = new Set();
-   for (const cand of candidates) {
-     const trimmed = typeof cand === 'string' ? cand.trim() : String(cand || '');
-     if (!trimmed) continue;
-     const norm = normalizeCode(trimmed);
-     if (!norm || candidateNormSet.has(norm)) continue;
-     candidateNormSet.add(norm);
-     candidateMap.push({ raw: trimmed, norm });
-   }
- 
-   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
-   const specRows = rawRows.length ? rawRows.slice(0) : (code ? [{ code }] : []);
-   if (!specRows.length) specRows.push({});
- 
-   const explodedEntries = [];
-   for (const row of specRows) {
-     const specsObj = row && typeof row === 'object' ? { ...row } : {};
-     explodedEntries.push(...explodeVariants({ brand: brandName, series: baseSeries, code: specsObj.code || null }, specsObj, bp));
-   }
-   if (!explodedEntries.length) {
-     explodedEntries.push({ base: { brand: brandName, series: baseSeries }, specs: {} });
-   }
- 
-+  // ---- 분할 여부 결정 ----
-+  const pnCands = candidateMap.map((c) => c.raw);
-+  const seriesCands = (candidates.length && series) ? candidateMap.filter((c) => /\d/.test(c.norm)).map((c) => c.raw) : [];
-+  const mustSplit = decideSplit({
-+    pnCandidates: pnCands,
-+    seriesCandidates: seriesCands,
-+    variantKeys,
-+    specs: (rawRows[0] || {})
-+  });
-+
-+  // 단일이라면 폭발 결과를 1건으로 제한
-+  if (!mustSplit && explodedEntries.length > 1) {
-+    explodedEntries.splice(1);
-+  }
-+
-   const seenCodes = new Set();
-   const pickNumeric = (...vals) => {
-     for (const v of vals) {
-       const n = coerceNumeric(v);
-       if (Number.isFinite(n)) return n;
-     }
-     return null;
-   };
- 
-   for (const entry of explodedEntries) {
-     const baseInfo = entry?.base || {};
-     const specs = entry?.specs || {};
-     const voltageNum = pickNumeric(
-       specs.coil_voltage_vdc,
-       specs.coil_voltage,
-       specs.voltage_vdc,
-       specs.voltage_dc,
-       specs.voltage
-     );
-     const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2, '0') : null;
- 
-     let mpn = null;
-     if (candidateMap.length) {
-       const match = voltageToken ? candidateMap.find((c) => c.norm.includes(voltageToken)) : null;
-       const pick = match || candidateMap[0];
+EOF
+)

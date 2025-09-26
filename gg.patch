@@ -1,524 +1,152 @@
-diff --git a/server.js b/server.js
-index 4847a4595f773f3225b5bb71eb954ed28204866e..5246c103ae094766da26026f46d2ad63a7def768 100644
---- a/server.js
-+++ b/server.js
-@@ -1,77 +1,76 @@
- ﻿/* server.js */
+diff --git a/src/utils/blueprint.js b/src/utils/blueprint.js
+index 624ae65abb1dc9dd3f9791ac7acfe666ace91045..9d0fc9c7f819ce73e61ef088b60d99f9571c322c 100644
+--- a/src/utils/blueprint.js
++++ b/src/utils/blueprint.js
+@@ -1,25 +1,130 @@
  'use strict';
- 
- const express = require('express');
- const cors = require('cors');
- const bodyParser = require('body-parser');
- const multer = require('multer');
- const crypto = require('crypto');
- const jwt = require('jsonwebtoken');
- 
- const { getPool } = require('./db');
--const { getFamilies, getBlueprint } = require('./lib/blueprint');
--const { classifyFamily, extractByBlueprint } = require('./lib/llm');
- const { Storage } = require('@google-cloud/storage');
- const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, parseGcsUri } = require('./src/utils/gcs');
- const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
- const { runAutoIngest } = require('./src/pipeline/ingestAuto');
- 
- const storage = new Storage();
- const pgPool = getPool();
- const query = (text, params) => pgPool.query(text, params);
- 
- 
- // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
-  const { CloudTasksClient } = require('@google-cloud/tasks');
-  const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-  const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
-  const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
-- const WORKER_TASK_URL  = process.env.WORKER_TASK_URL  || 'https://<YOUR-RUN-URL>/api/worker/ingest/run';
-+ const WORKER_TASK_URL  = process.env.WORKER_TASK_URL  || 'https://<YOUR-RUN-URL>/api/worker/ingest';
-  const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
- 
-  // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
-  let _tasks = null;
-  let _queuePath = null;
-  function getTasks() {
-    if (!_tasks) {
-     // 글로벌 엔드포인트 + REST fallback(HTTP/1)
-     _tasks = new CloudTasksClient({ fallback: true });
-      _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
-    }
-    return { tasks: _tasks, queuePath: _queuePath };
-  }
- 
-  async function enqueueIngestRun(payload) {
--   const { tasks, queuePath } = getTasks();
--     if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
--   const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
-+  const { tasks, queuePath } = getTasks();
-+    if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
-+  const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
- 
--     // ① 디스패치 데드라인 = 인제스트 예산(기본 120초) + 15초 여유
-+    // ① 디스패치 데드라인 = 인제스트 예산(기본 120초) + 15초 여유
-   const seconds = Math.ceil((Number(process.env.INGEST_BUDGET_MS || 120000) + 15000) / 1000);
- 
--  const body = Buffer.from(JSON.stringify(payload));
-+  const jobPayload = { ...payload, mode: 'direct' };
-+  const body = Buffer.from(JSON.stringify(jobPayload));
-   const httpRequest = {
-     url: WORKER_TASK_URL,
-     httpMethod: 'POST',
-     headers: { 'Content-Type': 'application/json' },
-     body,
-     ...(TASKS_INVOKER_SA
-       ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
-       : {}),
-   };
-   const task = {
-     httpRequest,
-     // ② Cloud Tasks에 타깃 응답 대기 한도를 명시(기본 10분 → 135초 내)
-     dispatchDeadline: { seconds: Math.min(Math.ceil(seconds), 1800) },
-   };
- 
-    // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
-    await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
-  }
- 
- 
- const app = express();
- 
- /* ---------------- Mount modular routers (keep existing) ---------------- */
- try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
- try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
-diff --git a/server.js b/server.js
-index 4847a4595f773f3225b5bb71eb954ed28204866e..5246c103ae094766da26026f46d2ad63a7def768 100644
---- a/server.js
-+++ b/server.js
-@@ -429,287 +428,275 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
-         brand: it.brand, code: it.code, series: it.series, display_name: it.display_name,
-         family_slug: it.family_slug, datasheet_uri: it.datasheet_uri, cover: it.cover,
-         source_gcs_uri: it.source_gcs_uri, raw_json: it.raw_json || null,
-         ...(it.values || {}),
-       });
-       out.push({ table, row });
-     }
-     res.json({ ok:true, count: out.length, items: out });
-   } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'bulk ingest failed', detail:String(e?.message || e) }); }
- });
- 
- app.post('/ingest/auto', requireSession, async (req, res) => {
-   try {
-     const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name, family_slug } = req.body || {};
-     const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
-     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
-     const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
-     res.json(result);
-   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
- });
- 
- app.post('/api/worker/ingest', requireSession, async (req, res) => {
-   const startedAt = Date.now();
-   const taskName  = req.get('X-Cloud-Tasks-TaskName') || null;
-   const retryCnt  = Number(req.get('X-Cloud-Tasks-TaskRetryCount') || 0);
-+  const modeParam = String(req.query.mode || req.body?.mode || '').toLowerCase();
-   const body = parseIngestBody(req);
-   const series = req.body?.series || null;
-   const displayName = req.body?.display_name || req.body?.displayName || null;
-+  const directRequested = modeParam === 'direct';
-+  const isDirect = directRequested || !!taskName;
-+  let runIdRef = body.run_id || req.body?.runId || null;
 +
-   try {
-     const uri = body.gcs_uri;
-+
-     if (!uri || !/^gs:\/\//i.test(uri)) {
-+      const errorText = 'gcs_uri required (gs://...)';
-+      if (isDirect) {
-+        if (runIdRef) {
-+          try {
-+            await query(
-+              `UPDATE public.ingest_run_logs
-+                  SET finished_at = now(),
-+                      duration_ms = $3,
-+                      status = 'FAILED',
-+                      error = $2,
-+                      updated_at = now()
-+                WHERE id = $1`,
-+              [runIdRef, errorText, Date.now() - startedAt],
-+            );
-+          } catch (_) {}
-+        }
-+        return res.status(400).json({ ok: false, error: errorText });
-+      }
-+
-       await query(
-         `INSERT INTO public.ingest_run_logs (gcs_uri, status, error, task_name, retry_count, uploader_id, content_type)
-          VALUES ($1,'FAILED',$2,$3,$4,$5,$6)`,
--        [uri || 'n/a', 'gcs_uri required (gs://...)', taskName, retryCnt, body.uploader_id, body.content_type]
-+        [uri || 'n/a', errorText, taskName, retryCnt, body.uploader_id, body.content_type]
-       );
-       return res.status(202).json({ ok: true, accepted: false });
-     }
+ const { pool } = require('./db');
  
--    const { rows:logRows } = await query(
--      `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, uploader_id, content_type)
--       VALUES ($1,$2,$3,'PROCESSING',$4,$5) RETURNING id`,
--      [taskName, retryCnt, uri, body.uploader_id, body.content_type]
--    );
--    const runId = logRows[0]?.id;
+ const CACHE = new Map();
+ const TTL = Number(process.env.BLUEPRINT_CACHE_TTL_MS || 60_000);
+ 
+-function now(){ return Date.now(); }
 -
--    // ✅ 1) 즉시 ACK → Cloud Tasks는 이 시점에 "완료"로 처리(재시도 루프 종료)
--    res.status(202).json({ ok: true, run_id: runId, accepted: true });
+-async function getBlueprint(familySlug) {
+-  const k = `bp:${familySlug}`;
+-  const hit = CACHE.get(k);
+-  if (hit && (now() - hit.t) < TTL) return hit.v;
 -
--    // ▶ 2) 다음 Cloud Tasks 요청으로 실행을 넘김(체인) — 응답 보낸 뒤이므로 절대 다시 res.* 호출 금지
--    enqueueIngestRun({ runId, gcsUri: uri, brand: body.brand, code: body.code, series, display_name: displayName, family_slug: body.family_slug })
--      .catch(async (err) => {
--        // enqueue 실패 시에도 응답은 이미 보냈으므로 DB만 FAILED로 마킹
-+    if (!isDirect) {
-+      const dedupeMinutesRaw = Number(process.env.INGEST_DEDUP_MINUTES || 5);
-+      const dedupeMinutes = Number.isFinite(dedupeMinutesRaw)
-+        ? Math.min(Math.max(Math.floor(dedupeMinutesRaw), 1), 60)
-+        : 5;
-+      let recent = null;
-+      try {
-+        const { rows } = await query(
-+          `SELECT id, status
-+             FROM public.ingest_run_logs
-+            WHERE gcs_uri = $1
-+              AND created_at >= now() - interval '${dedupeMinutes} minutes'
-+            ORDER BY created_at DESC
-+            LIMIT 1`,
-+          [uri]
-+        );
-+        recent = rows[0] || null;
-+      } catch (_) {}
-+
-+      if (recent && ['PROCESSING', 'RUNNING', 'SUCCEEDED'].includes(String(recent.status || '').toUpperCase())) {
-+        return res.status(200).json({ ok: true, accepted: false, run_id: recent.id, status: recent.status });
-+      }
-+
-+      const { rows:logRows } = await query(
-+        `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, uploader_id, content_type)
-+         VALUES ($1,$2,$3,'PROCESSING',$4,$5) RETURNING id`,
-+        [taskName, retryCnt, uri, body.uploader_id, body.content_type]
-+      );
-+      const runId = logRows[0]?.id;
-+      runIdRef = runId;
-+
-+      res.status(202).json({ ok: true, run_id: runId, accepted: true });
-+
-+      enqueueIngestRun({
-+        runId,
-+        gcsUri: uri,
-+        brand: body.brand,
-+        code: body.code,
-+        series,
-+        display_name: displayName,
-+        family_slug: body.family_slug,
-+        uploader_id: body.uploader_id,
-+        content_type: body.content_type,
-+      }).catch(async (err) => {
-         try {
-           await query(
-             `UPDATE public.ingest_run_logs
-                 SET finished_at = now(),
-                     duration_ms = $2,
-                     status = 'FAILED',
-                     error = $3,
-                     updated_at = now()
-               WHERE id = $1`,
-             [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
-           );
-         } catch (_) {}
-         console.error('[ingest enqueue failed]', err?.message || err);
-       });
-+      return;
-+    }
-+
-+    const { rows: runRows } = await query(
-+      `INSERT INTO public.ingest_run_logs (id, gcs_uri, status, started_at, updated_at, uploader_id, content_type)
-+       VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, 'RUNNING', now(), now(), $3, $4)
-+       ON CONFLICT (id)
-+       DO UPDATE SET
-+         status = 'RUNNING',
-+         gcs_uri = EXCLUDED.gcs_uri,
-+         uploader_id = COALESCE(EXCLUDED.uploader_id, ingest_run_logs.uploader_id),
-+         content_type = COALESCE(EXCLUDED.content_type, ingest_run_logs.content_type),
-+         started_at = COALESCE(ingest_run_logs.started_at, now()),
-+         updated_at = now()
-+       RETURNING id`,
-+      [runIdRef, uri, body.uploader_id, body.content_type]
-+    );
-+    const rid = runRows[0]?.id;
-+    runIdRef = rid || runIdRef;
-+
-+    const result = await runAutoIngest({
-+      gcsUri: uri,
-+      family_slug: body.family_slug,
-+      brand: body.brand,
-+      code: body.code,
-+      series,
-+      display_name: displayName,
-+    });
- 
--  } catch (e) {
-- // 여기로 들어왔다면 아직 202를 보내기 전일 수도 있으므로, 응답 전/후 모두 안전하도록 처리
--    // 1) DB 상태 갱신
-     try {
-       await query(
-         `UPDATE public.ingest_run_logs
--           SET finished_at = now(),
--               duration_ms = $2,
--               status = 'FAILED',
--               error = $3,
--               updated_at = now()
--         WHERE task_name = $1
--           AND status = 'PROCESSING'
--         ORDER BY started_at DESC
--         LIMIT 1`,
--        [ taskName, Date.now()-startedAt, String(e?.message || e) ]
-+            SET status='SUCCEEDED',
-+                family_slug=$2,
-+                final_table=$3,
-+                brand=$4,
-+                brand_norm=$5,
-+                code=$6,
-+                code_norm=$7,
-+                finished_at=now(),
-+                duration_ms=$8,
-+                updated_at=now(),
-+                error=NULL
-+          WHERE id=$1`,
-+        [
-+          runIdRef,
-+          result.family || null,
-+          result.final_table || null,
-+          result.brand || null,
-+          norm(result.brand),
-+          result.code || null,
-+          norm(result.code),
-+          Date.now() - startedAt,
-+        ],
-       );
--    } catch (_) {}
--    // 2) 아직 응답을 보내지 않았다면 500, 이미 보냈다면 로그만
-+    } catch (logErr) {
-+      console.warn('[ingest log update failed]', logErr?.message || logErr);
-+    }
-+
-+    return res.status(200).json({ ok: true, run_id: runIdRef, ...result });
-+  } catch (e) {
-+    console.error('[ingest error]', e?.message || e);
-+    const errMsg = String(e?.message || e);
-+    if (runIdRef) {
-+      try {
-+        await query(
-+          `UPDATE public.ingest_run_logs
-+              SET finished_at = now(),
-+                  duration_ms = $3,
-+                  status = 'FAILED',
-+                  error = $2,
-+                  updated_at = now()
-+            WHERE id = $1`,
-+          [runIdRef, errMsg, Date.now() - startedAt],
-+        );
-+      } catch (_) {}
-+    }
-     if (!res.headersSent) {
--      console.error('[ingest 500]', { error: e?.message });
--      return res.status(500).json({ ok:false, error:String(e?.message || e) });
--    } else {
--      console.error('[ingest post-ack error]', e?.message || e);
-+      return res.status(500).json({ ok:false, error: errMsg });
-     }
-   }
- });
- 
- // ---- 유틸
- const norm = s => (s || '').toString().trim().toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9._-]/g, '');
- 
- // 공통 바디 파서
- function parseIngestBody(req) {
-   const b = req.body || {};
-   return {
-     gcs_uri: b.gcs_uri || b.gcsUri || b.gcs_pdf_uri || b.gcsPdfUri || null,
-     uploader_id: b.uploader_id || b.uploaderId || 'anonymous',
-     content_type: b.content_type || b.mime || 'application/pdf',
-     run_id: b.run_id || b.runId || null,
-     family_slug: b.family_slug || null,
-     brand: b.brand || null,
-     code: b.code || null,
-   };
- }
- 
- // ---- ingest_run_logs 테이블 필요시 보장(앱 부팅시에 1회 호출)
- async function ensureIngestRunLogs() {
-   await query(`
-     CREATE TABLE IF NOT EXISTS public.ingest_run_logs (
-       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-       gcs_uri TEXT NOT NULL,
-       family_slug TEXT,
-       specs_table TEXT,
-       status TEXT NOT NULL DEFAULT 'PENDING',
-       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-       started_at TIMESTAMPTZ,
-       finished_at TIMESTAMPTZ,
-       error TEXT,
-       uploader_id TEXT,
-       content_type TEXT,
-       task_name TEXT,
-       retry_count INTEGER,
-       brand TEXT,
-       brand_norm TEXT,
-       code TEXT,
-       code_norm TEXT,
-       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-       duration_ms INTEGER
-     );
-   `);
-   await query(`CREATE INDEX IF NOT EXISTS idx_ingest_run_logs_created ON public.ingest_run_logs(created_at DESC);`);
- }
- 
--// ---- GCS 다운로드
--async function downloadBytes(gcsUri) {
--  const m = /^gs:\/\/([^/]+)\/(.+)$/.exec(gcsUri);
--  if (!m) throw new Error(`Bad gcs uri: ${gcsUri}`);
--  const [bucket, name] = [m[1], m[2]];
--  const [buf] = await storage.bucket(bucket).file(name).download();
--  return buf;
--}
--
--// ---- 업서트 (specs_table 과 (brand_norm, code_norm) 기준 멱등)
--async function upsertComponent({ family, specsTable, brand, code, datasheetUri, values }) {
--const pool = pgPool;
--
--  if (process.env.NO_SCHEMA_ENSURE !== '1') {
--    await pool.query('SELECT public.ensure_specs_table($1)', [family]);
--  }
--
--  const brandNorm = norm(brand);
--  const codeNorm = norm(code);
--
--  const cols = Object.keys(values || {});
--  const dbCols = cols.map(c => `"${c}"`);
--  const dbVals = cols.map((_, i) => `$${i + 7}`);
--  const insertCols = dbCols.length ? `, ${dbCols.join(',')}` : '';
--  const insertVals = dbVals.length ? `, ${dbVals.join(',')}` : '';
--  const updateCols = dbCols.length ? `${dbCols.map(c => `${c} = EXCLUDED.${c}`).join(', ')}, ` : '';
--
--  const sql = `
--    INSERT INTO public.${specsTable}
--      (id, family_slug, brand, brand_norm, code, code_norm, datasheet_uri${insertCols})
--    VALUES
--      (gen_random_uuid(), $1, $2, $3, $4, $5, $6${insertVals})
--    ON CONFLICT (brand_norm, code_norm)
--    DO UPDATE SET
--      brand = EXCLUDED.brand,
--      datasheet_uri = EXCLUDED.datasheet_uri,
--      ${updateCols}updated_at = now()
--    RETURNING id;
--  `;
--  const params = [
--    family, brand, brandNorm, code, codeNorm, datasheetUri,
--    ...cols.map(k => values[k]),
--  ];
--  await pool.query(sql, params);
--}
--
--// ▶ 체인 실행 엔드포인트: 3-스텝 멱등 파이프라인
--app.post('/api/worker/ingest/run', async (req, res) => {
--  const parsedDeadline = parseInt(
--    req.body?.deadline_ms || process.env.INGEST_DEADLINE_MS || '135000',
--    10
+-  const { rows } = await pool.query(
+-    `SELECT family_slug, fields_json, ingest_options, code_rules
+-       FROM component_spec_blueprint
+-      WHERE family_slug = $1`,
+-    [familySlug]
 -  );
--  const deadlineMs = Number.isFinite(parsedDeadline) ? parsedDeadline : 135000;
--  const body = parseIngestBody(req);
--  const runHint = body.run_id || req.body?.runId || 'n/a';
--  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runHint}`);
--  const timer = setTimeout(() => {
--    console.warn(`[ingest-run] local deadline hit`);
--    try { res.status(504).json({ error: 'deadline' }); } catch (e) {}
--  }, deadlineMs);
--
--  let rid = null;
--
--  try {
--    const gcsUri = body.gcs_uri;
--    const runId = body.run_id || req.body?.runId || null;
--    if (!gcsUri) {
--      clearTimeout(timer);
--      return res.status(400).json({ error: 'gcs_uri required' });
--    }
--
--    const { rows: runRows } = await query(`
--      INSERT INTO public.ingest_run_logs (id, gcs_uri, status, started_at, updated_at)
--      VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, 'RUNNING', now(), now())
--      ON CONFLICT (id) DO UPDATE SET status='RUNNING', started_at=COALESCE(ingest_run_logs.started_at, now()), updated_at=now()
--      RETURNING id`, [runId, gcsUri]);
--    rid = runRows[0].id;
--
--    const pdfBytes = await downloadBytes(gcsUri);
--
--    const families = await getFamilies();
--    const allowed = families.map(f => f.family_slug);
--    const fam = await classifyFamily({ pdfBytes, allowedFamilies: allowed });
--    const family = fam.family_slug;
--
--    const bp = await getBlueprint(family);
--    const values = await extractByBlueprint({ pdfBytes, family, fields: bp });
--
--    const match = families.find(f => f.family_slug === family);
--    if (!match) throw new Error(`Unknown family ${family}`);
--    const specsTable = match.specs_table;
--
--    await upsertComponent({
--      family,
--      specsTable,
--      brand: fam.brand || values.brand || 'unknown',
--      code: fam.code || values.code || 'unknown',
--      datasheetUri: gcsUri,
--      values,
--    });
--
--    await query(`UPDATE public.ingest_run_logs
--      SET status='SUCCEEDED', family_slug=$2, final_table=$3, brand=$4, brand_norm=$5, code=$6, code_norm=$7, finished_at=now(), updated_at=now(), error=NULL
--      WHERE id=$1`,
--      [rid, family, specsTable, fam.brand || null, norm(fam.brand), fam.code || null, norm(fam.code)]
--    );
--
--    clearTimeout(timer);
--    return res.status(200).json({ ok: true, runId: rid, family });
--  } catch (e) {
--    console.error('[ingest-run] error', e);
--    try {
--      await query(`UPDATE public.ingest_run_logs SET status='FAILED', error=$2, updated_at=now(), finished_at=now() WHERE id=$1`,
--        [rid || body.run_id || req.body?.runId || null, String(e?.message || e)]);
--    } catch {}
--    clearTimeout(timer);
--    return res.status(500).json({ error: String(e?.message || e) });
--  }
--});
--
--
- /* ---------------- 404 / error ---------------- */
- app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));
- app.use((err, req, res, next) => {
-   try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
-   res.status(500).json({ ok:false, error:'internal error' });
- });
+-  const v = rows[0] || null;
+-  CACHE.set(k, { t: now(), v });
+-  return v;
++function now() {
++  return Date.now();
++}
++
++function normalizeKeyList(list) {
++  if (!Array.isArray(list)) return [];
++  const seen = new Set();
++  const out = [];
++  for (const raw of list) {
++    const key = String(raw || '')
++      .trim()
++      .toLowerCase()
++      .replace(/[^a-z0-9_]/g, '');
++    if (!key || seen.has(key)) continue;
++    seen.add(key);
++    out.push(key);
++  }
++  return out;
++}
++
++function deriveAllowedKeys(fieldsJson = {}, ingestOptions = {}) {
++  if (Array.isArray(ingestOptions.allowed_keys)) {
++    const explicit = normalizeKeyList(ingestOptions.allowed_keys);
++    if (explicit.length) return explicit;
++  }
++  return normalizeKeyList(Object.keys(fieldsJson || {}));
++}
++
++function deriveVariantKeys(blueprintRow = {}) {
++  const ingestOptions = blueprintRow.ingest_options || blueprintRow.ingestOptions || {};
++  if (Array.isArray(ingestOptions.variant_keys)) {
++    return normalizeKeyList(ingestOptions.variant_keys);
++  }
++  if (Array.isArray(blueprintRow.variant_keys)) {
++    return normalizeKeyList(blueprintRow.variant_keys);
++  }
++  return [];
++}
++
++function normalizeBlueprint(row, registryRow) {
++  if (!row) return null;
++  const fields = row.fields_json || row.fields || {};
++  const ingestOptions = row.ingest_options || row.ingestOptions || {};
++  const codeRules = row.code_rules || row.codeRules || null;
++  const allowedKeys = deriveAllowedKeys(fields, ingestOptions);
++  const variantKeys = deriveVariantKeys(row);
++  const specsTable = registryRow?.specs_table || registryRow?.specsTable || `${row.family_slug}_specs`;
++
++  return {
++    family_slug: row.family_slug,
++    fields,
++    ingestOptions,
++    code_rules: codeRules,
++    allowedKeys,
++    variant_keys: variantKeys,
++    specsTable,
++  };
++}
++
++function computeFastKeys(blueprint) {
++  const ingestOptions = blueprint?.ingestOptions || {};
++  if (Array.isArray(ingestOptions.fast_keys)) {
++    const list = normalizeKeyList(ingestOptions.fast_keys);
++    if (list.length) return list;
++  }
++
++  const required = [];
++  if (blueprint?.fields && typeof blueprint.fields === 'object') {
++    for (const [key, meta] of Object.entries(blueprint.fields)) {
++      const isRequired = meta && typeof meta === 'object' && Boolean(meta.required);
++      if (isRequired) {
++        const norm = String(key || '')
++          .trim()
++          .toLowerCase()
++          .replace(/[^a-z0-9_]/g, '');
++        if (norm && !required.includes(norm)) required.push(norm);
++      }
++    }
++  }
++  if (required.length) return required;
++  return Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
++}
++
++async function getBlueprint(poolOrFamily, maybeFamily) {
++  let familySlug = null;
++  let client = pool;
++
++  if (typeof poolOrFamily === 'string' && maybeFamily == null) {
++    familySlug = poolOrFamily;
++  } else {
++    client = poolOrFamily || pool;
++    familySlug = maybeFamily;
++  }
++
++  if (!familySlug) throw new Error('familySlug required');
++
++  const cacheKey = `bp:${familySlug}`;
++  const hit = CACHE.get(cacheKey);
++  if (hit && now() - hit.t < TTL) return hit.v;
++
++  const [bpRes, regRes] = await Promise.all([
++    client.query(
++      `SELECT family_slug, fields_json, ingest_options, code_rules
++         FROM public.component_spec_blueprint
++        WHERE family_slug = $1
++        LIMIT 1`,
++      [familySlug]
++    ),
++    client.query(
++      `SELECT specs_table
++         FROM public.component_registry
++        WHERE family_slug = $1
++        LIMIT 1`,
++      [familySlug]
++    ),
++  ]);
++
++  const blueprint = normalizeBlueprint(bpRes.rows[0], regRes.rows[0]);
++  CACHE.set(cacheKey, { t: now(), v: blueprint });
++  return blueprint;
+ }
  
- /* ---------------- Boot-time setup ---------------- */
- (async () => {
-   try {
-     await query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
-     await query(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
-   } catch (e) {
-     console.warn('[BOOT] ensure extensions failed:', e?.message || e);
-   }
- })();
- 
- ensureIngestRunLogs()
-   .then(() => console.log('[BOOT] ensured ingest_run_logs'))
-   .catch(e => console.warn('[BOOT] ensure ingest_run_logs failed:', e?.message || e));
- 
- /* ---------------- Listen ---------------- */
- app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));
- 
- module.exports = app;
+-module.exports = { getBlueprint };
++module.exports = { getBlueprint, computeFastKeys };

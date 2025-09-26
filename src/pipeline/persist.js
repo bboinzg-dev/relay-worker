@@ -46,7 +46,8 @@ async function saveExtractedSpecs(familySlug, base, specs) {
   await ensureSpecsTableForFamily(familySlug);
 
   const blueprint = await getBlueprint(pool, familySlug);
-  const specsTable = blueprint?.specsTable;
+   if (!blueprint) throw new Error(`blueprint not found for family ${familySlug}`);
+  const specsTable = blueprint?.specsTable || blueprint?.specs_table;
   if (!specsTable) throw new Error(`specs table not found for family ${familySlug}`);
   const targetTable = specsTable.includes('.') ? specsTable : `public.${specsTable}`;
   const dbColTypes = await getColumnTypes(targetTable);

@@ -1,96 +1,156 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 4c176e13cbac050b609e4d91e30bcd7be4338ce4..0e7314bdad0377251f5040d0ff289e90e2e20a88 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -13,87 +13,89 @@ async function ensureSpecsTableForFamily(familySlug) {
- }
- 
- async function getColumnTypes(qualified) {
-   const [schema, table] = qualified.includes('.') ? qualified.split('.') : ['public', qualified];
-   const sql = `
-     SELECT lower(column_name) AS col, lower(data_type) AS dt
-       FROM information_schema.columns
-      WHERE table_schema=$1 AND table_name=$2
-   `;
-   const { rows } = await pool.query(sql, [schema, table]);
-   const out = new Map();
-   for (const { col, dt } of rows) {
-     if (/(integer|bigint|smallint)/.test(dt)) out.set(col, 'int');
-     else if (/(numeric|decimal|double precision|real)/.test(dt)) out.set(col, 'numeric');
-     else if (/boolean/.test(dt)) out.set(col, 'bool');
-     else out.set(col, 'text');
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 72484a18a028be92eb46f1a0cc4377890c53ff28..dd1825fc963f8b46c906fa2197e17be1562297a0 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -524,96 +524,113 @@ async function runAutoIngest({
+         if (raw && raw.length > 1000) {
+           const fieldsJson = Object.fromEntries((allowedKeys||[]).map(k => [k, 'text']));
+           const vals = await extractFields(raw, code || '', fieldsJson);
+           extracted = {
+             brand: brand || 'unknown',
+             rows: [{ brand: brand || 'unknown', code: code || (path.parse(fileName).name), ...(vals||{}) }],
+           };
+         } else {
+           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
+           extracted = await withTimeout(
+             extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
+             EXTRACT_HARD_CAP_MS,
+             'extract',
+           );
+         }
+       } else {
+         extracted = await withTimeout(
+           extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
+           EXTRACT_HARD_CAP_MS,
+           'extract',
+         );
+       }
+     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
    }
-   return out;
- }
  
- // "5, 6, 9, 12" / "1.5 to 24 V" 같은 문자열을 안전하게 수용
- function toNumberOrNull(v) {
-   if (v == null || v === '') return null;
-   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-   const s = String(v);
--  const mRange = s.match(/-?\d+(?:\.\d+)?/g);
--  if (mRange && mRange.length > 0) return Number(mRange[0]);
-+  if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/i.test(s)) return null;
-+  const mRange = s.match(/-?\d+(?:\.\d+)?/);
-+  if (mRange && mRange[0] != null) return Number(mRange[0]);
-   return null;
- }
- 
- async function saveExtractedSpecs(familySlug, base, specs) {
-   // 스키마 자동 보장(추가만 수행)
-   await ensureSpecsTableForFamily(familySlug);
- 
-   const blueprint = await getBlueprint(pool, familySlug);
-   const specsTable = blueprint?.specsTable;
-   if (!specsTable) throw new Error(`specs table not found for family ${familySlug}`);
-   const targetTable = specsTable.includes('.') ? specsTable : `public.${specsTable}`;
-   const dbColTypes = await getColumnTypes(targetTable);
- 
-   const baseCols = ['family_slug','brand','brand_norm','code','code_norm','series_code','mfr_full','datasheet_uri','verified_in_doc'];
-   const baseVals = [
-     familySlug,
-     base.brand, String(base.brand || '').toLowerCase(),
-     base.code,  String(base.code  || '').toLowerCase(),
-     base.series_code ?? null,
-     base.mfr_full ?? null,
-     base.datasheet_uri ?? null,
-     true
-   ];
- 
-   const RESERVED = new Set(['id','brand','code','brand_norm','code_norm','created_at','updated_at']);
-   const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
-   const allowedKeys = Array.isArray(blueprint?.allowedKeys)
-     ? blueprint.allowedKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-     : [];
-   const fieldTypes = blueprint?.fields || {};
-   function coerceNumeric(x) {
-     if (x == null || x === '') return null;
-     if (typeof x === 'number') return x;
-     let s = String(x).toLowerCase();
-     s = s.replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
-+    if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/.test(s)) return null;
-     const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
-     if (!m) return null;
-     let n = parseFloat(m[1]);
-     const mul = (m[2] || '').toLowerCase();
-     const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
-     if (mul && scale[mul] != null) n = n * scale[mul];
-     return Number.isFinite(n) ? n : null;
++  // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
+   let codes = [];
+   if (!code) {
+     const skuFromTable = pickSkuListFromTables(extracted);
+     codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint);
+     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
+     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
+     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
    }
-   function coerceByType(key, val) {
-     let t = String(fieldTypes[key] || '').toLowerCase();
-     if (t === 'string') t = 'text';
-     if (!t || t === 'text') t = dbColTypes.get(key) || t || 'text';
-     if (t === 'float' || t === 'double' || t === 'decimal') t = 'numeric';
-     if (t === 'integer' || t === 'bigint' || t === 'smallint') t = 'int';
-     if (t === 'numeric') return coerceNumeric(val);
-     if (t === 'int')     { const n = coerceNumeric(val); return (n==null?null:Math.round(n)); }
-     if (t === 'bool')    {
-       if (typeof val === 'boolean') return val;
-       const s = String(val||'').toLowerCase().trim();
-       if (!s) return null;
-       return /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
+ 
++  // 🔹 후보(candidates)가 아직 비었고, 방금 수집한 codes가 있으면 candidates로 승격
+   if (!candidates.length && codes.length) {
+     const merged = [];
+     const seen = new Set();
+     for (const raw of codes) {
+       const trimmed = typeof raw === 'string' ? raw.trim() : String(raw || '');
+       if (!trimmed) continue;
+       const norm = normalizeCode(trimmed);
+       if (seen.has(norm)) continue;
+       seen.add(norm);
+       merged.push(trimmed);
      }
-     return (val == null ? null : String(val));
+     if (merged.length) candidates = merged;
    }
-   const fastKeys = FAST
+ 
++  // 🔹 “애초에 분석단계에서 여러 MPN을 리스트업” — 추출 결과에 명시적으로 부착
++  if (extracted && typeof extracted === 'object') {
++    const list = (Array.isArray(codes) ? codes : []).filter(Boolean);
++    extracted.codes = list;        // <- 최종 MPN 배열
++    extracted.mpn_list = list;     // <- 동의어(외부에서 쓰기 쉽도록)
++  }
++
+   if (!code && !codes.length) {
+     let fullText = '';
+     try { fullText = await readText(gcsUri, 300 * 1024) || ''; } catch {}
+ 
+     const fromTypes  = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
+     const fromOrder  = rankPartNumbersFromOrderingSections(fullText, FIRST_PASS_CODES);
+     const fromSeries = extractPartNumbersBySeriesHeuristic(fullText, FIRST_PASS_CODES * 4);
+     // 가장 신뢰 높은 순서로 병합
+     const picks = fromTypes.length ? fromTypes : (fromOrder.length ? fromOrder : fromSeries);
+ 
+     if (!candidates.length && picks.length) {
+       const merged = [];
+       const seen = new Set();
+       for (const p of picks) {
+         const raw = typeof p === 'string' ? p : p?.code;
+         const trimmed = typeof raw === 'string' ? raw.trim() : '';
+         if (!trimmed) continue;
+         const norm = normalizeCode(trimmed);
+         if (seen.has(norm)) continue;
+         seen.add(norm);
+         merged.push(trimmed);
+       }
+-      if (merged.length) candidates = merged;
++      if (merged.length) {
++        candidates = merged;
++        // 🔹 types/order/series 휴리스틱으로도 찾은 경우, 이것도 추출 결과에 반영
++        if (extracted && typeof extracted === 'object') {
++          const uniq = Array.from(new Set([...(extracted.codes || []), ...merged]));
++          extracted.codes = uniq;
++          extracted.mpn_list = uniq;
++        }
++      }
+     }
+ 
+     // 분할 여부는 별도 판단. 여기서는 후보만 모아둠.
+     // extracted.rows는 건드리지 않음.
+   }
+ 
+ 
+   // 커버 추출 비활성(요청에 따라 완전 OFF)
+   let coverUri = null;
+   if (/^(1|true|on)$/i.test(process.env.COVER_CAPTURE || '0')) {
+     try {
+       const bForCover = brand || extracted.brand || 'unknown';
+       const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
+       coverUri = await withTimeout(
+         extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
+         Math.min(30000, Math.round(BUDGET * 0.15)),
+         'cover',
+       );
+     } catch (e) { console.warn('[cover fail]', e?.message || e); }
+   }
+ 
+   if (code) {
+     const trimmedCode = String(code || '').trim();
+     if (trimmedCode) {
+       const norm = normalizeCode(trimmedCode);
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 72484a18a028be92eb46f1a0cc4377890c53ff28..dd1825fc963f8b46c906fa2197e17be1562297a0 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -826,29 +843,32 @@ async function runAutoIngest({
+     for (const [k,v] of Object.entries(rec)) {
+       const kk = String(k || '').toLowerCase();
+       if (BASE_KEYS.has(kk)) continue;
+       if (!colsSet.has(kk)) continue;
+       if (META_KEYS.has(kk)) continue;
+       safe[kk] = v;
+     }
+     if (colsSet.has('updated_at')) safe.updated_at = now;
+ 
+     // ← 업서트 전에 숫자/정수/불리언 컬럼을 타입에 맞춰 정리(실패 키는 삭제)
+     sanitizeByColTypes(safe, colTypes);
+     await upsertByBrandCode(table, normalizeKeysOnce(safe));
+     upserted++;
+   }
+ 
+   return {
+     ok: true,
+     ms: Date.now() - started,
+     family,
+     final_table: table,
+     brand: records[0]?.brand,
+     code:  records[0]?.code,
+     datasheet_uri: gcsUri,
+     cover: records[0]?.image_uri || null,
+     rows: upserted,
++    // 🔹 호출자가 “이번 PDF에서 뽑힌 모든 MPN 리스트”를 바로 확인 가능
++    codes: Array.isArray(extracted?.codes) ? extracted.codes : [],
++    mpn_list: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
+   };
+ }
+ 
+ module.exports = { runAutoIngest };

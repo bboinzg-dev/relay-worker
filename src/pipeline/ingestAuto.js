@@ -546,6 +546,7 @@ async function runAutoIngest({
     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
   }
 
+  // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
   let codes = [];
   if (!code) {
     const skuFromTable = pickSkuListFromTables(extracted);
@@ -555,6 +556,7 @@ async function runAutoIngest({
     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
   }
 
+  // 🔹 후보(candidates)가 아직 비었고, 방금 수집한 codes가 있으면 candidates로 승격
   if (!candidates.length && codes.length) {
     const merged = [];
     const seen = new Set();
@@ -567,6 +569,13 @@ async function runAutoIngest({
       merged.push(trimmed);
     }
     if (merged.length) candidates = merged;
+  }
+
+  // 🔹 “애초에 분석단계에서 여러 MPN을 리스트업” — 추출 결과에 명시적으로 부착
+  if (extracted && typeof extracted === 'object') {
+    const list = (Array.isArray(codes) ? codes : []).filter(Boolean);
+    extracted.codes = list;        // <- 최종 MPN 배열
+    extracted.mpn_list = list;     // <- 동의어(외부에서 쓰기 쉽도록)
   }
 
   if (!code && !codes.length) {
@@ -591,7 +600,15 @@ async function runAutoIngest({
         seen.add(norm);
         merged.push(trimmed);
       }
-      if (merged.length) candidates = merged;
+      if (merged.length) {
+        candidates = merged;
+        // 🔹 types/order/series 휴리스틱으로도 찾은 경우, 이것도 추출 결과에 반영
+        if (extracted && typeof extracted === 'object') {
+          const uniq = Array.from(new Set([...(extracted.codes || []), ...merged]));
+          extracted.codes = uniq;
+          extracted.mpn_list = uniq;
+        }
+      }
     }
 
     // 분할 여부는 별도 판단. 여기서는 후보만 모아둠.
@@ -848,6 +865,9 @@ async function runAutoIngest({
     datasheet_uri: gcsUri,
     cover: records[0]?.image_uri || null,
     rows: upserted,
+    // 🔹 호출자가 “이번 PDF에서 뽑힌 모든 MPN 리스트”를 바로 확인 가능
+    codes: Array.isArray(extracted?.codes) ? extracted.codes : [],
+    mpn_list: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
   };
 }
 

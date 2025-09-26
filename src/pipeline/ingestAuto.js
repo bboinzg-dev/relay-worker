@@ -14,7 +14,6 @@ const { getBlueprint } = require('../utils/blueprint');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
 const { saveExtractedSpecs } = require('./persist');
-const { safeJsonParse } = require('../utils/safe-json');
 
 const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
 const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
@@ -78,22 +77,19 @@ function coerceNumeric(x) {
 }
 
 // "5, 6, 9, 12" / "5/12/24" / "5 12 24" → [5,12,24]
-// "1.5 to 24" 같은 범위는 "분할 금지" → [] 반환
+// "1.5 to 24" 같은 범위는 '분할 금지' → [] 반환
 function parseListOrRange(s) {
   if (Array.isArray(s)) return s;
-  const raw = String(s || '').trim();
+  const raw = String(s ?? '').trim();
   if (!raw) return [];
-  // 1) 범위: "1.5 to 24" or "1.5–24" → 분할 금지
   if (/(-?\d+(?:\.\d+)?)\s*(?:to|–|-)\s*(-?\d+(?:\.\d+)?)/i.test(raw)) return [];
-  // 2) 구분자 리스트
-  return raw.split(/[,、\/\s]+/).map(x => parseFloat(x)).filter(n => Number.isFinite(n));
+  return raw.split(/[,、\/\s]+/).map(x => parseFloat(x)).filter(Number.isFinite);
 }
 
-// 분할 여부 결정: 후보(PN/시리즈) ≥2 또는 variant 열거형 곱 ≥2 일 때만 분할
+// 분할 여부: PN 후보≥2 또는 variant 열거형 곱≥2 이면 분할
 function decideSplit({ pnCandidates = [], seriesCandidates = [], variantKeys = [], specs = {} }) {
   if ((pnCandidates?.length || 0) >= 2) return true;
   if ((seriesCandidates?.length || 0) >= 2) return true;
-
   if (Array.isArray(variantKeys) && variantKeys.length) {
     let count = 1;
     for (const k of variantKeys) {
@@ -103,48 +99,32 @@ function decideSplit({ pnCandidates = [], seriesCandidates = [], variantKeys = [
     }
     if (count >= 2) return true;
   }
-  return false; // 기본 단일
+  return false;
 }
 
-// 블루프린트 기반 폭발: variant_keys 교차곱
-function explodeVariants(base = {}, bp = {}) {
-  const keys = Array.isArray(bp?.variant_keys) ? bp.variant_keys : [];
-  if (!keys.length) return [base];
-  const arrays = keys.map((k) => {
-    const v = base[k];
-    if (Array.isArray(v)) return v;
-    if (typeof v === 'string') {
-      const trimmed = v.trim();
-      if (!trimmed) return [];
-      if (/^\s*\[/.test(trimmed)) {
-        try {
-          const parsed = safeJsonParse(trimmed);
-          if (Array.isArray(parsed) && parsed.length) return parsed;
-        } catch {}
-      }
-      const parts = trimmed.split(/[,;/\n]+/).map((s) => s.trim()).filter(Boolean);
-      if (parts.length) return parts;
-      return [trimmed];
-    }
-    if (v == null) return [];
-    return [v];
+// variant_keys 교차곱으로 base/specs 병합 배열 생성
+function explodeVariants(base = {}, specs = {}, bp = {}) {
+  const keys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
+  if (!keys.length) return [{ ...base, ...specs }];
+  const lists = keys.map(k => {
+    const arr = parseListOrRange(specs[k]);
+    if (arr.length) return arr;
+    return (specs[k] != null ? [specs[k]] : []);
   });
-  if (!arrays.length || arrays.some((a) => !a.length)) return [base];
-
-  const acc = [];
-  const rec = (i, cur) => {
-    if (i === keys.length) {
-      acc.push({ ...base, ...cur });
-      return;
-    }
-    for (const x of arrays[i]) rec(i + 1, { ...cur, [keys[i]]: x });
+  if (!lists.length || lists.some(a => !a.length)) return [{ ...base, ...specs }];
+  const out = [];
+  const dfs = (i, cur) => {
+    if (i === keys.length) { out.push({ ...base, ...cur }); return; }
+    const key = keys[i];
+    for (const v of lists[i]) dfs(i + 1, { ...cur, [key]: v });
   };
-  rec(0, {});
-  return acc;
+  dfs(0, { ...specs });
+  return out;
 }
 
+// pn_template 로 개별 MPN 조립
 function buildMpn(rec, bp) {
-  const t = bp?.pn_template;
+  const t = bp?.pn_template || bp?.ingestOptions?.pn_template;
   if (!t) return rec.code;
   return t.replace(/\$\{(\w+)\}/g, (_, k) => String(rec[k] ?? ''));
 }
@@ -522,9 +502,7 @@ async function runAutoIngest({
   // 블루프린트 허용 키
   const bp = await getBlueprint(family);
   const allowedKeys = bp.allowedKeys || [];
-  const fieldTypes  = bp.fields || {};   // { key: 'numeric' | 'int' | 'bool' | 'text' | ... }
   const variantKeys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
-  const pnTemplate  = bp.pn_template || null;
 
   // -------- 공용 강제정규화 유틸 --------
 
@@ -533,19 +511,6 @@ async function runAutoIngest({
     series = code; code = null;
   }
 
-  // 블루프린트 타입이 없으면 DB컬럼 타입으로 보강
-  function coerceByType(key, val) {
-    const t = String(fieldTypes[key] || colTypes.get(key) || 'text').toLowerCase();
-    if (t === 'numeric') return coerceNumeric(val);
-    if (t === 'int')     { const n = coerceNumeric(val); return (n==null?null:Math.round(n)); }
-    if (t === 'bool')    {
-      if (typeof val === 'boolean') return val;
-      const s = String(val||'').toLowerCase().trim();
-      if (!s) return null;
-      return /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
-    }
-    return (val == null ? null : String(val));
-  }
 
   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
   let previewText = '';
@@ -685,54 +650,25 @@ async function runAutoIngest({
   }
 
   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
-  const specRows = rawRows.length ? rawRows.slice(0) : (code ? [{ code }] : []);
-  if (!specRows.length) specRows.push({});
+  const specRows = rawRows.length ? rawRows.slice(0) : [{}];
 
-  const explodedEntries = [];
+  let explodedEntries = [];
   for (const row of specRows) {
-    const structured = row && typeof row === 'object' ? { ...row } : {};
-    const seedBrand = structured.brand || brandName;
-    const seedSeries = structured.series_code || structured.series || baseSeries || null;
-    const seedCode = structured.code ?? seedSeries ?? null;
-    const baseRecord = { ...structured, brand: seedBrand, code: seedCode };
-    const combos = explodeVariants(baseRecord, bp);
-    for (const combo of combos) {
-      const normalized = {
-        ...combo,
-        brand: combo.brand || seedBrand,
-      };
-      const seriesCode = normalized.series_code ?? normalized.series ?? seedSeries ?? normalized.code ?? null;
-      if (seriesCode != null) {
-        normalized.series_code = seriesCode;
-        if (normalized.series == null) normalized.series = seriesCode;
+    const r = row && typeof row === 'object' ? { ...row } : {};
+    const seedBrand  = extracted.brand || brandName;
+    const seedSeries = r.series_code || r.series || baseSeries || null;
+    const seedCode   = r.code ?? seedSeries ?? null; // 템플릿 없을 때 시리즈가 code
+    const baseRec    = { ...r, brand: seedBrand, series_code: seedSeries, code: seedCode };
+    const combos = explodeVariants({ brand: seedBrand, series_code: seedSeries }, r, bp);
+    if (combos.length) {
+      for (const combo of combos) {
+        explodedEntries.push({ ...baseRec, ...combo });
       }
-      const mpn = buildMpn(normalized, bp);
-      if (mpn) {
-        normalized.code = mpn;
-        normalized.code_norm = mpn.toLowerCase();
-      } else if (normalized.code) {
-        normalized.code_norm = String(normalized.code).toLowerCase();
-      }
-      const specPayload = {};
-      for (const key of allowedKeys) {
-        if (normalized[key] != null) specPayload[key] = normalized[key];
-      }
-      explodedEntries.push({ base: normalized, specs: specPayload });
+    } else {
+      explodedEntries.push({ ...baseRec });
     }
   }
-  if (!explodedEntries.length) {
-    const fallbackCode = baseSeries || null;
-    explodedEntries.push({
-      base: {
-        brand: brandName,
-        series: baseSeries || null,
-        series_code: baseSeries || null,
-        code: fallbackCode,
-        code_norm: fallbackCode ? String(fallbackCode).toLowerCase() : null,
-      },
-      specs: {},
-    });
-  }
+  if (!explodedEntries.length) explodedEntries = [{ brand: brandName, series_code: baseSeries || null, code: baseSeries || null }];
 
   // ---- 분할 여부 결정 ----
   const pnCands = candidateMap.map((c) => c.raw);
@@ -744,119 +680,69 @@ async function runAutoIngest({
     specs: (rawRows[0] || {})
   });
 
-  // 단일이면 1건만 유지
   if (!mustSplit && explodedEntries.length > 1) explodedEntries.splice(1);
-
-  // 분할이고, 후보 MPN이 2개 이상인데 entries 가 1건뿐이면 → 후보 수만큼 복제
   if (mustSplit && candidateMap.length > 1 && explodedEntries.length <= 1) {
     const max = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
-    const tmpl = explodedEntries[0] || {
-      base: { brand: brandName, series: baseSeries, series_code: baseSeries || null },
-      specs: {},
-    };
+    const tmpl = explodedEntries[0] || { brand: brandName, series_code: baseSeries || null };
     const dup = [];
     for (const c of candidateMap.slice(0, max)) {
-      dup.push({
-        base: {
-          ...tmpl.base,
-          code: c.raw,
-          code_norm: String(c.raw || '').toLowerCase(),
-        },
-        specs: { ...tmpl.specs },
-      });
+      dup.push({ ...tmpl, code: c.raw, code_norm: String(c.raw || '').toLowerCase() });
     }
-    explodedEntries.splice(0, explodedEntries.length, ...dup);
+    explodedEntries = dup;
   }
 
   const seenCodes = new Set();
-  const pickNumeric = (...vals) => {
-    for (const v of vals) {
-      const n = coerceNumeric(v);
-      if (Number.isFinite(n)) return n;
-    }
-    return null;
-  };
-
   for (const entry of explodedEntries) {
-    const baseInfo = entry?.base || {};
-    const specsSource = entry?.specs || {};
-    const recordBrand = baseInfo.brand || brandName;
+    const baseInfo = entry || {};
     const specs = {};
-    for (const key of allowedKeys) {
-      if (specsSource[key] != null) specs[key] = specsSource[key];
-      else if (baseInfo[key] != null) specs[key] = baseInfo[key];
-    }
+    for (const k of allowedKeys) if (entry[k] != null) specs[k] = entry[k];
+    const pickNumeric = (vals) => {
+      for (const v of (Array.isArray(vals) ? vals : [vals])) { const n = coerceNumeric(v); if (Number.isFinite(n)) return n; }
+      return null;
+    };
+    const voltageNum   = pickNumeric(specs.coil_voltage_vdc || specs.coil_voltage || specs.voltage_vdc || specs.voltage_dc || specs.voltage);
+    const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2,'0') : null;
 
-    const voltageNum = pickNumeric(
-      specs.coil_voltage_vdc,
-      specs.coil_voltage,
-      specs.voltage_vdc,
-      specs.voltage_dc,
-      specs.voltage
-    );
-    const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2, '0') : null;
-    const seriesSeed = baseInfo.series_code || baseInfo.series || baseSeries || null;
-
-    let mpn = baseInfo.code ? String(baseInfo.code).trim() : null; // 후보 복제의 효과
+    let mpn = baseInfo.code ? String(baseInfo.code).trim() : null;   // 후보 복제 시 base.code가 곧 MPN
     if (!mpn && candidateMap.length) {
-      const match = voltageToken ? candidateMap.find((c) => c.norm.includes(voltageToken)) : null;
-      const pick = match || candidateMap[0];
-      if (pick) mpn = pick.raw;
+      const match = voltageToken ? candidateMap.find(c => c.norm.includes(voltageToken)) : null;
+      mpn = (match || candidateMap[0])?.raw || null;
     }
-    if (!mpn && pnTemplate) {
-      const templated = buildMpn({ ...entry, code: seriesSeed ?? '' }, bp)?.trim();
+    if (!mpn) {
+      const templated = buildMpn({ ...specs, ...baseInfo }, bp);
       if (templated) mpn = templated;
     }
     if (!mpn && specs.code) mpn = String(specs.code).trim();
-    if (!mpn && seriesSeed) {
-      const prefix = seriesSeed;
-      if (prefix) {
-        const suffix = voltageToken || (voltageNum != null ? String(Math.round(voltageNum)) : '');
-        mpn = `${prefix}${suffix}`.trim();
-      }
-    }
-    if (!mpn && candidateMap.length) mpn = candidateMap[0].raw;
-    if (!mpn) {
-      const seed = seriesSeed || recordBrand || brandName || 'MPN';
-      mpn = `${seed}${Date.now().toString(16).slice(-4)}`.toUpperCase();
-    }
 
-    mpn = String(mpn || '').trim();
+    if (!mpn) {
+      const prefix = baseInfo.series_code || baseInfo.series || baseSeries || '';
+      const suffix = voltageToken || (voltageNum != null ? String(Math.round(voltageNum)) : '');
+      if (prefix || suffix) mpn = `${prefix}${suffix}`.trim();
+    }
     if (!mpn) continue;
+
     const mpnNorm = normalizeCode(mpn);
-    if (!mpnNorm) continue;
-    if (seenCodes.has(mpnNorm)) continue;
+    if (!mpnNorm || seenCodes.has(mpnNorm)) continue;
     seenCodes.add(mpnNorm);
 
     const rec = {
       family_slug: family,
-      brand: recordBrand,
+      brand: baseInfo.brand || brandName,
       code: mpn,
-      code_norm: mpn.toLowerCase(),
-      series_code: seriesSeed,
+      code_norm: mpnNorm,
+      series_code: baseInfo.series_code || baseSeries || null,
       datasheet_uri: gcsUri,
       image_uri: coverUri || null,
-      display_name: `${recordBrand} ${mpn}`,
+      display_name: `${baseInfo.brand || brandName} ${mpn}`,
       verified_in_doc: candidateNormSet.has(mpnNorm),
       updated_at: now,
     };
-
-    if (baseInfo.mfr_full && rec.mfr_full == null) rec.mfr_full = baseInfo.mfr_full;
-
     for (const k of allowedKeys) {
       let v = specs[k];
       if (v == null) continue;
-      if (Array.isArray(v)) {
-        v = v.length ? v[0] : null;
-      } else if (typeof v === 'string' && variantKeys.includes(k)) {
-        const arr = parseListOrRange(v);
-        v = arr.length ? arr[0] : null;
-      }
-      if (v == null) continue;
-      const coerced = coerceByType(k, v);
-      if (coerced != null) rec[k] = coerced;
+      if (Array.isArray(v)) v = v[0];
+      rec[k] = v;
     }
-
     if (bp.code_rules) applyCodeRules(rec.code, rec, bp.code_rules, colTypes);
     records.push(rec);
   }

@@ -1,48 +1,540 @@
-diff --git a/src/utils/vertex.js b/src/utils/vertex.js
-index c3508b964a1006bf0966c904645e274c4b61212a..d52e58502f40371c36e0e49d92a197fffa8d0fe0 100644
---- a/src/utils/vertex.js
-+++ b/src/utils/vertex.js
-@@ -1,36 +1,41 @@
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index a1806f8d15762134c4d68a83a027d71bc421d802..0d87976a00d01e937aca58a0fe146b0c48ea3b10 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1,42 +1,41 @@
  'use strict';
  
- const { VertexAI } = require('@google-cloud/vertexai');
-+const { safeJsonParse } = require('./safe-json');
+ const path = require('node:path');
+ const fs = require('node:fs/promises');
+ const os = require('node:os');
+ const { execFile } = require('node:child_process');
+ const { promisify } = require('node:util');
+ const execFileP = promisify(execFile);
  
- const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID;
- const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
- const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
+ const db = require('../utils/db');
+ const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
+ const { upsertByBrandCode } = require('../utils/schema');
+ const { getBlueprint } = require('../utils/blueprint');
+ const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
+ const { extractFields } = require('./extractByBlueprint');
+ const { saveExtractedSpecs } = require('./persist');
+-const { safeJsonParse } = require('../utils/safe-json');
  
- const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+ const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
+ const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
  
- // Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용
- function getModel(systemText, modelId = MODEL_ID) {
-   const cfg = { model: modelId };
-   if (systemText && String(systemText).trim()) {
-     cfg.systemInstruction = { parts: [{ text: String(systemText) }] };
+ // family별 "최소 키셋" (필요 최소치만 저장)
+ const MIN_KEYS = {
+   relay_power: [
+     'contact_form','contact_rating_ac','contact_rating_dc',
+     'coil_voltage_vdc','size_l_mm','size_w_mm','size_h_mm'
+   ],
+   relay_signal: [
+     'contact_form','contact_rating_ac','contact_rating_dc','coil_voltage_vdc'
+   ]
+ };
+ 
+ function normLower(s){ return String(s||'').trim().toLowerCase(); }
+ 
+ async function getTableColumns(qualified) {
+   const [schema, table] = qualified.includes('.') ? qualified.split('.') : ['public', qualified];
+   const q = `
+     SELECT a.attname AS col
+       FROM pg_attribute a
+       JOIN pg_class c ON a.attrelid = c.oid
+       JOIN pg_namespace n ON c.relnamespace = n.oid
+      WHERE n.nspname = $1 AND c.relname = $2
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index a1806f8d15762134c4d68a83a027d71bc421d802..0d87976a00d01e937aca58a0fe146b0c48ea3b10 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -56,117 +55,98 @@ async function getColumnTypes(qualified) {
+   const out = new Map();
+   for (const { col, dt } of rows) {
+     if (/(integer|bigint|smallint)/.test(dt)) out.set(col, 'int');
+     else if (/(numeric|decimal|double precision|real)/.test(dt)) out.set(col, 'numeric');
+     else if (/boolean/.test(dt)) out.set(col, 'bool');
+     else out.set(col, 'text');
    }
-   return vertex.getGenerativeModel(cfg);
+   return out;
  }
  
- async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.1 } = {}) {
-   const model = getModel(systemText, modelId);
-   const req = {
-     contents: [{ role: 'user', parts: [{ text: String(userText || '') }]}],
-     generationConfig: {
-       responseMimeType: 'application/json',
-       temperature,
-       maxOutputTokens,
-     },
+ // 숫자 강제정규화(콤마/단위/리스트/범위 허용 → 첫 숫자만)
+ function coerceNumeric(x) {
+   if (x == null || x === '') return null;
+   if (typeof x === 'number') return x;
+   let s = String(x).toLowerCase().replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
+   const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
+   if (!m) return null;
+   let n = parseFloat(m[1]);
+   const mul = (m[2] || '').toLowerCase();
+   const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
+   if (mul && scale[mul] != null) n *= scale[mul];
+   return Number.isFinite(n) ? n : null;
+ }
+ 
+ // "5, 6, 9, 12" / "5/12/24" / "5 12 24" → [5,12,24]
+-// "1.5 to 24" 같은 범위는 "분할 금지" → [] 반환
++// "1.5 to 24" 같은 범위는 '분할 금지' → [] 반환
+ function parseListOrRange(s) {
+   if (Array.isArray(s)) return s;
+-  const raw = String(s || '').trim();
++  const raw = String(s ?? '').trim();
+   if (!raw) return [];
+-  // 1) 범위: "1.5 to 24" or "1.5–24" → 분할 금지
+   if (/(-?\d+(?:\.\d+)?)\s*(?:to|–|-)\s*(-?\d+(?:\.\d+)?)/i.test(raw)) return [];
+-  // 2) 구분자 리스트
+-  return raw.split(/[,、\/\s]+/).map(x => parseFloat(x)).filter(n => Number.isFinite(n));
++  return raw.split(/[,、\/\s]+/).map(x => parseFloat(x)).filter(Number.isFinite);
+ }
+ 
+-// 분할 여부 결정: 후보(PN/시리즈) ≥2 또는 variant 열거형 곱 ≥2 일 때만 분할
++// 분할 여부: PN 후보≥2 또는 variant 열거형 곱≥2 이면 분할
+ function decideSplit({ pnCandidates = [], seriesCandidates = [], variantKeys = [], specs = {} }) {
+   if ((pnCandidates?.length || 0) >= 2) return true;
+   if ((seriesCandidates?.length || 0) >= 2) return true;
+-
+   if (Array.isArray(variantKeys) && variantKeys.length) {
+     let count = 1;
+     for (const k of variantKeys) {
+       const vals = parseListOrRange(specs[k]);
+       const n = vals.length || (specs[k] != null ? 1 : 0);
+       count *= Math.max(1, n);
+     }
+     if (count >= 2) return true;
+   }
+-  return false; // 기본 단일
++  return false;
+ }
+ 
+-// 블루프린트 기반 폭발: variant_keys 교차곱
+-function explodeVariants(base = {}, bp = {}) {
+-  const keys = Array.isArray(bp?.variant_keys) ? bp.variant_keys : [];
+-  if (!keys.length) return [base];
+-  const arrays = keys.map((k) => {
+-    const v = base[k];
+-    if (Array.isArray(v)) return v;
+-    if (typeof v === 'string') {
+-      const trimmed = v.trim();
+-      if (!trimmed) return [];
+-      if (/^\s*\[/.test(trimmed)) {
+-        try {
+-          const parsed = safeJsonParse(trimmed);
+-          if (Array.isArray(parsed) && parsed.length) return parsed;
+-        } catch {}
+-      }
+-      const parts = trimmed.split(/[,;/\n]+/).map((s) => s.trim()).filter(Boolean);
+-      if (parts.length) return parts;
+-      return [trimmed];
+-    }
+-    if (v == null) return [];
+-    return [v];
++// variant_keys 교차곱으로 base/specs 병합 배열 생성
++function explodeVariants(base = {}, specs = {}, bp = {}) {
++  const keys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
++  if (!keys.length) return [{ ...base, ...specs }];
++  const lists = keys.map(k => {
++    const arr = parseListOrRange(specs[k]);
++    if (arr.length) return arr;
++    return (specs[k] != null ? [specs[k]] : []);
+   });
+-  if (!arrays.length || arrays.some((a) => !a.length)) return [base];
+-
+-  const acc = [];
+-  const rec = (i, cur) => {
+-    if (i === keys.length) {
+-      acc.push({ ...base, ...cur });
+-      return;
+-    }
+-    for (const x of arrays[i]) rec(i + 1, { ...cur, [keys[i]]: x });
++  if (!lists.length || lists.some(a => !a.length)) return [{ ...base, ...specs }];
++  const out = [];
++  const dfs = (i, cur) => {
++    if (i === keys.length) { out.push({ ...base, ...cur }); return; }
++    const key = keys[i];
++    for (const v of lists[i]) dfs(i + 1, { ...cur, [key]: v });
    };
-   const resp = await model.generateContent(req);
-   const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
--  try { return JSON.parse(txt); }
--  catch { throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`); }
-+  try {
-+    const parsed = safeJsonParse(txt);
-+    return parsed ?? {};
-+  } catch {
-+    throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`);
-+  }
+-  rec(0, {});
+-  return acc;
++  dfs(0, { ...specs });
++  return out;
  }
  
- module.exports = { getModel, callModelJson };
++// pn_template 로 개별 MPN 조립
+ function buildMpn(rec, bp) {
+-  const t = bp?.pn_template;
++  const t = bp?.pn_template || bp?.ingestOptions?.pn_template;
+   if (!t) return rec.code;
+   return t.replace(/\$\{(\w+)\}/g, (_, k) => String(rec[k] ?? ''));
+ }
+ 
+ function pickSkuListFromTables(extracted = {}) {
+   const out = new Set();
+   const HEAD_RE = /(part\s*no\.?|ordering\s*information|part\s*number)/i;
+   for (const t of (extracted.tables || [])) {
+     if (!t) continue;
+     const headers = Array.isArray(t.headers) ? t.headers : [];
+     const head = headers.join(' ').trim();
+     if (!HEAD_RE.test(head)) continue;
+     let partIdx = 0;
+     const idx = headers.findIndex((h) => /part\s*no\.?/i.test(String(h || '')));
+     if (idx >= 0) partIdx = idx;
+     for (const row of (t.rows || [])) {
+       if (!Array.isArray(row)) continue;
+       const cand = String(row[partIdx] || '').trim();
+       if (/^[A-Z0-9][A-Z0-9\-_/\.]{3,}$/i.test(cand)) out.add(cand);
+     }
+   }
+   return [...out];
+ }
+ 
+ function expandFromCodeSystem(extracted, bp) {
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index a1806f8d15762134c4d68a83a027d71bc421d802..0d87976a00d01e937aca58a0fe146b0c48ea3b10 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -500,74 +480,59 @@ async function runAutoIngest({
+      const text = await readText(gcsUri, 256*1024);
+      family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
+      // ★ 강제 보정: 제목/본문에 Signal Relay가 있으면 무조건 signal로
+      if (/subminiature\s+signal\s+relay|signal\s+relay/i.test(text)) family = 'relay_signal';
+    } catch { family = 'relay_power'; }
+   }
+ 
+   // 목적 테이블
+   const reg = await db.query(
+     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+     [family]
+   );
+   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
+   const qualified = table.startsWith('public.')? table : `public.${table}`;
+ 
+   // 스키마 보장 (DB 함수) + 컬럼셋 확보
+     if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
+     await ensureSpecsTableByFamily(family);
+   }
+   const colsSet = await getTableColumns(qualified);
+   const colTypes = await getColumnTypes(qualified);
+ 
+   // 블루프린트 허용 키
+   const bp = await getBlueprint(family);
+   const allowedKeys = bp.allowedKeys || [];
+-  const fieldTypes  = bp.fields || {};   // { key: 'numeric' | 'int' | 'bool' | 'text' | ... }
+   const variantKeys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
+-  const pnTemplate  = bp.pn_template || null;
+ 
+   // -------- 공용 강제정규화 유틸 --------
+ 
+   if (code && !/\d/.test(String(code))) {
+     // "AGN","TQ" 처럼 숫자 없는 시리즈는 series로 넘기고 code는 비움
+     series = code; code = null;
+   }
+ 
+-  // 블루프린트 타입이 없으면 DB컬럼 타입으로 보강
+-  function coerceByType(key, val) {
+-    const t = String(fieldTypes[key] || colTypes.get(key) || 'text').toLowerCase();
+-    if (t === 'numeric') return coerceNumeric(val);
+-    if (t === 'int')     { const n = coerceNumeric(val); return (n==null?null:Math.round(n)); }
+-    if (t === 'bool')    {
+-      if (typeof val === 'boolean') return val;
+-      const s = String(val||'').toLowerCase().trim();
+-      if (!s) return null;
+-      return /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
+-    }
+-    return (val == null ? null : String(val));
+-  }
+ 
+   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
+   let previewText = '';
+   try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
+   let candidates = [];
+   try {
+     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
+   } catch { candidates = []; }
+ 
+   // PDF → 품번/스펙 추출
+   let extracted = { brand: brand || 'unknown', rows: [] };
+   if (!brand || !code) {
+     try {
+       if (FAST) {
+         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
+         let raw = previewText;
+         if (!raw) {
+           try { raw = await readText(gcsUri, PREVIEW_BYTES); } catch { raw = ''; }
+         }
+         if (raw && raw.length > 1000) {
+           const fieldsJson = Object.fromEntries((allowedKeys||[]).map(k => [k, 'text']));
+           const vals = await extractFields(raw, code || '', fieldsJson);
+           extracted = {
+             brand: brand || 'unknown',
+             rows: [{ brand: brand || 'unknown', code: code || (path.parse(fileName).name), ...(vals||{}) }],
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index a1806f8d15762134c4d68a83a027d71bc421d802..0d87976a00d01e937aca58a0fe146b0c48ea3b10 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -663,222 +628,143 @@ async function runAutoIngest({
+       const norm = normalizeCode(trimmedCode);
+       if (!candidates.some((c) => normalizeCode(c) === norm)) {
+         candidates = [trimmedCode, ...candidates];
+       }
+     }
+   }
+ 
+   // 레코드 구성
+   const records = [];
+   const now = new Date();
+   const brandName = brand || extracted.brand || 'unknown';
+   const baseSeries = series || code || null;
+ 
+   const candidateMap = [];
+   const candidateNormSet = new Set();
+   for (const cand of candidates) {
+     const trimmed = typeof cand === 'string' ? cand.trim() : String(cand || '');
+     if (!trimmed) continue;
+     const norm = normalizeCode(trimmed);
+     if (!norm || candidateNormSet.has(norm)) continue;
+     candidateNormSet.add(norm);
+     candidateMap.push({ raw: trimmed, norm });
+   }
+ 
+   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
+-  const specRows = rawRows.length ? rawRows.slice(0) : (code ? [{ code }] : []);
+-  if (!specRows.length) specRows.push({});
++  const specRows = rawRows.length ? rawRows.slice(0) : [{}];
+ 
+-  const explodedEntries = [];
++  let explodedEntries = [];
+   for (const row of specRows) {
+-    const structured = row && typeof row === 'object' ? { ...row } : {};
+-    const seedBrand = structured.brand || brandName;
+-    const seedSeries = structured.series_code || structured.series || baseSeries || null;
+-    const seedCode = structured.code ?? seedSeries ?? null;
+-    const baseRecord = { ...structured, brand: seedBrand, code: seedCode };
+-    const combos = explodeVariants(baseRecord, bp);
+-    for (const combo of combos) {
+-      const normalized = {
+-        ...combo,
+-        brand: combo.brand || seedBrand,
+-      };
+-      const seriesCode = normalized.series_code ?? normalized.series ?? seedSeries ?? normalized.code ?? null;
+-      if (seriesCode != null) {
+-        normalized.series_code = seriesCode;
+-        if (normalized.series == null) normalized.series = seriesCode;
+-      }
+-      const mpn = buildMpn(normalized, bp);
+-      if (mpn) {
+-        normalized.code = mpn;
+-        normalized.code_norm = mpn.toLowerCase();
+-      } else if (normalized.code) {
+-        normalized.code_norm = String(normalized.code).toLowerCase();
++    const r = row && typeof row === 'object' ? { ...row } : {};
++    const seedBrand  = extracted.brand || brandName;
++    const seedSeries = r.series_code || r.series || baseSeries || null;
++    const seedCode   = r.code ?? seedSeries ?? null; // 템플릿 없을 때 시리즈가 code
++    const baseRec    = { ...r, brand: seedBrand, series_code: seedSeries, code: seedCode };
++    const combos = explodeVariants({ brand: seedBrand, series_code: seedSeries }, r, bp);
++    if (combos.length) {
++      for (const combo of combos) {
++        explodedEntries.push({ ...baseRec, ...combo });
+       }
+-      const specPayload = {};
+-      for (const key of allowedKeys) {
+-        if (normalized[key] != null) specPayload[key] = normalized[key];
+-      }
+-      explodedEntries.push({ base: normalized, specs: specPayload });
++    } else {
++      explodedEntries.push({ ...baseRec });
+     }
+   }
+-  if (!explodedEntries.length) {
+-    const fallbackCode = baseSeries || null;
+-    explodedEntries.push({
+-      base: {
+-        brand: brandName,
+-        series: baseSeries || null,
+-        series_code: baseSeries || null,
+-        code: fallbackCode,
+-        code_norm: fallbackCode ? String(fallbackCode).toLowerCase() : null,
+-      },
+-      specs: {},
+-    });
+-  }
++  if (!explodedEntries.length) explodedEntries = [{ brand: brandName, series_code: baseSeries || null, code: baseSeries || null }];
+ 
+   // ---- 분할 여부 결정 ----
+   const pnCands = candidateMap.map((c) => c.raw);
+   const seriesCands = (candidates.length && series) ? candidateMap.filter((c) => /\d/.test(c.norm)).map((c) => c.raw) : [];
+   const mustSplit = decideSplit({
+     pnCandidates: pnCands,
+     seriesCandidates: seriesCands,
+     variantKeys,
+     specs: (rawRows[0] || {})
+   });
+ 
+-  // 단일이면 1건만 유지
+   if (!mustSplit && explodedEntries.length > 1) explodedEntries.splice(1);
+-
+-  // 분할이고, 후보 MPN이 2개 이상인데 entries 가 1건뿐이면 → 후보 수만큼 복제
+   if (mustSplit && candidateMap.length > 1 && explodedEntries.length <= 1) {
+     const max = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
+-    const tmpl = explodedEntries[0] || {
+-      base: { brand: brandName, series: baseSeries, series_code: baseSeries || null },
+-      specs: {},
+-    };
++    const tmpl = explodedEntries[0] || { brand: brandName, series_code: baseSeries || null };
+     const dup = [];
+     for (const c of candidateMap.slice(0, max)) {
+-      dup.push({
+-        base: {
+-          ...tmpl.base,
+-          code: c.raw,
+-          code_norm: String(c.raw || '').toLowerCase(),
+-        },
+-        specs: { ...tmpl.specs },
+-      });
++      dup.push({ ...tmpl, code: c.raw, code_norm: String(c.raw || '').toLowerCase() });
+     }
+-    explodedEntries.splice(0, explodedEntries.length, ...dup);
++    explodedEntries = dup;
+   }
+ 
+   const seenCodes = new Set();
+-  const pickNumeric = (...vals) => {
+-    for (const v of vals) {
+-      const n = coerceNumeric(v);
+-      if (Number.isFinite(n)) return n;
+-    }
+-    return null;
+-  };
+-
+   for (const entry of explodedEntries) {
+-    const baseInfo = entry?.base || {};
+-    const specsSource = entry?.specs || {};
+-    const recordBrand = baseInfo.brand || brandName;
++    const baseInfo = entry || {};
+     const specs = {};
+-    for (const key of allowedKeys) {
+-      if (specsSource[key] != null) specs[key] = specsSource[key];
+-      else if (baseInfo[key] != null) specs[key] = baseInfo[key];
+-    }
++    for (const k of allowedKeys) if (entry[k] != null) specs[k] = entry[k];
++    const pickNumeric = (vals) => {
++      for (const v of (Array.isArray(vals) ? vals : [vals])) { const n = coerceNumeric(v); if (Number.isFinite(n)) return n; }
++      return null;
++    };
++    const voltageNum   = pickNumeric(specs.coil_voltage_vdc || specs.coil_voltage || specs.voltage_vdc || specs.voltage_dc || specs.voltage);
++    const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2,'0') : null;
+ 
+-    const voltageNum = pickNumeric(
+-      specs.coil_voltage_vdc,
+-      specs.coil_voltage,
+-      specs.voltage_vdc,
+-      specs.voltage_dc,
+-      specs.voltage
+-    );
+-    const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2, '0') : null;
+-    const seriesSeed = baseInfo.series_code || baseInfo.series || baseSeries || null;
+-
+-    let mpn = baseInfo.code ? String(baseInfo.code).trim() : null; // 후보 복제의 효과
++    let mpn = baseInfo.code ? String(baseInfo.code).trim() : null;   // 후보 복제 시 base.code가 곧 MPN
+     if (!mpn && candidateMap.length) {
+-      const match = voltageToken ? candidateMap.find((c) => c.norm.includes(voltageToken)) : null;
+-      const pick = match || candidateMap[0];
+-      if (pick) mpn = pick.raw;
++      const match = voltageToken ? candidateMap.find(c => c.norm.includes(voltageToken)) : null;
++      mpn = (match || candidateMap[0])?.raw || null;
+     }
+-    if (!mpn && pnTemplate) {
+-      const templated = buildMpn({ ...entry, code: seriesSeed ?? '' }, bp)?.trim();
++    if (!mpn) {
++      const templated = buildMpn({ ...specs, ...baseInfo }, bp);
+       if (templated) mpn = templated;
+     }
+     if (!mpn && specs.code) mpn = String(specs.code).trim();
+-    if (!mpn && seriesSeed) {
+-      const prefix = seriesSeed;
+-      if (prefix) {
+-        const suffix = voltageToken || (voltageNum != null ? String(Math.round(voltageNum)) : '');
+-        mpn = `${prefix}${suffix}`.trim();
+-      }
+-    }
+-    if (!mpn && candidateMap.length) mpn = candidateMap[0].raw;
++
+     if (!mpn) {
+-      const seed = seriesSeed || recordBrand || brandName || 'MPN';
+-      mpn = `${seed}${Date.now().toString(16).slice(-4)}`.toUpperCase();
++      const prefix = baseInfo.series_code || baseInfo.series || baseSeries || '';
++      const suffix = voltageToken || (voltageNum != null ? String(Math.round(voltageNum)) : '');
++      if (prefix || suffix) mpn = `${prefix}${suffix}`.trim();
+     }
+-
+-    mpn = String(mpn || '').trim();
+     if (!mpn) continue;
++
+     const mpnNorm = normalizeCode(mpn);
+-    if (!mpnNorm) continue;
+-    if (seenCodes.has(mpnNorm)) continue;
++    if (!mpnNorm || seenCodes.has(mpnNorm)) continue;
+     seenCodes.add(mpnNorm);
+ 
+     const rec = {
+       family_slug: family,
+-      brand: recordBrand,
++      brand: baseInfo.brand || brandName,
+       code: mpn,
+-      code_norm: mpn.toLowerCase(),
+-      series_code: seriesSeed,
++      code_norm: mpnNorm,
++      series_code: baseInfo.series_code || baseSeries || null,
+       datasheet_uri: gcsUri,
+       image_uri: coverUri || null,
+-      display_name: `${recordBrand} ${mpn}`,
++      display_name: `${baseInfo.brand || brandName} ${mpn}`,
+       verified_in_doc: candidateNormSet.has(mpnNorm),
+       updated_at: now,
+     };
+-
+-    if (baseInfo.mfr_full && rec.mfr_full == null) rec.mfr_full = baseInfo.mfr_full;
+-
+     for (const k of allowedKeys) {
+       let v = specs[k];
+       if (v == null) continue;
+-      if (Array.isArray(v)) {
+-        v = v.length ? v[0] : null;
+-      } else if (typeof v === 'string' && variantKeys.includes(k)) {
+-        const arr = parseListOrRange(v);
+-        v = arr.length ? arr[0] : null;
+-      }
+-      if (v == null) continue;
+-      const coerced = coerceByType(k, v);
+-      if (coerced != null) rec[k] = coerced;
++      if (Array.isArray(v)) v = v[0];
++      rec[k] = v;
+     }
+-
+     if (bp.code_rules) applyCodeRules(rec.code, rec, bp.code_rules, colTypes);
+     records.push(rec);
+   }
+ 
+   // 최후 폴백 줄이기
+   if (!records.length) {
+     const tmp = 'TMP_' + (Math.random().toString(16).slice(2, 8)).toUpperCase();
+     records.push({
+       family_slug: family,
+       brand: brand || extracted.brand || 'unknown',
+       code: tmp,
+       series_code: series || code || null,
+       datasheet_uri: gcsUri,
+       image_uri: coverUri || null,
+       display_name: `${brand || extracted.brand || 'unknown'} ${tmp}`,
+       verified_in_doc: false,
+       updated_at: now,
+     });
+   }
+ 
+   // 업서트
+   let upserted = 0;
+   for (const rec of records) {
+     const safe = {};
+     // 공통 키

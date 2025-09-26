@@ -1,124 +1,48 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 3b40f4134a23e209c7f66059eba30dbbcaa5133d..c45fd70fa5e4363e7fc17275560aba80603274c5 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -28,55 +28,56 @@ async function getColumnTypes(qualified) {
-     else out.set(col, 'text');
+diff --git a/src/utils/vertex.js b/src/utils/vertex.js
+index d52e58502f40371c36e0e49d92a197fffa8d0fe0..f28b7e1cfeda69124634e6cf39cd8fda827511db 100644
+--- a/src/utils/vertex.js
++++ b/src/utils/vertex.js
+@@ -1,41 +1,42 @@
+ 'use strict';
+ 
+ const { VertexAI } = require('@google-cloud/vertexai');
+ const { safeJsonParse } = require('./safe-json');
+ 
+ const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID;
+ const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
+ const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
+ 
+ const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+ 
+ // Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용
+ function getModel(systemText, modelId = MODEL_ID) {
+   const cfg = { model: modelId };
+   if (systemText && String(systemText).trim()) {
+     cfg.systemInstruction = { parts: [{ text: String(systemText) }] };
    }
-   return out;
+   return vertex.getGenerativeModel(cfg);
  }
  
- // "5, 6, 9, 12" / "1.5 to 24 V" 같은 문자열을 안전하게 수용
- function toNumberOrNull(v) {
-   if (v == null || v === '') return null;
-   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-   const s = String(v);
-   const mRange = s.match(/-?\d+(?:\.\d+)?/g);
-   if (mRange && mRange.length > 0) return Number(mRange[0]);
-   return null;
+-async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.1 } = {}) {
++async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
+   const model = getModel(systemText, modelId);
+   const req = {
+     contents: [{ role: 'user', parts: [{ text: String(userText || '') }]}],
+     generationConfig: {
+       responseMimeType: 'application/json',
+       temperature,
++      topP,
+       maxOutputTokens,
+     },
+   };
+   const resp = await model.generateContent(req);
+   const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+   try {
+     const parsed = safeJsonParse(txt);
+     return parsed ?? {};
+   } catch {
+     throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`);
+   }
  }
  
- async function saveExtractedSpecs(familySlug, base, specs) {
-   // 스키마 자동 보장(추가만 수행)
-   await ensureSpecsTableForFamily(familySlug);
- 
-   const blueprint = await getBlueprint(pool, familySlug);
-   const specsTable = blueprint?.specsTable;
-   if (!specsTable) throw new Error(`specs table not found for family ${familySlug}`);
-   const targetTable = specsTable.includes('.') ? specsTable : `public.${specsTable}`;
-   const dbColTypes = await getColumnTypes(targetTable);
- 
--  const baseCols = ['family_slug','brand','brand_norm','code','code_norm','mfr_full','datasheet_uri','verified_in_doc'];
-+  const baseCols = ['family_slug','brand','brand_norm','code','code_norm','series_code','mfr_full','datasheet_uri','verified_in_doc'];
-   const baseVals = [
-     familySlug,
-     base.brand, String(base.brand || '').toLowerCase(),
-     base.code,  String(base.code  || '').toLowerCase(),
-+    base.series_code ?? null,
-     base.mfr_full ?? null,
-     base.datasheet_uri ?? null,
-     true
-   ];
- 
-   const RESERVED = new Set(['id','brand','code','brand_norm','code_norm','created_at','updated_at']);
-   const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
-   const allowedKeys = Array.isArray(blueprint?.allowedKeys)
-     ? blueprint.allowedKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-     : [];
-   const fieldTypes = blueprint?.fields || {};
-   function coerceNumeric(x) {
-     if (x == null || x === '') return null;
-     if (typeof x === 'number') return x;
-     let s = String(x).toLowerCase();
-     s = s.replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
-     const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
-     if (!m) return null;
-     let n = parseFloat(m[1]);
-     const mul = (m[2] || '').toLowerCase();
-     const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
-     if (mul && scale[mul] != null) n = n * scale[mul];
-     return Number.isFinite(n) ? n : null;
-   }
-   function coerceByType(key, val) {
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 3b40f4134a23e209c7f66059eba30dbbcaa5133d..c45fd70fa5e4363e7fc17275560aba80603274c5 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -92,50 +93,57 @@ async function saveExtractedSpecs(familySlug, base, specs) {
-       const s = String(val||'').toLowerCase().trim();
-       if (!s) return null;
-       return /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
-     }
-     return (val == null ? null : String(val));
-   }
-   const fastKeys = FAST
-     ? computeFastKeys(blueprint).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-     : allowedKeys;
-   const allowedSet = new Set(allowedKeys);
-   const fastSet = new Set(fastKeys);
-   const specsNorm = {};
-   for (const [rawKey, value] of Object.entries(specs || {})) {
-     const key = String(rawKey || '')
-       .trim()
-       .toLowerCase()
-       .replace(/[^a-z0-9_]/g, '');
-     if (!key || RESERVED.has(key)) continue;
-     if (allowedSet.size && !allowedSet.has(key)) continue;
-     if (FAST && fastSet.size && !fastSet.has(key)) continue;
-     if (!Object.prototype.hasOwnProperty.call(specsNorm, key)) {
-       specsNorm[key] = coerceByType(key, value); // 타입 강제정규화
-     }
-   }
- 
-+  for (const key of Object.keys(specsNorm)) {
-+    const t = dbColTypes.get(key);
-+    if (t === 'numeric' || t === 'int') {
-+      specsNorm[key] = toNumberOrNull(specsNorm[key]);
-+    }
-+  }
-+
-   const specCols = Object.keys(specsNorm);
-   const allCols = baseCols.concat(specCols);
-   const params = allCols.map((_, i) => `$${i + 1}`);
-   const values = baseVals.concat(specCols.map((k) => {
-     const x = specsNorm[k];
-     if (typeof x === 'string' && /to|,|\d/.test(x)) {
-       const n = toNumberOrNull(x);
-       return n ?? null;
-     }
-     return x;
-   }));
- 
-   const colList = allCols.map(safeColumnName).join(',');
-   const setList = specCols
-     .map((k) => `${safeColumnName(k)} = EXCLUDED.${safeColumnName(k)}`)
-     .join(',');
- 
-   const sql = `
-     INSERT INTO ${targetTable} (${colList})
-     VALUES (${params.join(',')})
-     ON CONFLICT (brand_norm, code_norm)
-     DO UPDATE SET
-       mfr_full = EXCLUDED.mfr_full,
-       datasheet_uri = EXCLUDED.datasheet_uri,
-       verified_in_doc = EXCLUDED.verified_in_doc
+ module.exports = { getModel, callModelJson };

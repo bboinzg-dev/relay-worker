@@ -92,8 +92,8 @@ async function extractFields(rawText, code, fieldsJson) {
   const model = vertex.getGenerativeModel({
     model: MODEL_ID,
     generationConfig: {
-      temperature: 0.0,
-      topP: 0.1,
+      temperature: 0.2,
+      topP: 0.8,
       maxOutputTokens: MAX_OUT_TOKENS,
       responseMimeType: 'application/json', // 구조화 출력 유지
     },

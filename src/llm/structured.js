@@ -36,6 +36,13 @@ async function callLLM({ modelEnv, fallback, prompt, pdfBase64, responseSchema, 
   const killer = setTimeout(() => ctrl.abort('TIMEOUT'), timeoutMs);
 
   try {
+    const generationConfig = {
+      temperature: 0.2,
+      topP: 0.8,
+      responseMimeType: 'application/json',
+    };
+    if (responseSchema) generationConfig.responseSchema = responseSchema; // Vertex 구조화 출력 사용
+
     const resp = await mdl.generateContent({
       contents: [{
         role: 'user',
@@ -44,10 +51,7 @@ async function callLLM({ modelEnv, fallback, prompt, pdfBase64, responseSchema, 
           pdfBase64 ? { inlineData: { mimeType: 'application/pdf', data: pdfBase64 } } : null
         ].filter(Boolean),
       }],
-      generationConfig: {
-        responseMimeType: responseSchema ? 'application/json' : undefined,
-        responseSchema: responseSchema || undefined, // Vertex 구조화 출력 사용
-      },
+      generationConfig,
     }, { signal: ctrl.signal });
 
     const parts = resp?.response?.candidates?.[0]?.content?.parts ?? [];

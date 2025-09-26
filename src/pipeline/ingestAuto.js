@@ -744,6 +744,16 @@ async function runAutoIngest({
 
   if (!mustSplit && explodedEntries.length > 1) explodedEntries.splice(1);
   if (mustSplit && candidateMap.length > 1) {
+    if (explodedEntries.length <= 1) {
+      const tmpl = explodedEntries[0]
+        ? { ...explodedEntries[0] }
+        : { brand: brandName, series_code: baseSeries || null };
+      delete tmpl.code;
+      delete tmpl.code_norm;
+      explodedEntries = candidateMap.slice(0, FIRST_PASS_CODES || 20)
+        .map((c) => ({ ...tmpl, code: c.raw, code_norm: c.norm }));
+    }
+
     const maxCodes = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
     if (maxCodes > 0) {
       const fallbackNorm = baseSeries ? normalizeCode(baseSeries) : null;

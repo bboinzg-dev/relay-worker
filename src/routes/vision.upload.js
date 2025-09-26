@@ -112,6 +112,7 @@ router.post('/api/vision/guess', upload.any(), async (req, res) => {
         }],
         generationConfig: {
           temperature: 0.2,
+          topP: 0.8,
           responseMimeType: 'application/json',
           responseSchema: {
             type: "object",

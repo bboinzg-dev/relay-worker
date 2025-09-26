@@ -18,13 +18,14 @@ function getModel(systemText, modelId = MODEL_ID) {
   return vertex.getGenerativeModel(cfg);
 }
 
-async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.1 } = {}) {
+async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
   const model = getModel(systemText, modelId);
   const req = {
     contents: [{ role: 'user', parts: [{ text: String(userText || '') }]}],
     generationConfig: {
       responseMimeType: 'application/json',
       temperature,
+      topP,
       maxOutputTokens,
     },
   };

@@ -222,7 +222,12 @@ async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText,
 
   const resp = await mdl.generateContent({
     contents: [{ role: 'user', parts: [{ text: userText }]}],
-    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 8192 },
+    generationConfig: {
+      temperature: 0.2,
+      topP: 0.8,
+      responseMimeType: 'application/json',
+      maxOutputTokens: 8192,
+    },
   });
 
   let txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';

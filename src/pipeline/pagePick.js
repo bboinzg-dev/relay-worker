@@ -11,6 +11,7 @@ exports.pickPages = async function pickPages(pdfBase64, family, k = 4) {
   };
   const prompt = `
 PDF에서 family=${family}의 스펙/주문정보가 있을 법한 페이지 번호만 최대 ${k}개 뽑아주세요.
+"Ordering Information", "Ordering Guide", "Part Numbering System" 등 주문 섹션 헤더가 보이면 가장 먼저 선택하세요.
 응답은 {"pages":[번호,...]} 하나만. 중복/설명 금지.
 `;
   const raw = await callLLM({ modelEnv:'VERTEX_PAGE_PICK_MODEL', fallback:'gemini-2.5-flash', prompt, pdfBase64, responseSchema:schema, timeoutMs:15000 });

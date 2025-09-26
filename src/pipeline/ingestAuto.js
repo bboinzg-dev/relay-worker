@@ -76,6 +76,49 @@ function coerceNumeric(x) {
   return Number.isFinite(n) ? n : null;
 }
 
+// "5, 6, 9, 12" / "1.5 to 24" / "5/12/24" / "5 12 24" → [5,12,24]
+function parseListOrRange(s) {
+  if (Array.isArray(s)) return s;
+  const raw = String(s || '').trim();
+  if (!raw) return [];
+  // 1) 범위: "1.5 to 24" or "1.5–24"
+  const range = raw.match(/(-?\d+(\.\d+)?)\s*(?:to|–|-)\s*(-?\d+(\.\d+)?)/i);
+  if (range) {
+    const lo = parseFloat(range[1]); const hi = parseFloat(range[3]);
+    if (Number.isFinite(lo) && Number.isFinite(hi)) return [lo, hi];
+  }
+  // 2) 구분자 리스트
+  return raw.split(/[,、\/\s]+/).map(x => parseFloat(x)).filter(n => Number.isFinite(n));
+}
+
+// 블루프린트 기반 폭발: variant_keys 교차곱
+function explodeVariants(base = {}, specs = {}, bp = {}) {
+  const keys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
+  const lists = keys.map((k) => {
+    const arr = parseListOrRange(specs[k]);
+    if (arr.length) return arr;
+    return specs[k] != null ? [specs[k]] : [];
+  });
+  if (!lists.length || lists.some((a) => !a.length)) return [{ base, specs }];
+
+  const out = [];
+  const dfs = (i, cur) => {
+    if (i === keys.length) {
+      out.push({ base, specs: cur.specs });
+      return;
+    }
+    const key = keys[i];
+    for (const v of lists[i]) {
+      dfs(i + 1, {
+        base: cur.base,
+        specs: { ...cur.specs, [key]: v }
+      });
+    }
+  };
+  dfs(0, { base, specs: { ...specs } });
+  return out;
+}
+
 function pickSkuListFromTables(extracted = {}) {
   const out = new Set();
   const HEAD_RE = /(part\s*no\.?|ordering\s*information|part\s*number)/i;
@@ -236,7 +279,7 @@ function normalizeCode(str) {
 }
 
 // “Ordering Information / How to Order / 주문 정보” 인접영역에서 품번 후보를 뽑아 점수화
-function extractPartNumbersFromText(full, limit = 50) {
+function rankPartNumbersFromOrderingSections(full, limit = 50) {
   const text = String(full || '');
   if (!text) return [];
 
@@ -369,6 +412,35 @@ function extractPartNumbersBySeriesHeuristic(full, limit = 200) {
 
 
 
+// 품번 후보 추출 (ordering/types/series 휴리스틱 재사용)
+async function extractPartNumbersFromText(text, { series } = {}) {
+  const src = String(text || '');
+  if (!src) return [];
+
+  const prefix = series ? normalizeCode(series) : null;
+  const seen = new Set();
+  const out = [];
+
+  const push = (raw) => {
+    if (!raw) return;
+    const norm = normalizeCode(raw);
+    if (!norm) return;
+    if (prefix && !norm.startsWith(prefix)) return;
+    if (seen.has(norm)) return;
+    seen.add(norm);
+    const cleaned = typeof raw === 'string' ? raw.trim() : String(raw || '');
+    out.push(cleaned || norm);
+  };
+
+  for (const { code } of extractPartNumbersFromTypesTables(src, 200)) push(code);
+  for (const { code } of rankPartNumbersFromOrderingSections(src, 200)) push(code);
+  for (const { code } of extractPartNumbersBySeriesHeuristic(src, 200)) push(code);
+
+  return out;
+}
+
+
+
 async function runAutoIngest({
   gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null,
 }) {
@@ -421,6 +493,8 @@ async function runAutoIngest({
   const bp = await getBlueprint(family);
   const allowedKeys = bp.allowedKeys || [];
   const fieldTypes  = bp.fields || {};   // { key: 'numeric' | 'int' | 'bool' | 'text' | ... }
+  const variantKeys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
+  const pnTemplate  = bp.pn_template || null;
 
   // -------- 공용 강제정규화 유틸 --------
   
@@ -438,13 +512,24 @@ async function runAutoIngest({
     return (val == null ? null : String(val));
   }
 
+  // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
+  let previewText = '';
+  try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
+  let candidates = [];
+  try {
+    candidates = await extractPartNumbersFromText(previewText, { series: series || code });
+  } catch { candidates = []; }
+
   // PDF → 품번/스펙 추출
   let extracted = { brand: brand || 'unknown', rows: [] };
   if (!brand || !code) {
     try {
       if (FAST) {
         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
-        const raw = await readText(gcsUri, PREVIEW_BYTES);
+        let raw = previewText;
+        if (!raw) {
+          try { raw = await readText(gcsUri, PREVIEW_BYTES); } catch { raw = ''; }
+        }
         if (raw && raw.length > 1000) {
           const fieldsJson = Object.fromEntries((allowedKeys||[]).map(k => [k, 'text']));
           const vals = await extractFields(raw, code || '', fieldsJson);
@@ -479,15 +564,44 @@ async function runAutoIngest({
     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
   }
 
+  if (!candidates.length && codes.length) {
+    const merged = [];
+    const seen = new Set();
+    for (const raw of codes) {
+      const trimmed = typeof raw === 'string' ? raw.trim() : String(raw || '');
+      if (!trimmed) continue;
+      const norm = normalizeCode(trimmed);
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      merged.push(trimmed);
+    }
+    if (merged.length) candidates = merged;
+  }
+
   if (!code && !codes.length) {
     let fullText = '';
     try { fullText = await readText(gcsUri, 300 * 1024) || ''; } catch {}
 
     const fromTypes  = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
-    const fromOrder  = extractPartNumbersFromText(fullText, FIRST_PASS_CODES);
+    const fromOrder  = rankPartNumbersFromOrderingSections(fullText, FIRST_PASS_CODES);
     const fromSeries = extractPartNumbersBySeriesHeuristic(fullText, FIRST_PASS_CODES * 4);
     // 가장 신뢰 높은 순서로 병합
     const picks = fromTypes.length ? fromTypes : (fromOrder.length ? fromOrder : fromSeries);
+
+    if (!candidates.length && picks.length) {
+      const merged = [];
+      const seen = new Set();
+      for (const p of picks) {
+        const raw = typeof p === 'string' ? p : p?.code;
+        const trimmed = typeof raw === 'string' ? raw.trim() : '';
+        if (!trimmed) continue;
+        const norm = normalizeCode(trimmed);
+        if (seen.has(norm)) continue;
+        seen.add(norm);
+        merged.push(trimmed);
+      }
+      if (merged.length) candidates = merged;
+    }
 
     // 다건이면 문서 유형과 무관하게 다건 업서트, 아니면 1건만
     if (picks.length > 1) {
@@ -512,87 +626,132 @@ async function runAutoIngest({
     } catch (e) { console.warn('[cover fail]', e?.message || e); }
   }
 
+  if (code) {
+    const trimmedCode = String(code || '').trim();
+    if (trimmedCode) {
+      const norm = normalizeCode(trimmedCode);
+      if (!candidates.some((c) => normalizeCode(c) === norm)) {
+        candidates = [trimmedCode, ...candidates];
+      }
+    }
+  }
+
   // 레코드 구성
   const records = [];
   const now = new Date();
   const brandName = brand || extracted.brand || 'unknown';
+  const baseSeries = series || code || null;
 
-  const assignAllowedSpecs = (target, source) => {
-    if (!source) return;
-    for (const k of allowedKeys) {
-      if (source[k] == null) continue;
-      target[k] = coerceByType(k, source[k]);
+  const candidateMap = [];
+  const candidateNormSet = new Set();
+  for (const cand of candidates) {
+    const trimmed = typeof cand === 'string' ? cand.trim() : String(cand || '');
+    if (!trimmed) continue;
+    const norm = normalizeCode(trimmed);
+    if (!norm || candidateNormSet.has(norm)) continue;
+    candidateNormSet.add(norm);
+    candidateMap.push({ raw: trimmed, norm });
+  }
+
+  const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
+  const specRows = rawRows.length ? rawRows.slice(0) : (code ? [{ code }] : []);
+  if (!specRows.length) specRows.push({});
+
+  const explodedEntries = [];
+  for (const row of specRows) {
+    const specsObj = row && typeof row === 'object' ? { ...row } : {};
+    explodedEntries.push(...explodeVariants({ brand: brandName, series: baseSeries, code: specsObj.code || null }, specsObj, bp));
+  }
+  if (!explodedEntries.length) {
+    explodedEntries.push({ base: { brand: brandName, series: baseSeries }, specs: {} });
+  }
+
+  const seenCodes = new Set();
+  const pickNumeric = (...vals) => {
+    for (const v of vals) {
+      const n = coerceNumeric(v);
+      if (Number.isFinite(n)) return n;
     }
+    return null;
   };
 
-  if (code) {
-    // 단일 강제 인입
-    records.push({
+  for (const entry of explodedEntries) {
+    const baseInfo = entry?.base || {};
+    const specs = entry?.specs || {};
+    const voltageNum = pickNumeric(
+      specs.coil_voltage_vdc,
+      specs.coil_voltage,
+      specs.voltage_vdc,
+      specs.voltage_dc,
+      specs.voltage
+    );
+    const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2, '0') : null;
+
+    let mpn = null;
+    if (candidateMap.length) {
+      const match = voltageToken ? candidateMap.find((c) => c.norm.includes(voltageToken)) : null;
+      const pick = match || candidateMap[0];
+      if (pick) mpn = pick.raw;
+    }
+    if (!mpn && pnTemplate) {
+      const templated = pnTemplate.replace(/\$\{(\w+)\}/g, (_, k) => {
+        const v = specs[k] ?? baseInfo[k];
+        return v == null ? '' : String(v);
+      }).trim();
+      if (templated) mpn = templated;
+    }
+    if (!mpn && specs.code) mpn = String(specs.code).trim();
+    if (!mpn && baseInfo.code) mpn = String(baseInfo.code).trim();
+    if (!mpn) {
+      const prefix = baseInfo.series || baseSeries || '';
+      if (prefix) {
+        const suffix = voltageToken || (voltageNum != null ? String(Math.round(voltageNum)) : '');
+        mpn = `${prefix}${suffix}`.trim();
+      }
+    }
+    if (!mpn && candidateMap.length) mpn = candidateMap[0].raw;
+    if (!mpn) {
+      const seed = baseSeries || brandName || 'MPN';
+      mpn = `${seed}${Date.now().toString(16).slice(-4)}`.toUpperCase();
+    }
+
+    mpn = String(mpn || '').trim();
+    if (!mpn) continue;
+    const mpnNorm = normalizeCode(mpn);
+    if (!mpnNorm) continue;
+    if (seenCodes.has(mpnNorm)) continue;
+    seenCodes.add(mpnNorm);
+
+    const recordBrand = baseInfo.brand || brandName;
+    const rec = {
       family_slug: family,
-      brand: brandName,
-      code,
-      series: series || null,
-      display_name: display_name || null,
+      brand: recordBrand,
+      code: mpn,
+      code_norm: mpn.toLowerCase(),
+      series_code: baseInfo.series || baseSeries || null,
       datasheet_uri: gcsUri,
       image_uri: coverUri || null,
-      verified_in_doc: false,
+      display_name: `${recordBrand} ${mpn}`,
+      verified_in_doc: candidateNormSet.has(mpnNorm),
       updated_at: now,
-    });
-  } else if (codes.length) {
-    const rowMap = new Map();
-    for (const row of (extracted.rows || [])) {
-      if (!row || !row.code) continue;
-      rowMap.set(normalizeCode(row.code), row);
-    }
-    const templateRow = (extracted.rows && extracted.rows[0]) || {};
-    const uniqCodes = [];
-    const seen = new Set();
-    for (const raw of codes) {
-      const trimmed = String(raw || '').trim();
-      if (!trimmed) continue;
-      const normalized = normalizeCode(trimmed);
-      if (!normalized || seen.has(normalized)) continue;
-      seen.add(normalized);
-      uniqCodes.push({ raw: trimmed, normalized });
-    }
-    for (const { raw, normalized } of uniqCodes) {
-      const srcRow = rowMap.get(normalized) || templateRow;
-      const finalCode = normalized || raw;
-      const base = {
-        family_slug: family,
-        brand: brandName,
-        code: finalCode,
-        datasheet_uri: gcsUri,
-        image_uri: coverUri || null,
-        display_name: `${brandName} ${finalCode}`,
-        verified_in_doc: true,
-        updated_at: now,
-      };
-      assignAllowedSpecs(base, srcRow);
-      if (bp.code_rules) applyCodeRules(base.code, base, bp.code_rules, colTypes);
-      records.push(base);
-    }
-  } else {
-    for (const r of (extracted.rows || [])) {
-      const base = {
-        family_slug: family,
-        brand: brandName,
-        code: r.code,
-        datasheet_uri: gcsUri,
-        image_uri: coverUri || null,
-        display_name: `${brandName} ${r.code}`,
-        verified_in_doc: true,
-        updated_at: now,
-      };
-      // 블루프린트 허용 값만 추가
-      for (const k of allowedKeys) {
-        if (r[k] == null) continue;
-        base[k] = coerceByType(k, r[k]);  // 타입에 맞춰 강제정규화
+    };
+
+    for (const k of allowedKeys) {
+      let v = specs[k];
+      if (v == null) continue;
+      if (Array.isArray(v)) {
+        v = v.length ? v[0] : null;
+      } else if (typeof v === 'string' && variantKeys.includes(k)) {
+        const arr = parseListOrRange(v);
+        v = arr.length ? arr[0] : null;
       }
-           // <- DB에 저장된 code_rules 적용 (모든 family 공통)
-      if (bp.code_rules) applyCodeRules(base.code, base, bp.code_rules, colTypes);
-      records.push(base);
+      if (v == null) continue;
+      const coerced = coerceByType(k, v);
+      if (coerced != null) rec[k] = coerced;
     }
+
+    if (bp.code_rules) applyCodeRules(rec.code, rec, bp.code_rules, colTypes);
+    records.push(rec);
   }
 
   // 최후 폴백 줄이기
@@ -602,6 +761,7 @@ async function runAutoIngest({
       family_slug: family,
       brand: brand || extracted.brand || 'unknown',
       code: tmp,
+      series_code: series || code || null,
       datasheet_uri: gcsUri,
       image_uri: coverUri || null,
       display_name: `${brand || extracted.brand || 'unknown'} ${tmp}`,
@@ -620,6 +780,7 @@ async function runAutoIngest({
     if (colsSet.has('code'))        safe.code  = rec.code;
     if (colsSet.has('brand_norm'))  safe.brand_norm = normLower(rec.brand);
     if (colsSet.has('code_norm'))   safe.code_norm  = normLower(rec.code);
+    if (colsSet.has('series_code')) safe.series_code = rec.series_code;
     if (colsSet.has('datasheet_uri')) safe.datasheet_uri = rec.datasheet_uri;
     if (colsSet.has('image_uri'))     safe.image_uri     = rec.image_uri;
     if (colsSet.has('datasheet_url')) safe.datasheet_url = rec.datasheet_uri; // 별칭 호환
@@ -630,7 +791,7 @@ async function runAutoIngest({
 
     // 블루프린트 값
     for (const [k,v] of Object.entries(rec)) {
-      if (['family_slug','brand','code','brand_norm','code_norm','datasheet_uri','image_uri','datasheet_url','display_name','displayname','cover','verified_in_doc','updated_at'].includes(k)) continue;
+      if (['family_slug','brand','code','brand_norm','code_norm','series_code','datasheet_uri','image_uri','datasheet_url','display_name','displayname','cover','verified_in_doc','updated_at'].includes(k)) continue;
       if (colsSet.has(k)) safe[k] = v;
     }
     if (colsSet.has('updated_at')) safe.updated_at = now;

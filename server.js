@@ -21,55 +21,6 @@ const pgPool = getPool();
 const query = (text, params) => pgPool.query(text, params);
 
 
-// ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
- const { CloudTasksClient } = require('@google-cloud/tasks');
- const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
- const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
- const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
- const WORKER_TASK_URL  = process.env.WORKER_TASK_URL  || 'https://<YOUR-RUN-URL>/api/worker/ingest/run';
- const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
-
- // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
- let _tasks = null;
- let _queuePath = null;
- function getTasks() {
-   if (!_tasks) {
-    // 글로벌 엔드포인트 + REST fallback(HTTP/1)
-    _tasks = new CloudTasksClient({ fallback: true });
-     _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
-   }
-   return { tasks: _tasks, queuePath: _queuePath };
- }
-
- async function enqueueIngestRun(payload) {
-   const { tasks, queuePath } = getTasks();
-     if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
-   const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
-
-     // ① 디스패치 데드라인 = 인제스트 예산(기본 120초) + 15초 여유
-  const seconds = Math.ceil((Number(process.env.INGEST_BUDGET_MS || 120000) + 15000) / 1000);
-
-  const body = Buffer.from(JSON.stringify(payload));
-  const httpRequest = {
-    url: WORKER_TASK_URL,
-    httpMethod: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
-    ...(TASKS_INVOKER_SA
-      ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
-      : {}),
-  };
-  const task = {
-    httpRequest,
-    // ② Cloud Tasks에 타깃 응답 대기 한도를 명시(기본 10분 → 135초 내)
-    dispatchDeadline: { seconds: Math.min(Math.ceil(seconds), 1800) },
-  };
-
-   // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
-   await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
- }
-
-
 const app = express();
 
 /* ---------------- Mount modular routers (keep existing) ---------------- */
@@ -447,81 +398,6 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
 });
 
-app.post('/api/worker/ingest', requireSession, async (req, res) => {
-  const startedAt = Date.now();
-  const taskName  = req.get('X-Cloud-Tasks-TaskName') || null;
-  const retryCnt  = Number(req.get('X-Cloud-Tasks-TaskRetryCount') || 0);
-  const body = parseIngestBody(req);
-  const series = req.body?.series || null;
-  const displayName = req.body?.display_name || req.body?.displayName || null;
-  try {
-    const uri = body.gcs_uri;
-    if (!uri || !/^gs:\/\//i.test(uri)) {
-      await query(
-        `INSERT INTO public.ingest_run_logs (gcs_uri, status, error, task_name, retry_count, uploader_id, content_type)
-         VALUES ($1,'FAILED',$2,$3,$4,$5,$6)`,
-        [uri || 'n/a', 'gcs_uri required (gs://...)', taskName, retryCnt, body.uploader_id, body.content_type]
-      );
-      return res.status(202).json({ ok: true, accepted: false });
-    }
-
-    const { rows:logRows } = await query(
-      `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, uploader_id, content_type)
-       VALUES ($1,$2,$3,'PROCESSING',$4,$5) RETURNING id`,
-      [taskName, retryCnt, uri, body.uploader_id, body.content_type]
-    );
-    const runId = logRows[0]?.id;
-
-    // ✅ 1) 즉시 ACK → Cloud Tasks는 이 시점에 "완료"로 처리(재시도 루프 종료)
-    res.status(202).json({ ok: true, run_id: runId, accepted: true });
-
-    // ▶ 2) 다음 Cloud Tasks 요청으로 실행을 넘김(체인) — 응답 보낸 뒤이므로 절대 다시 res.* 호출 금지
-    enqueueIngestRun({ runId, gcsUri: uri, brand: body.brand, code: body.code, series, display_name: displayName, family_slug: body.family_slug })
-      .catch(async (err) => {
-        // enqueue 실패 시에도 응답은 이미 보냈으므로 DB만 FAILED로 마킹
-        try {
-          await query(
-            `UPDATE public.ingest_run_logs
-                SET finished_at = now(),
-                    duration_ms = $2,
-                    status = 'FAILED',
-                    error = $3,
-                    updated_at = now()
-              WHERE id = $1`,
-            [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
-          );
-        } catch (_) {}
-        console.error('[ingest enqueue failed]', err?.message || err);
-      });
-
-  } catch (e) {
- // 여기로 들어왔다면 아직 202를 보내기 전일 수도 있으므로, 응답 전/후 모두 안전하도록 처리
-    // 1) DB 상태 갱신
-    try {
-      await query(
-        `UPDATE public.ingest_run_logs
-           SET finished_at = now(),
-               duration_ms = $2,
-               status = 'FAILED',
-               error = $3,
-               updated_at = now()
-         WHERE task_name = $1
-           AND status = 'PROCESSING'
-         ORDER BY started_at DESC
-         LIMIT 1`,
-        [ taskName, Date.now()-startedAt, String(e?.message || e) ]
-      );
-    } catch (_) {}
-    // 2) 아직 응답을 보내지 않았다면 500, 이미 보냈다면 로그만
-    if (!res.headersSent) {
-      console.error('[ingest 500]', { error: e?.message });
-      return res.status(500).json({ ok:false, error:String(e?.message || e) });
-    } else {
-      console.error('[ingest post-ack error]', e?.message || e);
-    }
-  }
-});
-
 // ---- 유틸
 const norm = s => (s || '').toString().trim().toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9._-]/g, '');
 
@@ -614,7 +490,7 @@ const pool = pgPool;
 }
 
 // ▶ 체인 실행 엔드포인트: 3-스텝 멱등 파이프라인
-app.post('/api/worker/ingest/run', async (req, res) => {
+app.post(['/api/worker/ingest', '/api/worker/ingest/run'], async (req, res) => {
   const parsedDeadline = parseInt(
     req.body?.deadline_ms || process.env.INGEST_DEADLINE_MS || '135000',
     10

@@ -9,7 +9,6 @@ const execFileP = promisify(execFile);
 
 const db = require('../utils/db');
 const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
-const { upsertByBrandCode } = require('../utils/schema');
 const { getBlueprint } = require('../utils/blueprint');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
@@ -52,19 +51,6 @@ function harvestMpnCandidates(text, series){
   const set = new Set();
   let m; while((m = rx.exec(src))) set.add(m[0]);
   return [...set];
-}
-
-async function getTableColumns(qualified) {
-  const [schema, table] = qualified.includes('.') ? qualified.split('.') : ['public', qualified];
-  const q = `
-    SELECT a.attname AS col
-      FROM pg_attribute a
-      JOIN pg_class c ON a.attrelid = c.oid
-      JOIN pg_namespace n ON c.relnamespace = n.oid
-     WHERE n.nspname = $1 AND c.relname = $2
-       AND a.attnum > 0 AND NOT a.attisdropped`;
-  const r = await db.query(q, [schema, table]);
-  return new Set(r.rows.map(x=>x.col));
 }
 
 // DB 컬럼 타입 조회 (fallback용)
@@ -170,42 +156,6 @@ function applyCodeRules(code, out, rules, colTypes) {
     }
   }
 }
-
-
-// 컬럼 타입에 맞춰 값 정리: 숫자/정수/불리언만 강제 변환, 실패하면 해당 키 제거
-function sanitizeByColTypes(obj, colTypes) {
-  for (const [k, v] of Object.entries({ ...obj })) {
-    const t = colTypes.get(k);
-    if (t === 'numeric') {
-      const n = coerceNumeric(v);
-      if (n == null) delete obj[k]; else obj[k] = n;
-    } else if (t === 'int') {
-      const n = coerceNumeric(v);
-      if (n == null) delete obj[k]; else obj[k] = Math.round(n);
-    } else if (t === 'bool') {
-      if (typeof v === 'boolean') continue;
-      const s = String(v ?? '').toLowerCase().trim();
-      if (!s) delete obj[k];
-      else obj[k] = /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
-    }
-  }
-  return obj;
-}
-
-function normalizeKeysOnce(obj = {}) {
-  const out = {};
-  for (const [key, value] of Object.entries(obj || {})) {
-    const normalized = String(key || '')
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9_]+/g, '_')
-      .replace(/^_+|_+$/g, '');
-    if (!normalized) continue;
-    if (!(normalized in out)) out[normalized] = value;
-  }
-  return out;
-}
-
 
 
 // DB 함수로 스키마 보장 (ensure_specs_table)
@@ -477,13 +427,10 @@ async function runAutoIngest({
   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
   const qualified = table.startsWith('public.')? table : `public.${table}`;
 
-  // 스키마 보장 (DB 함수) + 컬럼셋 확보
-    if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
+  // 스키마 보장 (DB 함수) + 컬럼 타입 확보
+  if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
     await ensureSpecsTableByFamily(family);
   }
-  const colsSet = new Set([
-    ...await getTableColumns(qualified)
-  ].map((c) => String(c || '').toLowerCase()));
   const colTypes = await getColumnTypes(qualified);
 
   // 블루프린트 허용 키
@@ -820,40 +767,51 @@ async function runAutoIngest({
     colsSanitized: colTypes?.size || 0,
   });
 
-  // 업서트
+  const persistedCodes = new Set();
   let upserted = 0;
   for (const rec of records) {
-    const safe = {};
-    // 공통 키
-    if (colsSet.has('family_slug')) safe.family_slug = rec.family_slug;
-    if (colsSet.has('brand'))       safe.brand = rec.brand;
-    if (colsSet.has('code'))        safe.code  = rec.code;
-    if (colsSet.has('brand_norm'))  safe.brand_norm = normLower(rec.brand);
-    if (colsSet.has('code_norm'))   safe.code_norm  = normLower(rec.code);
-    if (colsSet.has('series_code')) safe.series_code = rec.series_code;
-    if (colsSet.has('datasheet_uri')) safe.datasheet_uri = rec.datasheet_uri;
-    if (colsSet.has('image_uri'))     safe.image_uri     = rec.image_uri;
-    if (colsSet.has('datasheet_url')) safe.datasheet_url = rec.datasheet_uri; // 별칭 호환
-    if (colsSet.has('display_name'))  safe.display_name  = rec.display_name;
-    if (colsSet.has('displayname'))   safe.displayname   = rec.display_name;
-    if (colsSet.has('cover') && rec.image_uri) safe.cover = rec.image_uri;
-    if (colsSet.has('verified_in_doc')) safe.verified_in_doc = !!rec.verified_in_doc;
+    const codeValue = String(rec.code || '').trim();
+    if (!codeValue) continue;
 
-    // 블루프린트 값
-    for (const [k,v] of Object.entries(rec)) {
-      const kk = String(k || '').toLowerCase();
-      if (BASE_KEYS.has(kk)) continue;
-      if (!colsSet.has(kk)) continue;
-      if (META_KEYS.has(kk)) continue;
-      safe[kk] = v;
+    const base = {
+      brand: rec.brand || brandName,
+      code: codeValue,
+      series_code: rec.series_code ?? null,
+      datasheet_uri: rec.datasheet_uri || gcsUri,
+      verified_in_doc: !!rec.verified_in_doc,
+    };
+    if (rec.mfr_full) base.mfr_full = rec.mfr_full;
+
+    const specs = {};
+    for (const [rawKey, rawValue] of Object.entries(rec)) {
+      const key = String(rawKey || '').trim().toLowerCase();
+      if (!key || BASE_KEYS.has(key) || META_KEYS.has(key)) continue;
+      if (!Object.prototype.hasOwnProperty.call(specs, key)) {
+        specs[key] = rawValue;
+      }
     }
-    if (colsSet.has('updated_at')) safe.updated_at = now;
+    if (rec.display_name) {
+      if (specs.display_name == null) specs.display_name = rec.display_name;
+      if (specs.displayname == null) specs.displayname = rec.display_name;
+    }
+    if (rec.image_uri) {
+      if (specs.image_uri == null) specs.image_uri = rec.image_uri;
+      if (specs.cover == null) specs.cover = rec.image_uri;
+    } else if (coverUri && specs.cover == null) {
+      specs.cover = coverUri;
+    }
+    if (specs.datasheet_url == null && (rec.datasheet_uri || gcsUri)) {
+      specs.datasheet_url = rec.datasheet_uri || gcsUri;
+    }
 
-    // ← 업서트 전에 숫자/정수/불리언 컬럼을 타입에 맞춰 정리(실패 키는 삭제)
-    sanitizeByColTypes(safe, colTypes);
-    await upsertByBrandCode(table, normalizeKeysOnce(safe));
+    await saveExtractedSpecs(family, base, specs);
+    persistedCodes.add(codeValue);
     upserted++;
   }
+
+  const persistedList = Array.from(persistedCodes);
+  const mpnList = Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [];
+  const mergedMpns = Array.from(new Set([...persistedList, ...mpnList]));
 
   return {
     ok: true,
@@ -863,11 +821,10 @@ async function runAutoIngest({
     brand: records[0]?.brand,
     code:  records[0]?.code,
     datasheet_uri: gcsUri,
-    cover: records[0]?.image_uri || null,
+    cover: coverUri || records[0]?.image_uri || null,
     rows: upserted,
-    // 🔹 호출자가 “이번 PDF에서 뽑힌 모든 MPN 리스트”를 바로 확인 가능
-    codes: Array.isArray(extracted?.codes) ? extracted.codes : [],
-    mpn_list: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
+    codes: persistedList,
+    mpn_list: mergedMpns,
   };
 }
 

@@ -1,108 +1,124 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 27da1a3df6c2d3ce978065741196aa161d9b0745..16d2afb6f2a2d6f28caa307907b1dbdab3465636 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -677,55 +677,98 @@ async function runAutoIngest({
-       code: specsObj.code ?? fallbackSeries ?? null,
-     };
-     const expanded = explodeVariants(baseSeed, specsObj, bp).map((entry) => ({
-       ...entry,
-       brand: entry.brand || brandName,
-       series_code: entry.series_code || entry.series || fallbackSeries,
-       code: entry.code ?? specsObj.code ?? fallbackSeries ?? null,
-     }));
-     explodedEntries.push(...expanded);
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 3b40f4134a23e209c7f66059eba30dbbcaa5133d..c45fd70fa5e4363e7fc17275560aba80603274c5 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -28,55 +28,56 @@ async function getColumnTypes(qualified) {
+     else out.set(col, 'text');
    }
-   if (!explodedEntries.length) {
-     explodedEntries = [{ brand: brandName, series_code: baseSeries || null, code: baseSeries || null }];
+   return out;
+ }
+ 
+ // "5, 6, 9, 12" / "1.5 to 24 V" 같은 문자열을 안전하게 수용
+ function toNumberOrNull(v) {
+   if (v == null || v === '') return null;
+   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+   const s = String(v);
+   const mRange = s.match(/-?\d+(?:\.\d+)?/g);
+   if (mRange && mRange.length > 0) return Number(mRange[0]);
+   return null;
+ }
+ 
+ async function saveExtractedSpecs(familySlug, base, specs) {
+   // 스키마 자동 보장(추가만 수행)
+   await ensureSpecsTableForFamily(familySlug);
+ 
+   const blueprint = await getBlueprint(pool, familySlug);
+   const specsTable = blueprint?.specsTable;
+   if (!specsTable) throw new Error(`specs table not found for family ${familySlug}`);
+   const targetTable = specsTable.includes('.') ? specsTable : `public.${specsTable}`;
+   const dbColTypes = await getColumnTypes(targetTable);
+ 
+-  const baseCols = ['family_slug','brand','brand_norm','code','code_norm','mfr_full','datasheet_uri','verified_in_doc'];
++  const baseCols = ['family_slug','brand','brand_norm','code','code_norm','series_code','mfr_full','datasheet_uri','verified_in_doc'];
+   const baseVals = [
+     familySlug,
+     base.brand, String(base.brand || '').toLowerCase(),
+     base.code,  String(base.code  || '').toLowerCase(),
++    base.series_code ?? null,
+     base.mfr_full ?? null,
+     base.datasheet_uri ?? null,
+     true
+   ];
+ 
+   const RESERVED = new Set(['id','brand','code','brand_norm','code_norm','created_at','updated_at']);
+   const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
+   const allowedKeys = Array.isArray(blueprint?.allowedKeys)
+     ? blueprint.allowedKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+     : [];
+   const fieldTypes = blueprint?.fields || {};
+   function coerceNumeric(x) {
+     if (x == null || x === '') return null;
+     if (typeof x === 'number') return x;
+     let s = String(x).toLowerCase();
+     s = s.replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
+     const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
+     if (!m) return null;
+     let n = parseFloat(m[1]);
+     const mul = (m[2] || '').toLowerCase();
+     const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
+     if (mul && scale[mul] != null) n = n * scale[mul];
+     return Number.isFinite(n) ? n : null;
+   }
+   function coerceByType(key, val) {
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 3b40f4134a23e209c7f66059eba30dbbcaa5133d..c45fd70fa5e4363e7fc17275560aba80603274c5 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -92,50 +93,57 @@ async function saveExtractedSpecs(familySlug, base, specs) {
+       const s = String(val||'').toLowerCase().trim();
+       if (!s) return null;
+       return /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
+     }
+     return (val == null ? null : String(val));
+   }
+   const fastKeys = FAST
+     ? computeFastKeys(blueprint).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+     : allowedKeys;
+   const allowedSet = new Set(allowedKeys);
+   const fastSet = new Set(fastKeys);
+   const specsNorm = {};
+   for (const [rawKey, value] of Object.entries(specs || {})) {
+     const key = String(rawKey || '')
+       .trim()
+       .toLowerCase()
+       .replace(/[^a-z0-9_]/g, '');
+     if (!key || RESERVED.has(key)) continue;
+     if (allowedSet.size && !allowedSet.has(key)) continue;
+     if (FAST && fastSet.size && !fastSet.has(key)) continue;
+     if (!Object.prototype.hasOwnProperty.call(specsNorm, key)) {
+       specsNorm[key] = coerceByType(key, value); // 타입 강제정규화
+     }
    }
  
-   // ---- 분할 여부 결정 ----
-   const pnCands = candidateMap.map((c) => c.raw);
-   const seriesCands = (candidates.length && series) ? candidateMap.filter((c) => /\d/.test(c.norm)).map((c) => c.raw) : [];
-   const mustSplit = decideSplit({
-     pnCandidates: pnCands,
-     seriesCandidates: seriesCands,
-     variantKeys,
-     specs: (rawRows[0] || {})
-   });
- 
-   if (!mustSplit && explodedEntries.length > 1) explodedEntries.splice(1);
--  if (mustSplit && candidateMap.length > 1 && explodedEntries.length <= 1) {
--    const max = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
--    const tmpl = explodedEntries[0] || { brand: brandName, series_code: baseSeries || null };
--    explodedEntries = candidateMap.slice(0, max)
--      .map((c) => ({ ...tmpl, code: c.raw, code_norm: c.norm }));
-+  if (mustSplit && candidateMap.length > 1) {
-+    const maxCodes = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
-+    if (maxCodes > 0) {
-+      const fallbackNorm = baseSeries ? normalizeCode(baseSeries) : null;
-+      const assignedNorms = new Set();
-+
-+      // 이미 스펙 행에 코드가 정확히 채워져 있으면 그대로 사용
-+      for (const entry of explodedEntries) {
-+        const existing = entry.code ? normalizeCode(entry.code) : null;
-+        if (existing && candidateNormSet.has(existing) && !assignedNorms.has(existing)) {
-+          assignedNorms.add(existing);
-+        }
-+      }
-+
-+      let idx = 0;
-+      const nextCandidate = () => {
-+        while (idx < maxCodes && assignedNorms.has(candidateMap[idx].norm)) idx++;
-+        if (idx >= maxCodes) return null;
-+        const cand = candidateMap[idx++];
-+        assignedNorms.add(cand.norm);
-+        return cand;
-+      };
-+
-+      for (const entry of explodedEntries) {
-+        if (assignedNorms.size >= maxCodes) break;
-+        const norm = entry.code ? normalizeCode(entry.code) : null;
-+        const needsOverride = !norm || norm === fallbackNorm || assignedNorms.has(norm);
-+        if (!needsOverride) continue;
-+        const cand = nextCandidate();
-+        if (!cand) break;
-+        entry.code = cand.raw;
-+        entry.code_norm = cand.norm;
-+      }
-+
-+      const templateBase = explodedEntries[0]
-+        ? { ...explodedEntries[0] }
-+        : { brand: brandName, series_code: baseSeries || null };
-+      delete templateBase.code;
-+      delete templateBase.code_norm;
-+
-+      for (let cand = nextCandidate(); cand; cand = nextCandidate()) {
-+        explodedEntries.push({
-+          ...templateBase,
-+          code: cand.raw,
-+          code_norm: cand.norm,
-+        });
-+      }
++  for (const key of Object.keys(specsNorm)) {
++    const t = dbColTypes.get(key);
++    if (t === 'numeric' || t === 'int') {
++      specsNorm[key] = toNumberOrNull(specsNorm[key]);
 +    }
-   }
- 
-   const seenCodes = new Set();
-   for (const entry of explodedEntries) {
-     const baseInfo = entry || {};
-     const specs = {};
-     for (const k of allowedKeys) if (entry[k] != null) specs[k] = entry[k];
-     const pickNumeric = (vals) => {
-       for (const v of (Array.isArray(vals) ? vals : [vals])) { const n = coerceNumeric(v); if (Number.isFinite(n)) return n; }
-       return null;
-     };
-     const voltageNum   = pickNumeric(specs.coil_voltage_vdc || specs.coil_voltage || specs.voltage_vdc || specs.voltage_dc || specs.voltage);
-     const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2,'0') : null;
- 
-     let mpn = baseInfo.code ? String(baseInfo.code).trim() : null;   // 후보 복제 시 base.code가 곧 MPN
-     if (!mpn && candidateMap.length) {
-       const match = voltageToken ? candidateMap.find(c => c.norm.includes(voltageToken)) : null;
-       mpn = (match || candidateMap[0])?.raw || null;
++  }
++
+   const specCols = Object.keys(specsNorm);
+   const allCols = baseCols.concat(specCols);
+   const params = allCols.map((_, i) => `$${i + 1}`);
+   const values = baseVals.concat(specCols.map((k) => {
+     const x = specsNorm[k];
+     if (typeof x === 'string' && /to|,|\d/.test(x)) {
+       const n = toNumberOrNull(x);
+       return n ?? null;
      }
-     if (!mpn) {
-       const templated = buildMpn({ ...specs, ...baseInfo }, bp);
-       if (templated) mpn = templated;
-     }
-     if (!mpn && specs.code) mpn = String(specs.code).trim();
+     return x;
+   }));
  
+   const colList = allCols.map(safeColumnName).join(',');
+   const setList = specCols
+     .map((k) => `${safeColumnName(k)} = EXCLUDED.${safeColumnName(k)}`)
+     .join(',');
+ 
+   const sql = `
+     INSERT INTO ${targetTable} (${colList})
+     VALUES (${params.join(',')})
+     ON CONFLICT (brand_norm, code_norm)
+     DO UPDATE SET
+       mfr_full = EXCLUDED.mfr_full,
+       datasheet_uri = EXCLUDED.datasheet_uri,
+       verified_in_doc = EXCLUDED.verified_in_doc

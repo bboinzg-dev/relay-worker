@@ -30,6 +30,47 @@ const MIN_KEYS = {
 };
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
+function normIdent(s){ return String(s||'').trim().toLowerCase().replace(/[^a-z0-9_]/g, ''); }
+
+const VOLTAGE_GRID = [1.5,3,5,6,9,12,18,24,48];
+function parseVoltageList(v){
+  if (Array.isArray(v)) return v.map(Number).filter((n)=>Number.isFinite(n));
+  const s = String(v||'').toLowerCase();
+  const multi = s.match(/(\d+(?:\.\d+)?)/g);
+  if (multi && multi.length>1) return multi.map(Number).filter(Number.isFinite);
+  const range = s.match(/(\d+(?:\.\d+)?)\s*(?:v|vdc)?\s*(?:to|~|-)\s*(\d+(?:\.\d+)?)/);
+  if (range){
+    const lo = parseFloat(range[1]);
+    const hi = parseFloat(range[2]);
+    return VOLTAGE_GRID.filter((x)=>x>=lo && x<=hi);
+  }
+  const single = s.match(/(\d+(?:\.\d+)?)/);
+  if (single){ const n = Number(single[1]); return Number.isFinite(n)?[n]:[]; }
+  return [];
+}
+
+function tokenOf(x){
+  if (x==null) return '';
+  const s = String(x).toUpperCase();
+  const m = s.match(/[A-Z0-9\.]+/g);
+  return m ? m.join('') : '';
+}
+
+function harvestMpnCandidates(text, series){
+  const hay = String(text||'');
+  if (!hay) return [];
+  const ser = String(series||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+  const lines = hay.split(/\n+/);
+  const near = [];
+  for (const ln of lines){
+    if (/ordering|part\s*number|order code|品番|型番/i.test(ln)) near.push(ln);
+  }
+  const src = (near.length? near.join(' ') : hay).toUpperCase();
+  const rx = ser ? new RegExp(`\\b${ser}[A-Z0-9\\-]+\\b`,'g') : /\b[A-Z][A-Z0-9\-]{3,}\b/g;
+  const set = new Set();
+  let m; while((m = rx.exec(src))) set.add(m[0]);
+  return [...set];
+}
 
 async function getTableColumns(qualified) {
   const [schema, table] = qualified.includes('.') ? qualified.split('.') : ['public', qualified];
@@ -76,14 +117,14 @@ function coerceNumeric(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-// "5, 6, 9, 12" / "5/12/24" / "5 12 24" → [5,12,24]
-// "1.5 to 24" 같은 범위는 '분할 금지' → [] 반환
 function parseListOrRange(s) {
   if (Array.isArray(s)) return s;
   const raw = String(s ?? '').trim();
   if (!raw) return [];
-  if (/(-?\d+(?:\.\d+)?)\s*(?:to|–|-)\s*(-?\d+(?:\.\d+)?)/i.test(raw)) return [];
-  return raw.split(/[,、\/\s]+/).map(x => parseFloat(x)).filter(Number.isFinite);
+  const volts = parseVoltageList(raw);
+  if (volts.length) return volts;
+  if (/[;,、\/\s]/.test(raw)) return raw.split(/[;,、\/\s]+/).map(x => x.trim()).filter(Boolean);
+  return [raw];
 }
 
 // 분할 여부: PN 후보≥2 또는 variant 열거형 곱≥2 이면 분할
@@ -652,6 +693,9 @@ async function runAutoIngest({
   const brandName = brand || extracted.brand || 'unknown';
   const baseSeries = series || code || null;
 
+  const mpnsFromDoc = harvestMpnCandidates(extracted?.text || '', baseSeries || series || code || '');
+  const mpnNormFromDoc = new Set(mpnsFromDoc.map((m) => normalizeCode(m)).filter(Boolean));
+
   const candidateMap = [];
   const candidateNormSet = new Set();
   for (const cand of candidates) {
@@ -762,6 +806,26 @@ async function runAutoIngest({
     const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2,'0') : null;
 
     let mpn = baseInfo.code ? String(baseInfo.code).trim() : null;   // 후보 복제 시 base.code가 곧 MPN
+
+    const variantTokens = [];
+    for (const key of variantKeys) {
+      const rawKey = String(key || '');
+      const normKey = normIdent(rawKey);
+      let val = entry[rawKey];
+      if (val == null && normKey) val = entry[normKey];
+      if (val == null && specs[rawKey] != null) val = specs[rawKey];
+      if (val == null && normKey && specs[normKey] != null) val = specs[normKey];
+      if (val != null) variantTokens.push(tokenOf(val));
+    }
+
+    if (!mpn && mpnsFromDoc.length) {
+      const want = variantTokens.filter(Boolean);
+      const cand = want.length
+        ? mpnsFromDoc.find((code) => want.every((w) => code.includes(w)))
+        : mpnsFromDoc[0];
+      if (cand) mpn = cand;
+    }
+
     if (!mpn && candidateMap.length) {
       const match = voltageToken ? candidateMap.find(c => c.norm.includes(voltageToken)) : null;
       mpn = (match || candidateMap[0])?.raw || null;
@@ -774,7 +838,14 @@ async function runAutoIngest({
 
     if (!mpn) {
       const prefix = baseInfo.series_code || baseInfo.series || baseSeries || '';
-      const suffix = voltageToken || (voltageNum != null ? String(Math.round(voltageNum)) : '');
+      const tokens = variantTokens.filter(Boolean);
+      if (!tokens.length) {
+        for (const v of Object.values(specs)) {
+          const token = tokenOf(v);
+          if (token) tokens.push(token);
+        }
+      }
+      const suffix = tokens.length ? tokens.join('') : (voltageToken || (voltageNum != null ? String(Math.round(voltageNum)) : ''));
       if (prefix || suffix) mpn = `${prefix}${suffix}`.trim();
     }
     if (!mpn) continue;
@@ -792,7 +863,7 @@ async function runAutoIngest({
       datasheet_uri: gcsUri,
       image_uri: coverUri || null,
       display_name: `${baseInfo.brand || brandName} ${mpn}`,
-      verified_in_doc: candidateNormSet.has(mpnNorm),
+      verified_in_doc: candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm),
       updated_at: now,
     };
     for (const k of allowedKeys) {

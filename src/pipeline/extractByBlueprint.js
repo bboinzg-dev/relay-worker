@@ -30,6 +30,15 @@ function buildSchema(fieldsJson = {}) {
   return schema;
 }
 
+function normalizeList(v) {
+  if (Array.isArray(v)) return v;
+  const s = String(v || '').trim();
+  if (!s) return [];
+  if (/[;,\/]/.test(s)) return s.split(/[;,\/]/).map((x) => x.trim()).filter(Boolean);
+  if (/\d/.test(s) && /(to|~|-)/i.test(s)) return [s];
+  return [s];
+}
+
 function coerceValue(val, type) {
   if (val == null || val === '') return null;
   const t = String(type).toLowerCase();
@@ -118,7 +127,14 @@ async function extractFields(rawText, code, fieldsJson) {
 
   const out = {};
   for (const { name, type } of schema) {
-    out[name] = coerceValue(parsed[name], type);
+    const val = coerceValue(parsed[name], type);
+    if (val == null) { out[name] = null; continue; }
+    if (type === 'text' && typeof val === 'string') {
+      const arr = normalizeList(val);
+      out[name] = arr.length > 1 ? arr : arr[0];
+    } else {
+      out[name] = val;
+    }
   }
   return out;
 }

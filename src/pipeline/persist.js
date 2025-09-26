@@ -50,11 +50,12 @@ async function saveExtractedSpecs(familySlug, base, specs) {
   const targetTable = specsTable.includes('.') ? specsTable : `public.${specsTable}`;
   const dbColTypes = await getColumnTypes(targetTable);
 
-  const baseCols = ['family_slug','brand','brand_norm','code','code_norm','mfr_full','datasheet_uri','verified_in_doc'];
+  const baseCols = ['family_slug','brand','brand_norm','code','code_norm','series_code','mfr_full','datasheet_uri','verified_in_doc'];
   const baseVals = [
     familySlug,
     base.brand, String(base.brand || '').toLowerCase(),
     base.code,  String(base.code  || '').toLowerCase(),
+    base.series_code ?? null,
     base.mfr_full ?? null,
     base.datasheet_uri ?? null,
     true
@@ -111,6 +112,13 @@ async function saveExtractedSpecs(familySlug, base, specs) {
     if (FAST && fastSet.size && !fastSet.has(key)) continue;
     if (!Object.prototype.hasOwnProperty.call(specsNorm, key)) {
       specsNorm[key] = coerceByType(key, value); // 타입 강제정규화
+    }
+  }
+
+  for (const key of Object.keys(specsNorm)) {
+    const t = dbColTypes.get(key);
+    if (t === 'numeric' || t === 'int') {
+      specsNorm[key] = toNumberOrNull(specsNorm[key]);
     }
   }
 

@@ -691,9 +691,18 @@ async function runAutoIngest({
     specs: (rawRows[0] || {})
   });
 
-  // 단일이라면 폭발 결과를 1건으로 제한
-  if (!mustSplit && explodedEntries.length > 1) {
-    explodedEntries.splice(1);
+  // (A) 단일이라면 폭발 결과를 1건으로 제한
+  if (!mustSplit && explodedEntries.length > 1) explodedEntries.splice(1);
+
+  // (B) 분할인데 후보가 여러 개라면 entries를 후보 수만큼 복제
+  if (mustSplit && candidateMap.length > 1 && explodedEntries.length <= 1) {
+    const max = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
+    const tmpl = explodedEntries[0] || { base: { brand: brandName, series: baseSeries }, specs: {} };
+    const dup = [];
+    for (const c of candidateMap.slice(0, max)) {
+      dup.push({ base: { ...tmpl.base, code: c.raw }, specs: { ...tmpl.specs } });
+    }
+    explodedEntries.splice(0, explodedEntries.length, ...dup);
   }
 
   const seenCodes = new Set();
@@ -717,8 +726,9 @@ async function runAutoIngest({
     );
     const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2, '0') : null;
 
-    let mpn = null;
-    if (candidateMap.length) {
+    // (C) 후보 복제 시 base.code가 곧 MPN
+    let mpn = baseInfo.code ? String(baseInfo.code).trim() : null;
+    if (!mpn && candidateMap.length) {
       const match = voltageToken ? candidateMap.find((c) => c.norm.includes(voltageToken)) : null;
       const pick = match || candidateMap[0];
       if (pick) mpn = pick.raw;

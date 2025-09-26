@@ -32,7 +32,7 @@ function normalizeFieldNames(fieldsJson) {
 
 async function fetchBlueprint(pool, family) {
   const { rows } = await pool.query(
-    `SELECT b.fields_json, b.required_fields, r.specs_table
+    `SELECT b.fields_json, b.required_fields, b.ingest_options, r.specs_table
        FROM public.component_spec_blueprint b
        JOIN public.component_registry r USING (family_slug)
       WHERE b.family_slug=$1`, [family]);
@@ -47,6 +47,7 @@ async function fetchBlueprint(pool, family) {
     specsTable,
     allowedKeys: normalizeFieldNames(fields),
     requiredFields,
+    ingestOptions: rows[0].ingest_options || {},
   };
 }
 

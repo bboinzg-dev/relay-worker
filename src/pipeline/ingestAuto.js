@@ -152,7 +152,9 @@ function decideSplit({ pnCandidates = [], seriesCandidates = [], variantKeys = [
 
 // variant_keys 교차곱으로 base/specs 병합 배열 생성
 function explodeVariants(base = {}, specs = {}, bp = {}) {
-  const keys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
+  const keys = Array.isArray(bp?.ingestOptions?.variant_keys)
+    ? bp.ingestOptions.variant_keys.map((k) => String(k).toLowerCase())
+    : (Array.isArray(bp.variant_keys) ? bp.variant_keys : []);
   if (!keys.length) return [{ ...base, ...specs }];
   const lists = keys.map(k => {
     const arr = parseListOrRange(specs[k]);
@@ -566,7 +568,9 @@ async function runAutoIngest({
   // 블루프린트 허용 키
   const blueprint = await getBlueprint(family);
   const allowedKeys = blueprint?.allowedKeys || [];
-  const variantKeys = Array.isArray(blueprint?.variant_keys) ? blueprint.variant_keys : [];
+  const variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+    ? blueprint.ingestOptions.variant_keys.map((k) => String(k).toLowerCase())
+    : [];
 
   // -------- 공용 강제정규화 유틸 --------
 

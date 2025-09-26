@@ -1,67 +1,75 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/src/routes/files.js b/src/routes/files.js
-index 42b3a2dcb05d06dbcc74a6bd2a92ee91f361fab7..a7a47553e69cef745d0e90b2fd9f5f789f9f3e6c 100644
---- a/src/routes/files.js
-+++ b/src/routes/files.js
-@@ -57,51 +57,51 @@ router.post('/upload', upload.single('file'), async (req, res) => {
-     });
+diff --git a/lib/llm.js b/lib/llm.js
+index faf41ef53e4538c689cbfb4649e331b26caa6e12..b0c440f6cdfee39d5211cc8e4927ba485d06f610 100644
+--- a/lib/llm.js
++++ b/lib/llm.js
+@@ -1,66 +1,68 @@
+ const { VertexAI } = require('@google-cloud/vertexai');
++const { safeJsonParse } = require('../src/utils/safe-json');
  
-     const gcsUri = `gs://${BUCKET}/${objectName}`;
+ function getModel(name) {
+   const v = new VertexAI({
+     project: process.env.GCP_PROJECT_ID,
+     location: process.env.VERTEX_LOCATION || 'asia-northeast3',
+   });
+   return v.getGenerativeModel({ model: name });
+ }
  
-     // 2) 파라미터 정리
-     const payload = {
-       gcsUri,
-       filename: originalName,
-       family_slug: req.body.family_slug || null,
-       brand: req.body.brand || null,
-       code: req.body.code || null,
-       series: req.body.series || null,
-       display_name: req.body.display_name || null,
-     };
+ function partsText(resp) {
+   const parts = resp?.response?.candidates?.[0]?.content?.parts || [];
+   return parts.map(p => p?.text || '').join('');
+ }
  
-     // 3) Cloud Tasks가 설정되어 있으면 enq, 아니면 즉시 분석
-     const queue = process.env.QUEUE_NAME;
-     const location = process.env.TASKS_LOCATION;
-     const workerUrl = process.env.WORKER_TASK_URL; // e.g. https://worker-xxxx.run.app/api/worker/ingest
-     const invokerSA = process.env.TASKS_INVOKER_SA;
+ async function classifyFamily({ pdfBytes, allowedFamilies }) {
+   const mdl = getModel(process.env.GEMINI_MODEL_CLASSIFY || 'gemini-2.5-flash');
+   const prompt = `
+ PDF 전체를 보고 아래 JSON 한 객체로만 답하세요.
+ {"family_slug":"...", "brand": null|string, "code": null|string, "series": null|string}
  
-     if (queue && location && workerUrl) {
-       const client = new CloudTasksClient();
-       const parent = client.queuePath(process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT, location, queue);
+ - family_slug는 반드시 다음 중 정확히 하나: ${allowedFamilies.map(f => `"${f}"`).join(', ')}
+ - 허용 목록 외 값 금지. 불확실하면 가장 근접한 하나 선택.
+ `.trim();
  
--      const task = {
--        httpRequest: {
--          httpMethod: 'POST',
--          url: workerUrl,
--          headers: { 'Content-Type': 'application/json' },
--          body: Buffer.from(JSON.stringify(payload)).toString('base64'),
--        },
-+      const body = Buffer.from(JSON.stringify(payload));
-+      const httpRequest = {
-+        url: workerUrl,
-+        httpMethod: 'POST',
-+        headers: { 'Content-Type': 'application/json' },
-+        body,
-       };
-+      const task = { httpRequest };
-       if (invokerSA) {
-         task.httpRequest.oidcToken = { serviceAccountEmail: invokerSA, audience: workerUrl };
-       }
+   const resp = await mdl.generateContent({
+     contents: [{
+       role: 'user',
+       parts: [
+         { text: prompt },
+         { inlineData: { mimeType: 'application/pdf', data: pdfBytes.toString('base64') } },
+       ],
+     }],
+     generationConfig: { responseMimeType: 'application/json' },
+   });
  
-       const [resp] = await client.createTask({ parent, task });
-       return res.json({ ok: true, gcsUri, enqueued: true, task: resp.name });
-     }
+   const text = partsText(resp) || '{}';
+-  return JSON.parse(text);
++  const parsed = safeJsonParse(text) || {};
++  return parsed;
+ }
  
-     // fallback: 즉시 실행
-     const result = await runAutoIngest(payload);
-     return res.json({ ok: true, gcsUri, enqueued: false, result });
-   } catch (e) {
-     console.error(e);
-     res.status(400).json({ ok: false, error: String(e.message || e) });
-   }
- });
+ async function extractByBlueprint({ pdfBytes, family, fields }) {
+   const mdl = getModel(process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash');
+   const keys = Object.keys(fields);
+   const prompt = `
+ 다음 PDF에서 ${family} 부품의 스펙을 추출합니다.
+ 아래 컬럼들만 채우세요(없으면 null). 반드시 {"values": { "<컬럼>": <값> }} JSON 한 객체만 출력.
+ 허용 컬럼: ${keys.join(', ')}
+ `.trim();
  
- module.exports = router;
+   const resp = await mdl.generateContent({
+     contents: [{
+       role: 'user',
+       parts: [
+         { text: prompt },
+         { inlineData: { mimeType: 'application/pdf', data: pdfBytes.toString('base64') } },
+       ],
+     }],
+     generationConfig: { responseMimeType: 'application/json' },
+   });
  
-EOF
-)
+   const text = partsText(resp) || '{}';
+-  const j = JSON.parse(text);
++  const j = safeJsonParse(text) || {};
+   return j?.values || {};
+ }
+ 
+ module.exports = { classifyFamily, extractByBlueprint };

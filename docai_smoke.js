@@ -1,6 +1,7 @@
 const { batchProcess } = require('./docai_client');
 const { extractRelayFields } = require('./docai_parse');
 const { Storage } = require('@google-cloud/storage');
+const { safeJsonParse } = require('./src/utils/safe-json');
 const storage = new Storage();
 function parseGs(gs){ const s=gs.replace('gs://',''); const i=s.indexOf('/'); return {bucket:s.slice(0,i), name:s.slice(i+1)}; }
 (async ()=>{
@@ -13,7 +14,7 @@ function parseGs(gs){ const s=gs.replace('gs://',''); const i=s.indexOf('/'); re
     const first = outputs.find(u => u.endsWith('.json'));
     const {bucket,name} = parseGs(first);
     const [buf] = await storage.bucket(bucket).file(name).download();
-    const doc = JSON.parse(buf.toString('utf8'));
+    const doc = safeJsonParse(buf.toString('utf8'));
     console.log('Extracted:', extractRelayFields(doc));
   } catch(e){ console.error(e); process.exit(2); }
 })();

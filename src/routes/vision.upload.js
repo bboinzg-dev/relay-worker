@@ -5,6 +5,7 @@ const multer = require('multer');
 const crypto = require('crypto');
 const { Storage } = require('@google-cloud/storage');
 const { GoogleAuth } = require('google-auth-library');
+const { safeJsonParse } = require('../utils/safe-json');
 
 const router = express.Router();
 
@@ -140,10 +141,10 @@ router.post('/api/vision/guess', upload.any(), async (req, res) => {
     const vtext = await vr.text();
     if (!vr.ok) return res.status(502).json({ ok: false, error: `vertex ${vr.status}: ${vtext.slice(0, 200)}` });
 
-    let body = {}; try { body = JSON.parse(vtext); } catch {}
+    let body = {}; try { body = safeJsonParse(vtext) || {}; } catch {}
     const parts = body?.candidates?.[0]?.content?.parts || [];
     const rawText = parts.map(p => p?.text || '').join('\n');
-    let out = {}; try { out = rawText ? JSON.parse(rawText) : {}; } catch {}
+    let out = {}; try { out = rawText ? safeJsonParse(rawText) || {} : {}; } catch {}
 
     // ---------- 3) 폴백(누락 방지) ----------
     let brand  = (out.brand  || '').trim();

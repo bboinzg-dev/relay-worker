@@ -6,6 +6,7 @@ const multer = require('multer');
 const bodyParser = require('body-parser');
 const { VertexAI } = require('@google-cloud/vertexai');
 const db = require('./src/utils/db');
+const { safeJsonParse } = require('./src/utils/safe-json');
 
 const app = express();
 app.use(cors());
@@ -87,10 +88,10 @@ JSON 외 텍스트 절대 금지.`;
 
     let guess = {};
     try {
-      guess = JSON.parse(raw);
+      guess = safeJsonParse(raw) || {};
     } catch {
       try {
-        guess = JSON.parse(pickJson(raw));
+        guess = safeJsonParse(pickJson(raw)) || {};
       } catch {
         guess = {};
       }

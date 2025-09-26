@@ -702,7 +702,10 @@ async function runAutoIngest({
         brand: combo.brand || seedBrand,
       };
       const seriesCode = normalized.series_code ?? normalized.series ?? seedSeries ?? normalized.code ?? null;
-      if (seriesCode != null) normalized.series_code = seriesCode;
+      if (seriesCode != null) {
+        normalized.series_code = seriesCode;
+        if (normalized.series == null) normalized.series = seriesCode;
+      }
       const mpn = buildMpn(normalized, bp);
       if (mpn) {
         normalized.code = mpn;
@@ -710,14 +713,24 @@ async function runAutoIngest({
       } else if (normalized.code) {
         normalized.code_norm = String(normalized.code).toLowerCase();
       }
-      explodedEntries.push(normalized);
+      const specPayload = {};
+      for (const key of allowedKeys) {
+        if (normalized[key] != null) specPayload[key] = normalized[key];
+      }
+      explodedEntries.push({ base: normalized, specs: specPayload });
     }
   }
   if (!explodedEntries.length) {
+    const fallbackCode = baseSeries || null;
     explodedEntries.push({
-      brand: brandName,
-      code: baseSeries || null,
-      series_code: baseSeries || null,
+      base: {
+        brand: brandName,
+        series: baseSeries || null,
+        series_code: baseSeries || null,
+        code: fallbackCode,
+        code_norm: fallbackCode ? String(fallbackCode).toLowerCase() : null,
+      },
+      specs: {},
     });
   }
 
@@ -731,19 +744,25 @@ async function runAutoIngest({
     specs: (rawRows[0] || {})
   });
 
-  // (A) 단일이라면 폭발 결과를 1건으로 제한
+  // 단일이면 1건만 유지
   if (!mustSplit && explodedEntries.length > 1) explodedEntries.splice(1);
 
-  // (B) 분할인데 후보가 여러 개라면 entries를 후보 수만큼 복제
+  // 분할이고, 후보 MPN이 2개 이상인데 entries 가 1건뿐이면 → 후보 수만큼 복제
   if (mustSplit && candidateMap.length > 1 && explodedEntries.length <= 1) {
     const max = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
-    const tmpl = explodedEntries[0] || { brand: brandName, series_code: baseSeries || null };
+    const tmpl = explodedEntries[0] || {
+      base: { brand: brandName, series: baseSeries, series_code: baseSeries || null },
+      specs: {},
+    };
     const dup = [];
     for (const c of candidateMap.slice(0, max)) {
       dup.push({
-        ...tmpl,
-        code: c.raw,
-        code_norm: String(c.raw || '').toLowerCase(),
+        base: {
+          ...tmpl.base,
+          code: c.raw,
+          code_norm: String(c.raw || '').toLowerCase(),
+        },
+        specs: { ...tmpl.specs },
       });
     }
     explodedEntries.splice(0, explodedEntries.length, ...dup);
@@ -759,10 +778,13 @@ async function runAutoIngest({
   };
 
   for (const entry of explodedEntries) {
-    const recordBrand = entry?.brand || brandName;
+    const baseInfo = entry?.base || {};
+    const specsSource = entry?.specs || {};
+    const recordBrand = baseInfo.brand || brandName;
     const specs = {};
     for (const key of allowedKeys) {
-      if (entry[key] != null) specs[key] = entry[key];
+      if (specsSource[key] != null) specs[key] = specsSource[key];
+      else if (baseInfo[key] != null) specs[key] = baseInfo[key];
     }
 
     const voltageNum = pickNumeric(
@@ -773,9 +795,9 @@ async function runAutoIngest({
       specs.voltage
     );
     const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2, '0') : null;
-    const seriesSeed = entry.series_code || entry.series || baseSeries || null;
+    const seriesSeed = baseInfo.series_code || baseInfo.series || baseSeries || null;
 
-    let mpn = entry.code ? String(entry.code).trim() : null;
+    let mpn = baseInfo.code ? String(baseInfo.code).trim() : null; // 후보 복제의 효과
     if (!mpn && candidateMap.length) {
       const match = voltageToken ? candidateMap.find((c) => c.norm.includes(voltageToken)) : null;
       const pick = match || candidateMap[0];
@@ -819,7 +841,7 @@ async function runAutoIngest({
       updated_at: now,
     };
 
-    if (entry.mfr_full && rec.mfr_full == null) rec.mfr_full = entry.mfr_full;
+    if (baseInfo.mfr_full && rec.mfr_full == null) rec.mfr_full = baseInfo.mfr_full;
 
     for (const k of allowedKeys) {
       let v = specs[k];
@@ -881,7 +903,7 @@ async function runAutoIngest({
     }
     if (colsSet.has('updated_at')) safe.updated_at = now;
 
-   // ← 업서트 전에 숫자/정수/불리언 컬럼을 타입에 맞춰 정리(실패 키는 삭제)
+    // ← 업서트 전에 숫자/정수/불리언 컬럼을 타입에 맞춰 정리(실패 키는 삭제)
     sanitizeByColTypes(safe, colTypes);
     await upsertByBrandCode(table, safe);
     upserted++;

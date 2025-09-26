@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const db = require('./src/utils/db');
+const { safeJsonParse } = require('./src/utils/safe-json');
 
 const app = express();
 app.use(cors());
@@ -132,7 +133,7 @@ async function searchOneTable(table, cols, { q, filters, sort, limitPerTable=200
 }
 
 function mergeFacets(a, b){
-  const out = JSON.parse(JSON.stringify(a));
+  const out = safeJsonParse(JSON.stringify(a)) || {};
   function plusCount(obj, add){
     for (const [k,v] of Object.entries(add)) obj[k] = (obj[k]||0) + (v||0);
   }

@@ -4,6 +4,10 @@ import { Pool } from "pg";
 import jwt from "jsonwebtoken";
 import argon2 from "argon2";
 import crypto from "node:crypto";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { safeJsonParse } = require("../utils/safe-json");
 
 const router = express.Router();
 
@@ -57,8 +61,13 @@ async function ensureAuthTables(client) {
 // JSON 파서: body가 text일 수도 있으니 방어적으로
 function getJsonBody(req) {
   if (req.is && req.is("application/json")) return req.body || {};
-  try { return typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {}); }
-  catch { return {}; }
+  try {
+    return typeof req.body === "string"
+      ? safeJsonParse(req.body || "{}") || {}
+      : (req.body || {});
+  } catch {
+    return {};
+  }
 }
 
 // 간단 HS256 JWT (수동 서명)

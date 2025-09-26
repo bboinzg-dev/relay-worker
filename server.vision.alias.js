@@ -4,6 +4,7 @@ const express = require('express');
 const multer  = require('multer');
 const upload  = multer({ storage: multer.memoryStorage() });
 const { VertexAI } = require('@google-cloud/vertexai');
+const { safeJsonParse } = require('./src/utils/safe-json');
 
 const router = express.Router();
 
@@ -32,7 +33,7 @@ router.post('/api/vision/guess', upload.single('file'), async (req, res) => {
 
     const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
     const raw   = parts.map(p => p.text ?? '').join('');
-    const guess = JSON.parse(raw || '{}');
+    const guess = safeJsonParse(raw || '{}') || {};
 
     return res.json({ ok:true, guess });
   } catch (e) {

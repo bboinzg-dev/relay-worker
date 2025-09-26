@@ -1,6 +1,7 @@
 'use strict';
 
 const { VertexAI } = require('@google-cloud/vertexai');
+const { safeJsonParse } = require('./safe-json');
 
 const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID;
 const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
@@ -29,8 +30,12 @@ async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 
   };
   const resp = await model.generateContent(req);
   const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  try { return JSON.parse(txt); }
-  catch { throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`); }
+  try {
+    const parsed = safeJsonParse(txt);
+    return parsed ?? {};
+  } catch {
+    throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`);
+  }
 }
 
 module.exports = { getModel, callModelJson };

@@ -1,3 +1,5 @@
+const { safeJsonParse } = require('./safe-json');
+
 const UNITS = {
   '': 1,
   'k': 1e3, 'K': 1e3,
@@ -44,7 +46,7 @@ function normalizeByType(type, v){
     case 'jsonb':
       if (v==null) return null;
       if (typeof v === 'object') return v;
-      try { return JSON.parse(String(v)); } catch { return { value: v }; }
+      try { return safeJsonParse(String(v)) ?? { value: v }; } catch { return { value: v }; }
     default:
       return normalizeText(v);
   }

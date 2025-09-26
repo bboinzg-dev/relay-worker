@@ -1,118 +1,96 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 84fc4b79ec65a2d5c4c93fe338688666af5f74eb..429befd43d4702915a0206db54d62aec24519304 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -130,51 +130,53 @@ function parseListOrRange(s) {
-   if (!raw) return [];
-   const volts = parseVoltageList(raw);
-   if (volts.length) return volts;
-   if (/[;,、\/\s]/.test(raw)) return raw.split(/[;,、\/\s]+/).map(x => x.trim()).filter(Boolean);
-   return [raw];
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 4c176e13cbac050b609e4d91e30bcd7be4338ce4..0e7314bdad0377251f5040d0ff289e90e2e20a88 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -13,87 +13,89 @@ async function ensureSpecsTableForFamily(familySlug) {
  }
  
- // 분할 여부: PN 후보≥2 또는 variant 열거형 곱≥2 이면 분할
- function decideSplit({ pnCandidates = [], seriesCandidates = [], variantKeys = [], specs = {} }) {
-   if ((pnCandidates?.length || 0) >= 2) return true;
-   if ((seriesCandidates?.length || 0) >= 2) return true;
-   if (Array.isArray(variantKeys) && variantKeys.length) {
-     let count = 1;
-     for (const k of variantKeys) {
-       const vals = parseListOrRange(specs[k]);
-       const n = vals.length || (specs[k] != null ? 1 : 0);
-       count *= Math.max(1, n);
-     }
-     if (count >= 2) return true;
+ async function getColumnTypes(qualified) {
+   const [schema, table] = qualified.includes('.') ? qualified.split('.') : ['public', qualified];
+   const sql = `
+     SELECT lower(column_name) AS col, lower(data_type) AS dt
+       FROM information_schema.columns
+      WHERE table_schema=$1 AND table_name=$2
+   `;
+   const { rows } = await pool.query(sql, [schema, table]);
+   const out = new Map();
+   for (const { col, dt } of rows) {
+     if (/(integer|bigint|smallint)/.test(dt)) out.set(col, 'int');
+     else if (/(numeric|decimal|double precision|real)/.test(dt)) out.set(col, 'numeric');
+     else if (/boolean/.test(dt)) out.set(col, 'bool');
+     else out.set(col, 'text');
    }
-   return false;
- }
- 
- // variant_keys 교차곱으로 base/specs 병합 배열 생성
- function explodeVariants(base = {}, specs = {}, bp = {}) {
--  const keys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
-+  const keys = Array.isArray(bp?.ingestOptions?.variant_keys)
-+    ? bp.ingestOptions.variant_keys.map((k) => String(k).toLowerCase())
-+    : (Array.isArray(bp.variant_keys) ? bp.variant_keys : []);
-   if (!keys.length) return [{ ...base, ...specs }];
-   const lists = keys.map(k => {
-     const arr = parseListOrRange(specs[k]);
-     if (arr.length) return arr;
-     return (specs[k] != null ? [specs[k]] : []);
-   });
-   if (!lists.length || lists.some(a => !a.length)) return [{ ...base, ...specs }];
-   const out = [];
-   const dfs = (i, cur) => {
-     if (i === keys.length) { out.push({ ...base, ...cur }); return; }
-     const key = keys[i];
-     for (const v of lists[i]) dfs(i + 1, { ...cur, [key]: v });
-   };
-   dfs(0, { ...specs });
    return out;
  }
  
- // pn_template 로 개별 MPN 조립
- function buildMpn(rec, bp) {
-   const t = bp?.pn_template || bp?.ingestOptions?.pn_template;
-   if (!t) return rec.code;
-   return t.replace(/\$\{(\w+)\}/g, (_, k) => String(rec[k] ?? ''));
+ // "5, 6, 9, 12" / "1.5 to 24 V" 같은 문자열을 안전하게 수용
+ function toNumberOrNull(v) {
+   if (v == null || v === '') return null;
+   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+   const s = String(v);
+-  const mRange = s.match(/-?\d+(?:\.\d+)?/g);
+-  if (mRange && mRange.length > 0) return Number(mRange[0]);
++  if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/i.test(s)) return null;
++  const mRange = s.match(/-?\d+(?:\.\d+)?/);
++  if (mRange && mRange[0] != null) return Number(mRange[0]);
+   return null;
  }
  
- function pickSkuListFromTables(extracted = {}) {
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 84fc4b79ec65a2d5c4c93fe338688666af5f74eb..429befd43d4702915a0206db54d62aec24519304 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -544,51 +546,53 @@ async function runAutoIngest({
-      // ★ 강제 보정: 제목/본문에 Signal Relay가 있으면 무조건 signal로
-      if (/subminiature\s+signal\s+relay|signal\s+relay/i.test(text)) family = 'relay_signal';
-    } catch { family = 'relay_power'; }
+ async function saveExtractedSpecs(familySlug, base, specs) {
+   // 스키마 자동 보장(추가만 수행)
+   await ensureSpecsTableForFamily(familySlug);
+ 
+   const blueprint = await getBlueprint(pool, familySlug);
+   const specsTable = blueprint?.specsTable;
+   if (!specsTable) throw new Error(`specs table not found for family ${familySlug}`);
+   const targetTable = specsTable.includes('.') ? specsTable : `public.${specsTable}`;
+   const dbColTypes = await getColumnTypes(targetTable);
+ 
+   const baseCols = ['family_slug','brand','brand_norm','code','code_norm','series_code','mfr_full','datasheet_uri','verified_in_doc'];
+   const baseVals = [
+     familySlug,
+     base.brand, String(base.brand || '').toLowerCase(),
+     base.code,  String(base.code  || '').toLowerCase(),
+     base.series_code ?? null,
+     base.mfr_full ?? null,
+     base.datasheet_uri ?? null,
+     true
+   ];
+ 
+   const RESERVED = new Set(['id','brand','code','brand_norm','code_norm','created_at','updated_at']);
+   const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
+   const allowedKeys = Array.isArray(blueprint?.allowedKeys)
+     ? blueprint.allowedKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+     : [];
+   const fieldTypes = blueprint?.fields || {};
+   function coerceNumeric(x) {
+     if (x == null || x === '') return null;
+     if (typeof x === 'number') return x;
+     let s = String(x).toLowerCase();
+     s = s.replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
++    if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/.test(s)) return null;
+     const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
+     if (!m) return null;
+     let n = parseFloat(m[1]);
+     const mul = (m[2] || '').toLowerCase();
+     const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
+     if (mul && scale[mul] != null) n = n * scale[mul];
+     return Number.isFinite(n) ? n : null;
    }
- 
-   // 목적 테이블
-   const reg = await db.query(
-     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
-     [family]
-   );
-   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
-   const qualified = table.startsWith('public.')? table : `public.${table}`;
- 
-   // 스키마 보장 (DB 함수) + 컬럼셋 확보
-     if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
-     await ensureSpecsTableByFamily(family);
+   function coerceByType(key, val) {
+     let t = String(fieldTypes[key] || '').toLowerCase();
+     if (t === 'string') t = 'text';
+     if (!t || t === 'text') t = dbColTypes.get(key) || t || 'text';
+     if (t === 'float' || t === 'double' || t === 'decimal') t = 'numeric';
+     if (t === 'integer' || t === 'bigint' || t === 'smallint') t = 'int';
+     if (t === 'numeric') return coerceNumeric(val);
+     if (t === 'int')     { const n = coerceNumeric(val); return (n==null?null:Math.round(n)); }
+     if (t === 'bool')    {
+       if (typeof val === 'boolean') return val;
+       const s = String(val||'').toLowerCase().trim();
+       if (!s) return null;
+       return /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
+     }
+     return (val == null ? null : String(val));
    }
-   const colsSet = new Set([
-     ...await getTableColumns(qualified)
-   ].map((c) => String(c || '').toLowerCase()));
-   const colTypes = await getColumnTypes(qualified);
- 
-   // 블루프린트 허용 키
-   const blueprint = await getBlueprint(family);
-   const allowedKeys = blueprint?.allowedKeys || [];
--  const variantKeys = Array.isArray(blueprint?.variant_keys) ? blueprint.variant_keys : [];
-+  const variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-+    ? blueprint.ingestOptions.variant_keys.map((k) => String(k).toLowerCase())
-+    : [];
- 
-   // -------- 공용 강제정규화 유틸 --------
- 
-   if (code && !/\d/.test(String(code))) {
-     // "AGN","TQ" 처럼 숫자 없는 시리즈는 series로 넘기고 code는 비움
-     series = code; code = null;
-   }
- 
- 
-   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
-   let previewText = '';
-   try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
-   let candidates = [];
-   try {
-     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
-   } catch { candidates = []; }
- 
-   // PDF → 품번/스펙 추출
-   let extracted = { brand: brand || 'unknown', rows: [] };
-   if (!brand || !code) {
-     try {
-       if (FAST) {
-         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
-         let raw = previewText;
-         if (!raw) {
+   const fastKeys = FAST

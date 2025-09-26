@@ -37,31 +37,6 @@ const BASE_KEYS = new Set([
 ]);
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
-function normIdent(s){ return String(s||'').trim().toLowerCase().replace(/[^a-z0-9_]/g, ''); }
-
-const VOLTAGE_GRID = [1.5,3,5,6,9,12,18,24,48];
-function parseVoltageList(v){
-  if (Array.isArray(v)) return v.map(Number).filter((n)=>Number.isFinite(n));
-  const s = String(v||'').toLowerCase();
-  const multi = s.match(/(\d+(?:\.\d+)?)/g);
-  if (multi && multi.length>1) return multi.map(Number).filter(Number.isFinite);
-  const range = s.match(/(\d+(?:\.\d+)?)\s*(?:v|vdc)?\s*(?:to|~|-)\s*(\d+(?:\.\d+)?)/);
-  if (range){
-    const lo = parseFloat(range[1]);
-    const hi = parseFloat(range[2]);
-    return VOLTAGE_GRID.filter((x)=>x>=lo && x<=hi);
-  }
-  const single = s.match(/(\d+(?:\.\d+)?)/);
-  if (single){ const n = Number(single[1]); return Number.isFinite(n)?[n]:[]; }
-  return [];
-}
-
-function tokenOf(x){
-  if (x==null) return '';
-  const s = String(x).toUpperCase();
-  const m = s.match(/[A-Z0-9\.]+/g);
-  return m ? m.join('') : '';
-}
 
 function harvestMpnCandidates(text, series){
   const hay = String(text||'');
@@ -115,6 +90,7 @@ function coerceNumeric(x) {
   if (x == null || x === '') return null;
   if (typeof x === 'number') return x;
   let s = String(x).toLowerCase().replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
+  if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/.test(s)) return null;
   const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
   if (!m) return null;
   let n = parseFloat(m[1]);
@@ -122,61 +98,6 @@ function coerceNumeric(x) {
   const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
   if (mul && scale[mul] != null) n *= scale[mul];
   return Number.isFinite(n) ? n : null;
-}
-
-function parseListOrRange(s) {
-  if (Array.isArray(s)) return s;
-  const raw = String(s ?? '').trim();
-  if (!raw) return [];
-  const volts = parseVoltageList(raw);
-  if (volts.length) return volts;
-  if (/[;,、\/\s]/.test(raw)) return raw.split(/[;,、\/\s]+/).map(x => x.trim()).filter(Boolean);
-  return [raw];
-}
-
-// 분할 여부: PN 후보≥2 또는 variant 열거형 곱≥2 이면 분할
-function decideSplit({ pnCandidates = [], seriesCandidates = [], variantKeys = [], specs = {} }) {
-  if ((pnCandidates?.length || 0) >= 2) return true;
-  if ((seriesCandidates?.length || 0) >= 2) return true;
-  if (Array.isArray(variantKeys) && variantKeys.length) {
-    let count = 1;
-    for (const k of variantKeys) {
-      const vals = parseListOrRange(specs[k]);
-      const n = vals.length || (specs[k] != null ? 1 : 0);
-      count *= Math.max(1, n);
-    }
-    if (count >= 2) return true;
-  }
-  return false;
-}
-
-// variant_keys 교차곱으로 base/specs 병합 배열 생성
-function explodeVariants(base = {}, specs = {}, bp = {}) {
-  const keys = Array.isArray(bp?.ingestOptions?.variant_keys)
-    ? bp.ingestOptions.variant_keys.map((k) => String(k).toLowerCase())
-    : (Array.isArray(bp.variant_keys) ? bp.variant_keys : []);
-  if (!keys.length) return [{ ...base, ...specs }];
-  const lists = keys.map(k => {
-    const arr = parseListOrRange(specs[k]);
-    if (arr.length) return arr;
-    return (specs[k] != null ? [specs[k]] : []);
-  });
-  if (!lists.length || lists.some(a => !a.length)) return [{ ...base, ...specs }];
-  const out = [];
-  const dfs = (i, cur) => {
-    if (i === keys.length) { out.push({ ...base, ...cur }); return; }
-    const key = keys[i];
-    for (const v of lists[i]) dfs(i + 1, { ...cur, [key]: v });
-  };
-  dfs(0, { ...specs });
-  return out;
-}
-
-// pn_template 로 개별 MPN 조립
-function buildMpn(rec, bp) {
-  const t = bp?.pn_template || bp?.ingestOptions?.pn_template;
-  if (!t) return rec.code;
-  return t.replace(/\$\{(\w+)\}/g, (_, k) => String(rec[k] ?? ''));
 }
 
 function pickSkuListFromTables(extracted = {}) {
@@ -569,8 +490,10 @@ async function runAutoIngest({
   const blueprint = await getBlueprint(family);
   const allowedKeys = blueprint?.allowedKeys || [];
   const variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-    ? blueprint.ingestOptions.variant_keys.map((k) => String(k).toLowerCase())
-    : [];
+    ? blueprint.ingestOptions.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+    : (Array.isArray(blueprint?.variant_keys)
+      ? blueprint.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+      : []);
 
   // -------- 공용 강제정규화 유틸 --------
 
@@ -722,129 +645,136 @@ async function runAutoIngest({
 
   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
   const specRows = rawRows.length ? rawRows.slice(0) : [{}];
+  const pnTemplate = blueprint?.pn_template || blueprint?.ingestOptions?.pn_template || null;
 
-  let explodedEntries = [];
+  const expandedRows = [];
+
   for (const row of specRows) {
     const specsObj = row && typeof row === 'object' ? { ...row } : {};
     const fallbackSeries = specsObj.series_code || specsObj.series || baseSeries || null;
-    const baseSeed = {
-      brand: brandName,
-      series: fallbackSeries,
-      series_code: fallbackSeries,
-      code: specsObj.code ?? fallbackSeries ?? null,
+
+    const values = {};
+    for (const [rawKey, rawValue] of Object.entries(specsObj)) {
+      const key = String(rawKey || '').trim();
+      if (!key) continue;
+      values[key] = rawValue;
+    }
+    if (fallbackSeries != null) {
+      if (values.series == null) values.series = fallbackSeries;
+      if (values.series_code == null) values.series_code = fallbackSeries;
+    }
+
+    const mpnList = [];
+    const mpnSeen = new Set();
+    const addSeed = (val) => {
+      if (val == null) return;
+      const str = String(val).trim();
+      if (!str) return;
+      const norm = str.toLowerCase();
+      if (mpnSeen.has(norm)) return;
+      mpnSeen.add(norm);
+      mpnList.push(str);
     };
-    const expanded = explodeVariants(baseSeed, specsObj, blueprint).map((entry) => ({
-      ...entry,
-      brand: entry.brand || brandName,
-      series_code: entry.series_code || entry.series || fallbackSeries,
-      code: entry.code ?? specsObj.code ?? fallbackSeries ?? null,
-    }));
-    explodedEntries.push(...expanded);
-  }
-  if (!explodedEntries.length) {
-    explodedEntries = [{ brand: brandName, series_code: baseSeries || null, code: baseSeries || null }];
+    const pushSeed = (val) => {
+      if (val == null) return;
+      if (Array.isArray(val)) { val.forEach(pushSeed); return; }
+      if (typeof val === 'string') {
+        const trimmed = val.trim();
+        if (!trimmed) return;
+        const parts = splitAndCarryPrefix(trimmed);
+        if (parts.length > 1) { parts.forEach(pushSeed); return; }
+        addSeed(trimmed);
+        return;
+      }
+      addSeed(val);
+    };
+
+    pushSeed(specsObj.mpn);
+    pushSeed(specsObj.code);
+    pushSeed(specsObj.part_number);
+    pushSeed(specsObj.part_no);
+    for (const cand of candidateMap) pushSeed(cand.raw);
+    for (const doc of mpnsFromDoc) pushSeed(doc);
+
+    const baseRecord = {
+      family_slug: family,
+      brand: brandName,
+      series: fallbackSeries || baseSeries || null,
+      series_code: fallbackSeries || baseSeries || null,
+      datasheet_uri: gcsUri,
+      values,
+      mpn: mpnList.length ? mpnList : undefined,
+    };
+
+    const rows = explodeToRows(baseRecord, { variantKeys, pnTemplate });
+    for (const r of rows) {
+      expandedRows.push({
+        base: {
+          brand: baseRecord.brand,
+          series: baseRecord.series,
+          series_code: baseRecord.series_code,
+        },
+        code: r.code,
+        code_norm: r.code_norm,
+        values: r.values,
+      });
+    }
   }
 
-  // ---- 분할 여부 결정 ----
-  const pnCands = candidateMap.map((c) => c.raw);
-  const seriesCands = (candidates.length && series) ? candidateMap.filter((c) => /\d/.test(c.norm)).map((c) => c.raw) : [];
-  const mustSplit = decideSplit({
-    pnCandidates: pnCands,
-    seriesCandidates: seriesCands,
-    variantKeys,
-    specs: (rawRows[0] || {})
-  });
-
-  if (!mustSplit && explodedEntries.length > 1) explodedEntries.splice(1);
-  if (mustSplit && candidateMap.length > 1 && explodedEntries.length <= 1) {
-    const max = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
-    const tmpl = explodedEntries[0] || { brand: brandName, series_code: baseSeries || null };
-    explodedEntries = candidateMap.slice(0, max)
-      .map((c) => ({ ...tmpl, code: c.raw, code_norm: c.norm }));
+  if (!expandedRows.length && candidateMap.length) {
+    const fallbackSeries = baseSeries || null;
+    const baseInfo = { brand: brandName, series: fallbackSeries, series_code: fallbackSeries };
+    for (const cand of candidateMap) {
+      expandedRows.push({
+        base: baseInfo,
+        code: cand.raw,
+        code_norm: cand.norm,
+        values: fallbackSeries ? { series: fallbackSeries, series_code: fallbackSeries } : {},
+      });
+    }
   }
 
   const seenCodes = new Set();
-  for (const entry of explodedEntries) {
-    const baseInfo = entry || {};
-    const specs = {};
-    for (const k of allowedKeys) if (entry[k] != null) specs[k] = entry[k];
-    const pickNumeric = (vals) => {
-      for (const v of (Array.isArray(vals) ? vals : [vals])) { const n = coerceNumeric(v); if (Number.isFinite(n)) return n; }
-      return null;
-    };
-    const voltageNum   = pickNumeric(specs.coil_voltage_vdc || specs.coil_voltage || specs.voltage_vdc || specs.voltage_dc || specs.voltage);
-    const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2,'0') : null;
-
-    let mpn = baseInfo.code ? String(baseInfo.code).trim() : null;   // 후보 복제 시 base.code가 곧 MPN
-
-    if (!mpn && candidateMap.length) {
-      const match = voltageToken ? candidateMap.find(c => c.norm.includes(voltageToken)) : null;
-      mpn = (match || candidateMap[0])?.raw || null;
-    }
-    const variantTokens = [];
-    for (const key of variantKeys) {
-      const rawKey = String(key || '');
-      const normKey = normIdent(rawKey);
-      let val = entry[rawKey];
-      if (val == null && normKey) val = entry[normKey];
-      if (val == null && specs[rawKey] != null) val = specs[rawKey];
-      if (val == null && normKey && specs[normKey] != null) val = specs[normKey];
-      if (val != null) variantTokens.push(tokenOf(val));
-    }
-
-    if (
-      !mpn &&
-      (blueprint?.pn_template || blueprint?.ingestOptions?.pn_template)
-    ) {
-      const templated = buildMpn({ ...specs, ...baseInfo }, blueprint);
-      if (templated) mpn = templated;
-    }
-
-    if (!mpn && mpnsFromDoc.length) {
-      const want = variantTokens.filter(Boolean);
-      const cand = want.length
-        ? mpnsFromDoc.find((code) => want.every((w) => code.includes(w)))
-        : mpnsFromDoc[0];
-      if (cand) mpn = cand;
-    }
-    if (!mpn && specs.code) mpn = String(specs.code).trim();
-
-    if (!mpn) {
-      const prefix = baseInfo.series_code || baseInfo.series || baseSeries || '';
-      const tokens = variantTokens.filter(Boolean);
-      if (!tokens.length) {
-        for (const v of Object.values(specs)) {
-          const token = tokenOf(v);
-          if (token) tokens.push(token);
-        }
-      }
-      const suffix = tokens.length ? tokens.join('') : (voltageToken || (voltageNum != null ? String(Math.round(voltageNum)) : ''));
-      if (prefix || suffix) mpn = `${prefix}${suffix}`.trim();
-    }
+  for (const entry of expandedRows) {
+    const mpn = entry.code ? String(entry.code).trim() : '';
     if (!mpn) continue;
-
     const mpnNorm = normalizeCode(mpn);
     if (!mpnNorm || seenCodes.has(mpnNorm)) continue;
     seenCodes.add(mpnNorm);
 
+    const baseInfo = entry.base || {};
     const rec = {
       family_slug: family,
       brand: baseInfo.brand || brandName,
       code: mpn,
       code_norm: mpnNorm,
-      series_code: baseInfo.series_code || baseSeries || null,
+      series_code: baseInfo.series_code || baseInfo.series || baseSeries || null,
       datasheet_uri: gcsUri,
       image_uri: coverUri || null,
       display_name: `${baseInfo.brand || brandName} ${mpn}`,
       verified_in_doc: candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm),
       updated_at: now,
     };
+
+    const rowValues = entry.values || {};
+    const valueMap = new Map();
+    for (const [rawKey, rawValue] of Object.entries(rowValues)) {
+      const key = String(rawKey || '').trim();
+      if (!key) continue;
+      if (!valueMap.has(key)) valueMap.set(key, rawValue);
+      const lower = key.toLowerCase();
+      if (!valueMap.has(lower)) valueMap.set(lower, rawValue);
+    }
+
     for (const k of allowedKeys) {
-      let v = specs[k];
+      const key = String(k || '').trim();
+      if (!key) continue;
+      let v = valueMap.has(key) ? valueMap.get(key) : valueMap.get(key.toLowerCase());
       if (v == null) continue;
       if (Array.isArray(v)) v = v[0];
-      rec[k] = v;
+      rec[key] = v;
     }
+
     if (blueprint?.code_rules) applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
     records.push(rec);
   }
@@ -868,10 +798,9 @@ async function runAutoIngest({
   console.log('[MPNDBG]', {
     picks: candidateMap.length,
     vkeys: Array.isArray(blueprint?.ingestOptions?.variant_keys) ? blueprint.ingestOptions.variant_keys : [],
-    exploded: explodedEntries.length,
-    mustSplit,
+    expanded: expandedRows.length,
     recs: records.length,
-    colsSanitized: Object.keys(colTypes || {}).length,
+    colsSanitized: colTypes?.size || 0,
   });
 
   // 업서트

@@ -35,8 +35,9 @@ function toNumberOrNull(v) {
   if (v == null || v === '') return null;
   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
   const s = String(v);
-  const mRange = s.match(/-?\d+(?:\.\d+)?/g);
-  if (mRange && mRange.length > 0) return Number(mRange[0]);
+  if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/i.test(s)) return null;
+  const mRange = s.match(/-?\d+(?:\.\d+)?/);
+  if (mRange && mRange[0] != null) return Number(mRange[0]);
   return null;
 }
 
@@ -72,6 +73,7 @@ async function saveExtractedSpecs(familySlug, base, specs) {
     if (typeof x === 'number') return x;
     let s = String(x).toLowerCase();
     s = s.replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
+    if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/.test(s)) return null;
     const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
     if (!m) return null;
     let n = parseFloat(m[1]);

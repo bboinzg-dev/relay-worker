@@ -1,62 +1,383 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index c45fd70fa5e4363e7fc17275560aba80603274c5..4c176e13cbac050b609e4d91e30bcd7be4338ce4 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -100,51 +100,56 @@ async function saveExtractedSpecs(familySlug, base, specs) {
-     ? computeFastKeys(blueprint).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-     : allowedKeys;
-   const allowedSet = new Set(allowedKeys);
-   const fastSet = new Set(fastKeys);
-   const specsNorm = {};
-   for (const [rawKey, value] of Object.entries(specs || {})) {
-     const key = String(rawKey || '')
-       .trim()
-       .toLowerCase()
-       .replace(/[^a-z0-9_]/g, '');
-     if (!key || RESERVED.has(key)) continue;
-     if (allowedSet.size && !allowedSet.has(key)) continue;
-     if (FAST && fastSet.size && !fastSet.has(key)) continue;
-     if (!Object.prototype.hasOwnProperty.call(specsNorm, key)) {
-       specsNorm[key] = coerceByType(key, value); // 타입 강제정규화
-     }
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index e8a0fa9baef77754664f45e20e78dc1039eab5c3..84fc4b79ec65a2d5c4c93fe338688666af5f74eb 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -542,53 +542,53 @@ async function runAutoIngest({
+      const text = await readText(gcsUri, 256*1024);
+      family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
+      // ★ 강제 보정: 제목/본문에 Signal Relay가 있으면 무조건 signal로
+      if (/subminiature\s+signal\s+relay|signal\s+relay/i.test(text)) family = 'relay_signal';
+    } catch { family = 'relay_power'; }
    }
  
-   for (const key of Object.keys(specsNorm)) {
-     const t = dbColTypes.get(key);
-     if (t === 'numeric' || t === 'int') {
-       specsNorm[key] = toNumberOrNull(specsNorm[key]);
-     }
+   // 목적 테이블
+   const reg = await db.query(
+     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+     [family]
+   );
+   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
+   const qualified = table.startsWith('public.')? table : `public.${table}`;
+ 
+   // 스키마 보장 (DB 함수) + 컬럼셋 확보
+     if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
+     await ensureSpecsTableByFamily(family);
+   }
+   const colsSet = new Set([
+     ...await getTableColumns(qualified)
+   ].map((c) => String(c || '').toLowerCase()));
+   const colTypes = await getColumnTypes(qualified);
+ 
+   // 블루프린트 허용 키
+-  const bp = await getBlueprint(family);
+-  const allowedKeys = bp.allowedKeys || [];
+-  const variantKeys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
++  const blueprint = await getBlueprint(family);
++  const allowedKeys = blueprint?.allowedKeys || [];
++  const variantKeys = Array.isArray(blueprint?.variant_keys) ? blueprint.variant_keys : [];
+ 
+   // -------- 공용 강제정규화 유틸 --------
+ 
+   if (code && !/\d/.test(String(code))) {
+     // "AGN","TQ" 처럼 숫자 없는 시리즈는 series로 넘기고 code는 비움
+     series = code; code = null;
    }
  
--  const specCols = Object.keys(specsNorm);
-+  // 실제 테이블 컬럼만 남기고, 메타 키(옵션/설정)는 제외
-+  const physicalCols = new Set(dbColTypes.keys());
-+  const META = new Set(['variant_keys','pn_template','ingest_options']);
-+  const specCols = Object.keys(specsNorm)
-+    .map((s) => s.toLowerCase())
-+    .filter((s) => physicalCols.has(s) && !META.has(s));
-   const allCols = baseCols.concat(specCols);
-   const params = allCols.map((_, i) => `$${i + 1}`);
-   const values = baseVals.concat(specCols.map((k) => {
-     const x = specsNorm[k];
-     if (typeof x === 'string' && /to|,|\d/.test(x)) {
-       const n = toNumberOrNull(x);
-       return n ?? null;
+ 
+   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
+   let previewText = '';
+   try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
+   let candidates = [];
+   try {
+     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
+   } catch { candidates = []; }
+ 
+   // PDF → 품번/스펙 추출
+   let extracted = { brand: brand || 'unknown', rows: [] };
+   if (!brand || !code) {
+     try {
+       if (FAST) {
+         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
+         let raw = previewText;
+         if (!raw) {
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index e8a0fa9baef77754664f45e20e78dc1039eab5c3..84fc4b79ec65a2d5c4c93fe338688666af5f74eb 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -600,51 +600,51 @@ async function runAutoIngest({
+           extracted = {
+             brand: brand || 'unknown',
+             rows: [{ brand: brand || 'unknown', code: code || (path.parse(fileName).name), ...(vals||{}) }],
+           };
+         } else {
+           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
+           extracted = await withTimeout(
+             extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
+             EXTRACT_HARD_CAP_MS,
+             'extract',
+           );
+         }
+       } else {
+         extracted = await withTimeout(
+           extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
+           EXTRACT_HARD_CAP_MS,
+           'extract',
+         );
+       }
+     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
+   }
+ 
+   let codes = [];
+   if (!code) {
+     const skuFromTable = pickSkuListFromTables(extracted);
+-    codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, bp);
++    codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint);
+     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
+     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
+     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
+   }
+ 
+   if (!candidates.length && codes.length) {
+     const merged = [];
+     const seen = new Set();
+     for (const raw of codes) {
+       const trimmed = typeof raw === 'string' ? raw.trim() : String(raw || '');
+       if (!trimmed) continue;
+       const norm = normalizeCode(trimmed);
+       if (seen.has(norm)) continue;
+       seen.add(norm);
+       merged.push(trimmed);
      }
-     return x;
-   }));
+     if (merged.length) candidates = merged;
+   }
  
-   const colList = allCols.map(safeColumnName).join(',');
-   const setList = specCols
-     .map((k) => `${safeColumnName(k)} = EXCLUDED.${safeColumnName(k)}`)
-     .join(',');
+   if (!code && !codes.length) {
+     let fullText = '';
+     try { fullText = await readText(gcsUri, 300 * 1024) || ''; } catch {}
  
-   const sql = `
-     INSERT INTO ${targetTable} (${colList})
-     VALUES (${params.join(',')})
-     ON CONFLICT (brand_norm, code_norm)
-     DO UPDATE SET
-       mfr_full = EXCLUDED.mfr_full,
-       datasheet_uri = EXCLUDED.datasheet_uri,
-       verified_in_doc = EXCLUDED.verified_in_doc
-       ${setList ? ',' + setList : ''}
+     const fromTypes  = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
+     const fromOrder  = rankPartNumbersFromOrderingSections(fullText, FIRST_PASS_CODES);
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index e8a0fa9baef77754664f45e20e78dc1039eab5c3..84fc4b79ec65a2d5c4c93fe338688666af5f74eb 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -707,232 +707,191 @@ async function runAutoIngest({
+ 
+   const candidateMap = [];
+   const candidateNormSet = new Set();
+   for (const cand of candidates) {
+     const trimmed = typeof cand === 'string' ? cand.trim() : String(cand || '');
+     if (!trimmed) continue;
+     const norm = normalizeCode(trimmed);
+     if (!norm || candidateNormSet.has(norm)) continue;
+     candidateNormSet.add(norm);
+     candidateMap.push({ raw: trimmed, norm });
+   }
+ 
+   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
+   const specRows = rawRows.length ? rawRows.slice(0) : [{}];
+ 
+   let explodedEntries = [];
+   for (const row of specRows) {
+     const specsObj = row && typeof row === 'object' ? { ...row } : {};
+     const fallbackSeries = specsObj.series_code || specsObj.series || baseSeries || null;
+     const baseSeed = {
+       brand: brandName,
+       series: fallbackSeries,
+       series_code: fallbackSeries,
+       code: specsObj.code ?? fallbackSeries ?? null,
+     };
+-    const expanded = explodeVariants(baseSeed, specsObj, bp).map((entry) => ({
++    const expanded = explodeVariants(baseSeed, specsObj, blueprint).map((entry) => ({
+       ...entry,
+       brand: entry.brand || brandName,
+       series_code: entry.series_code || entry.series || fallbackSeries,
+       code: entry.code ?? specsObj.code ?? fallbackSeries ?? null,
+     }));
+     explodedEntries.push(...expanded);
+   }
+   if (!explodedEntries.length) {
+     explodedEntries = [{ brand: brandName, series_code: baseSeries || null, code: baseSeries || null }];
+   }
+ 
+   // ---- 분할 여부 결정 ----
+   const pnCands = candidateMap.map((c) => c.raw);
+   const seriesCands = (candidates.length && series) ? candidateMap.filter((c) => /\d/.test(c.norm)).map((c) => c.raw) : [];
+   const mustSplit = decideSplit({
+     pnCandidates: pnCands,
+     seriesCandidates: seriesCands,
+     variantKeys,
+     specs: (rawRows[0] || {})
+   });
+ 
+   if (!mustSplit && explodedEntries.length > 1) explodedEntries.splice(1);
+-  if (mustSplit && candidateMap.length > 1) {
+-    if (explodedEntries.length <= 1) {
+-      const tmpl = explodedEntries[0]
+-        ? { ...explodedEntries[0] }
+-        : { brand: brandName, series_code: baseSeries || null };
+-      delete tmpl.code;
+-      delete tmpl.code_norm;
+-      explodedEntries = candidateMap.slice(0, FIRST_PASS_CODES || 20)
+-        .map((c) => ({ ...tmpl, code: c.raw, code_norm: c.norm }));
+-    }
+-
+-    const maxCodes = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
+-    if (maxCodes > 0) {
+-      const fallbackNorm = baseSeries ? normalizeCode(baseSeries) : null;
+-      const assignedNorms = new Set();
+-
+-      // 이미 스펙 행에 코드가 정확히 채워져 있으면 그대로 사용
+-      for (const entry of explodedEntries) {
+-        const existing = entry.code ? normalizeCode(entry.code) : null;
+-        if (existing && candidateNormSet.has(existing) && !assignedNorms.has(existing)) {
+-          assignedNorms.add(existing);
+-        }
+-      }
+-
+-      let idx = 0;
+-      const nextCandidate = () => {
+-        while (idx < maxCodes && assignedNorms.has(candidateMap[idx].norm)) idx++;
+-        if (idx >= maxCodes) return null;
+-        const cand = candidateMap[idx++];
+-        assignedNorms.add(cand.norm);
+-        return cand;
+-      };
+-
+-      for (const entry of explodedEntries) {
+-        if (assignedNorms.size >= maxCodes) break;
+-        const norm = entry.code ? normalizeCode(entry.code) : null;
+-        const needsOverride = !norm || norm === fallbackNorm || assignedNorms.has(norm);
+-        if (!needsOverride) continue;
+-        const cand = nextCandidate();
+-        if (!cand) break;
+-        entry.code = cand.raw;
+-        entry.code_norm = cand.norm;
+-      }
+-
+-      const templateBase = explodedEntries[0]
+-        ? { ...explodedEntries[0] }
+-        : { brand: brandName, series_code: baseSeries || null };
+-      delete templateBase.code;
+-      delete templateBase.code_norm;
+-
+-      for (let cand = nextCandidate(); cand; cand = nextCandidate()) {
+-        explodedEntries.push({
+-          ...templateBase,
+-          code: cand.raw,
+-          code_norm: cand.norm,
+-        });
+-      }
+-    }
++  if (mustSplit && candidateMap.length > 1 && explodedEntries.length <= 1) {
++    const max = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
++    const tmpl = explodedEntries[0] || { brand: brandName, series_code: baseSeries || null };
++    explodedEntries = candidateMap.slice(0, max)
++      .map((c) => ({ ...tmpl, code: c.raw, code_norm: c.norm }));
+   }
+ 
+   const seenCodes = new Set();
+   for (const entry of explodedEntries) {
+     const baseInfo = entry || {};
+     const specs = {};
+     for (const k of allowedKeys) if (entry[k] != null) specs[k] = entry[k];
+     const pickNumeric = (vals) => {
+       for (const v of (Array.isArray(vals) ? vals : [vals])) { const n = coerceNumeric(v); if (Number.isFinite(n)) return n; }
+       return null;
+     };
+     const voltageNum   = pickNumeric(specs.coil_voltage_vdc || specs.coil_voltage || specs.voltage_vdc || specs.voltage_dc || specs.voltage);
+     const voltageToken = voltageNum != null ? String(Math.round(voltageNum)).padStart(2,'0') : null;
+ 
+     let mpn = baseInfo.code ? String(baseInfo.code).trim() : null;   // 후보 복제 시 base.code가 곧 MPN
+ 
++    if (!mpn && candidateMap.length) {
++      const match = voltageToken ? candidateMap.find(c => c.norm.includes(voltageToken)) : null;
++      mpn = (match || candidateMap[0])?.raw || null;
++    }
+     const variantTokens = [];
+     for (const key of variantKeys) {
+       const rawKey = String(key || '');
+       const normKey = normIdent(rawKey);
+       let val = entry[rawKey];
+       if (val == null && normKey) val = entry[normKey];
+       if (val == null && specs[rawKey] != null) val = specs[rawKey];
+       if (val == null && normKey && specs[normKey] != null) val = specs[normKey];
+       if (val != null) variantTokens.push(tokenOf(val));
+     }
+ 
++    if (
++      !mpn &&
++      (blueprint?.pn_template || blueprint?.ingestOptions?.pn_template)
++    ) {
++      const templated = buildMpn({ ...specs, ...baseInfo }, blueprint);
++      if (templated) mpn = templated;
++    }
++
+     if (!mpn && mpnsFromDoc.length) {
+       const want = variantTokens.filter(Boolean);
+       const cand = want.length
+         ? mpnsFromDoc.find((code) => want.every((w) => code.includes(w)))
+         : mpnsFromDoc[0];
+       if (cand) mpn = cand;
+     }
+-
+-    if (!mpn && candidateMap.length) {
+-      const match = voltageToken ? candidateMap.find(c => c.norm.includes(voltageToken)) : null;
+-      mpn = (match || candidateMap[0])?.raw || null;
+-    }
+-    if (!mpn) {
+-      const templated = buildMpn({ ...specs, ...baseInfo }, bp);
+-      if (templated) mpn = templated;
+-    }
+     if (!mpn && specs.code) mpn = String(specs.code).trim();
+ 
+     if (!mpn) {
+       const prefix = baseInfo.series_code || baseInfo.series || baseSeries || '';
+       const tokens = variantTokens.filter(Boolean);
+       if (!tokens.length) {
+         for (const v of Object.values(specs)) {
+           const token = tokenOf(v);
+           if (token) tokens.push(token);
+         }
+       }
+       const suffix = tokens.length ? tokens.join('') : (voltageToken || (voltageNum != null ? String(Math.round(voltageNum)) : ''));
+       if (prefix || suffix) mpn = `${prefix}${suffix}`.trim();
+     }
+     if (!mpn) continue;
+ 
+     const mpnNorm = normalizeCode(mpn);
+     if (!mpnNorm || seenCodes.has(mpnNorm)) continue;
+     seenCodes.add(mpnNorm);
+ 
+     const rec = {
+       family_slug: family,
+       brand: baseInfo.brand || brandName,
+       code: mpn,
+       code_norm: mpnNorm,
+       series_code: baseInfo.series_code || baseSeries || null,
+       datasheet_uri: gcsUri,
+       image_uri: coverUri || null,
+       display_name: `${baseInfo.brand || brandName} ${mpn}`,
+       verified_in_doc: candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm),
+       updated_at: now,
+     };
+     for (const k of allowedKeys) {
+       let v = specs[k];
+       if (v == null) continue;
+       if (Array.isArray(v)) v = v[0];
+       rec[k] = v;
+     }
+-    if (bp.code_rules) applyCodeRules(rec.code, rec, bp.code_rules, colTypes);
++    if (blueprint?.code_rules) applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
+     records.push(rec);
+   }
+ 
+   // 최후 폴백 줄이기
+   if (!records.length) {
+     const tmp = 'TMP_' + (Math.random().toString(16).slice(2, 8)).toUpperCase();
+     records.push({
+       family_slug: family,
+       brand: brand || extracted.brand || 'unknown',
+       code: tmp,
+       series_code: series || code || null,
+       datasheet_uri: gcsUri,
+       image_uri: coverUri || null,
+       display_name: `${brand || extracted.brand || 'unknown'} ${tmp}`,
+       verified_in_doc: false,
+       updated_at: now,
+     });
+   }
+ 
++  console.log('[MPNDBG]', {
++    picks: candidateMap.length,
++    vkeys: Array.isArray(blueprint?.ingestOptions?.variant_keys) ? blueprint.ingestOptions.variant_keys : [],
++    exploded: explodedEntries.length,
++    mustSplit,
++    recs: records.length,
++    colsSanitized: Object.keys(colTypes || {}).length,
++  });
++
+   // 업서트
+   let upserted = 0;
+   for (const rec of records) {
+     const safe = {};
+     // 공통 키
+     if (colsSet.has('family_slug')) safe.family_slug = rec.family_slug;
+     if (colsSet.has('brand'))       safe.brand = rec.brand;
+     if (colsSet.has('code'))        safe.code  = rec.code;
+     if (colsSet.has('brand_norm'))  safe.brand_norm = normLower(rec.brand);
+     if (colsSet.has('code_norm'))   safe.code_norm  = normLower(rec.code);
+     if (colsSet.has('series_code')) safe.series_code = rec.series_code;
+     if (colsSet.has('datasheet_uri')) safe.datasheet_uri = rec.datasheet_uri;
+     if (colsSet.has('image_uri'))     safe.image_uri     = rec.image_uri;
+     if (colsSet.has('datasheet_url')) safe.datasheet_url = rec.datasheet_uri; // 별칭 호환
+     if (colsSet.has('display_name'))  safe.display_name  = rec.display_name;
+     if (colsSet.has('displayname'))   safe.displayname   = rec.display_name;
+     if (colsSet.has('cover') && rec.image_uri) safe.cover = rec.image_uri;
+     if (colsSet.has('verified_in_doc')) safe.verified_in_doc = !!rec.verified_in_doc;
+ 
+     // 블루프린트 값
+     for (const [k,v] of Object.entries(rec)) {
+       const kk = String(k || '').toLowerCase();
+       if (BASE_KEYS.has(kk)) continue;
+       if (!colsSet.has(kk)) continue;
+       if (META_KEYS.has(kk)) continue;

@@ -564,9 +564,9 @@ async function runAutoIngest({
   const colTypes = await getColumnTypes(qualified);
 
   // 블루프린트 허용 키
-  const bp = await getBlueprint(family);
-  const allowedKeys = bp.allowedKeys || [];
-  const variantKeys = Array.isArray(bp.variant_keys) ? bp.variant_keys : [];
+  const blueprint = await getBlueprint(family);
+  const allowedKeys = blueprint?.allowedKeys || [];
+  const variantKeys = Array.isArray(blueprint?.variant_keys) ? blueprint.variant_keys : [];
 
   // -------- 공용 강제정규화 유틸 --------
 
@@ -622,7 +622,7 @@ async function runAutoIngest({
   let codes = [];
   if (!code) {
     const skuFromTable = pickSkuListFromTables(extracted);
-    codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, bp);
+    codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint);
     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
@@ -729,7 +729,7 @@ async function runAutoIngest({
       series_code: fallbackSeries,
       code: specsObj.code ?? fallbackSeries ?? null,
     };
-    const expanded = explodeVariants(baseSeed, specsObj, bp).map((entry) => ({
+    const expanded = explodeVariants(baseSeed, specsObj, blueprint).map((entry) => ({
       ...entry,
       brand: entry.brand || brandName,
       series_code: entry.series_code || entry.series || fallbackSeries,
@@ -752,64 +752,11 @@ async function runAutoIngest({
   });
 
   if (!mustSplit && explodedEntries.length > 1) explodedEntries.splice(1);
-  if (mustSplit && candidateMap.length > 1) {
-    if (explodedEntries.length <= 1) {
-      const tmpl = explodedEntries[0]
-        ? { ...explodedEntries[0] }
-        : { brand: brandName, series_code: baseSeries || null };
-      delete tmpl.code;
-      delete tmpl.code_norm;
-      explodedEntries = candidateMap.slice(0, FIRST_PASS_CODES || 20)
-        .map((c) => ({ ...tmpl, code: c.raw, code_norm: c.norm }));
-    }
-
-    const maxCodes = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
-    if (maxCodes > 0) {
-      const fallbackNorm = baseSeries ? normalizeCode(baseSeries) : null;
-      const assignedNorms = new Set();
-
-      // 이미 스펙 행에 코드가 정확히 채워져 있으면 그대로 사용
-      for (const entry of explodedEntries) {
-        const existing = entry.code ? normalizeCode(entry.code) : null;
-        if (existing && candidateNormSet.has(existing) && !assignedNorms.has(existing)) {
-          assignedNorms.add(existing);
-        }
-      }
-
-      let idx = 0;
-      const nextCandidate = () => {
-        while (idx < maxCodes && assignedNorms.has(candidateMap[idx].norm)) idx++;
-        if (idx >= maxCodes) return null;
-        const cand = candidateMap[idx++];
-        assignedNorms.add(cand.norm);
-        return cand;
-      };
-
-      for (const entry of explodedEntries) {
-        if (assignedNorms.size >= maxCodes) break;
-        const norm = entry.code ? normalizeCode(entry.code) : null;
-        const needsOverride = !norm || norm === fallbackNorm || assignedNorms.has(norm);
-        if (!needsOverride) continue;
-        const cand = nextCandidate();
-        if (!cand) break;
-        entry.code = cand.raw;
-        entry.code_norm = cand.norm;
-      }
-
-      const templateBase = explodedEntries[0]
-        ? { ...explodedEntries[0] }
-        : { brand: brandName, series_code: baseSeries || null };
-      delete templateBase.code;
-      delete templateBase.code_norm;
-
-      for (let cand = nextCandidate(); cand; cand = nextCandidate()) {
-        explodedEntries.push({
-          ...templateBase,
-          code: cand.raw,
-          code_norm: cand.norm,
-        });
-      }
-    }
+  if (mustSplit && candidateMap.length > 1 && explodedEntries.length <= 1) {
+    const max = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
+    const tmpl = explodedEntries[0] || { brand: brandName, series_code: baseSeries || null };
+    explodedEntries = candidateMap.slice(0, max)
+      .map((c) => ({ ...tmpl, code: c.raw, code_norm: c.norm }));
   }
 
   const seenCodes = new Set();
@@ -826,6 +773,10 @@ async function runAutoIngest({
 
     let mpn = baseInfo.code ? String(baseInfo.code).trim() : null;   // 후보 복제 시 base.code가 곧 MPN
 
+    if (!mpn && candidateMap.length) {
+      const match = voltageToken ? candidateMap.find(c => c.norm.includes(voltageToken)) : null;
+      mpn = (match || candidateMap[0])?.raw || null;
+    }
     const variantTokens = [];
     for (const key of variantKeys) {
       const rawKey = String(key || '');
@@ -837,21 +788,20 @@ async function runAutoIngest({
       if (val != null) variantTokens.push(tokenOf(val));
     }
 
+    if (
+      !mpn &&
+      (blueprint?.pn_template || blueprint?.ingestOptions?.pn_template)
+    ) {
+      const templated = buildMpn({ ...specs, ...baseInfo }, blueprint);
+      if (templated) mpn = templated;
+    }
+
     if (!mpn && mpnsFromDoc.length) {
       const want = variantTokens.filter(Boolean);
       const cand = want.length
         ? mpnsFromDoc.find((code) => want.every((w) => code.includes(w)))
         : mpnsFromDoc[0];
       if (cand) mpn = cand;
-    }
-
-    if (!mpn && candidateMap.length) {
-      const match = voltageToken ? candidateMap.find(c => c.norm.includes(voltageToken)) : null;
-      mpn = (match || candidateMap[0])?.raw || null;
-    }
-    if (!mpn) {
-      const templated = buildMpn({ ...specs, ...baseInfo }, bp);
-      if (templated) mpn = templated;
     }
     if (!mpn && specs.code) mpn = String(specs.code).trim();
 
@@ -891,7 +841,7 @@ async function runAutoIngest({
       if (Array.isArray(v)) v = v[0];
       rec[k] = v;
     }
-    if (bp.code_rules) applyCodeRules(rec.code, rec, bp.code_rules, colTypes);
+    if (blueprint?.code_rules) applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
     records.push(rec);
   }
 
@@ -910,6 +860,15 @@ async function runAutoIngest({
       updated_at: now,
     });
   }
+
+  console.log('[MPNDBG]', {
+    picks: candidateMap.length,
+    vkeys: Array.isArray(blueprint?.ingestOptions?.variant_keys) ? blueprint.ingestOptions.variant_keys : [],
+    exploded: explodedEntries.length,
+    mustSplit,
+    recs: records.length,
+    colsSanitized: Object.keys(colTypes || {}).length,
+  });
 
   // 업서트
   let upserted = 0;

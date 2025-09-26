@@ -221,6 +221,20 @@ function sanitizeByColTypes(obj, colTypes) {
   return obj;
 }
 
+function normalizeKeysOnce(obj = {}) {
+  const out = {};
+  for (const [key, value] of Object.entries(obj || {})) {
+    const normalized = String(key || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+    if (!normalized) continue;
+    if (!(normalized in out)) out[normalized] = value;
+  }
+  return out;
+}
+
 
 
 // DB 함수로 스키마 보장 (ensure_specs_table)
@@ -654,21 +668,25 @@ async function runAutoIngest({
 
   let explodedEntries = [];
   for (const row of specRows) {
-    const r = row && typeof row === 'object' ? { ...row } : {};
-    const seedBrand  = extracted.brand || brandName;
-    const seedSeries = r.series_code || r.series || baseSeries || null;
-    const seedCode   = r.code ?? seedSeries ?? null; // 템플릿 없을 때 시리즈가 code
-    const baseRec    = { ...r, brand: seedBrand, series_code: seedSeries, code: seedCode };
-    const combos = explodeVariants({ brand: seedBrand, series_code: seedSeries }, r, bp);
-    if (combos.length) {
-      for (const combo of combos) {
-        explodedEntries.push({ ...baseRec, ...combo });
-      }
-    } else {
-      explodedEntries.push({ ...baseRec });
-    }
+    const specsObj = row && typeof row === 'object' ? { ...row } : {};
+    const fallbackSeries = specsObj.series_code || specsObj.series || baseSeries || null;
+    const baseSeed = {
+      brand: brandName,
+      series: fallbackSeries,
+      series_code: fallbackSeries,
+      code: specsObj.code ?? fallbackSeries ?? null,
+    };
+    const expanded = explodeVariants(baseSeed, specsObj, bp).map((entry) => ({
+      ...entry,
+      brand: entry.brand || brandName,
+      series_code: entry.series_code || entry.series || fallbackSeries,
+      code: entry.code ?? specsObj.code ?? fallbackSeries ?? null,
+    }));
+    explodedEntries.push(...expanded);
   }
-  if (!explodedEntries.length) explodedEntries = [{ brand: brandName, series_code: baseSeries || null, code: baseSeries || null }];
+  if (!explodedEntries.length) {
+    explodedEntries = [{ brand: brandName, series_code: baseSeries || null, code: baseSeries || null }];
+  }
 
   // ---- 분할 여부 결정 ----
   const pnCands = candidateMap.map((c) => c.raw);
@@ -684,11 +702,8 @@ async function runAutoIngest({
   if (mustSplit && candidateMap.length > 1 && explodedEntries.length <= 1) {
     const max = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
     const tmpl = explodedEntries[0] || { brand: brandName, series_code: baseSeries || null };
-    const dup = [];
-    for (const c of candidateMap.slice(0, max)) {
-      dup.push({ ...tmpl, code: c.raw, code_norm: String(c.raw || '').toLowerCase() });
-    }
-    explodedEntries = dup;
+    explodedEntries = candidateMap.slice(0, max)
+      .map((c) => ({ ...tmpl, code: c.raw, code_norm: c.norm }));
   }
 
   const seenCodes = new Set();
@@ -791,7 +806,7 @@ async function runAutoIngest({
 
     // ← 업서트 전에 숫자/정수/불리언 컬럼을 타입에 맞춰 정리(실패 키는 삭제)
     sanitizeByColTypes(safe, colTypes);
-    await upsertByBrandCode(table, safe);
+    await upsertByBrandCode(table, normalizeKeysOnce(safe));
     upserted++;
   }
 

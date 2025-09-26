@@ -122,7 +122,12 @@ async function saveExtractedSpecs(familySlug, base, specs) {
     }
   }
 
-  const specCols = Object.keys(specsNorm);
+  // 실제 테이블 컬럼만 남기고, 메타 키(옵션/설정)는 제외
+  const physicalCols = new Set(dbColTypes.keys());
+  const META = new Set(['variant_keys','pn_template','ingest_options']);
+  const specCols = Object.keys(specsNorm)
+    .map((s) => s.toLowerCase())
+    .filter((s) => physicalCols.has(s) && !META.has(s));
   const allCols = baseCols.concat(specCols);
   const params = allCols.map((_, i) => `$${i + 1}`);
   const values = baseVals.concat(specCols.map((k) => {

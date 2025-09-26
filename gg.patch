@@ -1,48 +1,62 @@
-diff --git a/src/utils/vertex.js b/src/utils/vertex.js
-index d52e58502f40371c36e0e49d92a197fffa8d0fe0..f28b7e1cfeda69124634e6cf39cd8fda827511db 100644
---- a/src/utils/vertex.js
-+++ b/src/utils/vertex.js
-@@ -1,41 +1,42 @@
- 'use strict';
- 
- const { VertexAI } = require('@google-cloud/vertexai');
- const { safeJsonParse } = require('./safe-json');
- 
- const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID;
- const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
- const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
- 
- const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
- 
- // Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용
- function getModel(systemText, modelId = MODEL_ID) {
-   const cfg = { model: modelId };
-   if (systemText && String(systemText).trim()) {
-     cfg.systemInstruction = { parts: [{ text: String(systemText) }] };
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index c45fd70fa5e4363e7fc17275560aba80603274c5..4c176e13cbac050b609e4d91e30bcd7be4338ce4 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -100,51 +100,56 @@ async function saveExtractedSpecs(familySlug, base, specs) {
+     ? computeFastKeys(blueprint).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+     : allowedKeys;
+   const allowedSet = new Set(allowedKeys);
+   const fastSet = new Set(fastKeys);
+   const specsNorm = {};
+   for (const [rawKey, value] of Object.entries(specs || {})) {
+     const key = String(rawKey || '')
+       .trim()
+       .toLowerCase()
+       .replace(/[^a-z0-9_]/g, '');
+     if (!key || RESERVED.has(key)) continue;
+     if (allowedSet.size && !allowedSet.has(key)) continue;
+     if (FAST && fastSet.size && !fastSet.has(key)) continue;
+     if (!Object.prototype.hasOwnProperty.call(specsNorm, key)) {
+       specsNorm[key] = coerceByType(key, value); // 타입 강제정규화
+     }
    }
-   return vertex.getGenerativeModel(cfg);
- }
  
--async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.1 } = {}) {
-+async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
-   const model = getModel(systemText, modelId);
-   const req = {
-     contents: [{ role: 'user', parts: [{ text: String(userText || '') }]}],
-     generationConfig: {
-       responseMimeType: 'application/json',
-       temperature,
-+      topP,
-       maxOutputTokens,
-     },
-   };
-   const resp = await model.generateContent(req);
-   const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-   try {
-     const parsed = safeJsonParse(txt);
-     return parsed ?? {};
-   } catch {
-     throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`);
+   for (const key of Object.keys(specsNorm)) {
+     const t = dbColTypes.get(key);
+     if (t === 'numeric' || t === 'int') {
+       specsNorm[key] = toNumberOrNull(specsNorm[key]);
+     }
    }
- }
  
- module.exports = { getModel, callModelJson };
+-  const specCols = Object.keys(specsNorm);
++  // 실제 테이블 컬럼만 남기고, 메타 키(옵션/설정)는 제외
++  const physicalCols = new Set(dbColTypes.keys());
++  const META = new Set(['variant_keys','pn_template','ingest_options']);
++  const specCols = Object.keys(specsNorm)
++    .map((s) => s.toLowerCase())
++    .filter((s) => physicalCols.has(s) && !META.has(s));
+   const allCols = baseCols.concat(specCols);
+   const params = allCols.map((_, i) => `$${i + 1}`);
+   const values = baseVals.concat(specCols.map((k) => {
+     const x = specsNorm[k];
+     if (typeof x === 'string' && /to|,|\d/.test(x)) {
+       const n = toNumberOrNull(x);
+       return n ?? null;
+     }
+     return x;
+   }));
+ 
+   const colList = allCols.map(safeColumnName).join(',');
+   const setList = specCols
+     .map((k) => `${safeColumnName(k)} = EXCLUDED.${safeColumnName(k)}`)
+     .join(',');
+ 
+   const sql = `
+     INSERT INTO ${targetTable} (${colList})
+     VALUES (${params.join(',')})
+     ON CONFLICT (brand_norm, code_norm)
+     DO UPDATE SET
+       mfr_full = EXCLUDED.mfr_full,
+       datasheet_uri = EXCLUDED.datasheet_uri,
+       verified_in_doc = EXCLUDED.verified_in_doc
+       ${setList ? ',' + setList : ''}

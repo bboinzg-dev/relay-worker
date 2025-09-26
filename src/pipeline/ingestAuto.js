@@ -29,6 +29,13 @@ const MIN_KEYS = {
   ]
 };
 
+const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
+const BASE_KEYS = new Set([
+  'family_slug','brand','code','brand_norm','code_norm','series_code',
+  'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
+  'cover','verified_in_doc','updated_at'
+]);
+
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
 function normIdent(s){ return String(s||'').trim().toLowerCase().replace(/[^a-z0-9_]/g, ''); }
 
@@ -551,7 +558,9 @@ async function runAutoIngest({
     if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
     await ensureSpecsTableByFamily(family);
   }
-  const colsSet = await getTableColumns(qualified);
+  const colsSet = new Set([
+    ...await getTableColumns(qualified)
+  ].map((c) => String(c || '').toLowerCase()));
   const colTypes = await getColumnTypes(qualified);
 
   // 블루프린트 허용 키
@@ -923,8 +932,11 @@ async function runAutoIngest({
 
     // 블루프린트 값
     for (const [k,v] of Object.entries(rec)) {
-      if (['family_slug','brand','code','brand_norm','code_norm','series_code','datasheet_uri','image_uri','datasheet_url','display_name','displayname','cover','verified_in_doc','updated_at'].includes(k)) continue;
-      if (colsSet.has(k)) safe[k] = v;
+      const kk = String(k || '').toLowerCase();
+      if (BASE_KEYS.has(kk)) continue;
+      if (!colsSet.has(kk)) continue;
+      if (META_KEYS.has(kk)) continue;
+      safe[kk] = v;
     }
     if (colsSet.has('updated_at')) safe.updated_at = now;
 

@@ -699,11 +699,54 @@ async function runAutoIngest({
   });
 
   if (!mustSplit && explodedEntries.length > 1) explodedEntries.splice(1);
-  if (mustSplit && candidateMap.length > 1 && explodedEntries.length <= 1) {
-    const max = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
-    const tmpl = explodedEntries[0] || { brand: brandName, series_code: baseSeries || null };
-    explodedEntries = candidateMap.slice(0, max)
-      .map((c) => ({ ...tmpl, code: c.raw, code_norm: c.norm }));
+  if (mustSplit && candidateMap.length > 1) {
+    const maxCodes = Math.min(candidateMap.length, FIRST_PASS_CODES || 20);
+    if (maxCodes > 0) {
+      const fallbackNorm = baseSeries ? normalizeCode(baseSeries) : null;
+      const assignedNorms = new Set();
+
+      // 이미 스펙 행에 코드가 정확히 채워져 있으면 그대로 사용
+      for (const entry of explodedEntries) {
+        const existing = entry.code ? normalizeCode(entry.code) : null;
+        if (existing && candidateNormSet.has(existing) && !assignedNorms.has(existing)) {
+          assignedNorms.add(existing);
+        }
+      }
+
+      let idx = 0;
+      const nextCandidate = () => {
+        while (idx < maxCodes && assignedNorms.has(candidateMap[idx].norm)) idx++;
+        if (idx >= maxCodes) return null;
+        const cand = candidateMap[idx++];
+        assignedNorms.add(cand.norm);
+        return cand;
+      };
+
+      for (const entry of explodedEntries) {
+        if (assignedNorms.size >= maxCodes) break;
+        const norm = entry.code ? normalizeCode(entry.code) : null;
+        const needsOverride = !norm || norm === fallbackNorm || assignedNorms.has(norm);
+        if (!needsOverride) continue;
+        const cand = nextCandidate();
+        if (!cand) break;
+        entry.code = cand.raw;
+        entry.code_norm = cand.norm;
+      }
+
+      const templateBase = explodedEntries[0]
+        ? { ...explodedEntries[0] }
+        : { brand: brandName, series_code: baseSeries || null };
+      delete templateBase.code;
+      delete templateBase.code_norm;
+
+      for (let cand = nextCandidate(); cand; cand = nextCandidate()) {
+        explodedEntries.push({
+          ...templateBase,
+          code: cand.raw,
+          code_norm: cand.norm,
+        });
+      }
+    }
   }
 
   const seenCodes = new Set();

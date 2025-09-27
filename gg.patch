@@ -1,232 +1,197 @@
-diff --git a/server.js b/server.js
-index 29d1ba4bb015e89a7eb73089f120957ecafdbac2..8f5067ea4f227b3493be41c59e93b05d9f0c796f 100644
---- a/server.js
-+++ b/server.js
-@@ -431,180 +431,213 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
-     res.json({ ok:true, count: out.length, items: out });
-   } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'bulk ingest failed', detail:String(e?.message || e) }); }
- });
+diff --git a/src/ingest/mpn-exploder.js b/src/ingest/mpn-exploder.js
+index 8426f4da979cdd018afa734747f3c667a77fe50c..b826a8ca3608bdadf3bba8629eca88694d93ac05 100644
+--- a/src/ingest/mpn-exploder.js
++++ b/src/ingest/mpn-exploder.js
+@@ -1,84 +1,182 @@
+ 'use strict';
  
- app.post('/ingest/auto', requireSession, async (req, res) => {
-   try {
-     const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name, family_slug } = req.body || {};
-     const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
-     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
-     const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
-     res.json(result);
-   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
- });
+ const LIST_SEP = /[\,\s/;|·•]+/;
++const CANDIDATE_KEYS = [
++  'candidates',
++  'codes',
++  'mpn_candidates',
++  'mpnCandidates',
++  'mpn_list',
++  'mpnList',
++  'mpns',
++];
  
- async function handleWorkerIngest(req, res) {
-   const startedAt = Date.now();
-   const taskName =
-     req.get('X-CloudTasks-TaskName') ||
-     req.get('X-Cloud-Tasks-TaskName') ||
-     null;
-   const retryCnt = Number(
-     req.get('X-CloudTasks-TaskRetryCount') ||
-     req.get('X-Cloud-Tasks-TaskRetryCount') ||
-     0
-   );
--  const payload = req.body || {};
--  const runIdFromClient = payload?.runId || null;
--  const fromTasks = Boolean(taskName);
-+  const payload = (req.body && typeof req.body === 'object') ? req.body : {};
-+
-+  const runIdFromClient = [payload?.runId, payload?.run_id]
-+    .map((val) => (typeof val === 'string' && val.trim()) ? val.trim() : null)
-+    .find(Boolean) || null;
-+
-   const rawUri = [
-     payload?.gcsUri,
-+    payload?.gcs_uri,
-     payload?.gsUri,
-     payload?.gcsPdfUri,
--    payload?.gcs_uri,       // ← 추가
--    payload?.gcs_pdf_uri,   // ← 추가
-+    payload?.gcs_pdf_uri,
-     payload?.uri,
-     payload?.url,
--  ].find((value) => typeof value === 'string' && value.trim());
--  const gcsUri = rawUri ? rawUri.trim() : '';
-+  ].map((value) => (typeof value === 'string' ? value.trim() : '')).find((value) => !!value);
-+  const gcsUri = rawUri || '';
-+
-+  const fromTasks = Boolean(taskName || payload?.fromTasks);
-+
-+  const familySlug = payload?.family_slug ?? null;
-+  const brand = payload?.brand ?? null;
-+  const code = payload?.code ?? null;
-+  const series = payload?.series ?? null;
-+  const displayName = payload?.display_name ?? null;
-+  const uploaderId = payload?.uploader_id ?? null;
+ function normalizeList(raw) {
+   if (raw == null) return [];
+   if (Array.isArray(raw)) return raw.filter(v => v != null && String(v).trim() !== '');
+   const s = String(raw).trim();
+   if (!s) return [];
+   // "DC5V", "5 V", "05" 등에서 숫자만 뽑아 pad에 쓰기 좋게
+   return s.split(LIST_SEP).map(tok => tok.trim()).filter(Boolean);
+ }
  
-   if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
-     console.warn('[ingest-run] bad payload', {
-       fromTasks,
-       runId: runIdFromClient,
-       keys: Object.keys(payload || {}),
+ function pad(val, n = 2) {
+   const s = String(val).replace(/\D+/g, '') || String(val);
+   return s.padStart(n, '0');
+ }
+ 
+ function renderTemplate(tpl, obj) {
+   return String(tpl || '').replace(/\{\{([^}]+)\}\}/g, (_, expr) => {
+     const [rawKey, ...mods] = expr.split('|').map(s => s.trim());
+     let v = obj[rawKey];
+     for (const mod of mods) {
+       const m = /^pad=(\d+)$/.exec(mod);
+       if (m) v = pad(v, Number(m[1]));
+     }
+     return v == null ? '' : String(v);
+   });
+ }
+ 
+ // 곱집합
+ function cartesian(arrays) {
+   return arrays.reduce((acc, arr) => {
+     const out = [];
+     for (const a of acc) for (const b of arr) out.push(a.concat([b]));
+     return out;
+   }, [[]]);
+ }
+ 
++function collectCandidates(row = {}) {
++  const out = [];
++  const seen = new Set();
++
++  const push = (val) => {
++    if (val == null) return;
++    if (Array.isArray(val)) {
++      for (const v of val) push(v);
++      return;
++    }
++    if (typeof val === 'object') {
++      if (val.raw != null) push(val.raw);
++      if (val.code != null) push(val.code);
++      return;
++    }
++    const code = String(val || '').trim();
++    if (!code) return;
++    const norm = code.toLowerCase();
++    if (seen.has(norm)) return;
++    seen.add(norm);
++    out.push(code);
++  };
++
++  for (const key of CANDIDATE_KEYS) {
++    if (key in row) push(row[key]);
++  }
++
++  return out;
++}
++
++function stripCandidateFields(target) {
++  for (const key of CANDIDATE_KEYS) {
++    if (key in target) delete target[key];
++  }
++}
++
++function dedupeByBrandCode(rows = []) {
++  const out = [];
++  const seen = new Set();
++  for (const row of rows) {
++    if (!row || typeof row !== 'object') continue;
++    let code = row.code;
++    if (code == null || code === '') continue;
++    code = String(code).trim();
++    if (!code) continue;
++    const codeNorm = (row.code_norm || code.toLowerCase());
++    const brandNorm = String(row.brand_norm || row.brand || '').trim().toLowerCase();
++    const key = `${brandNorm}::${codeNorm}`;
++    if (seen.has(key)) continue;
++    if (!row.code_norm) row.code_norm = codeNorm;
++    seen.add(key);
++    out.push(row);
++  }
++  return out;
++}
++
+ /**
+  * @param {object} blueprint - { ingest_options: { variant_keys, pn_template }, ... }
+  * @param {Array<object>} rows - 추출된 행(스펙행). 각 행은 { series, series_code, ..., field:value }
+  * @returns {Array<object>} - 변형 축을 모두 풀어낸 행들. code/code_norm 포함
+  */
+-function explodeToRows(blueprint, rows = []) {
++function explodeToRows(blueprint, rows = [], options = {}) {
+   const ingest = blueprint?.ingest_options || blueprint?.ingestOptions || {};
+   const variantKeys = Array.isArray(ingest.variant_keys) ? ingest.variant_keys : [];
+   const tpl = ingest.pn_template || ingest.pnTemplate || null;
+ 
+-  const out = [];
++  const parseVariantsFromCode = typeof options.parseVariantsFromCode === 'function'
++    ? options.parseVariantsFromCode
++    : null;
++
++  const baseRows = rows.length ? rows : [{}];
++  for (const row0 of baseRows) {
++    const baseFields = { ...(row0 || {}) };
++    const candidates = collectCandidates(baseFields);
++    stripCandidateFields(baseFields);
++
++    if (Array.isArray(candidates) && candidates.length) {
++      const out = [];
++      const seen = new Set();
++      for (const raw of candidates) {
++        const code = String(raw || '').trim();
++        if (!code) continue;
++        const norm = code.toLowerCase();
++        if (seen.has(norm)) continue;
++        seen.add(norm);
+ 
+-  for (const row0 of (rows.length ? rows : [{}])) {
+-    const row = { ...row0 };
++        const v = parseVariantsFromCode
++          ? parseVariantsFromCode(code, blueprint?.code_rules || {})
++          : {};
++        out.push({
++          ...baseFields,
++          ...v,
++          code,
++          code_norm: norm,
++        });
++      }
++      return out;
++    }
++  }
++
++  const expandedRows = [];
++
++  for (const row0 of baseRows) {
++    const row = { ...(row0 || {}) };
+     const series = row.series_code || row.series || '';
+ 
+-    // 각 variant key를 리스트화
+     const lists = variantKeys.map(k => {
+       const v = row[k];
+       const list = normalizeList(v);
+-      return list.length ? list : [null]; // 값이 없으면 단일 null 유지
++      return list.length ? list : [null];
      });
-     return res
-       .status(fromTasks ? 200 : 400)
-       .json({ ok: true, ignored: true });
+ 
+     const combos = lists.length ? cartesian(lists) : [[]];
+     for (const combo of combos) {
+       const r = { ...row };
+       variantKeys.forEach((k, i) => { r[k] = combo[i]; });
+ 
+-      // code 생성: pn_template 있으면 그걸로, 없으면 series + 주요키
+       let code = tpl
+         ? renderTemplate(tpl, { ...r, series })
+         : [series, ...variantKeys.map(k => r[k]).filter(Boolean)].join('');
+ 
+-      // 후처리: 공백/슬래시 제거 등 최소 정규화
+       code = String(code).replace(/\s+/g, '').trim();
++      if (!code) continue;
+ 
+       r.code = code;
+       r.code_norm = code.toLowerCase();
+-      out.push(r);
++      expandedRows.push(r);
+     }
    }
+-  return out;
++
++  return dedupeByBrandCode(expandedRows);
+ }
  
-   if (!fromTasks) {
-     const runId = generateRunId();
-     try {
--      const { brand, code, series, display_name, family_slug = null } = payload;
-       await db.query(
-         `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
-            VALUES ($1,$2,$3,$4,'RUNNING')`,
-         [runId, taskName, retryCnt, gcsUri]
-       );
- 
--      res.status(202).json({ ok: true, run_id: runId });
-+      res.status(202).json({ ok: true, runId, run_id: runId });
- 
-       const ingestPayload = {
-         // runId / gcsUri는 케멀/스네이크 모두 넣어 Tasks 경유 중간 계층이 바꿔도 안전
--        runId, run_id: runId,
--        gcsUri, gcs_uri: gcsUri,
--        brand, code, series, display_name, family_slug,
-+        runId,
-+        run_id: runId,
-+        gcsUri,
-+        gcs_uri: gcsUri,
-+        family_slug: familySlug,
-+        brand,
-+        code,
-+        series,
-+        display_name: displayName,
-+        uploader_id: uploaderId,
-+        fromTasks: true,
-       };
- 
-       enqueueIngestRun(ingestPayload).catch(async (err) => {
-         try {
-           await db.query(
-             `UPDATE public.ingest_run_logs
-                 SET finished_at = now(),
-                     duration_ms = $2,
-                     status = 'FAILED',
-                     error_message = $3
-               WHERE id = $1`,
-             [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
-           );
-         } catch (_) {}
-         console.error('[ingest enqueue failed]', err?.message || err);
-       });
-     } catch (e) {
-       try {
-         await db.query(
-           `UPDATE public.ingest_run_logs
-              SET finished_at = now(),
-                  duration_ms = $2,
-                  status = 'FAILED',
-                  error_message = $3
-            WHERE id = $1`,
-           [ runId, Date.now() - startedAt, String(e?.message || e) ]
-         );
-       } catch (_) {}
-       if (!res.headersSent) {
-         console.error('[ingest 500]', { error: e?.message });
-         return res.status(500).json({ ok:false, error:String(e?.message || e) });
-       }
-       console.error('[ingest post-ack error]', e?.message || e);
-     }
-     return;
-   }
- 
-   // ---------- Cloud Tasks에서 온 호출(2차 실행) ----------
-   let killer;
-   try {
-     // A-1) 타임아웃 암(ingest_budget + buffer)
-     const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
-     killer = setTimeout(() => {
-       if (!res.headersSent) {
-         try { res.status(202).json({ ok: true, timeout: true }); } catch {}
-       }
-     }, deadlineMs);
- 
-     // A-2) runId 보정(fallback 생성)
--    let { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
-+    let runId = runIdFromClient || payload?.runId || payload?.run_id;
-+    if (typeof runId === 'string') runId = runId.trim();
-     if (!runId) {
-       runId = generateRunId();
-       console.warn('[ingest-run] runId missing -> created', { runId, taskName, retryCnt });
-     }
- 
-     const ensureLog = async () => {
-       const update = await db.query(
-         `UPDATE public.ingest_run_logs
-             SET status = 'RUNNING',
-                 task_name = $2,
-                 retry_count = $3,
-                 gcs_uri = COALESCE($4, gcs_uri),
-                 error_message = NULL,
-                 finished_at = NULL,
-                 duration_ms = NULL,
-                 final_table = NULL,
-                 final_family = NULL,
-                 final_brand = NULL,
-                 final_code = NULL,
-                 final_datasheet = NULL
-           WHERE id = $1`,
-         [ runId, taskName, retryCnt, gcsUri ]
-       );
-       if (!update.rowCount) {
-         await db.query(
-           `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
-              VALUES ($1,$2,$3,$4,'RUNNING')`,
-           [ runId, taskName, retryCnt, gcsUri ]
-         );
-       }
-     };
-     await ensureLog();
-     console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runId}`);
- 
-     // B-1) 실행부: 실패 → FAILED 업데이트 + 500 (또는 post-ACK 로그)
-     const label = `[ingest] ${runId}`;
-     console.time(label);
--    const ingestPayload = { ...payload, runId, gcsUri };
-+    const ingestPayload = {
-+      ...payload,
-+      runId,
-+      run_id: runId,
-+      gcsUri,
-+      gcs_uri: gcsUri,
-+      family_slug: familySlug,
-+      brand,
-+      code,
-+      series,
-+      display_name: displayName,
-+      uploader_id: uploaderId,
-+      fromTasks: true,
-+    };
-     let out;
-     try {
-       out = await runAutoIngest(ingestPayload);
-     } catch (err) {
-       try {
-         await db.query(
-           `UPDATE public.ingest_run_logs
-               SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
-             WHERE id = $1`,
-           [ runId, Date.now() - startedAt, String(err?.message || err) ]
-         );
-       } catch (_) {}
-       console.timeEnd(label);
-       if (!res.headersSent) return res.status(500).json({ ok:false, error:String(err?.message||err) });
-       console.warn('[ingest-run post-ACK error]', String(err?.message || err));
-       return;
-     }
-     console.timeEnd(label);
- 
-     // B-2) 성공 업데이트: 여기서 오류 나도 응답은 200 유지(로그만)
-     try {
-       await db.query(
-         `UPDATE public.ingest_run_logs
-             SET finished_at = now(),
-                 duration_ms = $2,
+ module.exports = { explodeToRows, renderTemplate, normalizeList, cartesian };

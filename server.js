@@ -453,19 +453,31 @@ async function handleWorkerIngest(req, res) {
     req.get('X-Cloud-Tasks-TaskRetryCount') ||
     0
   );
-  const payload = req.body || {};
-  const runIdFromClient = payload?.runId || null;
-  const fromTasks = Boolean(taskName);
+  const payload = (req.body && typeof req.body === 'object') ? req.body : {};
+
+  const runIdFromClient = [payload?.runId, payload?.run_id]
+    .map((val) => (typeof val === 'string' && val.trim()) ? val.trim() : null)
+    .find(Boolean) || null;
+
   const rawUri = [
     payload?.gcsUri,
+    payload?.gcs_uri,
     payload?.gsUri,
     payload?.gcsPdfUri,
-    payload?.gcs_uri,       // ← 추가
-    payload?.gcs_pdf_uri,   // ← 추가
+    payload?.gcs_pdf_uri,
     payload?.uri,
     payload?.url,
-  ].find((value) => typeof value === 'string' && value.trim());
-  const gcsUri = rawUri ? rawUri.trim() : '';
+  ].map((value) => (typeof value === 'string' ? value.trim() : '')).find((value) => !!value);
+  const gcsUri = rawUri || '';
+
+  const fromTasks = Boolean(taskName || payload?.fromTasks);
+
+  const familySlug = payload?.family_slug ?? null;
+  const brand = payload?.brand ?? null;
+  const code = payload?.code ?? null;
+  const series = payload?.series ?? null;
+  const displayName = payload?.display_name ?? null;
+  const uploaderId = payload?.uploader_id ?? null;
 
   if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
     console.warn('[ingest-run] bad payload', {
@@ -481,20 +493,27 @@ async function handleWorkerIngest(req, res) {
   if (!fromTasks) {
     const runId = generateRunId();
     try {
-      const { brand, code, series, display_name, family_slug = null } = payload;
       await db.query(
         `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
            VALUES ($1,$2,$3,$4,'RUNNING')`,
         [runId, taskName, retryCnt, gcsUri]
       );
 
-      res.status(202).json({ ok: true, run_id: runId });
+      res.status(202).json({ ok: true, runId, run_id: runId });
 
       const ingestPayload = {
         // runId / gcsUri는 케멀/스네이크 모두 넣어 Tasks 경유 중간 계층이 바꿔도 안전
-        runId, run_id: runId,
-        gcsUri, gcs_uri: gcsUri,
-        brand, code, series, display_name, family_slug,
+        runId,
+        run_id: runId,
+        gcsUri,
+        gcs_uri: gcsUri,
+        family_slug: familySlug,
+        brand,
+        code,
+        series,
+        display_name: displayName,
+        uploader_id: uploaderId,
+        fromTasks: true,
       };
 
       enqueueIngestRun(ingestPayload).catch(async (err) => {
@@ -544,7 +563,8 @@ async function handleWorkerIngest(req, res) {
     }, deadlineMs);
 
     // A-2) runId 보정(fallback 생성)
-    let { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
+    let runId = runIdFromClient || payload?.runId || payload?.run_id;
+    if (typeof runId === 'string') runId = runId.trim();
     if (!runId) {
       runId = generateRunId();
       console.warn('[ingest-run] runId missing -> created', { runId, taskName, retryCnt });
@@ -582,7 +602,20 @@ async function handleWorkerIngest(req, res) {
     // B-1) 실행부: 실패 → FAILED 업데이트 + 500 (또는 post-ACK 로그)
     const label = `[ingest] ${runId}`;
     console.time(label);
-    const ingestPayload = { ...payload, runId, gcsUri };
+    const ingestPayload = {
+      ...payload,
+      runId,
+      run_id: runId,
+      gcsUri,
+      gcs_uri: gcsUri,
+      family_slug: familySlug,
+      brand,
+      code,
+      series,
+      display_name: displayName,
+      uploader_id: uploaderId,
+      fromTasks: true,
+    };
     let out;
     try {
       out = await runAutoIngest(ingestPayload);

@@ -20,20 +20,9 @@ const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
 const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
 const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
 
-// family별 "최소 키셋" (필요 최소치만 저장)
-const MIN_KEYS = {
-  relay_power: [
-    'contact_form','contact_rating_ac','contact_rating_dc',
-    'coil_voltage_vdc','size_l_mm','size_w_mm','size_h_mm'
-  ],
-  relay_signal: [
-    'contact_form','contact_rating_ac','contact_rating_dc','coil_voltage_vdc'
-  ]
-};
-
 const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
 const BASE_KEYS = new Set([
-  'family_slug','brand','code','brand_norm','code_norm','series_code',
+  'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
   'cover','verified_in_doc','updated_at'
 ]);
@@ -164,6 +153,10 @@ function applyCodeRules(code, out, rules, colTypes) {
 // DB 함수로 스키마 보장 (ensure_specs_table)
 async function ensureSpecsTableByFamily(family){
   await db.query(`SELECT public.ensure_specs_table($1)`, [family]);
+}
+
+async function ensureBlueprintVariantColumns(family) {
+  await db.query(`SELECT public.ensure_blueprint_variant_columns($1)`, [family]);
 }
 
 async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
@@ -432,7 +425,7 @@ async function runAutoIngest(input = {}) {
    } catch { family = 'relay_power'; }
   }
 
-  // 목적 테이블
+// 목적 테이블
   const reg = await db.query(
     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
     [family]
@@ -440,11 +433,13 @@ async function runAutoIngest(input = {}) {
   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
   const qualified = table.startsWith('public.')? table : `public.${table}`;
 
- // 스키마 보장 (DB 함수) + 컬럼 자동 보강 후 타입 확보
+  const blueprint = await getBlueprint(family);
+
+  // 스키마 보장 (DB 함수) + 컬럼 자동 보강 후 타입 확보
   if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
     await ensureSpecsTableByFamily(family);
+    await ensureBlueprintVariantColumns(family);
   }
-  const blueprint = await getBlueprint(family);
   await ensureSpecColumnsForBlueprint(qualified, blueprint);
   const colTypes = await getColumnTypes(qualified);
 
@@ -669,12 +664,17 @@ async function runAutoIngest(input = {}) {
     mpn = String(mpn || '').trim();
     if (!mpn) continue;
     const mpnNorm = normalizeCode(mpn);
-    if (!mpnNorm || seenCodes.has(mpnNorm)) continue;
-    seenCodes.add(mpnNorm);
+    const brandKey = normLower(rec.brand || brandName);
+    const naturalKey = `${brandKey}::${mpnNorm}`;
+    if (!mpnNorm || seenCodes.has(naturalKey)) continue;
+    seenCodes.add(naturalKey);
 
     const rec = {};
+    rec.family_slug = family;
     rec.brand = row.brand || brandName;
-    rec.code = mpn;
+    rec.pn = mpn;
+    if (row.code != null) rec.code = row.code;
+    if (!rec.code) rec.code = mpn;
     rec.series_code = row.series_code ?? row.series ?? baseSeries ?? null;
     if (row.series != null && physicalCols.has('series')) rec.series = row.series;
     rec.datasheet_uri = row.datasheet_uri || gcsUri;
@@ -698,6 +698,7 @@ async function runAutoIngest(input = {}) {
     rec.display_name = displayName;
     if (rec.displayname == null && displayName != null) rec.displayname = displayName;
     rec.updated_at = now;
+    if (row.raw_json != null) rec.raw_json = row.raw_json;
 
     for (const [rawKey, rawValue] of Object.entries(row)) {
       const key = String(rawKey || '').trim();
@@ -717,11 +718,14 @@ async function runAutoIngest(input = {}) {
     const fallbackSeries = baseSeries || null;
     for (const cand of candidateMap) {
       const norm = cand.norm;
-      if (seenCodes.has(norm)) continue;
-      seenCodes.add(norm);
+      const naturalKey = `${normLower(brandName)}::${norm}`;
+      if (seenCodes.has(naturalKey)) continue;
+      seenCodes.add(naturalKey);
       const verified = mpnNormFromDoc.has(norm);
       const rec = {
+        family_slug: family,
         brand: brandName,
+        pn: cand.raw,
         code: cand.raw,
         series_code: fallbackSeries,
         datasheet_uri: gcsUri,
@@ -738,25 +742,6 @@ async function runAutoIngest(input = {}) {
     }
   }
 
-  // 최후 폴백 줄이기
-  if (!records.length) {
-    const tmp = 'TMP_' + (Math.random().toString(16).slice(2, 8)).toUpperCase();
-    records.push({
-      family_slug: family,
-      brand: brand || extracted.brand || 'unknown',
-      code: tmp,
-      series_code: series || code || null,
-      datasheet_uri: gcsUri,
-      image_uri: coverUri || null,
-      cover: coverUri || null,
-      display_name: `${brand || extracted.brand || 'unknown'} ${tmp}`,
-      displayname: `${brand || extracted.brand || 'unknown'} ${tmp}`,
-      datasheet_url: gcsUri,
-      verified_in_doc: false,
-      updated_at: now,
-    });
-  }
-
   console.log('[MPNDBG]', {
     picks: candidateMap.length,
     vkeys: Array.isArray(blueprint?.ingestOptions?.variant_keys) ? blueprint.ingestOptions.variant_keys : [],
@@ -765,25 +750,55 @@ async function runAutoIngest(input = {}) {
     colsSanitized: colTypes?.size || 0,
   });
 
-  await saveExtractedSpecs(qualified, family, records);
+  let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
+  if (records.length) {
+    persistResult = await saveExtractedSpecs(qualified, family, records) || persistResult;
+  } else {
+    persistResult.skipped = [{ reason: 'missing_pn' }];
+  }
 
-  const persistedCodes = new Set(records.map((rec) => String(rec.code || '').trim()).filter(Boolean));
+  const persistedCodes = new Set(
+    (persistResult.written || [])
+      .map((pn) => String(pn || '').trim())
+      .filter(Boolean)
+  );
+  if (!persistedCodes.size && records.length) {
+    for (const rec of records) {
+      const pn = String(rec.pn || rec.code || '').trim();
+      if (pn) persistedCodes.add(pn);
+    }
+  }
+
   const persistedList = Array.from(persistedCodes);
   const mpnList = Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [];
   const mergedMpns = Array.from(new Set([...persistedList, ...mpnList]));
 
+  const rejectReasons = new Set(
+    (persistResult.skipped || [])
+      .map((it) => (it && typeof it === 'object' ? it.reason : it))
+      .filter(Boolean)
+  );
+  const warningReasons = new Set(
+    (persistResult.warnings || []).filter(Boolean)
+  );
+
+  const ok = persistedList.length > 0;
+
   return {
-    ok: true,
+    ok,
     ms: Date.now() - started,
     family,
     final_table: table,
-    brand: records[0]?.brand,
-    code:  records[0]?.code,
+    specs_table: table,
+    brand: records[0]?.brand || extracted?.brand || brand || null,
+    code:  persistedList[0] || records[0]?.pn || records[0]?.code || null,
     datasheet_uri: gcsUri,
     cover: coverUri || records[0]?.image_uri || null,
-    rows: records.length,
+    rows: persistResult.upserts || persistedList.length,
     codes: persistedList,
     mpn_list: mergedMpns,
+    reject_reasons: Array.from(rejectReasons),
+    warnings: Array.from(warningReasons),
   };
 }
 

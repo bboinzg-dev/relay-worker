@@ -56,17 +56,7 @@ function normalizeBlueprint(row, registryRow) {
   let variantKeys = deriveVariantKeys(row);
   const specsTable = registryRow?.specs_table || registryRow?.specsTable || `${row.family_slug}_specs`;
 
-  const forceVariant = (list) => normalizeKeyList(Array.isArray(list) ? list : []);
-  if (row.family_slug === 'relay_power') {
-    const forcedVariants = forceVariant(['coil_voltage_vdc', 'contact_form', 'suffix']);
-    variantKeys = forcedVariants;
-    ingestOptions.variant_keys = forcedVariants;
-    ingestOptions.pn_template = '{{series}}{{contact_form}}{{coil_voltage_vdc|pad=2}}{{suffix}}';
-  } else if (row.family_slug === 'relay_signal') {
-    const forcedVariants = forceVariant(['coil_voltage_vdc', 'contact_arrangement']);
-    variantKeys = forcedVariants;
-    ingestOptions.variant_keys = forcedVariants;
-  } else if (Array.isArray(ingestOptions.variant_keys)) {
+  if (Array.isArray(ingestOptions.variant_keys)) {
     ingestOptions.variant_keys = normalizeKeyList(ingestOptions.variant_keys);
   }
 

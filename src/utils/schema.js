@@ -52,28 +52,38 @@ function canonKeys(obj = {}) {
   return out;
 }
 
-const NO_UPDATE = new Set(['id', 'created_at', 'updated_at', 'brand_norm', 'code_norm']);
+const NO_UPDATE = new Set(['id', 'created_at', 'updated_at', 'brand_norm', 'code_norm', 'pn', 'pn_norm']);
 
 async function upsertByBrandCode(tableName, values = {}) {
   const { schema, table, qualified } = parseTableName(tableName);
 
   const brand = values?.brand ?? null;
   const code = values?.code ?? null;
+  const pn = values?.pn ?? values?.code ?? null;
   const rest = { ...values };
   const brandNormInput = rest.brand_norm;
   const codeNormInput = rest.code_norm;
+  const pnNormInput = rest.pn_norm;
   delete rest.brand;
   delete rest.code;
+  delete rest.pn;
   delete rest.brand_norm;
   delete rest.code_norm;
+  delete rest.pn_norm;
 
   const payload = canonKeys({
     brand,
     code,
+    pn,
     brand_norm: brand ? String(brand).toLowerCase() : brandNormInput ?? null,
     code_norm: code ? String(code).toLowerCase() : codeNormInput ?? null,
+    pn_norm: pn ? String(pn).toLowerCase() : pnNormInput ?? null,
     ...rest,
   });
+
+  if (!payload.pn) {
+    throw new Error('pn required');
+  }
 
   const cols = Object.keys(payload);
   if (!cols.length) return null;
@@ -109,7 +119,7 @@ async function upsertByBrandCode(tableName, values = {}) {
   const sql = `
     insert into ${qualified} (${insertCols.join(',')})
     values (${params.join(',')})
-    on conflict (brand_norm, code_norm)
+    on conflict (brand_norm, pn)
     do update set ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
     returning *`;
 

@@ -1,116 +1,108 @@
-diff --git a/src/ingest/mpn-exploder.js b/src/ingest/mpn-exploder.js
-index d2ffac69349f42d7f4089f5e5cbde306c801ca2d..22b9238c80d069ee3602286bf89ac4fef9e9b0ab 100644
---- a/src/ingest/mpn-exploder.js
-+++ b/src/ingest/mpn-exploder.js
-@@ -90,93 +90,92 @@ function dedupeByBrandCode(rows = []) {
-     let code = row.code;
-     if (code == null || code === '') continue;
-     code = String(code).trim();
-     if (!code) continue;
-     const codeNorm = (row.code_norm || code.toLowerCase());
-     const brandNorm = String(row.brand_norm || row.brand || '').trim().toLowerCase();
-     const key = `${brandNorm}::${codeNorm}`;
-     if (seen.has(key)) continue;
-     if (!row.code_norm) row.code_norm = codeNorm;
-     seen.add(key);
-     out.push(row);
+diff --git a/src/utils/schema.js b/src/utils/schema.js
+index ef936ea27b0289fdf8a52bb464de7b946a7bd5ef..888d6a3b21172290f72bb1d81957f0b6a0dfbfb9 100644
+--- a/src/utils/schema.js
++++ b/src/utils/schema.js
+@@ -30,91 +30,101 @@ function parseTableName(tableName) {
+   }
+ 
+   schema = normalizeIdentifier(schema) || 'public';
+   table = normalizeIdentifier(table);
+   if (!table) throw new Error('invalid table name');
+ 
+   return {
+     schema,
+     table,
+     qualified: `${schema}.${table}`,
+   };
+ }
+ 
+ function canonKeys(obj = {}) {
+   const out = {};
+   for (const [rawKey, value] of Object.entries(obj)) {
+     const key = normalizeIdentifier(rawKey);
+     if (!key) continue;
+     if (!Object.prototype.hasOwnProperty.call(out, key)) {
+       out[key] = value;
+     }
    }
    return out;
  }
  
- /**
-  * @param {object} blueprint - { ingest_options: { variant_keys, pn_template }, ... }
-  * @param {Array<object>} rows - 추출된 행(스펙행). 각 행은 { series, series_code, ..., field:value }
-  * @returns {Array<object>} - 변형 축을 모두 풀어낸 행들. code/code_norm 포함
-  */
- function explodeToRows(blueprint, rows = [], options = {}) {
-   const ingest = blueprint?.ingest_options || blueprint?.ingestOptions || {};
-   const variantKeys = Array.isArray(ingest.variant_keys) ? ingest.variant_keys : [];
-   const tpl = ingest.pn_template || ingest.pnTemplate || null;
+-const NO_UPDATE = new Set(['id', 'created_at', 'updated_at', 'brand_norm', 'code_norm']);
++const NO_UPDATE = new Set(['id', 'created_at', 'updated_at', 'brand_norm', 'code_norm', 'pn', 'pn_norm']);
  
-- const parseVariantsFromCode = typeof options.parseVariantsFromCode === 'function'
-+  const parseVariantsFromCode = typeof options.parseVariantsFromCode === 'function'
-     ? options.parseVariantsFromCode
-     : null;
+ async function upsertByBrandCode(tableName, values = {}) {
+   const { schema, table, qualified } = parseTableName(tableName);
  
-   const baseRows = rows.length ? rows : [{}];
-+  const candidateRows = [];
-+  const expandedRows = [];
+   const brand = values?.brand ?? null;
+   const code = values?.code ?? null;
++  const pn = values?.pn ?? values?.code ?? null;
+   const rest = { ...values };
+   const brandNormInput = rest.brand_norm;
+   const codeNormInput = rest.code_norm;
++  const pnNormInput = rest.pn_norm;
+   delete rest.brand;
+   delete rest.code;
++  delete rest.pn;
+   delete rest.brand_norm;
+   delete rest.code_norm;
++  delete rest.pn_norm;
+ 
+   const payload = canonKeys({
+     brand,
+     code,
++    pn,
+     brand_norm: brand ? String(brand).toLowerCase() : brandNormInput ?? null,
+     code_norm: code ? String(code).toLowerCase() : codeNormInput ?? null,
++    pn_norm: pn ? String(pn).toLowerCase() : pnNormInput ?? null,
+     ...rest,
+   });
+ 
++  if (!payload.pn) {
++    throw new Error('pn required');
++  }
 +
-   for (const row0 of baseRows) {
--    const baseFields = { ...(row0 || {}) };
--    const candidates = collectCandidates(baseFields);
--    stripCandidateFields(baseFields);
-+    const row = { ...(row0 || {}) };
-+    const candidates = collectCandidates(row);
-+    stripCandidateFields(row);
+   const cols = Object.keys(payload);
+   if (!cols.length) return null;
  
-     if (Array.isArray(candidates) && candidates.length) {
--      const out = [];
-       const seen = new Set();
-       for (const raw of candidates) {
-         const code = String(raw || '').trim();
-         if (!code) continue;
-         const norm = code.toLowerCase();
-         if (seen.has(norm)) continue;
-         seen.add(norm);
+   const meta = await db.query(
+     `select column_name, is_generated
+        from information_schema.columns
+       where table_schema=$1 and table_name=$2`,
+     [schema, table],
+   );
+   const allowed = new Set(meta.rows.map((r) => String(r.column_name).toLowerCase()));
+   const generated = new Set(
+     meta.rows
+       .filter((r) => String(r.is_generated || '').toUpperCase() === 'ALWAYS')
+       .map((r) => String(r.column_name).toLowerCase()),
+   );
  
-         const v = parseVariantsFromCode
-           ? parseVariantsFromCode(code, blueprint?.code_rules || {})
-           : {};
--        out.push({
--          ...baseFields,
-+
-+        candidateRows.push({
-+          ...row,
-           ...v,
-           code,
-           code_norm: norm,
-         });
-       }
--      return out;
-+      continue;
-     }
--  }
- 
--  const expandedRows = [];
--
--  for (const row0 of baseRows) {
--    const row = { ...(row0 || {}) };
-     const series = row.series_code || row.series || '';
- 
--    const lists = variantKeys.map(k => {
-+    const lists = variantKeys.map((k) => {
-       const v = row[k];
-       const list = normalizeList(v);
--        return list.length ? list : [null];
-+      return list.length ? list : [null];
-     });
- 
-     const combos = lists.length ? cartesian(lists) : [[]];
-     for (const combo of combos) {
-       const r = { ...row };
-       variantKeys.forEach((k, i) => { r[k] = combo[i]; });
- 
-       let code = tpl
-         ? renderTemplate(tpl, { ...r, series })
--        : [series, ...variantKeys.map(k => r[k]).filter(Boolean)].join('');
-+        : [series, ...variantKeys.map((k) => r[k]).filter(Boolean)].join('');
- 
-       code = String(code).replace(/\s+/g, '').trim();
--        if (!code) continue;
-+      if (!code) continue;
- 
-       r.code = code;
-       r.code_norm = code.toLowerCase();
--       expandedRows.push(r);
-+      expandedRows.push(r);
-     }
+   const insertCols = [];
+   const insertVals = [];
+   for (const col of cols) {
+     if (!allowed.has(col)) continue;
+     if (generated.has(col)) continue;
+     insertCols.push(col);
+     insertVals.push(payload[col]);
    }
+   if (!insertCols.length) return null;
  
--  return dedupeByBrandCode(expandedRows);
-+  const rowsOut = candidateRows.length ? candidateRows : expandedRows;
-+  return dedupeByBrandCode(rowsOut);
+   const params = insertCols.map((_, i) => `$${i + 1}`);
+   const updates = insertCols
+     .filter((col) => !NO_UPDATE.has(col))
+     .map((col) => `${col}=EXCLUDED.${col}`);
+ 
+   const sql = `
+     insert into ${qualified} (${insertCols.join(',')})
+     values (${params.join(',')})
+-    on conflict (brand_norm, code_norm)
++    on conflict (brand_norm, pn)
+     do update set ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
+     returning *`;
+ 
+   const res = await db.query(sql, insertVals);
+   return res.rows?.[0] || null;
  }
  
- module.exports = { explodeToRows, renderTemplate, normalizeList, cartesian };
+ module.exports = { upsertByBrandCode };

@@ -403,7 +403,17 @@ app.post('/ingest', requireSession, async (req, res) => {
 
     await ensureSpecsTable(table, fields);
     const row = await upsertByBrandCode(table, {
-      brand, code, series, display_name, family_slug, datasheet_uri, cover, source_gcs_uri, raw_json, ...values
+      brand,
+      code,
+      pn: code,
+      series,
+      display_name: display_name || (brand ? `${brand} ${code}` : null),
+      family_slug,
+      datasheet_uri,
+      cover,
+      source_gcs_uri,
+      raw_json,
+      ...values,
     });
 
     res.json({ ok:true, table, row });
@@ -421,9 +431,16 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
       const table = (it.specs_table || `${it.family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
       await ensureSpecsTable(table, it.fields || {});
       const row = await upsertByBrandCode(table, {
-        brand: it.brand, code: it.code, series: it.series, display_name: it.display_name,
-        family_slug: it.family_slug, datasheet_uri: it.datasheet_uri, cover: it.cover,
-        source_gcs_uri: it.source_gcs_uri, raw_json: it.raw_json || null,
+        brand: it.brand,
+        code: it.code,
+        pn: it.pn || it.code,
+        series: it.series,
+        display_name: it.display_name || (it.brand && it.code ? `${it.brand} ${it.code}` : null),
+        family_slug: it.family_slug,
+        datasheet_uri: it.datasheet_uri,
+        cover: it.cover,
+        source_gcs_uri: it.source_gcs_uri,
+        raw_json: it.raw_json || null,
         ...(it.values || {}),
       });
       out.push({ table, row });
@@ -635,6 +652,41 @@ async function handleWorkerIngest(req, res) {
     }
     console.timeEnd(label);
 
+    const failureReasons = new Set();
+    if (Array.isArray(out?.reject_reasons)) {
+      for (const reason of out.reject_reasons) {
+        if (reason) failureReasons.add(reason);
+      }
+    }
+    const warningReasons = new Set();
+    if (Array.isArray(out?.warnings)) {
+      for (const reason of out.warnings) {
+        if (reason) warningReasons.add(reason);
+      }
+    }
+
+    if (!out?.ok) {
+      const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
+      const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
+      try {
+        await db.query(
+          `UPDATE public.ingest_run_logs
+              SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
+            WHERE id = $1`,
+          [ runId, (out?.ms ?? (Date.now() - startedAt)), message ]
+        );
+      } catch (err2) {
+        console.error('[ingest-run reject update failed]', err2?.message || err2);
+      }
+
+      return res.status(200).json({
+        ok: false,
+        run_id: runId,
+        reject_reasons: reasonList,
+        warnings: Array.from(warningReasons),
+      });
+    }
+
     // B-2) 성공 업데이트: 여기서 오류 나도 응답은 200 유지(로그만)
     try {
       await db.query(
@@ -646,7 +698,8 @@ async function handleWorkerIngest(req, res) {
                 final_family = $4,
                 final_brand = $5,
                 final_code  = $6,
-                final_datasheet = $7
+                final_datasheet = $7,
+                error_message = NULL
           WHERE id = $1`,
         [ runId, (out?.ms ?? (Date.now() - startedAt)),
           out?.specs_table || null,
@@ -659,7 +712,7 @@ async function handleWorkerIngest(req, res) {
       console.error('[ingest-run update SUCCEEDED failed]', err2?.message || err2);
     }
 
-    return res.json({ ok:true, run_id: runId });
+    return res.json({ ok:true, run_id: runId, warnings: Array.from(warningReasons) });
   } finally {
     if (killer) clearTimeout(killer);
   }
@@ -667,6 +720,97 @@ async function handleWorkerIngest(req, res) {
 
 const workerIngestMiddlewares = [requireSession, handleWorkerIngest];
 app.post('/api/worker/ingest', workerIngestMiddlewares);
+
+async function seedManufacturerAliases() {
+  try {
+    const { rows } = await db.query(
+      `SELECT lower(column_name) AS column
+         FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'manufacturer_alias'`
+    );
+    const available = new Set(rows.map((r) => r.column));
+    if (!available.has('brand') || !available.has('alias')) return;
+
+    const seeds = [
+      { brand: 'Panasonic', alias: 'Matsushita' },
+      { brand: 'OMRON', alias: 'Omron Corporation' },
+      { brand: 'TE Connectivity', alias: 'Tyco Electronics' },
+      { brand: 'Finder', alias: 'Finder Relays' },
+      { brand: 'Schneider Electric', alias: 'Square D' },
+    ];
+
+    for (const { brand, alias } of seeds) {
+      await db.query(
+        `INSERT INTO public.manufacturer_alias (brand, alias)
+         VALUES ($1,$2)
+         ON CONFLICT DO NOTHING`,
+        [brand, alias]
+      );
+    }
+  } catch (err) {
+    console.warn('[BOOT] seed manufacturer_alias skipped:', err?.message || err);
+  }
+}
+
+async function seedExtractionRecipe() {
+  try {
+    const { rows } = await db.query(
+      `SELECT lower(column_name) AS column
+         FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'extraction_recipe'`
+    );
+    const available = new Set(rows.map((r) => r.column));
+    if (!available.size) return;
+
+    const payload = {};
+    if (available.has('slug')) payload.slug = 'generic-universal';
+    if (available.has('name')) payload.name = 'Generic Datasheet Extraction';
+    if (available.has('description')) payload.description = 'Universal recipe for multi-brand datasheet parsing without series-specific assumptions.';
+    if (available.has('family')) payload.family = null;
+    if (available.has('is_active')) payload.is_active = true;
+    if (available.has('rules_json')) {
+      payload.rules_json = JSON.stringify({
+        steps: [
+          { action: 'collect_part_number_candidates', options: { allow_series_hint: false } },
+          { action: 'filter_tokens', options: { blacklist: ['sample', 'example', 'typical'] } },
+          { action: 'normalize_units', options: { prefer: 'si' } },
+          { action: 'parse_numbers', options: { tolerant: true, preserve_range: true } },
+        ],
+      });
+    }
+
+    const entries = Object.entries(payload);
+    if (!entries.length) return;
+
+    const columns = entries.map(([col]) => `"${col}"`).join(',');
+    const placeholders = entries.map((_, idx) => `$${idx + 1}`).join(',');
+    const values = entries.map(([, value]) => value);
+
+    let conflict = 'ON CONFLICT DO NOTHING';
+    if (available.has('slug')) {
+      const updateCols = entries
+        .filter(([col]) => col !== 'slug')
+        .map(([col]) => `"${col}" = EXCLUDED."${col}"`)
+        .join(', ');
+      conflict = updateCols ? `ON CONFLICT (slug) DO UPDATE SET ${updateCols}` : 'ON CONFLICT (slug) DO NOTHING';
+    } else if (available.has('name')) {
+      const updateCols = entries
+        .filter(([col]) => col !== 'name')
+        .map(([col]) => `"${col}" = EXCLUDED."${col}"`)
+        .join(', ');
+      conflict = updateCols ? `ON CONFLICT (name) DO UPDATE SET ${updateCols}` : 'ON CONFLICT (name) DO NOTHING';
+    }
+
+    await db.query(
+      `INSERT INTO public.extraction_recipe (${columns})
+       VALUES (${placeholders})
+       ${conflict}`,
+      values
+    );
+  } catch (err) {
+    console.warn('[BOOT] seed extraction_recipe skipped:', err?.message || err);
+  }
+}
 
 /* ---------------- 404 / error ---------------- */
 app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));
@@ -699,6 +843,8 @@ app.use((err, req, res, next) => {
     await db.query(`ALTER TABLE IF EXISTS public.relay_power_specs ADD COLUMN IF NOT EXISTS suffix text`);
     await db.query(`ALTER TABLE IF EXISTS public.relay_signal_specs ADD COLUMN IF NOT EXISTS coil_voltage_vdc text`);
     await db.query(`ALTER TABLE IF EXISTS public.relay_signal_specs ADD COLUMN IF NOT EXISTS contact_arrangement text`);
+    await seedManufacturerAliases();
+    await seedExtractionRecipe();
     console.log('[BOOT] ensured ingest_run_logs');
   } catch (e) {
     console.warn('[BOOT] ensure ingest_run_logs failed:', e?.message || e);

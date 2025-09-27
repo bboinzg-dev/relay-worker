@@ -388,11 +388,21 @@ async function extractPartNumbersFromText(text, { series } = {}) {
 
 
 
-async function runAutoIngest({
-  gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null,
-}) {
+async function runAutoIngest(input = {}) {
+  const {
+    gcsUri: rawGcsUri = null,
+    gsUri: rawGsUri = null,
+    family_slug = null,
+    brand = null,
+    code = null,
+    series = null,
+    display_name = null,
+  } = input;
+
+  const gcsUri = (rawGcsUri || rawGsUri || '').trim();
+
   const started = Date.now();
-  if (!gcsUri) throw new Error('gcsUri required');
+  if (!gcsUri) throw new Error('gcsUri/gsUri required');
    // 기본 2분로 단축 (원하면 ENV로 재조정)
   const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
   const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');

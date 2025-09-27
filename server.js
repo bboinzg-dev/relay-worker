@@ -478,7 +478,18 @@ async function handleWorkerIngest(req, res) {
 
       res.status(202).json({ ok: true, run_id: runId });
 
-      enqueueIngestRun({ runId, gcsUri: gsUri, brand, code, series, display_name, family_slug })
+      const ingestPayload = {
+        runId,
+        gsUri,
+        gcsUri: gsUri,
+        brand,
+        code,
+        series,
+        display_name,
+        family_slug,
+      };
+
+      enqueueIngestRun(ingestPayload)
         .catch(async (err) => {
           try {
             await db.query(
@@ -530,12 +541,13 @@ async function handleWorkerIngest(req, res) {
     if (!runId || !gsUri || !/^gs:\/\//i.test(gsUri)) {
       const statusCode = fromTasks ? 200 : 400;
       console.warn('[ingest-run] bad payload', { fromTasks, runId, keys: Object.keys(payload || {}) });
-      return res.status(statusCode).json({ ok:false, error:'runId & gsUri required' });
+      return res.status(statusCode).json({ ok:false, error:'runId & gsUri/gcsUri required' });
     }
 
     const label = `[ingest] ${runId}`;
     console.time(label);
-    const out = await runAutoIngest({ gcsUri: gsUri, brand, code, series, display_name, family_slug });
+    const ingestPayload = { gsUri, gcsUri: gsUri, brand, code, series, display_name, family_slug };
+    const out = await runAutoIngest(ingestPayload);
     console.timeEnd(label);
 
     await db.query(

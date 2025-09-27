@@ -453,6 +453,8 @@ async function handleWorkerIngest(req, res) {
     payload?.gcsUri,
     payload?.gsUri,
     payload?.gcsPdfUri,
+    payload?.gcs_uri,       // ← 추가
+    payload?.gcs_pdf_uri,   // ← 추가
     payload?.uri,
     payload?.url,
   ].find((value) => typeof value === 'string' && value.trim());
@@ -481,15 +483,12 @@ async function handleWorkerIngest(req, res) {
 
       res.status(202).json({ ok: true, run_id: runId });
 
-      const ingestPayload = {
-        runId,
-        gcsUri,
-        brand,
-        code,
-        series,
-        display_name,
-        family_slug,
-      };
+  const ingestPayload = {
+    // runId / gcsUri는 케멀/스네이크 모두 넣어 Tasks 경유 중간 계층이 바꿔도 안전
+    runId, run_id: runId,
+    gcsUri, gcs_uri: gcsUri,
+    brand, code, series, display_name, family_slug,
+  };
 
       enqueueIngestRun(ingestPayload)
         .catch(async (err) => {
@@ -538,12 +537,17 @@ async function handleWorkerIngest(req, res) {
   }, deadlineMs);
   console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
 
-  try {
-    const { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
-    if (!runId) {
-      console.warn('[ingest-run] bad payload', { fromTasks, runId, keys: Object.keys(payload || {}) });
-      return res.status(fromTasks ? 200 : 400).json({ ok: true, ignored: true });
-    }
+  let { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
+  if (!runId) {
+    // Fallback: runId가 누락된 태스크라면 지금 생성해서 이어간다
+    const { rows } = await db.query(
+      `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
+         VALUES ($1,$2,$3,'RUNNING') RETURNING id`,
+      [ taskName, retryCnt, gcsUri ]
+    );
+    runId = rows[0]?.id;
+    console.warn('[ingest-run] runId missing -> created', { runId, taskName, retryCnt });
+  }
 
     const label = `[ingest] ${runId}`;
     console.time(label);

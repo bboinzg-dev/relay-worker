@@ -1,108 +1,63 @@
-diff --git a/src/utils/schema.js b/src/utils/schema.js
-index ef936ea27b0289fdf8a52bb464de7b946a7bd5ef..888d6a3b21172290f72bb1d81957f0b6a0dfbfb9 100644
---- a/src/utils/schema.js
-+++ b/src/utils/schema.js
-@@ -30,91 +30,101 @@ function parseTableName(tableName) {
-   }
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 41d6635befccbeb987196b47ad7b8bf321b63765..14612fcd729b9db58480c06c304c8a45203f4f68 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -642,56 +642,56 @@ async function runAutoIngest(input = {}) {
+   for (const row of explodedRows) {
+     const seeds = [];
+     const seenSeed = new Set();
+     const pushSeed = (val) => {
+       if (val == null) return;
+       if (Array.isArray(val)) { val.forEach(pushSeed); return; }
+       const str = String(val).trim();
+       if (!str) return;
+       const parts = splitAndCarryPrefix(str);
+       if (parts.length > 1) { parts.forEach(pushSeed); return; }
+       const normed = str.toLowerCase();
+       if (seenSeed.has(normed)) return;
+       seenSeed.add(normed);
+       seeds.push(str);
+     };
+     pushSeed(row.code);
+     pushSeed(row.mpn);
+     pushSeed(row.part_number);
+     pushSeed(row.part_no);
  
-   schema = normalizeIdentifier(schema) || 'public';
-   table = normalizeIdentifier(table);
-   if (!table) throw new Error('invalid table name');
+     let mpn = seeds.length ? seeds[0] : '';
+     if (!mpn && candidateMap.length) mpn = candidateMap[0].raw;
+     mpn = String(mpn || '').trim();
+     if (!mpn) continue;
+     const mpnNorm = normalizeCode(mpn);
+-    const brandKey = normLower(rec.brand || brandName);
++    const brandKey = normLower(row.brand || brandName);
++    const rec = {};
+     const naturalKey = `${brandKey}::${mpnNorm}`;
+     if (!mpnNorm || seenCodes.has(naturalKey)) continue;
+     seenCodes.add(naturalKey);
  
-   return {
-     schema,
-     table,
-     qualified: `${schema}.${table}`,
-   };
- }
- 
- function canonKeys(obj = {}) {
-   const out = {};
-   for (const [rawKey, value] of Object.entries(obj)) {
-     const key = normalizeIdentifier(rawKey);
-     if (!key) continue;
-     if (!Object.prototype.hasOwnProperty.call(out, key)) {
-       out[key] = value;
+-    const rec = {};
+     rec.family_slug = family;
+     rec.brand = row.brand || brandName;
+     rec.pn = mpn;
+     if (row.code != null) rec.code = row.code;
+     if (!rec.code) rec.code = mpn;
+     rec.series_code = row.series_code ?? row.series ?? baseSeries ?? null;
+     if (row.series != null && physicalCols.has('series')) rec.series = row.series;
+     rec.datasheet_uri = row.datasheet_uri || gcsUri;
+     if (row.datasheet_url) rec.datasheet_url = row.datasheet_url;
+     else if (rec.datasheet_uri && rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
+     if (row.mfr_full != null) rec.mfr_full = row.mfr_full;
+     let verified;
+     if (row.verified_in_doc != null) {
+       if (typeof row.verified_in_doc === 'string') {
+         verified = row.verified_in_doc.trim().toLowerCase() === 'true';
+       } else {
+         verified = Boolean(row.verified_in_doc);
+       }
+     } else {
+       verified = candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm);
      }
-   }
-   return out;
- }
- 
--const NO_UPDATE = new Set(['id', 'created_at', 'updated_at', 'brand_norm', 'code_norm']);
-+const NO_UPDATE = new Set(['id', 'created_at', 'updated_at', 'brand_norm', 'code_norm', 'pn', 'pn_norm']);
- 
- async function upsertByBrandCode(tableName, values = {}) {
-   const { schema, table, qualified } = parseTableName(tableName);
- 
-   const brand = values?.brand ?? null;
-   const code = values?.code ?? null;
-+  const pn = values?.pn ?? values?.code ?? null;
-   const rest = { ...values };
-   const brandNormInput = rest.brand_norm;
-   const codeNormInput = rest.code_norm;
-+  const pnNormInput = rest.pn_norm;
-   delete rest.brand;
-   delete rest.code;
-+  delete rest.pn;
-   delete rest.brand_norm;
-   delete rest.code_norm;
-+  delete rest.pn_norm;
- 
-   const payload = canonKeys({
-     brand,
-     code,
-+    pn,
-     brand_norm: brand ? String(brand).toLowerCase() : brandNormInput ?? null,
-     code_norm: code ? String(code).toLowerCase() : codeNormInput ?? null,
-+    pn_norm: pn ? String(pn).toLowerCase() : pnNormInput ?? null,
-     ...rest,
-   });
- 
-+  if (!payload.pn) {
-+    throw new Error('pn required');
-+  }
-+
-   const cols = Object.keys(payload);
-   if (!cols.length) return null;
- 
-   const meta = await db.query(
-     `select column_name, is_generated
-        from information_schema.columns
-       where table_schema=$1 and table_name=$2`,
-     [schema, table],
-   );
-   const allowed = new Set(meta.rows.map((r) => String(r.column_name).toLowerCase()));
-   const generated = new Set(
-     meta.rows
-       .filter((r) => String(r.is_generated || '').toUpperCase() === 'ALWAYS')
-       .map((r) => String(r.column_name).toLowerCase()),
-   );
- 
-   const insertCols = [];
-   const insertVals = [];
-   for (const col of cols) {
-     if (!allowed.has(col)) continue;
-     if (generated.has(col)) continue;
-     insertCols.push(col);
-     insertVals.push(payload[col]);
-   }
-   if (!insertCols.length) return null;
- 
-   const params = insertCols.map((_, i) => `$${i + 1}`);
-   const updates = insertCols
-     .filter((col) => !NO_UPDATE.has(col))
-     .map((col) => `${col}=EXCLUDED.${col}`);
- 
-   const sql = `
-     insert into ${qualified} (${insertCols.join(',')})
-     values (${params.join(',')})
--    on conflict (brand_norm, code_norm)
-+    on conflict (brand_norm, pn)
-     do update set ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
-     returning *`;
- 
-   const res = await db.query(sql, insertVals);
-   return res.rows?.[0] || null;
- }
- 
- module.exports = { upsertByBrandCode };
+     rec.verified_in_doc = Boolean(verified);
+     rec.image_uri = row.image_uri || coverUri || null;
+     if (coverUri && rec.cover == null) rec.cover = coverUri;
+     const displayName = row.display_name || row.displayname || `${rec.brand} ${mpn}`;

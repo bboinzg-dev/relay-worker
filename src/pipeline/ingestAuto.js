@@ -664,12 +664,12 @@ async function runAutoIngest(input = {}) {
     mpn = String(mpn || '').trim();
     if (!mpn) continue;
     const mpnNorm = normalizeCode(mpn);
-    const brandKey = normLower(rec.brand || brandName);
+    const brandKey = normLower(row.brand || brandName);
+    const rec = {};
     const naturalKey = `${brandKey}::${mpnNorm}`;
     if (!mpnNorm || seenCodes.has(naturalKey)) continue;
     seenCodes.add(naturalKey);
 
-    const rec = {};
     rec.family_slug = family;
     rec.brand = row.brand || brandName;
     rec.pn = mpn;

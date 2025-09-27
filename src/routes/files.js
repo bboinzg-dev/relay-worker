@@ -5,6 +5,7 @@ const multer = require('multer');
 const { Storage } = require('@google-cloud/storage');
 const { CloudTasksClient } = require('@google-cloud/tasks');
 const { runAutoIngest } = require('../pipeline/ingestAuto');
+const { generateRunId } = require('../utils/run-id');
 
 const router = express.Router();
 
@@ -79,7 +80,15 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       const client = new CloudTasksClient();
       const parent = client.queuePath(process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT, location, queue);
 
-      const body = Buffer.from(JSON.stringify(payload));
+      const runId = generateRunId();
+      const queuePayload = {
+        ...payload,
+        runId,
+        run_id: runId,
+        gcs_uri: payload.gcsUri,
+      };
+      const body = Buffer.from(JSON.stringify(queuePayload)).toString('base64');
+      const audience = process.env.WORKER_AUDIENCE || workerUrl;
       const httpRequest = {
         url: workerUrl,
         httpMethod: 'POST',
@@ -88,11 +97,11 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       };
       const task = { httpRequest };
       if (invokerSA) {
-        task.httpRequest.oidcToken = { serviceAccountEmail: invokerSA, audience: workerUrl };
+        task.httpRequest.oidcToken = { serviceAccountEmail: invokerSA, audience };
       }
 
       const [resp] = await client.createTask({ parent, task });
-      return res.json({ ok: true, gcsUri, enqueued: true, task: resp.name });
+      return res.json({ ok: true, gcsUri, enqueued: true, task: resp.name, run_id: runId });
     }
 
     // fallback: 즉시 실행

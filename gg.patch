@@ -1,191 +1,92 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index fc3f1d104fb7587cd526bb619ef225e3a5024304..6ebeba8ff668bf289da313fc0ac1b77f60b08587 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -1,39 +1,167 @@
- 'use strict';
-+
- const { pool } = require('../utils/db');
-+const { getColumnsOf } = require('./ensure-spec-columns');
-+
-+const META_KEYS = new Set([
-+  'family_slug',
-+  'brand',
-+  'brand_norm',
-+  'code',
-+  'code_norm',
-+  'mfr_full',
-+  'datasheet_uri',
-+  'verified_in_doc',
-+  'display_name',
-+  'displayname',
-+  'image_uri',
-+  'cover',
-+  'series',
-+  'series_code',
-+  'created_at',
-+  'updated_at',
-+]);
-+
-+const CONFLICT_KEYS = ['brand_norm', 'code_norm', 'family_slug'];
-+
-+function normKey(key) {
-+  return String(key || '')
-+    .trim()
-+    .toLowerCase();
-+}
-+
-+async function getColumnTypes(targetTable) {
-+  const [schema, table] = targetTable.includes('.')
-+    ? targetTable.split('.', 2)
-+    : ['public', targetTable];
-+
-+  const { rows } = await pool.query(
-+    `SELECT lower(column_name) AS column, data_type
-+       FROM information_schema.columns
-+      WHERE table_schema = $1
-+        AND table_name   = $2`,
-+    [schema, table]
-+  );
-+
-+  const map = new Map();
-+  for (const row of rows) {
-+    map.set(row.column, String(row.data_type || '').toLowerCase());
-+  }
-+  return map;
-+}
-+
-+function coerceValueForType(value, type) {
-+  if (value == null) return null;
-+  const t = String(type || '').toLowerCase();
-+
-+  if (!t) return value;
-+
-+  if (t.includes('int')) {
-+    const num = Number(String(value).replace(/[^0-9.+\-eE]/g, ''));
-+    if (!Number.isFinite(num)) return null;
-+    return Math.trunc(num);
-+  }
-+
-+  if (
-+    t.includes('numeric') ||
-+    t.includes('decimal') ||
-+    t.includes('real') ||
-+    t.includes('double')
-+  ) {
-+    const num = Number(String(value).replace(/[^0-9.+\-eE]/g, ''));
-+    return Number.isFinite(num) ? num : null;
-+  }
-+
-+  if (t === 'boolean') {
-+    const s = String(value).trim().toLowerCase();
-+    if (/^(true|t|yes|y|1|on)$/i.test(s)) return true;
-+    if (/^(false|f|no|n|0|off)$/i.test(s)) return false;
-+    return null;
-+  }
-+
-+  if (t.includes('timestamp') || t === 'date') {
-+    const d = value instanceof Date ? value : new Date(value);
-+    return Number.isNaN(d.getTime()) ? null : d;
-+  }
-+
-+  if (t.includes('json')) {
-+    if (typeof value === 'string') {
-+      try {
-+        return JSON.parse(value);
-+      } catch (_) {
-+        return value;
-+      }
-+    }
-+    return value;
-+  }
-+
-+  if (Array.isArray(value)) return value;
-+
-+  const str = String(value).trim();
-+  return str.length ? str : null;
-+}
- 
- async function saveExtractedSpecs(targetTable, familySlug, rows) {
-   if (!rows?.length) return;
- 
--  const cols = new Set(['family_slug','brand','brand_norm','code','code_norm','mfr_full','datasheet_uri','verified_in_doc']);
--  // 동적으로 스펙 컬럼 추가
--  for (const r of rows) Object.keys(r).forEach(k => cols.add(k));
-+  const physicalCols = await getColumnsOf(targetTable);
-+  if (!physicalCols.size) return;
-+
-+  const columnTypes = await getColumnTypes(targetTable);
-+
-+  const allKeys = new Set();
-+  for (const meta of META_KEYS) {
-+    if (physicalCols.has(meta)) allKeys.add(meta);
-+  }
-+
-+  for (const row of rows) {
-+    for (const key of Object.keys(row || {})) {
-+      const normalized = normKey(key);
-+      if (physicalCols.has(normalized)) allKeys.add(normalized);
-+    }
-+  }
-+
-+  if (!allKeys.size) return;
- 
--  const colList = Array.from(cols);
--  const placeholders = colList.map((_, i) => `$${i+1}`).join(',');
-+  const colList = Array.from(allKeys).sort();
-+  const placeholders = colList.map((_, i) => `$${i + 1}`).join(',');
- 
--  const sql = `
--    INSERT INTO ${targetTable} (${colList.map(c => `"${c}"`).join(',')})
--    VALUES (${placeholders})
--    ON CONFLICT (brand_norm, code_norm, family_slug)
--    DO UPDATE SET
--      mfr_full = EXCLUDED.mfr_full,
--      datasheet_uri = EXCLUDED.datasheet_uri,
--      verified_in_doc = EXCLUDED.verified_in_doc
--  `;
-+  const updateCols = colList.filter((col) => !CONFLICT_KEYS.includes(col));
-+  const updateSql = updateCols.length
-+    ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ')
-+    : null;
-+
-+  const sql = [
-+    `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
-+    `VALUES (${placeholders})`,
-+    'ON CONFLICT (brand_norm, code_norm, family_slug)',
-+    updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
-+  ].join('\n');
- 
-   const client = await pool.connect();
-   try {
--    for (const r of rows) {
--      const rec = { ...r };
-+    for (const row of rows) {
-+      const rec = {};
-+      for (const [key, value] of Object.entries(row || {})) {
-+        rec[normKey(key)] = value;
-+      }
-+
-       rec.family_slug = familySlug;
--      rec.brand_norm = (rec.brand || 'unknown').toLowerCase();
--      rec.code_norm  = (rec.code  || '').toLowerCase();
--      const vals = colList.map(c => rec[c]);
-+      const brandRaw = rec.brand ?? rec.brand_norm ?? 'unknown';
-+      rec.brand_norm = normKey(brandRaw) || 'unknown';
-+      const codeRaw = rec.code ?? rec.code_norm ?? '';
-+      rec.code_norm = normKey(codeRaw);
-+
-+      const vals = colList.map((col) => {
-+        const value = rec[col];
-+        return coerceValueForType(value, columnTypes.get(col));
-+      });
-+
-       await client.query(sql, vals);
-     }
-   } finally {
-     client.release();
-   }
+diff --git a/src/utils/blueprint.js b/src/utils/blueprint.js
+index 9d0fc9c7f819ce73e61ef088b60d99f9571c322c..490c49ededde55c40ad8a4ef44a12b810d4b901a 100644
+--- a/src/utils/blueprint.js
++++ b/src/utils/blueprint.js
+@@ -25,62 +25,83 @@ function normalizeKeyList(list) {
+   return out;
  }
  
- module.exports = { saveExtractedSpecs };
+ function deriveAllowedKeys(fieldsJson = {}, ingestOptions = {}) {
+   if (Array.isArray(ingestOptions.allowed_keys)) {
+     const explicit = normalizeKeyList(ingestOptions.allowed_keys);
+     if (explicit.length) return explicit;
+   }
+   return normalizeKeyList(Object.keys(fieldsJson || {}));
+ }
+ 
+ function deriveVariantKeys(blueprintRow = {}) {
+   const ingestOptions = blueprintRow.ingest_options || blueprintRow.ingestOptions || {};
+   if (Array.isArray(ingestOptions.variant_keys)) {
+     return normalizeKeyList(ingestOptions.variant_keys);
+   }
+   if (Array.isArray(blueprintRow.variant_keys)) {
+     return normalizeKeyList(blueprintRow.variant_keys);
+   }
+   return [];
+ }
+ 
+ function normalizeBlueprint(row, registryRow) {
+   if (!row) return null;
+   const fields = row.fields_json || row.fields || {};
+-  const ingestOptions = row.ingest_options || row.ingestOptions || {};
++  const ingestOptionsRaw = row.ingest_options || row.ingestOptions || {};
++  const ingestOptions = ingestOptionsRaw && typeof ingestOptionsRaw === 'object'
++    ? { ...ingestOptionsRaw }
++    : {};
+   const codeRules = row.code_rules || row.codeRules || null;
+-  const allowedKeys = deriveAllowedKeys(fields, ingestOptions);
+-  const variantKeys = deriveVariantKeys(row);
++  const allowedKeys = deriveAllowedKeys(fields, ingestOptionsRaw);
++  let variantKeys = deriveVariantKeys(row);
+   const specsTable = registryRow?.specs_table || registryRow?.specsTable || `${row.family_slug}_specs`;
+ 
++  const forceVariant = (list) => normalizeKeyList(Array.isArray(list) ? list : []);
++  if (row.family_slug === 'relay_power') {
++    const forcedVariants = forceVariant(['coil_voltage_vdc', 'contact_form', 'suffix']);
++    variantKeys = forcedVariants;
++    ingestOptions.variant_keys = forcedVariants;
++    ingestOptions.pn_template = '{{series}}{{contact_form}}{{coil_voltage_vdc|pad=2}}{{suffix}}';
++  } else if (row.family_slug === 'relay_signal') {
++    const forcedVariants = forceVariant(['coil_voltage_vdc', 'contact_arrangement']);
++    variantKeys = forcedVariants;
++    ingestOptions.variant_keys = forcedVariants;
++  } else if (Array.isArray(ingestOptions.variant_keys)) {
++    ingestOptions.variant_keys = normalizeKeyList(ingestOptions.variant_keys);
++  }
++
++  variantKeys = Array.isArray(variantKeys) ? variantKeys : [];
++
++  const allowedKeysFinal = Array.from(new Set([...(allowedKeys || []), ...variantKeys]));
++
+   return {
+     family_slug: row.family_slug,
+     fields,
+     ingestOptions,
+     code_rules: codeRules,
+-    allowedKeys,
++    allowedKeys: allowedKeysFinal,
+     variant_keys: variantKeys,
+     specsTable,
+   };
+ }
+ 
+ function computeFastKeys(blueprint) {
+   const ingestOptions = blueprint?.ingestOptions || {};
+   if (Array.isArray(ingestOptions.fast_keys)) {
+     const list = normalizeKeyList(ingestOptions.fast_keys);
+     if (list.length) return list;
+   }
+ 
+   const required = [];
+   if (blueprint?.fields && typeof blueprint.fields === 'object') {
+     for (const [key, meta] of Object.entries(blueprint.fields)) {
+       const isRequired = meta && typeof meta === 'object' && Boolean(meta.required);
+       if (isRequired) {
+         const norm = String(key || '')
+           .trim()
+           .toLowerCase()
+           .replace(/[^a-z0-9_]/g, '');
+         if (norm && !required.includes(norm)) required.push(norm);
+       }
+     }
+   }

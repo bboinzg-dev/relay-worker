@@ -607,7 +607,10 @@ async function runAutoIngest(input = {}) {
   const brandName = brand || extracted.brand || 'unknown';
   const baseSeries = series || code || null;
 
-  const mpnsFromDoc = harvestMpnCandidates(extracted?.text || '', baseSeries || series || code || '');
+  const mpnsFromDoc = harvestMpnCandidates(
+    extracted?.text ?? '',
+    (baseSeries || series || code || '')
+  );
   const mpnNormFromDoc = new Set(mpnsFromDoc.map((m) => normalizeCode(m)).filter(Boolean));
 
   const candidateMap = [];

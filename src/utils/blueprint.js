@@ -47,18 +47,39 @@ function deriveVariantKeys(blueprintRow = {}) {
 function normalizeBlueprint(row, registryRow) {
   if (!row) return null;
   const fields = row.fields_json || row.fields || {};
-  const ingestOptions = row.ingest_options || row.ingestOptions || {};
+  const ingestOptionsRaw = row.ingest_options || row.ingestOptions || {};
+  const ingestOptions = ingestOptionsRaw && typeof ingestOptionsRaw === 'object'
+    ? { ...ingestOptionsRaw }
+    : {};
   const codeRules = row.code_rules || row.codeRules || null;
-  const allowedKeys = deriveAllowedKeys(fields, ingestOptions);
-  const variantKeys = deriveVariantKeys(row);
+  const allowedKeys = deriveAllowedKeys(fields, ingestOptionsRaw);
+  let variantKeys = deriveVariantKeys(row);
   const specsTable = registryRow?.specs_table || registryRow?.specsTable || `${row.family_slug}_specs`;
+
+  const forceVariant = (list) => normalizeKeyList(Array.isArray(list) ? list : []);
+  if (row.family_slug === 'relay_power') {
+    const forcedVariants = forceVariant(['coil_voltage_vdc', 'contact_form', 'suffix']);
+    variantKeys = forcedVariants;
+    ingestOptions.variant_keys = forcedVariants;
+    ingestOptions.pn_template = '{{series}}{{contact_form}}{{coil_voltage_vdc|pad=2}}{{suffix}}';
+  } else if (row.family_slug === 'relay_signal') {
+    const forcedVariants = forceVariant(['coil_voltage_vdc', 'contact_arrangement']);
+    variantKeys = forcedVariants;
+    ingestOptions.variant_keys = forcedVariants;
+  } else if (Array.isArray(ingestOptions.variant_keys)) {
+    ingestOptions.variant_keys = normalizeKeyList(ingestOptions.variant_keys);
+  }
+
+  variantKeys = Array.isArray(variantKeys) ? variantKeys : [];
+
+  const allowedKeysFinal = Array.from(new Set([...(allowedKeys || []), ...variantKeys]));
 
   return {
     family_slug: row.family_slug,
     fields,
     ingestOptions,
     code_rules: codeRules,
-    allowedKeys,
+    allowedKeys: allowedKeysFinal,
     variant_keys: variantKeys,
     specsTable,
   };

@@ -12,6 +12,7 @@ const db = require('./src/utils/db');
 const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest } = require('./src/pipeline/ingestAuto');
+const { generateRunId } = require('./src/utils/run-id');
 
 
 
@@ -35,28 +36,34 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
    return { tasks: _tasks, queuePath: _queuePath };
  }
 
- async function enqueueIngestRun(payload) {
-   const { tasks, queuePath } = getTasks();
-     if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
-   const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
+async function enqueueIngestRun(payload = {}) {
+  const { tasks, queuePath } = getTasks();
+  if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
+  const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
+
+  const bodyPayload = { ...payload };
+  const runId = bodyPayload.runId || bodyPayload.run_id || generateRunId();
+  bodyPayload.runId = runId;
+  bodyPayload.run_id = runId;
+
+  const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
 
   const task = {
     httpRequest: {
       httpMethod: 'POST',
       url: WORKER_TASK_URL,
       headers: { 'Content-Type': 'application/json' },
-      body: Buffer.from(JSON.stringify(payload)).toString('base64'),
+      body,
       ...(TASKS_INVOKER_SA
         ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
         : {}),
     },
-    // Cloud Tasks gRPC Duration 객체(15분) — HTTP 타스크 허용 범위 내 고정 값
-    dispatchDeadline: { seconds: 900 },
   };
 
-   // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
-   await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
- }
+  // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
+  await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
+  return runId;
+}
 
 
 const app = express();
@@ -472,39 +479,38 @@ async function handleWorkerIngest(req, res) {
   }
 
   if (!fromTasks) {
+    const runId = generateRunId();
     try {
       const { brand, code, series, display_name, family_slug = null } = payload;
-      const { rows: logRows } = await db.query(
-        `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
-           VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
-        [taskName, retryCnt, gcsUri]
+      await db.query(
+        `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
+           VALUES ($1,$2,$3,$4,'RUNNING')`,
+        [runId, taskName, retryCnt, gcsUri]
       );
-      const runId = logRows[0]?.id;
 
       res.status(202).json({ ok: true, run_id: runId });
 
-  const ingestPayload = {
-    // runId / gcsUri는 케멀/스네이크 모두 넣어 Tasks 경유 중간 계층이 바꿔도 안전
-    runId, run_id: runId,
-    gcsUri, gcs_uri: gcsUri,
-    brand, code, series, display_name, family_slug,
-  };
+      const ingestPayload = {
+        // runId / gcsUri는 케멀/스네이크 모두 넣어 Tasks 경유 중간 계층이 바꿔도 안전
+        runId, run_id: runId,
+        gcsUri, gcs_uri: gcsUri,
+        brand, code, series, display_name, family_slug,
+      };
 
-      enqueueIngestRun(ingestPayload)
-        .catch(async (err) => {
-          try {
-            await db.query(
-              `UPDATE public.ingest_run_logs
-                  SET finished_at = now(),
-                      duration_ms = $2,
-                      status = 'FAILED',
-                      error_message = $3
-                WHERE id = $1`,
-              [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
-            );
-          } catch (_) {}
-          console.error('[ingest enqueue failed]', err?.message || err);
-        });
+      enqueueIngestRun(ingestPayload).catch(async (err) => {
+        try {
+          await db.query(
+            `UPDATE public.ingest_run_logs
+                SET finished_at = now(),
+                    duration_ms = $2,
+                    status = 'FAILED',
+                    error_message = $3
+              WHERE id = $1`,
+            [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
+          );
+        } catch (_) {}
+        console.error('[ingest enqueue failed]', err?.message || err);
+      });
     } catch (e) {
       try {
         await db.query(
@@ -513,11 +519,8 @@ async function handleWorkerIngest(req, res) {
                  duration_ms = $2,
                  status = 'FAILED',
                  error_message = $3
-           WHERE task_name = $1
-             AND status = 'PROCESSING'
-           ORDER BY started_at DESC
-           LIMIT 1`,
-          [ taskName, Date.now() - startedAt, String(e?.message || e) ]
+           WHERE id = $1`,
+          [ runId, Date.now() - startedAt, String(e?.message || e) ]
         );
       } catch (_) {}
       if (!res.headersSent) {
@@ -539,19 +542,42 @@ async function handleWorkerIngest(req, res) {
         try { res.status(202).json({ ok: true, timeout: true }); } catch {}
       }
     }, deadlineMs);
-    console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
 
     // A-2) runId 보정(fallback 생성)
     let { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
     if (!runId) {
-      const { rows } = await db.query(
-        `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
-           VALUES ($1,$2,$3,'RUNNING') RETURNING id`,
-        [ taskName, retryCnt, gcsUri ]
-      );
-      runId = rows[0]?.id;
+      runId = generateRunId();
       console.warn('[ingest-run] runId missing -> created', { runId, taskName, retryCnt });
     }
+
+    const ensureLog = async () => {
+      const update = await db.query(
+        `UPDATE public.ingest_run_logs
+            SET status = 'RUNNING',
+                task_name = $2,
+                retry_count = $3,
+                gcs_uri = COALESCE($4, gcs_uri),
+                error_message = NULL,
+                finished_at = NULL,
+                duration_ms = NULL,
+                final_table = NULL,
+                final_family = NULL,
+                final_brand = NULL,
+                final_code = NULL,
+                final_datasheet = NULL
+          WHERE id = $1`,
+        [ runId, taskName, retryCnt, gcsUri ]
+      );
+      if (!update.rowCount) {
+        await db.query(
+          `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
+             VALUES ($1,$2,$3,$4,'RUNNING')`,
+          [ runId, taskName, retryCnt, gcsUri ]
+        );
+      }
+    };
+    await ensureLog();
+    console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runId}`);
 
     // B-1) 실행부: 실패 → FAILED 업데이트 + 500 (또는 post-ACK 로그)
     const label = `[ingest] ${runId}`;
@@ -625,12 +651,22 @@ app.use((err, req, res, next) => {
       CREATE TABLE IF NOT EXISTS public.ingest_run_logs (
         id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
         task_name text, retry_count integer, gcs_uri text not null,
-        status text CHECK (status in ('PROCESSING','SUCCEEDED','FAILED')),
+        status text CHECK (status in ('RUNNING','SUCCEEDED','FAILED')),
         final_table text, final_family text, final_brand text, final_code text,
         final_datasheet text, duration_ms integer, error_message text,
         started_at timestamptz DEFAULT now(), finished_at timestamptz
       )
     `);
+    await db.query(`UPDATE public.ingest_run_logs SET status='RUNNING' WHERE status='PROCESSING'`);
+    await db.query(`ALTER TABLE public.ingest_run_logs DROP CONSTRAINT IF EXISTS ingest_run_logs_status_check`);
+    await db.query(`ALTER TABLE public.ingest_run_logs ADD CONSTRAINT ingest_run_logs_status_check CHECK (status IN ('RUNNING','SUCCEEDED','FAILED'))`);
+    await db.query(`ALTER TABLE public.ingest_run_logs ALTER COLUMN status SET DEFAULT 'RUNNING'`);
+
+    await db.query(`ALTER TABLE IF EXISTS public.relay_power_specs ADD COLUMN IF NOT EXISTS coil_voltage_vdc text`);
+    await db.query(`ALTER TABLE IF EXISTS public.relay_power_specs ADD COLUMN IF NOT EXISTS contact_form text`);
+    await db.query(`ALTER TABLE IF EXISTS public.relay_power_specs ADD COLUMN IF NOT EXISTS suffix text`);
+    await db.query(`ALTER TABLE IF EXISTS public.relay_signal_specs ADD COLUMN IF NOT EXISTS coil_voltage_vdc text`);
+    await db.query(`ALTER TABLE IF EXISTS public.relay_signal_specs ADD COLUMN IF NOT EXISTS contact_arrangement text`);
     console.log('[BOOT] ensured ingest_run_logs');
   } catch (e) {
     console.warn('[BOOT] ensure ingest_run_logs failed:', e?.message || e);

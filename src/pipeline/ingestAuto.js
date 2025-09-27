@@ -666,7 +666,7 @@ async function runAutoIngest({
     if (row.datasheet_url) rec.datasheet_url = row.datasheet_url;
     else if (rec.datasheet_uri && rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
     if (row.mfr_full != null) rec.mfr_full = row.mfr_full;
-    const verified = row.verified_in_doc ?? candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm);
+    const verified = row.verified_in_doc ?? (candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm));
     rec.verified_in_doc = Boolean(verified);
     rec.image_uri = row.image_uri || coverUri || null;
     if (coverUri && rec.cover == null) rec.cover = coverUri;

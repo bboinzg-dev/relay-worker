@@ -13,7 +13,8 @@ const { getBlueprint } = require('../utils/blueprint');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
 const { saveExtractedSpecs } = require('./persist');
-const { splitAndCarryPrefix, explodeToRows } = require('../utils/mpn-exploder');
+const { explodeToRows } = require('../ingest/mpn-exploder');
+const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
 
 const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
 const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
@@ -609,139 +610,107 @@ async function runAutoIngest({
   }
 
   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
-  const specRows = rawRows.length ? rawRows.slice(0) : [{}];
-  const pnTemplate = blueprint?.pn_template || blueprint?.ingestOptions?.pn_template || null;
-
-  const expandedRows = [];
-
-  for (const row of specRows) {
-    const specsObj = row && typeof row === 'object' ? { ...row } : {};
-    const fallbackSeries = specsObj.series_code || specsObj.series || baseSeries || null;
-
-    const values = {};
-    for (const [rawKey, rawValue] of Object.entries(specsObj)) {
-      const key = String(rawKey || '').trim();
-      if (!key) continue;
-      values[key] = rawValue;
-    }
+  const baseRows = (rawRows.length ? rawRows : [{}]).map((row) => {
+    const obj = row && typeof row === 'object' ? { ...row } : {};
+    if (obj.brand == null) obj.brand = brandName;
+    const fallbackSeries = obj.series_code || obj.series || baseSeries || null;
     if (fallbackSeries != null) {
-      if (values.series == null) values.series = fallbackSeries;
-      if (values.series_code == null) values.series_code = fallbackSeries;
+      if (obj.series == null) obj.series = fallbackSeries;
+      if (obj.series_code == null) obj.series_code = fallbackSeries;
     }
+    if (obj.datasheet_uri == null) obj.datasheet_uri = gcsUri;
+    if (coverUri && obj.cover == null) obj.cover = coverUri;
+    return obj;
+  });
 
-    const mpnList = [];
-    const mpnSeen = new Set();
-    const addSeed = (val) => {
-      if (val == null) return;
-      const str = String(val).trim();
-      if (!str) return;
-      const norm = str.toLowerCase();
-      if (mpnSeen.has(norm)) return;
-      mpnSeen.add(norm);
-      mpnList.push(str);
-    };
+  const explodedRows = explodeToRows(blueprint, baseRows);
+  const physicalCols = new Set(colTypes ? [...colTypes.keys()] : []);
+  const allowedSet = new Set((allowedKeys || []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
+  const variantSet = new Set(variantKeys);
+
+  const seenCodes = new Set();
+  for (const row of explodedRows) {
+    const seeds = [];
+    const seenSeed = new Set();
     const pushSeed = (val) => {
       if (val == null) return;
       if (Array.isArray(val)) { val.forEach(pushSeed); return; }
-      if (typeof val === 'string') {
-        const trimmed = val.trim();
-        if (!trimmed) return;
-        const parts = splitAndCarryPrefix(trimmed);
-        if (parts.length > 1) { parts.forEach(pushSeed); return; }
-        addSeed(trimmed);
-        return;
-      }
-      addSeed(val);
+      const str = String(val).trim();
+      if (!str) return;
+      const parts = splitAndCarryPrefix(str);
+      if (parts.length > 1) { parts.forEach(pushSeed); return; }
+      const normed = str.toLowerCase();
+      if (seenSeed.has(normed)) return;
+      seenSeed.add(normed);
+      seeds.push(str);
     };
+    pushSeed(row.code);
+    pushSeed(row.mpn);
+    pushSeed(row.part_number);
+    pushSeed(row.part_no);
 
-    pushSeed(specsObj.mpn);
-    pushSeed(specsObj.code);
-    pushSeed(specsObj.part_number);
-    pushSeed(specsObj.part_no);
-    for (const cand of candidateMap) pushSeed(cand.raw);
-    for (const doc of mpnsFromDoc) pushSeed(doc);
-
-    const baseRecord = {
-      family_slug: family,
-      brand: brandName,
-      series: fallbackSeries || baseSeries || null,
-      series_code: fallbackSeries || baseSeries || null,
-      datasheet_uri: gcsUri,
-      values,
-      mpn: mpnList.length ? mpnList : undefined,
-    };
-
-    const rows = explodeToRows(baseRecord, { variantKeys, pnTemplate });
-    for (const r of rows) {
-      expandedRows.push({
-        base: {
-          brand: baseRecord.brand,
-          series: baseRecord.series,
-          series_code: baseRecord.series_code,
-        },
-        code: r.code,
-        code_norm: r.code_norm,
-        values: r.values,
-      });
-    }
-  }
-
-  if (!expandedRows.length && candidateMap.length) {
-    const fallbackSeries = baseSeries || null;
-    const baseInfo = { brand: brandName, series: fallbackSeries, series_code: fallbackSeries };
-    for (const cand of candidateMap) {
-      expandedRows.push({
-        base: baseInfo,
-        code: cand.raw,
-        code_norm: cand.norm,
-        values: fallbackSeries ? { series: fallbackSeries, series_code: fallbackSeries } : {},
-      });
-    }
-  }
-
-  const seenCodes = new Set();
-  for (const entry of expandedRows) {
-    const mpn = entry.code ? String(entry.code).trim() : '';
+    let mpn = seeds.length ? seeds[0] : '';
+    if (!mpn && candidateMap.length) mpn = candidateMap[0].raw;
+    mpn = String(mpn || '').trim();
     if (!mpn) continue;
     const mpnNorm = normalizeCode(mpn);
     if (!mpnNorm || seenCodes.has(mpnNorm)) continue;
     seenCodes.add(mpnNorm);
 
-    const baseInfo = entry.base || {};
-    const rec = {
-      family_slug: family,
-      brand: baseInfo.brand || brandName,
-      code: mpn,
-      code_norm: mpnNorm,
-      series_code: baseInfo.series_code || baseInfo.series || baseSeries || null,
-      datasheet_uri: gcsUri,
-      image_uri: coverUri || null,
-      display_name: `${baseInfo.brand || brandName} ${mpn}`,
-      verified_in_doc: candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm),
-      updated_at: now,
-    };
+    const rec = {};
+    rec.brand = row.brand || brandName;
+    rec.code = mpn;
+    rec.series_code = row.series_code ?? row.series ?? baseSeries ?? null;
+    if (row.series != null && physicalCols.has('series')) rec.series = row.series;
+    rec.datasheet_uri = row.datasheet_uri || gcsUri;
+    if (row.datasheet_url) rec.datasheet_url = row.datasheet_url;
+    else if (rec.datasheet_uri && rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
+    if (row.mfr_full != null) rec.mfr_full = row.mfr_full;
+    const verified = row.verified_in_doc ?? candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm);
+    rec.verified_in_doc = Boolean(verified);
+    rec.image_uri = row.image_uri || coverUri || null;
+    if (coverUri && rec.cover == null) rec.cover = coverUri;
+    const displayName = row.display_name || row.displayname || `${rec.brand} ${mpn}`;
+    rec.display_name = displayName;
+    if (rec.displayname == null && displayName != null) rec.displayname = displayName;
+    rec.updated_at = now;
 
-    const rowValues = entry.values || {};
-    const valueMap = new Map();
-    for (const [rawKey, rawValue] of Object.entries(rowValues)) {
+    for (const [rawKey, rawValue] of Object.entries(row)) {
       const key = String(rawKey || '').trim();
       if (!key) continue;
-      if (!valueMap.has(key)) valueMap.set(key, rawValue);
       const lower = key.toLowerCase();
-      if (!valueMap.has(lower)) valueMap.set(lower, rawValue);
-    }
-
-    for (const k of allowedKeys) {
-      const key = String(k || '').trim();
-      if (!key) continue;
-      let v = valueMap.has(key) ? valueMap.get(key) : valueMap.get(key.toLowerCase());
-      if (v == null) continue;
-      if (Array.isArray(v)) v = v[0];
-      rec[key] = v;
+      if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
+      if (physicalCols.has(lower) || allowedSet.has(lower) || variantSet.has(lower)) {
+        rec[lower] = rawValue;
+      }
     }
 
     if (blueprint?.code_rules) applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
     records.push(rec);
+  }
+
+  if (!records.length && candidateMap.length) {
+    const fallbackSeries = baseSeries || null;
+    for (const cand of candidateMap) {
+      const norm = cand.norm;
+      if (seenCodes.has(norm)) continue;
+      seenCodes.add(norm);
+      const rec = {
+        brand: brandName,
+        code: cand.raw,
+        series_code: fallbackSeries,
+        datasheet_uri: gcsUri,
+        image_uri: coverUri || null,
+        display_name: `${brandName} ${cand.raw}`,
+        verified_in_doc: true,
+        updated_at: now,
+      };
+      if (coverUri) rec.cover = coverUri;
+      if (physicalCols.has('series') && fallbackSeries != null) rec.series = fallbackSeries;
+      if (rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
+      if (rec.display_name != null && rec.displayname == null) rec.displayname = rec.display_name;
+      records.push(rec);
+    }
   }
 
   // 최후 폴백 줄이기
@@ -754,7 +723,10 @@ async function runAutoIngest({
       series_code: series || code || null,
       datasheet_uri: gcsUri,
       image_uri: coverUri || null,
+      cover: coverUri || null,
       display_name: `${brand || extracted.brand || 'unknown'} ${tmp}`,
+      displayname: `${brand || extracted.brand || 'unknown'} ${tmp}`,
+      datasheet_url: gcsUri,
       verified_in_doc: false,
       updated_at: now,
     });
@@ -763,53 +735,14 @@ async function runAutoIngest({
   console.log('[MPNDBG]', {
     picks: candidateMap.length,
     vkeys: Array.isArray(blueprint?.ingestOptions?.variant_keys) ? blueprint.ingestOptions.variant_keys : [],
-    expanded: expandedRows.length,
+    expanded: explodedRows.length,
     recs: records.length,
     colsSanitized: colTypes?.size || 0,
   });
 
-  const persistedCodes = new Set();
-  let upserted = 0;
-  for (const rec of records) {
-    const codeValue = String(rec.code || '').trim();
-    if (!codeValue) continue;
+  await saveExtractedSpecs(qualified, family, records);
 
-    const base = {
-      brand: rec.brand || brandName,
-      code: codeValue,
-      series_code: rec.series_code ?? null,
-      datasheet_uri: rec.datasheet_uri || gcsUri,
-      verified_in_doc: !!rec.verified_in_doc,
-    };
-    if (rec.mfr_full) base.mfr_full = rec.mfr_full;
-
-    const specs = {};
-    for (const [rawKey, rawValue] of Object.entries(rec)) {
-      const key = String(rawKey || '').trim().toLowerCase();
-      if (!key || BASE_KEYS.has(key) || META_KEYS.has(key)) continue;
-      if (!Object.prototype.hasOwnProperty.call(specs, key)) {
-        specs[key] = rawValue;
-      }
-    }
-    if (rec.display_name) {
-      if (specs.display_name == null) specs.display_name = rec.display_name;
-      if (specs.displayname == null) specs.displayname = rec.display_name;
-    }
-    if (rec.image_uri) {
-      if (specs.image_uri == null) specs.image_uri = rec.image_uri;
-      if (specs.cover == null) specs.cover = rec.image_uri;
-    } else if (coverUri && specs.cover == null) {
-      specs.cover = coverUri;
-    }
-    if (specs.datasheet_url == null && (rec.datasheet_uri || gcsUri)) {
-      specs.datasheet_url = rec.datasheet_uri || gcsUri;
-    }
-
-    await saveExtractedSpecs(family, base, specs);
-    persistedCodes.add(codeValue);
-    upserted++;
-  }
-
+  const persistedCodes = new Set(records.map((rec) => String(rec.code || '').trim()).filter(Boolean));
   const persistedList = Array.from(persistedCodes);
   const mpnList = Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [];
   const mergedMpns = Array.from(new Set([...persistedList, ...mpnList]));
@@ -823,7 +756,7 @@ async function runAutoIngest({
     code:  records[0]?.code,
     datasheet_uri: gcsUri,
     cover: coverUri || records[0]?.image_uri || null,
-    rows: upserted,
+    rows: records.length,
     codes: persistedList,
     mpn_list: mergedMpns,
   };

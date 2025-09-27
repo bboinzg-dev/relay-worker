@@ -15,6 +15,7 @@ const { extractFields } = require('./extractByBlueprint');
 const { saveExtractedSpecs } = require('./persist');
 const { explodeToRows } = require('../ingest/mpn-exploder');
 const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
+const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
 
 const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
 const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
@@ -439,14 +440,15 @@ async function runAutoIngest(input = {}) {
   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
   const qualified = table.startsWith('public.')? table : `public.${table}`;
 
-  // 스키마 보장 (DB 함수) + 컬럼 타입 확보
+ // 스키마 보장 (DB 함수) + 컬럼 자동 보강 후 타입 확보
   if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
     await ensureSpecsTableByFamily(family);
   }
+  const blueprint = await getBlueprint(family);
+  await ensureSpecColumnsForBlueprint(qualified, blueprint);
   const colTypes = await getColumnTypes(qualified);
 
   // 블루프린트 허용 키
-  const blueprint = await getBlueprint(family);
   const allowedKeys = blueprint?.allowedKeys || [];
   const variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
     ? blueprint.ingestOptions.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)

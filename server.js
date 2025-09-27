@@ -667,7 +667,6 @@ async function handleWorkerIngest(req, res) {
 
 const workerIngestMiddlewares = [requireSession, handleWorkerIngest];
 app.post('/api/worker/ingest', workerIngestMiddlewares);
-app.post('/api/worker/ingest/run', workerIngestMiddlewares);
 
 /* ---------------- 404 / error ---------------- */
 app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));

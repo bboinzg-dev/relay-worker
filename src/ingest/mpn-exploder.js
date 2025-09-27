@@ -112,18 +112,20 @@ function explodeToRows(blueprint, rows = [], options = {}) {
   const variantKeys = Array.isArray(ingest.variant_keys) ? ingest.variant_keys : [];
   const tpl = ingest.pn_template || ingest.pnTemplate || null;
 
- const parseVariantsFromCode = typeof options.parseVariantsFromCode === 'function'
+  const parseVariantsFromCode = typeof options.parseVariantsFromCode === 'function'
     ? options.parseVariantsFromCode
     : null;
 
   const baseRows = rows.length ? rows : [{}];
+  const candidateRows = [];
+  const expandedRows = [];
+
   for (const row0 of baseRows) {
-    const baseFields = { ...(row0 || {}) };
-    const candidates = collectCandidates(baseFields);
-    stripCandidateFields(baseFields);
+    const row = { ...(row0 || {}) };
+    const candidates = collectCandidates(row);
+    stripCandidateFields(row);
 
     if (Array.isArray(candidates) && candidates.length) {
-      const out = [];
       const seen = new Set();
       for (const raw of candidates) {
         const code = String(raw || '').trim();
@@ -135,27 +137,23 @@ function explodeToRows(blueprint, rows = [], options = {}) {
         const v = parseVariantsFromCode
           ? parseVariantsFromCode(code, blueprint?.code_rules || {})
           : {};
-        out.push({
-          ...baseFields,
+
+        candidateRows.push({
+          ...row,
           ...v,
           code,
           code_norm: norm,
         });
       }
-      return out;
+     continue;
     }
-  }
 
-  const expandedRows = [];
-
-  for (const row0 of baseRows) {
-    const row = { ...(row0 || {}) };
     const series = row.series_code || row.series || '';
 
-    const lists = variantKeys.map(k => {
+    const lists = variantKeys.map((k) => {
       const v = row[k];
       const list = normalizeList(v);
-        return list.length ? list : [null];
+      return list.length ? list : [null];
     });
 
     const combos = lists.length ? cartesian(lists) : [[]];
@@ -165,18 +163,19 @@ function explodeToRows(blueprint, rows = [], options = {}) {
 
       let code = tpl
         ? renderTemplate(tpl, { ...r, series })
-        : [series, ...variantKeys.map(k => r[k]).filter(Boolean)].join('');
+        : [series, ...variantKeys.map((k) => r[k]).filter(Boolean)].join('');
 
       code = String(code).replace(/\s+/g, '').trim();
-        if (!code) continue;
+      if (!code) continue;
 
       r.code = code;
       r.code_norm = code.toLowerCase();
-       expandedRows.push(r);
+      expandedRows.push(r);
     }
   }
 
-  return dedupeByBrandCode(expandedRows);
+  const rowsOut = candidateRows.length ? candidateRows : expandedRows;
+  return dedupeByBrandCode(rowsOut);
 }
 
 module.exports = { explodeToRows, renderTemplate, normalizeList, cartesian };

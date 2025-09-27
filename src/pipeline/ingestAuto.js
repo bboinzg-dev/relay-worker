@@ -666,7 +666,16 @@ async function runAutoIngest({
     if (row.datasheet_url) rec.datasheet_url = row.datasheet_url;
     else if (rec.datasheet_uri && rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
     if (row.mfr_full != null) rec.mfr_full = row.mfr_full;
-    const verified = row.verified_in_doc ?? (candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm));
+    let verified;
+    if (row.verified_in_doc != null) {
+      if (typeof row.verified_in_doc === 'string') {
+        verified = row.verified_in_doc.trim().toLowerCase() === 'true';
+      } else {
+        verified = Boolean(row.verified_in_doc);
+      }
+    } else {
+      verified = candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm);
+    }
     rec.verified_in_doc = Boolean(verified);
     rec.image_uri = row.image_uri || coverUri || null;
     if (coverUri && rec.cover == null) rec.cover = coverUri;
@@ -695,6 +704,7 @@ async function runAutoIngest({
       const norm = cand.norm;
       if (seenCodes.has(norm)) continue;
       seenCodes.add(norm);
+      const verified = mpnNormFromDoc.has(norm);
       const rec = {
         brand: brandName,
         code: cand.raw,
@@ -702,7 +712,7 @@ async function runAutoIngest({
         datasheet_uri: gcsUri,
         image_uri: coverUri || null,
         display_name: `${brandName} ${cand.raw}`,
-        verified_in_doc: true,
+        verified_in_doc: verified,
         updated_at: now,
       };
       if (coverUri) rec.cover = coverUri;

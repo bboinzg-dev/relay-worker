@@ -40,9 +40,6 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
      if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
    const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
 
-     // ① 디스패치 데드라인 = 인제스트 예산(기본 120초) + 15초 여유
-  const seconds = Math.ceil((Number(process.env.INGEST_BUDGET_MS || 120000) + 15000) / 1000);
-
   const task = {
     httpRequest: {
       httpMethod: 'POST',
@@ -53,8 +50,8 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
         ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
         : {}),
     },
-    // ② Cloud Tasks에 타깃 응답 대기 한도를 명시(기본 10분 → 135초 내)
-    dispatchDeadline: `${seconds}s`,
+    // Cloud Tasks REST Duration 문자열(15분) — HTTP 타스크 허용 범위 내 고정 값
+    dispatchDeadline: '900s',
   };
 
    // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
@@ -438,96 +435,91 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
 });
 
-app.post('/api/worker/ingest', requireSession, async (req, res) => {
+async function handleWorkerIngest(req, res) {
   const startedAt = Date.now();
-  const taskName  = req.get('X-Cloud-Tasks-TaskName') || null;
-  const retryCnt  = Number(req.get('X-Cloud-Tasks-TaskRetryCount') || 0);
-  try {
-    const { gcsUri, gcsPdfUri, brand, code, series, display_name, family_slug = null } = req.body || {};
-    const uri = gcsUri || gcsPdfUri;
-    if (!uri || !/^gs:\/\//i.test(uri)) {
-      await db.query(
-        `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
-         VALUES ($1,$2,$3,'FAILED',$4)`,
-        [taskName, retryCnt, uri || '', 'gcsUri required (gs://...)']
-      );
-      return res.status(400).json({ ok:false, error:'gcsUri required (gs://...)' });
-    }
+  const taskName = req.get('X-Cloud-Tasks-TaskName') || null;
+  const retryCnt = Number(req.get('X-Cloud-Tasks-TaskRetryCount') || 0);
+  const payload = req.body || {};
+  const runIdFromPayload = payload.runId || null;
+  const isTaskInvocation = Boolean(taskName) || runIdFromPayload != null;
 
-    const { rows:logRows } = await db.query(
-      `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
-       VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
-      [taskName, retryCnt, uri]
-    );
-    const runId = logRows[0]?.id;
-
-    // ✅ 1) 즉시 ACK → Cloud Tasks는 이 시점에 "완료"로 처리(재시도 루프 종료)
-    res.status(202).json({ ok: true, run_id: runId });
-
-    // ▶ 2) 다음 Cloud Tasks 요청으로 실행을 넘김(체인) — 응답 보낸 뒤이므로 절대 다시 res.* 호출 금지
-    enqueueIngestRun({ runId, gcsUri: uri, brand, code, series, display_name, family_slug })
-      .catch(async (err) => {
-        // enqueue 실패 시에도 응답은 이미 보냈으므로 DB만 FAILED로 마킹
-        try {
-          await db.query(
-            `UPDATE public.ingest_run_logs
-                SET finished_at = now(),
-                    duration_ms = $2,
-                    status = 'FAILED',
-                    error_message = $3
-              WHERE id = $1`,
-            [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
-          );
-        } catch (_) {}
-        console.error('[ingest enqueue failed]', err?.message || err);
-      });
-
-  } catch (e) {
- // 여기로 들어왔다면 아직 202를 보내기 전일 수도 있으므로, 응답 전/후 모두 안전하도록 처리
-    // 1) DB 상태 갱신
+  if (!isTaskInvocation) {
     try {
-      await db.query(
-        `UPDATE public.ingest_run_logs
-           SET finished_at = now(),
-               duration_ms = $2,
-               status = 'FAILED',
-               error_message = $3
-         WHERE task_name = $1
-           AND status = 'PROCESSING'
-         ORDER BY started_at DESC
-         LIMIT 1`,
-        [ taskName, Date.now()-startedAt, String(e?.message || e) ]
+      const { gcsUri, gcsPdfUri, brand, code, series, display_name, family_slug = null } = payload;
+      const uri = gcsUri || gcsPdfUri;
+      if (!uri || !/^gs:\/\//i.test(uri)) {
+        await db.query(
+          `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
+             VALUES ($1,$2,$3,'FAILED',$4)`,
+          [taskName, retryCnt, uri || '', 'gcsUri required (gs://...)']
+        );
+        return res.status(400).json({ ok:false, error:'gcsUri required (gs://...)' });
+      }
+
+      const { rows: logRows } = await db.query(
+        `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
+           VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
+        [taskName, retryCnt, uri]
       );
-    } catch (_) {}
-    // 2) 아직 응답을 보내지 않았다면 500, 이미 보냈다면 로그만
-    if (!res.headersSent) {
-      console.error('[ingest 500]', { error: e?.message });
-      return res.status(500).json({ ok:false, error:String(e?.message || e) });
-    } else {
+      const runId = logRows[0]?.id;
+
+      res.status(202).json({ ok: true, run_id: runId });
+
+      enqueueIngestRun({ runId, gcsUri: uri, brand, code, series, display_name, family_slug })
+        .catch(async (err) => {
+          try {
+            await db.query(
+              `UPDATE public.ingest_run_logs
+                  SET finished_at = now(),
+                      duration_ms = $2,
+                      status = 'FAILED',
+                      error_message = $3
+                WHERE id = $1`,
+              [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
+            );
+          } catch (_) {}
+          console.error('[ingest enqueue failed]', err?.message || err);
+        });
+    } catch (e) {
+      try {
+        await db.query(
+          `UPDATE public.ingest_run_logs
+             SET finished_at = now(),
+                 duration_ms = $2,
+                 status = 'FAILED',
+                 error_message = $3
+           WHERE task_name = $1
+             AND status = 'PROCESSING'
+           ORDER BY started_at DESC
+           LIMIT 1`,
+          [ taskName, Date.now() - startedAt, String(e?.message || e) ]
+        );
+      } catch (_) {}
+      if (!res.headersSent) {
+        console.error('[ingest 500]', { error: e?.message });
+        return res.status(500).json({ ok:false, error:String(e?.message || e) });
+      }
       console.error('[ingest post-ack error]', e?.message || e);
     }
+    return;
   }
-});
 
-// ▶ 체인 실행 엔드포인트: 여기서 runAutoIngest를 실제로 수행
-app.post('/api/worker/ingest', async (req, res) => {
-    const startedAt = Date.now();
-  // 예산(기본 120초) + 15초 여유 안에 "반드시" 2xx로 ACK
   const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
   const killer = setTimeout(() => {
     if (!res.headersSent) {
       try { res.status(202).json({ ok: true, timeout: true }); } catch {}
     }
   }, deadlineMs);
-   console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${req.body?.runId || 'n/a'}`);
+  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${payload?.runId || 'n/a'}`);
 
   try {
-    const { runId, gcsUri, brand, code, series, display_name, family_slug = null } = req.body || {};
-    if (!runId || !gcsUri) return res.status(400).json({ ok:false, error:'runId & gcsUri required' });
+    const { runId, gcsUri, gcsPdfUri, brand, code, series, display_name, family_slug = null } = payload;
+    const uri = gcsUri || gcsPdfUri;
+    if (!runId || !uri) return res.status(400).json({ ok:false, error:'runId & gcsUri required' });
 
     const label = `[ingest] ${runId}`;
     console.time(label);
-    const out = await runAutoIngest({ gcsUri, brand, code, series, display_name, family_slug });
+    const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name, family_slug });
     console.timeEnd(label);
 
     await db.query(
@@ -546,7 +538,7 @@ app.post('/api/worker/ingest', async (req, res) => {
         out?.family || out?.family_slug || null,
         out?.brand || null,
         (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
-        out?.datasheet_uri || gcsUri ]
+        out?.datasheet_uri || uri ]
     );
 
     return res.json({ ok:true, run_id: runId });
@@ -555,20 +547,22 @@ app.post('/api/worker/ingest', async (req, res) => {
       `UPDATE public.ingest_run_logs
           SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
         WHERE id = $1`,
-      [ req.body?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
+      [ payload?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
     );
     console.error('[ingest-run failed]', e?.message || e);
-   if (!res.headersSent) {
-     return res.status(500).json({ ok:false, error:String(e?.message||e) });
-   } else {
-     // 이미 202를 보냈다면 응답은 끝 — 로그만 남김
-     console.warn('[ingest-run post-ACK error]', String(e?.message || e));
-     return;
-   }
+    if (!res.headersSent) {
+      return res.status(500).json({ ok:false, error:String(e?.message||e) });
+    }
+    console.warn('[ingest-run post-ACK error]', String(e?.message || e));
+    return;
   } finally {
     clearTimeout(killer);
   }
-});
+}
+
+const workerIngestMiddlewares = [requireSession, handleWorkerIngest];
+app.post('/api/worker/ingest', workerIngestMiddlewares);
+app.post('/api/worker/ingest/run', workerIngestMiddlewares);
 
 /* ---------------- 404 / error ---------------- */
 app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));

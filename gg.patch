@@ -1,192 +1,104 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 073f191db53c1b5aac4b71b54d2e5fc1e9da4068..fc3f1d104fb7587cd526bb619ef225e3a5024304 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -1,164 +1,39 @@
- 'use strict';
--
- const { pool } = require('../utils/db');
--const { getBlueprint, computeFastKeys } = require('../utils/blueprint');
--
--function safeColumnName(name) {
--  if (!/^[a-z0-9_]+$/i.test(name)) throw new Error('invalid column: ' + name);
--  return `"${name}"`;
--}
--
--async function ensureSpecsTableForFamily(familySlug) {
--  await pool.query('SELECT public.ensure_specs_table($1)', [familySlug]);
--}
--
--async function getColumnTypes(qualified) {
--  const [schema, table] = qualified.includes('.') ? qualified.split('.') : ['public', qualified];
--  const sql = `
--    SELECT lower(column_name) AS col, lower(data_type) AS dt
--      FROM information_schema.columns
--     WHERE table_schema=$1 AND table_name=$2
--  `;
--  const { rows } = await pool.query(sql, [schema, table]);
--  const out = new Map();
--  for (const { col, dt } of rows) {
--    if (/(integer|bigint|smallint)/.test(dt)) out.set(col, 'int');
--    else if (/(numeric|decimal|double precision|real)/.test(dt)) out.set(col, 'numeric');
--    else if (/boolean/.test(dt)) out.set(col, 'bool');
--    else out.set(col, 'text');
--  }
--  return out;
--}
--
--// "5, 6, 9, 12" / "1.5 to 24 V" 같은 문자열을 안전하게 수용
--function toNumberOrNull(v) {
--  if (v == null || v === '') return null;
--  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
--  const s = String(v);
--  if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/i.test(s)) return null;
--  const mRange = s.match(/-?\d+(?:\.\d+)?/);
--  if (mRange && mRange[0] != null) return Number(mRange[0]);
--  return null;
--}
--
--async function saveExtractedSpecs(familySlug, base, specs) {
--  // 스키마 자동 보장(추가만 수행)
--  await ensureSpecsTableForFamily(familySlug);
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 7c30be2ea0520173522e9b53807170a38a5ab1d9..f887d805d8a7e12340fd1e73f739c99586849219 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -644,87 +644,97 @@ async function runAutoIngest({
+       seenSeed.add(normed);
+       seeds.push(str);
+     };
+     pushSeed(row.code);
+     pushSeed(row.mpn);
+     pushSeed(row.part_number);
+     pushSeed(row.part_no);
  
--  const blueprint = await getBlueprint(pool, familySlug);
--   if (!blueprint) throw new Error(`blueprint not found for family ${familySlug}`);
--  const specsTable = blueprint?.specsTable || blueprint?.specs_table;
--  if (!specsTable) throw new Error(`specs table not found for family ${familySlug}`);
--  const targetTable = specsTable.includes('.') ? specsTable : `public.${specsTable}`;
--  const dbColTypes = await getColumnTypes(targetTable);
-+async function saveExtractedSpecs(targetTable, familySlug, rows) {
-+  if (!rows?.length) return;
+     let mpn = seeds.length ? seeds[0] : '';
+     if (!mpn && candidateMap.length) mpn = candidateMap[0].raw;
+     mpn = String(mpn || '').trim();
+     if (!mpn) continue;
+     const mpnNorm = normalizeCode(mpn);
+     if (!mpnNorm || seenCodes.has(mpnNorm)) continue;
+     seenCodes.add(mpnNorm);
  
--  const baseCols = ['family_slug','brand','brand_norm','code','code_norm','series_code','mfr_full','datasheet_uri','verified_in_doc'];
--  const baseVals = [
--    familySlug,
--    base.brand, String(base.brand || '').toLowerCase(),
--    base.code,  String(base.code  || '').toLowerCase(),
--    base.series_code ?? null,
--    base.mfr_full ?? null,
--    base.datasheet_uri ?? null,
--    true
--  ];
-+  const cols = new Set(['family_slug','brand','brand_norm','code','code_norm','mfr_full','datasheet_uri','verified_in_doc']);
-+  // 동적으로 스펙 컬럼 추가
-+  for (const r of rows) Object.keys(r).forEach(k => cols.add(k));
- 
--  const RESERVED = new Set(['id','brand','code','brand_norm','code_norm','created_at','updated_at']);
--  const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
--  const allowedKeys = Array.isArray(blueprint?.allowedKeys)
--    ? blueprint.allowedKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
--    : [];
--  const fieldTypes = blueprint?.fields || {};
--  function coerceNumeric(x) {
--    if (x == null || x === '') return null;
--    if (typeof x === 'number') return x;
--    let s = String(x).toLowerCase();
--    s = s.replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
--    if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/.test(s)) return null;
--    const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
--    if (!m) return null;
--    let n = parseFloat(m[1]);
--    const mul = (m[2] || '').toLowerCase();
--    const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
--    if (mul && scale[mul] != null) n = n * scale[mul];
--    return Number.isFinite(n) ? n : null;
--  }
--  function coerceByType(key, val) {
--    let t = String(fieldTypes[key] || '').toLowerCase();
--    if (t === 'string') t = 'text';
--    if (!t || t === 'text') t = dbColTypes.get(key) || t || 'text';
--    if (t === 'float' || t === 'double' || t === 'decimal') t = 'numeric';
--    if (t === 'integer' || t === 'bigint' || t === 'smallint') t = 'int';
--    if (t === 'numeric') return coerceNumeric(val);
--    if (t === 'int')     { const n = coerceNumeric(val); return (n==null?null:Math.round(n)); }
--    if (t === 'bool')    {
--      if (typeof val === 'boolean') return val;
--      const s = String(val||'').toLowerCase().trim();
--      if (!s) return null;
--      return /^(true|yes|y|1|on|enable|enabled|pass)$/i.test(s);
--    }
--    return (val == null ? null : String(val));
--  }
--  const fastKeys = FAST
--    ? computeFastKeys(blueprint).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
--    : allowedKeys;
--  const allowedSet = new Set(allowedKeys);
--  const fastSet = new Set(fastKeys);
--  const specsNorm = {};
--  for (const [rawKey, value] of Object.entries(specs || {})) {
--    const key = String(rawKey || '')
--      .trim()
--      .toLowerCase()
--      .replace(/[^a-z0-9_]/g, '');
--    if (!key || RESERVED.has(key)) continue;
--    if (allowedSet.size && !allowedSet.has(key)) continue;
--    if (FAST && fastSet.size && !fastSet.has(key)) continue;
--    if (!Object.prototype.hasOwnProperty.call(specsNorm, key)) {
--      specsNorm[key] = coerceByType(key, value); // 타입 강제정규화
--    }
--  }
--
--  for (const key of Object.keys(specsNorm)) {
--    const t = dbColTypes.get(key);
--    if (t === 'numeric' || t === 'int') {
--      specsNorm[key] = toNumberOrNull(specsNorm[key]);
--    }
--  }
--
--  // 실제 테이블 컬럼만 남기고, 메타 키(옵션/설정)는 제외
--  const physicalCols = new Set(dbColTypes.keys());
--  const META = new Set(['variant_keys','pn_template','ingest_options']);
--  const specCols = Object.keys(specsNorm)
--    .map((s) => s.toLowerCase())
--    .filter((s) => physicalCols.has(s) && !META.has(s));
--  const allCols = baseCols.concat(specCols);
--  const params = allCols.map((_, i) => `$${i + 1}`);
--  const values = baseVals.concat(specCols.map((k) => {
--    const x = specsNorm[k];
--    if (typeof x === 'string' && /to|,|\d/.test(x)) {
--      const n = toNumberOrNull(x);
--      return n ?? null;
--    }
--    return x;
--  }));
--
--  const colList = allCols.map(safeColumnName).join(',');
--  const setList = specCols
--    .map((k) => `${safeColumnName(k)} = EXCLUDED.${safeColumnName(k)}`)
--    .join(',');
-+  const colList = Array.from(cols);
-+  const placeholders = colList.map((_, i) => `$${i+1}`).join(',');
- 
-   const sql = `
--    INSERT INTO ${targetTable} (${colList})
--    VALUES (${params.join(',')})
--    ON CONFLICT (brand_norm, code_norm)
-+    INSERT INTO ${targetTable} (${colList.map(c => `"${c}"`).join(',')})
-+    VALUES (${placeholders})
-+    ON CONFLICT (brand_norm, code_norm, family_slug)
-     DO UPDATE SET
-       mfr_full = EXCLUDED.mfr_full,
-       datasheet_uri = EXCLUDED.datasheet_uri,
-       verified_in_doc = EXCLUDED.verified_in_doc
--      ${setList ? ',' + setList : ''}
-   `;
- 
--  await pool.query(sql, values);
-+  const client = await pool.connect();
-+  try {
-+    for (const r of rows) {
-+      const rec = { ...r };
-+      rec.family_slug = familySlug;
-+      rec.brand_norm = (rec.brand || 'unknown').toLowerCase();
-+      rec.code_norm  = (rec.code  || '').toLowerCase();
-+      const vals = colList.map(c => rec[c]);
-+      await client.query(sql, vals);
+     const rec = {};
+     rec.brand = row.brand || brandName;
+     rec.code = mpn;
+     rec.series_code = row.series_code ?? row.series ?? baseSeries ?? null;
+     if (row.series != null && physicalCols.has('series')) rec.series = row.series;
+     rec.datasheet_uri = row.datasheet_uri || gcsUri;
+     if (row.datasheet_url) rec.datasheet_url = row.datasheet_url;
+     else if (rec.datasheet_uri && rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
+     if (row.mfr_full != null) rec.mfr_full = row.mfr_full;
+-    const verified = row.verified_in_doc ?? (candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm));
++    let verified;
++    if (row.verified_in_doc != null) {
++      if (typeof row.verified_in_doc === 'string') {
++        verified = row.verified_in_doc.trim().toLowerCase() === 'true';
++      } else {
++        verified = Boolean(row.verified_in_doc);
++      }
++    } else {
++      verified = candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm);
 +    }
-+  } finally {
-+    client.release();
-+  }
- }
+     rec.verified_in_doc = Boolean(verified);
+     rec.image_uri = row.image_uri || coverUri || null;
+     if (coverUri && rec.cover == null) rec.cover = coverUri;
+     const displayName = row.display_name || row.displayname || `${rec.brand} ${mpn}`;
+     rec.display_name = displayName;
+     if (rec.displayname == null && displayName != null) rec.displayname = displayName;
+     rec.updated_at = now;
  
- module.exports = { saveExtractedSpecs };
+     for (const [rawKey, rawValue] of Object.entries(row)) {
+       const key = String(rawKey || '').trim();
+       if (!key) continue;
+       const lower = key.toLowerCase();
+       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
+       if (physicalCols.has(lower) || allowedSet.has(lower) || variantSet.has(lower)) {
+         rec[lower] = rawValue;
+       }
+     }
+ 
+     if (blueprint?.code_rules) applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
+     records.push(rec);
+   }
+ 
+   if (!records.length && candidateMap.length) {
+     const fallbackSeries = baseSeries || null;
+     for (const cand of candidateMap) {
+       const norm = cand.norm;
+       if (seenCodes.has(norm)) continue;
+       seenCodes.add(norm);
++      const verified = mpnNormFromDoc.has(norm);
+       const rec = {
+         brand: brandName,
+         code: cand.raw,
+         series_code: fallbackSeries,
+         datasheet_uri: gcsUri,
+         image_uri: coverUri || null,
+         display_name: `${brandName} ${cand.raw}`,
+-        verified_in_doc: true,
++        verified_in_doc: verified,
+         updated_at: now,
+       };
+       if (coverUri) rec.cover = coverUri;
+       if (physicalCols.has('series') && fallbackSeries != null) rec.series = fallbackSeries;
+       if (rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
+       if (rec.display_name != null && rec.displayname == null) rec.displayname = rec.display_name;
+       records.push(rec);
+     }
+   }
+ 
+   // 최후 폴백 줄이기
+   if (!records.length) {
+     const tmp = 'TMP_' + (Math.random().toString(16).slice(2, 8)).toUpperCase();
+     records.push({
+       family_slug: family,
+       brand: brand || extracted.brand || 'unknown',
+       code: tmp,
+       series_code: series || code || null,
+       datasheet_uri: gcsUri,
+       image_uri: coverUri || null,
+       cover: coverUri || null,
+       display_name: `${brand || extracted.brand || 'unknown'} ${tmp}`,
+       displayname: `${brand || extracted.brand || 'unknown'} ${tmp}`,
+       datasheet_url: gcsUri,
+       verified_in_doc: false,

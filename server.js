@@ -448,30 +448,37 @@ async function handleWorkerIngest(req, res) {
   );
   const payload = req.body || {};
   const fromTasks = Boolean(taskName);
+  const normalizedGsUri = [
+    payload?.gsUri,
+    payload?.gcsUri,
+    payload?.gcsPdfUri,
+    payload?.uri,
+    payload?.url,
+  ].find((value) => typeof value === 'string' && value.trim()) || null;
+  const gsUri = normalizedGsUri ? normalizedGsUri.trim() : null;
 
   if (!fromTasks) {
     try {
-      const { gcsUri, gcsPdfUri, brand, code, series, display_name, family_slug = null } = payload;
-      const uri = gcsUri || gcsPdfUri;
-      if (!uri || !/^gs:\/\//i.test(uri)) {
+      const { brand, code, series, display_name, family_slug = null } = payload;
+      if (!gsUri || !/^gs:\/\//i.test(gsUri)) {
         await db.query(
           `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
              VALUES ($1,$2,$3,'FAILED',$4)`,
-          [taskName, retryCnt, uri || '', 'gcsUri required (gs://...)']
+          [taskName, retryCnt, gsUri || '', 'gsUri/gcsUri required (gs://...)']
         );
-        return res.status(400).json({ ok:false, error:'gcsUri required (gs://...)' });
+        return res.status(400).json({ ok:false, error:'gsUri/gcsUri required (gs://...)' });
       }
 
       const { rows: logRows } = await db.query(
         `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
            VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
-        [taskName, retryCnt, uri]
+        [taskName, retryCnt, gsUri]
       );
       const runId = logRows[0]?.id;
 
       res.status(202).json({ ok: true, run_id: runId });
 
-      enqueueIngestRun({ runId, gcsUri: uri, brand, code, series, display_name, family_slug })
+      enqueueIngestRun({ runId, gcsUri: gsUri, brand, code, series, display_name, family_slug })
         .catch(async (err) => {
           try {
             await db.query(
@@ -519,13 +526,16 @@ async function handleWorkerIngest(req, res) {
   console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${payload?.runId || 'n/a'}`);
 
   try {
-    const { runId, gcsUri, gcsPdfUri, brand, code, series, display_name, family_slug = null } = payload;
-    const uri = gcsUri || gcsPdfUri;
-    if (!runId || !uri) return res.status(400).json({ ok:false, error:'runId & gcsUri required' });
+    const { runId, brand, code, series, display_name, family_slug = null } = payload;
+    if (!runId || !gsUri || !/^gs:\/\//i.test(gsUri)) {
+      const statusCode = fromTasks ? 200 : 400;
+      console.warn('[ingest-run] bad payload', { fromTasks, runId, keys: Object.keys(payload || {}) });
+      return res.status(statusCode).json({ ok:false, error:'runId & gsUri required' });
+    }
 
     const label = `[ingest] ${runId}`;
     console.time(label);
-    const out = await runAutoIngest({ gcsUri: uri, brand, code, series, display_name, family_slug });
+    const out = await runAutoIngest({ gcsUri: gsUri, brand, code, series, display_name, family_slug });
     console.timeEnd(label);
 
     await db.query(
@@ -544,7 +554,7 @@ async function handleWorkerIngest(req, res) {
         out?.family || out?.family_slug || null,
         out?.brand || null,
         (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
-        out?.datasheet_uri || uri ]
+        out?.datasheet_uri || gsUri ]
     );
 
     return res.json({ ok:true, run_id: runId });

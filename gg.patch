@@ -1,185 +1,191 @@
-diff --git a/server.js b/server.js
-index 1d9881f24d5c7c79a7657d846f8ea5fb1c595cb0..62a37286426ff4168b7ac8f23514a602828cb4ee 100644
---- a/server.js
-+++ b/server.js
-@@ -507,115 +507,124 @@ async function handleWorkerIngest(req, res) {
-         });
-     } catch (e) {
-       try {
-         await db.query(
-           `UPDATE public.ingest_run_logs
-              SET finished_at = now(),
-                  duration_ms = $2,
-                  status = 'FAILED',
-                  error_message = $3
-            WHERE task_name = $1
-              AND status = 'PROCESSING'
-            ORDER BY started_at DESC
-            LIMIT 1`,
-           [ taskName, Date.now() - startedAt, String(e?.message || e) ]
-         );
-       } catch (_) {}
-       if (!res.headersSent) {
-         console.error('[ingest 500]', { error: e?.message });
-         return res.status(500).json({ ok:false, error:String(e?.message || e) });
-       }
-       console.error('[ingest post-ack error]', e?.message || e);
-     }
-     return;
-   }
- 
--  const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
--  const killer = setTimeout(() => {
--    if (!res.headersSent) {
--      try { res.status(202).json({ ok: true, timeout: true }); } catch {}
-+  // ---------- Cloud Tasks에서 온 호출(2차 실행) ----------
-+  let killer;
-+  try {
-+    // A-1) 타임아웃 암(ingest_budget + buffer)
-+    const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
-+    killer = setTimeout(() => {
-+      if (!res.headersSent) {
-+        try { res.status(202).json({ ok: true, timeout: true }); } catch {}
-+      }
-+    }, deadlineMs);
-+    console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index fc3f1d104fb7587cd526bb619ef225e3a5024304..6ebeba8ff668bf289da313fc0ac1b77f60b08587 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -1,39 +1,167 @@
+ 'use strict';
 +
-+    // A-2) runId 보정(fallback 생성)
-+    let { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
-+    if (!runId) {
-+      const { rows } = await db.query(
-+        `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
-+           VALUES ($1,$2,$3,'RUNNING') RETURNING id`,
-+        [ taskName, retryCnt, gcsUri ]
-+      );
-+      runId = rows[0]?.id;
-+      console.warn('[ingest-run] runId missing -> created', { runId, taskName, retryCnt });
-     }
--  }, deadlineMs);
--  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
--
--  let { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
--  if (!runId) {
--    // Fallback: runId가 누락된 태스크라면 지금 생성해서 이어간다
--    const { rows } = await db.query(
--      `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
--         VALUES ($1,$2,$3,'RUNNING') RETURNING id`,
--      [ taskName, retryCnt, gcsUri ]
--    );
--    runId = rows[0]?.id;
--    console.warn('[ingest-run] runId missing -> created', { runId, taskName, retryCnt });
--  }
- 
-+    // B-1) 실행부: 실패 → FAILED 업데이트 + 500 (또는 post-ACK 로그)
-     const label = `[ingest] ${runId}`;
-     console.time(label);
--    const ingestPayload = {
--      ...payload,
--      runId,
--      gcsUri,
--    };
--    const out = await runAutoIngest(ingestPayload);
-+    const ingestPayload = { ...payload, runId, gcsUri };
-+    let out;
-+    try {
-+      out = await runAutoIngest(ingestPayload);
-+    } catch (err) {
+ const { pool } = require('../utils/db');
++const { getColumnsOf } = require('./ensure-spec-columns');
++
++const META_KEYS = new Set([
++  'family_slug',
++  'brand',
++  'brand_norm',
++  'code',
++  'code_norm',
++  'mfr_full',
++  'datasheet_uri',
++  'verified_in_doc',
++  'display_name',
++  'displayname',
++  'image_uri',
++  'cover',
++  'series',
++  'series_code',
++  'created_at',
++  'updated_at',
++]);
++
++const CONFLICT_KEYS = ['brand_norm', 'code_norm', 'family_slug'];
++
++function normKey(key) {
++  return String(key || '')
++    .trim()
++    .toLowerCase();
++}
++
++async function getColumnTypes(targetTable) {
++  const [schema, table] = targetTable.includes('.')
++    ? targetTable.split('.', 2)
++    : ['public', targetTable];
++
++  const { rows } = await pool.query(
++    `SELECT lower(column_name) AS column, data_type
++       FROM information_schema.columns
++      WHERE table_schema = $1
++        AND table_name   = $2`,
++    [schema, table]
++  );
++
++  const map = new Map();
++  for (const row of rows) {
++    map.set(row.column, String(row.data_type || '').toLowerCase());
++  }
++  return map;
++}
++
++function coerceValueForType(value, type) {
++  if (value == null) return null;
++  const t = String(type || '').toLowerCase();
++
++  if (!t) return value;
++
++  if (t.includes('int')) {
++    const num = Number(String(value).replace(/[^0-9.+\-eE]/g, ''));
++    if (!Number.isFinite(num)) return null;
++    return Math.trunc(num);
++  }
++
++  if (
++    t.includes('numeric') ||
++    t.includes('decimal') ||
++    t.includes('real') ||
++    t.includes('double')
++  ) {
++    const num = Number(String(value).replace(/[^0-9.+\-eE]/g, ''));
++    return Number.isFinite(num) ? num : null;
++  }
++
++  if (t === 'boolean') {
++    const s = String(value).trim().toLowerCase();
++    if (/^(true|t|yes|y|1|on)$/i.test(s)) return true;
++    if (/^(false|f|no|n|0|off)$/i.test(s)) return false;
++    return null;
++  }
++
++  if (t.includes('timestamp') || t === 'date') {
++    const d = value instanceof Date ? value : new Date(value);
++    return Number.isNaN(d.getTime()) ? null : d;
++  }
++
++  if (t.includes('json')) {
++    if (typeof value === 'string') {
 +      try {
-+        await db.query(
-+          `UPDATE public.ingest_run_logs
-+              SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
-+            WHERE id = $1`,
-+          [ runId, Date.now() - startedAt, String(err?.message || err) ]
-+        );
-+      } catch (_) {}
-+      console.timeEnd(label);
-+      if (!res.headersSent) return res.status(500).json({ ok:false, error:String(err?.message||err) });
-+      console.warn('[ingest-run post-ACK error]', String(err?.message || err));
-+      return;
++        return JSON.parse(value);
++      } catch (_) {
++        return value;
++      }
 +    }
-     console.timeEnd(label);
++    return value;
++  }
++
++  if (Array.isArray(value)) return value;
++
++  const str = String(value).trim();
++  return str.length ? str : null;
++}
  
--    await db.query(
--      `UPDATE public.ingest_run_logs
--          SET finished_at = now(),
--              duration_ms = $2,
--              status = 'SUCCEEDED',
--              final_table = $3,
--              final_family = $4,
--              final_brand = $5,
--              final_code  = $6,
--              final_datasheet = $7
--        WHERE id = $1`,
--      [ runId, (out?.ms ?? (Date.now() - startedAt)),
--        out?.specs_table || null,
--        out?.family || out?.family_slug || null,
--        out?.brand || null,
--        (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
--        out?.datasheet_uri || gcsUri ]
--    );
-+    // B-2) 성공 업데이트: 여기서 오류 나도 응답은 200 유지(로그만)
-+    try {
-+      await db.query(
-+        `UPDATE public.ingest_run_logs
-+            SET finished_at = now(),
-+                duration_ms = $2,
-+                status = 'SUCCEEDED',
-+                final_table = $3,
-+                final_family = $4,
-+                final_brand = $5,
-+                final_code  = $6,
-+                final_datasheet = $7
-+          WHERE id = $1`,
-+        [ runId, (out?.ms ?? (Date.now() - startedAt)),
-+          out?.specs_table || null,
-+          out?.family || out?.family_slug || null,
-+          out?.brand || null,
-+          (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
-+          out?.datasheet_uri || gcsUri ]
-+      );
-+    } catch (err2) {
-+      console.error('[ingest-run update SUCCEEDED failed]', err2?.message || err2);
+ async function saveExtractedSpecs(targetTable, familySlug, rows) {
+   if (!rows?.length) return;
+ 
+-  const cols = new Set(['family_slug','brand','brand_norm','code','code_norm','mfr_full','datasheet_uri','verified_in_doc']);
+-  // 동적으로 스펙 컬럼 추가
+-  for (const r of rows) Object.keys(r).forEach(k => cols.add(k));
++  const physicalCols = await getColumnsOf(targetTable);
++  if (!physicalCols.size) return;
++
++  const columnTypes = await getColumnTypes(targetTable);
++
++  const allKeys = new Set();
++  for (const meta of META_KEYS) {
++    if (physicalCols.has(meta)) allKeys.add(meta);
++  }
++
++  for (const row of rows) {
++    for (const key of Object.keys(row || {})) {
++      const normalized = normKey(key);
++      if (physicalCols.has(normalized)) allKeys.add(normalized);
 +    }
++  }
++
++  if (!allKeys.size) return;
  
-     return res.json({ ok:true, run_id: runId });
--  } catch (e) {
--    await db.query(
--      `UPDATE public.ingest_run_logs
--          SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
--        WHERE id = $1`,
--      [ runIdFromClient || payload?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
--    );
--    console.error('[ingest-run failed]', e?.message || e);
--    if (!res.headersSent) {
--      return res.status(500).json({ ok:false, error:String(e?.message||e) });
--    }
--    console.warn('[ingest-run post-ACK error]', String(e?.message || e));
--    return;
+-  const colList = Array.from(cols);
+-  const placeholders = colList.map((_, i) => `$${i+1}`).join(',');
++  const colList = Array.from(allKeys).sort();
++  const placeholders = colList.map((_, i) => `$${i + 1}`).join(',');
+ 
+-  const sql = `
+-    INSERT INTO ${targetTable} (${colList.map(c => `"${c}"`).join(',')})
+-    VALUES (${placeholders})
+-    ON CONFLICT (brand_norm, code_norm, family_slug)
+-    DO UPDATE SET
+-      mfr_full = EXCLUDED.mfr_full,
+-      datasheet_uri = EXCLUDED.datasheet_uri,
+-      verified_in_doc = EXCLUDED.verified_in_doc
+-  `;
++  const updateCols = colList.filter((col) => !CONFLICT_KEYS.includes(col));
++  const updateSql = updateCols.length
++    ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ')
++    : null;
++
++  const sql = [
++    `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
++    `VALUES (${placeholders})`,
++    'ON CONFLICT (brand_norm, code_norm, family_slug)',
++    updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
++  ].join('\n');
+ 
+   const client = await pool.connect();
+   try {
+-    for (const r of rows) {
+-      const rec = { ...r };
++    for (const row of rows) {
++      const rec = {};
++      for (const [key, value] of Object.entries(row || {})) {
++        rec[normKey(key)] = value;
++      }
++
+       rec.family_slug = familySlug;
+-      rec.brand_norm = (rec.brand || 'unknown').toLowerCase();
+-      rec.code_norm  = (rec.code  || '').toLowerCase();
+-      const vals = colList.map(c => rec[c]);
++      const brandRaw = rec.brand ?? rec.brand_norm ?? 'unknown';
++      rec.brand_norm = normKey(brandRaw) || 'unknown';
++      const codeRaw = rec.code ?? rec.code_norm ?? '';
++      rec.code_norm = normKey(codeRaw);
++
++      const vals = colList.map((col) => {
++        const value = rec[col];
++        return coerceValueForType(value, columnTypes.get(col));
++      });
++
+       await client.query(sql, vals);
+     }
    } finally {
--    clearTimeout(killer);
-+    if (killer) clearTimeout(killer);
+     client.release();
    }
  }
  
- const workerIngestMiddlewares = [requireSession, handleWorkerIngest];
- app.post('/api/worker/ingest', workerIngestMiddlewares);
- app.post('/api/worker/ingest/run', workerIngestMiddlewares);
- 
- /* ---------------- 404 / error ---------------- */
- app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));
- app.use((err, req, res, next) => {
-   try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
-   res.status(500).json({ ok:false, error:'internal error' });
- });
- 
- /* ---------------- Boot-time setup ---------------- */
- (async () => {
-   try {
-     await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
-     await db.query(`
-       CREATE TABLE IF NOT EXISTS public.ingest_run_logs (
-         id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
-         task_name text, retry_count integer, gcs_uri text not null,
-         status text CHECK (status in ('PROCESSING','SUCCEEDED','FAILED')),
-         final_table text, final_family text, final_brand text, final_code text,
-         final_datasheet text, duration_ms integer, error_message text,
+ module.exports = { saveExtractedSpecs };

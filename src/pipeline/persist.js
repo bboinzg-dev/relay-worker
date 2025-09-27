@@ -1,34 +1,162 @@
 'use strict';
+
 const { pool } = require('../utils/db');
+const { getColumnsOf } = require('./ensure-spec-columns');
+
+const META_KEYS = new Set([
+  'family_slug',
+  'brand',
+  'brand_norm',
+  'code',
+  'code_norm',
+  'mfr_full',
+  'datasheet_uri',
+  'verified_in_doc',
+  'display_name',
+  'displayname',
+  'image_uri',
+  'cover',
+  'series',
+  'series_code',
+  'created_at',
+  'updated_at',
+]);
+
+const CONFLICT_KEYS = ['brand_norm', 'code_norm', 'family_slug'];
+
+function normKey(key) {
+  return String(key || '')
+    .trim()
+    .toLowerCase();
+}
+
+async function getColumnTypes(targetTable) {
+  const [schema, table] = targetTable.includes('.')
+    ? targetTable.split('.', 2)
+    : ['public', targetTable];
+
+  const { rows } = await pool.query(
+    `SELECT lower(column_name) AS column, data_type
+       FROM information_schema.columns
+      WHERE table_schema = $1
+        AND table_name   = $2`,
+    [schema, table]
+  );
+
+  const map = new Map();
+  for (const row of rows) {
+    map.set(row.column, String(row.data_type || '').toLowerCase());
+  }
+  return map;
+}
+
+function coerceValueForType(value, type) {
+  if (value == null) return null;
+  const t = String(type || '').toLowerCase();
+
+  if (!t) return value;
+
+  if (t.includes('int')) {
+    const num = Number(String(value).replace(/[^0-9.+\-eE]/g, ''));
+    if (!Number.isFinite(num)) return null;
+    return Math.trunc(num);
+  }
+
+  if (
+    t.includes('numeric') ||
+    t.includes('decimal') ||
+    t.includes('real') ||
+    t.includes('double')
+  ) {
+    const num = Number(String(value).replace(/[^0-9.+\-eE]/g, ''));
+    return Number.isFinite(num) ? num : null;
+  }
+
+  if (t === 'boolean') {
+    const s = String(value).trim().toLowerCase();
+    if (/^(true|t|yes|y|1|on)$/i.test(s)) return true;
+    if (/^(false|f|no|n|0|off)$/i.test(s)) return false;
+    return null;
+  }
+
+  if (t.includes('timestamp') || t === 'date') {
+    const d = value instanceof Date ? value : new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  if (t.includes('json')) {
+    if (typeof value === 'string') {
+      try {
+        return JSON.parse(value);
+      } catch (_) {
+        return value;
+      }
+    }
+    return value;
+  }
+
+  if (Array.isArray(value)) return value;
+
+  const str = String(value).trim();
+  return str.length ? str : null;
+}
 
 async function saveExtractedSpecs(targetTable, familySlug, rows) {
   if (!rows?.length) return;
 
-  const cols = new Set(['family_slug','brand','brand_norm','code','code_norm','mfr_full','datasheet_uri','verified_in_doc']);
-  // 동적으로 스펙 컬럼 추가
-  for (const r of rows) Object.keys(r).forEach(k => cols.add(k));
+  const physicalCols = await getColumnsOf(targetTable);
+  if (!physicalCols.size) return;
 
-  const colList = Array.from(cols);
-  const placeholders = colList.map((_, i) => `$${i+1}`).join(',');
+  const columnTypes = await getColumnTypes(targetTable);
 
-  const sql = `
-    INSERT INTO ${targetTable} (${colList.map(c => `"${c}"`).join(',')})
-    VALUES (${placeholders})
-    ON CONFLICT (brand_norm, code_norm, family_slug)
-    DO UPDATE SET
-      mfr_full = EXCLUDED.mfr_full,
-      datasheet_uri = EXCLUDED.datasheet_uri,
-      verified_in_doc = EXCLUDED.verified_in_doc
-  `;
+  const allKeys = new Set();
+  for (const meta of META_KEYS) {
+    if (physicalCols.has(meta)) allKeys.add(meta);
+  }
+
+  for (const row of rows) {
+    for (const key of Object.keys(row || {})) {
+      const normalized = normKey(key);
+      if (physicalCols.has(normalized)) allKeys.add(normalized);
+    }
+  }
+
+  if (!allKeys.size) return;
+
+  const colList = Array.from(allKeys).sort();
+  const placeholders = colList.map((_, i) => `$${i + 1}`).join(',');
+
+  const updateCols = colList.filter((col) => !CONFLICT_KEYS.includes(col));
+  const updateSql = updateCols.length
+    ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ')
+    : null;
+
+  const sql = [
+    `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
+    `VALUES (${placeholders})`,
+    'ON CONFLICT (brand_norm, code_norm, family_slug)',
+    updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
+  ].join('\n');
 
   const client = await pool.connect();
   try {
-    for (const r of rows) {
-      const rec = { ...r };
+    for (const row of rows) {
+      const rec = {};
+      for (const [key, value] of Object.entries(row || {})) {
+        rec[normKey(key)] = value;
+      }
+
       rec.family_slug = familySlug;
-      rec.brand_norm = (rec.brand || 'unknown').toLowerCase();
-      rec.code_norm  = (rec.code  || '').toLowerCase();
-      const vals = colList.map(c => rec[c]);
+      const brandRaw = rec.brand ?? rec.brand_norm ?? 'unknown';
+      rec.brand_norm = normKey(brandRaw) || 'unknown';
+      const codeRaw = rec.code ?? rec.code_norm ?? '';
+      rec.code_norm = normKey(codeRaw);
+
+      const vals = colList.map((col) => {
+        const value = rec[col];
+        return coerceValueForType(value, columnTypes.get(col));
+      });
+
       await client.query(sql, vals);
     }
   } finally {

@@ -447,32 +447,35 @@ async function handleWorkerIngest(req, res) {
     0
   );
   const payload = req.body || {};
+  const runIdFromClient = payload?.runId || null;
   const fromTasks = Boolean(taskName);
-  const normalizedGsUri = [
-    payload?.gsUri,
+  const rawUri = [
     payload?.gcsUri,
+    payload?.gsUri,
     payload?.gcsPdfUri,
     payload?.uri,
     payload?.url,
-  ].find((value) => typeof value === 'string' && value.trim()) || null;
-  const gsUri = normalizedGsUri ? normalizedGsUri.trim() : null;
+  ].find((value) => typeof value === 'string' && value.trim());
+  const gcsUri = rawUri ? rawUri.trim() : '';
+
+  if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
+    console.warn('[ingest-run] bad payload', {
+      fromTasks,
+      runId: runIdFromClient,
+      keys: Object.keys(payload || {}),
+    });
+    return res
+      .status(fromTasks ? 200 : 400)
+      .json({ ok: true, ignored: true });
+  }
 
   if (!fromTasks) {
     try {
       const { brand, code, series, display_name, family_slug = null } = payload;
-      if (!gsUri || !/^gs:\/\//i.test(gsUri)) {
-        await db.query(
-          `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
-             VALUES ($1,$2,$3,'FAILED',$4)`,
-          [taskName, retryCnt, gsUri || '', 'gsUri/gcsUri required (gs://...)']
-        );
-        return res.status(400).json({ ok:false, error:'gsUri/gcsUri required (gs://...)' });
-      }
-
       const { rows: logRows } = await db.query(
         `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
            VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
-        [taskName, retryCnt, gsUri]
+        [taskName, retryCnt, gcsUri]
       );
       const runId = logRows[0]?.id;
 
@@ -480,8 +483,7 @@ async function handleWorkerIngest(req, res) {
 
       const ingestPayload = {
         runId,
-        gsUri,
-        gcsUri: gsUri,
+        gcsUri,
         brand,
         code,
         series,
@@ -534,19 +536,22 @@ async function handleWorkerIngest(req, res) {
       try { res.status(202).json({ ok: true, timeout: true }); } catch {}
     }
   }, deadlineMs);
-  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${payload?.runId || 'n/a'}`);
+  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
 
   try {
-    const { runId, brand, code, series, display_name, family_slug = null } = payload;
-    if (!runId || !gsUri || !/^gs:\/\//i.test(gsUri)) {
-      const statusCode = fromTasks ? 200 : 400;
+    const { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
+    if (!runId) {
       console.warn('[ingest-run] bad payload', { fromTasks, runId, keys: Object.keys(payload || {}) });
-      return res.status(statusCode).json({ ok:false, error:'runId & gsUri/gcsUri required' });
+      return res.status(fromTasks ? 200 : 400).json({ ok: true, ignored: true });
     }
 
     const label = `[ingest] ${runId}`;
     console.time(label);
-    const ingestPayload = { gsUri, gcsUri: gsUri, brand, code, series, display_name, family_slug };
+    const ingestPayload = {
+      ...payload,
+      runId,
+      gcsUri,
+    };
     const out = await runAutoIngest(ingestPayload);
     console.timeEnd(label);
 
@@ -566,7 +571,7 @@ async function handleWorkerIngest(req, res) {
         out?.family || out?.family_slug || null,
         out?.brand || null,
         (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
-        out?.datasheet_uri || gsUri ]
+        out?.datasheet_uri || gcsUri ]
     );
 
     return res.json({ ok:true, run_id: runId });
@@ -575,7 +580,7 @@ async function handleWorkerIngest(req, res) {
       `UPDATE public.ingest_run_logs
           SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
         WHERE id = $1`,
-      [ payload?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
+      [ runIdFromClient || payload?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
     );
     console.error('[ingest-run failed]', e?.message || e);
     if (!res.headersSent) {

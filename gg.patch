@@ -1,74 +1,216 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index f887d805d8a7e12340fd1e73f739c99586849219..124285123331be5709c0c972539080b1de98bb9b 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -366,55 +366,65 @@ async function extractPartNumbersFromText(text, { series } = {}) {
+diff --git a/server.js b/server.js
+index 360a2589297c7fa92cb78a06beceaad24258dac5..257042e1b9a046424a2ecdbc264c6079931ba264 100644
+--- a/server.js
++++ b/server.js
+@@ -425,85 +425,87 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
+   } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'bulk ingest failed', detail:String(e?.message || e) }); }
+ });
  
-   const prefix = series ? normalizeCode(series) : null;
-   const seen = new Set();
-   const out = [];
+ app.post('/ingest/auto', requireSession, async (req, res) => {
+   try {
+     const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name, family_slug } = req.body || {};
+     const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
+     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
+     const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
+     res.json(result);
+   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
+ });
  
-   const push = (raw) => {
-     if (!raw) return;
-     const norm = normalizeCode(raw);
-     if (!norm) return;
-     if (prefix && !norm.startsWith(prefix)) return;
-     if (seen.has(norm)) return;
-     seen.add(norm);
-     const cleaned = typeof raw === 'string' ? raw.trim() : String(raw || '');
-     out.push(cleaned || norm);
-   };
+ async function handleWorkerIngest(req, res) {
+   const startedAt = Date.now();
+   const taskName =
+     req.get('X-CloudTasks-TaskName') ||
+     req.get('X-Cloud-Tasks-TaskName') ||
+     null;
+   const retryCnt = Number(
+     req.get('X-CloudTasks-TaskRetryCount') ||
+     req.get('X-Cloud-Tasks-TaskRetryCount') ||
+     0
+   );
+   const payload = req.body || {};
++  const runIdFromClient = payload?.runId || null;
+   const fromTasks = Boolean(taskName);
+-  const normalizedGsUri = [
+-    payload?.gsUri,
++  const rawUri = [
+     payload?.gcsUri,
++    payload?.gsUri,
+     payload?.gcsPdfUri,
+     payload?.uri,
+     payload?.url,
+-  ].find((value) => typeof value === 'string' && value.trim()) || null;
+-  const gsUri = normalizedGsUri ? normalizedGsUri.trim() : null;
++  ].find((value) => typeof value === 'string' && value.trim());
++  const gcsUri = rawUri ? rawUri.trim() : '';
++
++  if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
++    console.warn('[ingest-run] bad payload', {
++      fromTasks,
++      runId: runIdFromClient,
++      keys: Object.keys(payload || {}),
++    });
++    return res
++      .status(fromTasks ? 200 : 400)
++      .json({ ok: true, ignored: true });
++  }
  
-   for (const { code } of extractPartNumbersFromTypesTables(src, 200)) push(code);
-   for (const { code } of rankPartNumbersFromOrderingSections(src, 200)) push(code);
-   for (const { code } of extractPartNumbersBySeriesHeuristic(src, 200)) push(code);
+   if (!fromTasks) {
+     try {
+       const { brand, code, series, display_name, family_slug = null } = payload;
+-      if (!gsUri || !/^gs:\/\//i.test(gsUri)) {
+-        await db.query(
+-          `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
+-             VALUES ($1,$2,$3,'FAILED',$4)`,
+-          [taskName, retryCnt, gsUri || '', 'gsUri/gcsUri required (gs://...)']
+-        );
+-        return res.status(400).json({ ok:false, error:'gsUri/gcsUri required (gs://...)' });
+-      }
+-
+       const { rows: logRows } = await db.query(
+         `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
+            VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
+-        [taskName, retryCnt, gsUri]
++        [taskName, retryCnt, gcsUri]
+       );
+       const runId = logRows[0]?.id;
  
-   return out;
+       res.status(202).json({ ok: true, run_id: runId });
+ 
+       const ingestPayload = {
+         runId,
+-        gsUri,
+-        gcsUri: gsUri,
++        gcsUri,
+         brand,
+         code,
+         series,
+         display_name,
+         family_slug,
+       };
+ 
+       enqueueIngestRun(ingestPayload)
+         .catch(async (err) => {
+           try {
+             await db.query(
+               `UPDATE public.ingest_run_logs
+                   SET finished_at = now(),
+                       duration_ms = $2,
+                       status = 'FAILED',
+                       error_message = $3
+                 WHERE id = $1`,
+               [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
+             );
+           } catch (_) {}
+           console.error('[ingest enqueue failed]', err?.message || err);
+         });
+     } catch (e) {
+       try {
+         await db.query(
+diff --git a/server.js b/server.js
+index 360a2589297c7fa92cb78a06beceaad24258dac5..257042e1b9a046424a2ecdbc264c6079931ba264 100644
+--- a/server.js
++++ b/server.js
+@@ -512,92 +514,95 @@ async function handleWorkerIngest(req, res) {
+                  duration_ms = $2,
+                  status = 'FAILED',
+                  error_message = $3
+            WHERE task_name = $1
+              AND status = 'PROCESSING'
+            ORDER BY started_at DESC
+            LIMIT 1`,
+           [ taskName, Date.now() - startedAt, String(e?.message || e) ]
+         );
+       } catch (_) {}
+       if (!res.headersSent) {
+         console.error('[ingest 500]', { error: e?.message });
+         return res.status(500).json({ ok:false, error:String(e?.message || e) });
+       }
+       console.error('[ingest post-ack error]', e?.message || e);
+     }
+     return;
+   }
+ 
+   const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
+   const killer = setTimeout(() => {
+     if (!res.headersSent) {
+       try { res.status(202).json({ ok: true, timeout: true }); } catch {}
+     }
+   }, deadlineMs);
+-  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${payload?.runId || 'n/a'}`);
++  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
+ 
+   try {
+-    const { runId, brand, code, series, display_name, family_slug = null } = payload;
+-    if (!runId || !gsUri || !/^gs:\/\//i.test(gsUri)) {
+-      const statusCode = fromTasks ? 200 : 400;
++    const { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
++    if (!runId) {
+       console.warn('[ingest-run] bad payload', { fromTasks, runId, keys: Object.keys(payload || {}) });
+-      return res.status(statusCode).json({ ok:false, error:'runId & gsUri/gcsUri required' });
++      return res.status(fromTasks ? 200 : 400).json({ ok: true, ignored: true });
+     }
+ 
+     const label = `[ingest] ${runId}`;
+     console.time(label);
+-    const ingestPayload = { gsUri, gcsUri: gsUri, brand, code, series, display_name, family_slug };
++    const ingestPayload = {
++      ...payload,
++      runId,
++      gcsUri,
++    };
+     const out = await runAutoIngest(ingestPayload);
+     console.timeEnd(label);
+ 
+     await db.query(
+       `UPDATE public.ingest_run_logs
+           SET finished_at = now(),
+               duration_ms = $2,
+               status = 'SUCCEEDED',
+               final_table = $3,
+               final_family = $4,
+               final_brand = $5,
+               final_code  = $6,
+               final_datasheet = $7
+         WHERE id = $1`,
+       [ runId, (out?.ms ?? (Date.now() - startedAt)),
+         out?.specs_table || null,
+         out?.family || out?.family_slug || null,
+         out?.brand || null,
+         (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
+-        out?.datasheet_uri || gsUri ]
++        out?.datasheet_uri || gcsUri ]
+     );
+ 
+     return res.json({ ok:true, run_id: runId });
+   } catch (e) {
+     await db.query(
+       `UPDATE public.ingest_run_logs
+           SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
+         WHERE id = $1`,
+-      [ payload?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
++      [ runIdFromClient || payload?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
+     );
+     console.error('[ingest-run failed]', e?.message || e);
+     if (!res.headersSent) {
+       return res.status(500).json({ ok:false, error:String(e?.message||e) });
+     }
+     console.warn('[ingest-run post-ACK error]', String(e?.message || e));
+     return;
+   } finally {
+     clearTimeout(killer);
+   }
  }
  
+ const workerIngestMiddlewares = [requireSession, handleWorkerIngest];
+ app.post('/api/worker/ingest', workerIngestMiddlewares);
+ app.post('/api/worker/ingest/run', workerIngestMiddlewares);
  
+ /* ---------------- 404 / error ---------------- */
+ app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));
+ app.use((err, req, res, next) => {
+   try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
+   res.status(500).json({ ok:false, error:'internal error' });
+ });
  
--async function runAutoIngest({
--  gcsUri, family_slug=null, brand=null, code=null, series=null, display_name=null,
--}) {
-+async function runAutoIngest(input = {}) {
-+  const {
-+    gcsUri: rawGcsUri = null,
-+    gsUri: rawGsUri = null,
-+    family_slug = null,
-+    brand = null,
-+    code = null,
-+    series = null,
-+    display_name = null,
-+  } = input;
-+
-+  const gcsUri = (rawGcsUri || rawGsUri || '').trim();
-+
-   const started = Date.now();
--  if (!gcsUri) throw new Error('gcsUri required');
-+  if (!gcsUri) throw new Error('gcsUri/gsUri required');
-    // 기본 2분로 단축 (원하면 ENV로 재조정)
-   const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
-   const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
-   const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || (FAST ? 32768 : 65536));
-   const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || (FAST ? 30000 : Math.round(BUDGET * 0.6)));
-   const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
- 
-   const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
-     const timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
-     Promise.resolve(p)
-       .then((val) => { clearTimeout(timer); resolve(val); })
-       .catch((err) => { clearTimeout(timer); reject(err); });
-   });
- 
- 
-     // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
-   let fileName = '';
-   try { const { name } = parseGcsUri(gcsUri); fileName = path.basename(name); } catch {}
-   let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
-   if (!family && !FAST) {
-     try {
-      const text = await readText(gcsUri, 256*1024);
-      family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
-      // ★ 강제 보정: 제목/본문에 Signal Relay가 있으면 무조건 signal로
-      if (/subminiature\s+signal\s+relay|signal\s+relay/i.test(text)) family = 'relay_signal';
+ /* ---------------- Boot-time setup ---------------- */
+ (async () => {

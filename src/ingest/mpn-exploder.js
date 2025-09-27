@@ -174,7 +174,7 @@ function explodeToRows(blueprint, rows = [], options = {}) {
     }
   }
 
-  const rowsOut = candidateRows.length ? candidateRows : expandedRows;
+  const rowsOut = [...expandedRows, ...candidateRows];
   return dedupeByBrandCode(rowsOut);
 }
 

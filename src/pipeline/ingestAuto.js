@@ -713,7 +713,7 @@ async function runAutoIngest(input = {}) {
     records.push(rec);
   }
 
-  if (!records.length && candidateMap.length) {
+  if (candidateMap.length) {
     const fallbackSeries = baseSeries || null;
     for (const cand of candidateMap) {
       const norm = cand.norm;

@@ -1,116 +1,14 @@
 diff --git a/server.js b/server.js
-index 360a2589297c7fa92cb78a06beceaad24258dac5..257042e1b9a046424a2ecdbc264c6079931ba264 100644
+index 1d9881f24d5c7c79a7657d846f8ea5fb1c595cb0..62a37286426ff4168b7ac8f23514a602828cb4ee 100644
 --- a/server.js
 +++ b/server.js
-@@ -425,85 +425,87 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
-   } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'bulk ingest failed', detail:String(e?.message || e) }); }
- });
- 
- app.post('/ingest/auto', requireSession, async (req, res) => {
-   try {
-     const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name, family_slug } = req.body || {};
-     const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
-     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
-     const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
-     res.json(result);
-   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
- });
- 
- async function handleWorkerIngest(req, res) {
-   const startedAt = Date.now();
-   const taskName =
-     req.get('X-CloudTasks-TaskName') ||
-     req.get('X-Cloud-Tasks-TaskName') ||
-     null;
-   const retryCnt = Number(
-     req.get('X-CloudTasks-TaskRetryCount') ||
-     req.get('X-Cloud-Tasks-TaskRetryCount') ||
-     0
-   );
-   const payload = req.body || {};
-+  const runIdFromClient = payload?.runId || null;
-   const fromTasks = Boolean(taskName);
--  const normalizedGsUri = [
--    payload?.gsUri,
-+  const rawUri = [
-     payload?.gcsUri,
-+    payload?.gsUri,
-     payload?.gcsPdfUri,
-     payload?.uri,
-     payload?.url,
--  ].find((value) => typeof value === 'string' && value.trim()) || null;
--  const gsUri = normalizedGsUri ? normalizedGsUri.trim() : null;
-+  ].find((value) => typeof value === 'string' && value.trim());
-+  const gcsUri = rawUri ? rawUri.trim() : '';
-+
-+  if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
-+    console.warn('[ingest-run] bad payload', {
-+      fromTasks,
-+      runId: runIdFromClient,
-+      keys: Object.keys(payload || {}),
-+    });
-+    return res
-+      .status(fromTasks ? 200 : 400)
-+      .json({ ok: true, ignored: true });
-+  }
- 
-   if (!fromTasks) {
-     try {
-       const { brand, code, series, display_name, family_slug = null } = payload;
--      if (!gsUri || !/^gs:\/\//i.test(gsUri)) {
--        await db.query(
--          `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
--             VALUES ($1,$2,$3,'FAILED',$4)`,
--          [taskName, retryCnt, gsUri || '', 'gsUri/gcsUri required (gs://...)']
--        );
--        return res.status(400).json({ ok:false, error:'gsUri/gcsUri required (gs://...)' });
--      }
--
-       const { rows: logRows } = await db.query(
-         `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
-            VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
--        [taskName, retryCnt, gsUri]
-+        [taskName, retryCnt, gcsUri]
-       );
-       const runId = logRows[0]?.id;
- 
-       res.status(202).json({ ok: true, run_id: runId });
- 
-       const ingestPayload = {
-         runId,
--        gsUri,
--        gcsUri: gsUri,
-+        gcsUri,
-         brand,
-         code,
-         series,
-         display_name,
-         family_slug,
-       };
- 
-       enqueueIngestRun(ingestPayload)
-         .catch(async (err) => {
-           try {
-             await db.query(
-               `UPDATE public.ingest_run_logs
-                   SET finished_at = now(),
-                       duration_ms = $2,
-                       status = 'FAILED',
-                       error_message = $3
-                 WHERE id = $1`,
-               [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
-             );
-           } catch (_) {}
-           console.error('[ingest enqueue failed]', err?.message || err);
+@@ -507,115 +507,124 @@ async function handleWorkerIngest(req, res) {
          });
      } catch (e) {
        try {
          await db.query(
-diff --git a/server.js b/server.js
-index 360a2589297c7fa92cb78a06beceaad24258dac5..257042e1b9a046424a2ecdbc264c6079931ba264 100644
---- a/server.js
-+++ b/server.js
-@@ -512,92 +514,95 @@ async function handleWorkerIngest(req, res) {
+           `UPDATE public.ingest_run_logs
+              SET finished_at = now(),
                   duration_ms = $2,
                   status = 'FAILED',
                   error_message = $3
@@ -130,74 +28,136 @@ index 360a2589297c7fa92cb78a06beceaad24258dac5..257042e1b9a046424a2ecdbc264c6079
      return;
    }
  
-   const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
-   const killer = setTimeout(() => {
-     if (!res.headersSent) {
-       try { res.status(202).json({ ok: true, timeout: true }); } catch {}
-     }
-   }, deadlineMs);
--  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${payload?.runId || 'n/a'}`);
-+  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
- 
-   try {
--    const { runId, brand, code, series, display_name, family_slug = null } = payload;
--    if (!runId || !gsUri || !/^gs:\/\//i.test(gsUri)) {
--      const statusCode = fromTasks ? 200 : 400;
-+    const { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
+-  const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
+-  const killer = setTimeout(() => {
+-    if (!res.headersSent) {
+-      try { res.status(202).json({ ok: true, timeout: true }); } catch {}
++  // ---------- Cloud Tasks에서 온 호출(2차 실행) ----------
++  let killer;
++  try {
++    // A-1) 타임아웃 암(ingest_budget + buffer)
++    const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
++    killer = setTimeout(() => {
++      if (!res.headersSent) {
++        try { res.status(202).json({ ok: true, timeout: true }); } catch {}
++      }
++    }, deadlineMs);
++    console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
++
++    // A-2) runId 보정(fallback 생성)
++    let { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
 +    if (!runId) {
-       console.warn('[ingest-run] bad payload', { fromTasks, runId, keys: Object.keys(payload || {}) });
--      return res.status(statusCode).json({ ok:false, error:'runId & gsUri/gcsUri required' });
-+      return res.status(fromTasks ? 200 : 400).json({ ok: true, ignored: true });
++      const { rows } = await db.query(
++        `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
++           VALUES ($1,$2,$3,'RUNNING') RETURNING id`,
++        [ taskName, retryCnt, gcsUri ]
++      );
++      runId = rows[0]?.id;
++      console.warn('[ingest-run] runId missing -> created', { runId, taskName, retryCnt });
      }
+-  }, deadlineMs);
+-  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
+-
+-  let { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
+-  if (!runId) {
+-    // Fallback: runId가 누락된 태스크라면 지금 생성해서 이어간다
+-    const { rows } = await db.query(
+-      `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
+-         VALUES ($1,$2,$3,'RUNNING') RETURNING id`,
+-      [ taskName, retryCnt, gcsUri ]
+-    );
+-    runId = rows[0]?.id;
+-    console.warn('[ingest-run] runId missing -> created', { runId, taskName, retryCnt });
+-  }
  
++    // B-1) 실행부: 실패 → FAILED 업데이트 + 500 (또는 post-ACK 로그)
      const label = `[ingest] ${runId}`;
      console.time(label);
--    const ingestPayload = { gsUri, gcsUri: gsUri, brand, code, series, display_name, family_slug };
-+    const ingestPayload = {
-+      ...payload,
-+      runId,
-+      gcsUri,
-+    };
-     const out = await runAutoIngest(ingestPayload);
+-    const ingestPayload = {
+-      ...payload,
+-      runId,
+-      gcsUri,
+-    };
+-    const out = await runAutoIngest(ingestPayload);
++    const ingestPayload = { ...payload, runId, gcsUri };
++    let out;
++    try {
++      out = await runAutoIngest(ingestPayload);
++    } catch (err) {
++      try {
++        await db.query(
++          `UPDATE public.ingest_run_logs
++              SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
++            WHERE id = $1`,
++          [ runId, Date.now() - startedAt, String(err?.message || err) ]
++        );
++      } catch (_) {}
++      console.timeEnd(label);
++      if (!res.headersSent) return res.status(500).json({ ok:false, error:String(err?.message||err) });
++      console.warn('[ingest-run post-ACK error]', String(err?.message || err));
++      return;
++    }
      console.timeEnd(label);
  
-     await db.query(
-       `UPDATE public.ingest_run_logs
-           SET finished_at = now(),
-               duration_ms = $2,
-               status = 'SUCCEEDED',
-               final_table = $3,
-               final_family = $4,
-               final_brand = $5,
-               final_code  = $6,
-               final_datasheet = $7
-         WHERE id = $1`,
-       [ runId, (out?.ms ?? (Date.now() - startedAt)),
-         out?.specs_table || null,
-         out?.family || out?.family_slug || null,
-         out?.brand || null,
-         (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
--        out?.datasheet_uri || gsUri ]
-+        out?.datasheet_uri || gcsUri ]
-     );
+-    await db.query(
+-      `UPDATE public.ingest_run_logs
+-          SET finished_at = now(),
+-              duration_ms = $2,
+-              status = 'SUCCEEDED',
+-              final_table = $3,
+-              final_family = $4,
+-              final_brand = $5,
+-              final_code  = $6,
+-              final_datasheet = $7
+-        WHERE id = $1`,
+-      [ runId, (out?.ms ?? (Date.now() - startedAt)),
+-        out?.specs_table || null,
+-        out?.family || out?.family_slug || null,
+-        out?.brand || null,
+-        (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
+-        out?.datasheet_uri || gcsUri ]
+-    );
++    // B-2) 성공 업데이트: 여기서 오류 나도 응답은 200 유지(로그만)
++    try {
++      await db.query(
++        `UPDATE public.ingest_run_logs
++            SET finished_at = now(),
++                duration_ms = $2,
++                status = 'SUCCEEDED',
++                final_table = $3,
++                final_family = $4,
++                final_brand = $5,
++                final_code  = $6,
++                final_datasheet = $7
++          WHERE id = $1`,
++        [ runId, (out?.ms ?? (Date.now() - startedAt)),
++          out?.specs_table || null,
++          out?.family || out?.family_slug || null,
++          out?.brand || null,
++          (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
++          out?.datasheet_uri || gcsUri ]
++      );
++    } catch (err2) {
++      console.error('[ingest-run update SUCCEEDED failed]', err2?.message || err2);
++    }
  
      return res.json({ ok:true, run_id: runId });
-   } catch (e) {
-     await db.query(
-       `UPDATE public.ingest_run_logs
-           SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
-         WHERE id = $1`,
--      [ payload?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
-+      [ runIdFromClient || payload?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
-     );
-     console.error('[ingest-run failed]', e?.message || e);
-     if (!res.headersSent) {
-       return res.status(500).json({ ok:false, error:String(e?.message||e) });
-     }
-     console.warn('[ingest-run post-ACK error]', String(e?.message || e));
-     return;
+-  } catch (e) {
+-    await db.query(
+-      `UPDATE public.ingest_run_logs
+-          SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
+-        WHERE id = $1`,
+-      [ runIdFromClient || payload?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
+-    );
+-    console.error('[ingest-run failed]', e?.message || e);
+-    if (!res.headersSent) {
+-      return res.status(500).json({ ok:false, error:String(e?.message||e) });
+-    }
+-    console.warn('[ingest-run post-ACK error]', String(e?.message || e));
+-    return;
    } finally {
-     clearTimeout(killer);
+-    clearTimeout(killer);
++    if (killer) clearTimeout(killer);
    }
  }
  
@@ -214,3 +174,12 @@ index 360a2589297c7fa92cb78a06beceaad24258dac5..257042e1b9a046424a2ecdbc264c6079
  
  /* ---------------- Boot-time setup ---------------- */
  (async () => {
+   try {
+     await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
+     await db.query(`
+       CREATE TABLE IF NOT EXISTS public.ingest_run_logs (
+         id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+         task_name text, retry_count integer, gcs_uri text not null,
+         status text CHECK (status in ('PROCESSING','SUCCEEDED','FAILED')),
+         final_table text, final_family text, final_brand text, final_code text,
+         final_datasheet text, duration_ms integer, error_message text,

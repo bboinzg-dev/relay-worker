@@ -529,71 +529,80 @@ async function handleWorkerIngest(req, res) {
     return;
   }
 
-  const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
-  const killer = setTimeout(() => {
-    if (!res.headersSent) {
-      try { res.status(202).json({ ok: true, timeout: true }); } catch {}
+  // ---------- Cloud Tasks에서 온 호출(2차 실행) ----------
+  let killer;
+  try {
+    // A-1) 타임아웃 암(ingest_budget + buffer)
+    const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
+    killer = setTimeout(() => {
+      if (!res.headersSent) {
+        try { res.status(202).json({ ok: true, timeout: true }); } catch {}
+      }
+    }, deadlineMs);
+    console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
+
+    // A-2) runId 보정(fallback 생성)
+    let { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
+    if (!runId) {
+      const { rows } = await db.query(
+        `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
+           VALUES ($1,$2,$3,'RUNNING') RETURNING id`,
+        [ taskName, retryCnt, gcsUri ]
+      );
+      runId = rows[0]?.id;
+      console.warn('[ingest-run] runId missing -> created', { runId, taskName, retryCnt });
     }
-  }, deadlineMs);
-  console.log(`[ingest-run] killer armed at ${deadlineMs}ms for runId=${runIdFromClient || 'n/a'}`);
 
-  let { runId = runIdFromClient, brand, code, series, display_name, family_slug = null } = payload;
-  if (!runId) {
-    // Fallback: runId가 누락된 태스크라면 지금 생성해서 이어간다
-    const { rows } = await db.query(
-      `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
-         VALUES ($1,$2,$3,'RUNNING') RETURNING id`,
-      [ taskName, retryCnt, gcsUri ]
-    );
-    runId = rows[0]?.id;
-    console.warn('[ingest-run] runId missing -> created', { runId, taskName, retryCnt });
-  }
-
+    // B-1) 실행부: 실패 → FAILED 업데이트 + 500 (또는 post-ACK 로그)
     const label = `[ingest] ${runId}`;
     console.time(label);
-    const ingestPayload = {
-      ...payload,
-      runId,
-      gcsUri,
-    };
-    const out = await runAutoIngest(ingestPayload);
+    const ingestPayload = { ...payload, runId, gcsUri };
+    let out;
+    try {
+      out = await runAutoIngest(ingestPayload);
+    } catch (err) {
+      try {
+        await db.query(
+          `UPDATE public.ingest_run_logs
+              SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
+            WHERE id = $1`,
+          [ runId, Date.now() - startedAt, String(err?.message || err) ]
+        );
+      } catch (_) {}
+      console.timeEnd(label);
+      if (!res.headersSent) return res.status(500).json({ ok:false, error:String(err?.message||err) });
+      console.warn('[ingest-run post-ACK error]', String(err?.message || err));
+      return;
+    }
     console.timeEnd(label);
 
-    await db.query(
-      `UPDATE public.ingest_run_logs
-          SET finished_at = now(),
-              duration_ms = $2,
-              status = 'SUCCEEDED',
-              final_table = $3,
-              final_family = $4,
-              final_brand = $5,
-              final_code  = $6,
-              final_datasheet = $7
-        WHERE id = $1`,
-      [ runId, (out?.ms ?? (Date.now() - startedAt)),
-        out?.specs_table || null,
-        out?.family || out?.family_slug || null,
-        out?.brand || null,
-        (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
-        out?.datasheet_uri || gcsUri ]
-    );
+    // B-2) 성공 업데이트: 여기서 오류 나도 응답은 200 유지(로그만)
+    try {
+      await db.query(
+        `UPDATE public.ingest_run_logs
+            SET finished_at = now(),
+                duration_ms = $2,
+                status = 'SUCCEEDED',
+                final_table = $3,
+                final_family = $4,
+                final_brand = $5,
+                final_code  = $6,
+                final_datasheet = $7
+          WHERE id = $1`,
+        [ runId, (out?.ms ?? (Date.now() - startedAt)),
+          out?.specs_table || null,
+          out?.family || out?.family_slug || null,
+          out?.brand || null,
+          (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
+          out?.datasheet_uri || gcsUri ]
+      );
+    } catch (err2) {
+      console.error('[ingest-run update SUCCEEDED failed]', err2?.message || err2);
+    }
 
     return res.json({ ok:true, run_id: runId });
-  } catch (e) {
-    await db.query(
-      `UPDATE public.ingest_run_logs
-          SET finished_at = now(), duration_ms = $2, status = 'FAILED', error_message = $3
-        WHERE id = $1`,
-      [ runIdFromClient || payload?.runId || null, Date.now() - startedAt, String(e?.message || e) ]
-    );
-    console.error('[ingest-run failed]', e?.message || e);
-    if (!res.headersSent) {
-      return res.status(500).json({ ok:false, error:String(e?.message||e) });
-    }
-    console.warn('[ingest-run post-ACK error]', String(e?.message || e));
-    return;
   } finally {
-    clearTimeout(killer);
+    if (killer) clearTimeout(killer);
   }
 }
 

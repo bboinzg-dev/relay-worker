@@ -288,7 +288,17 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint = nu
 
   if (!out.length) for (const c of codes.slice(0, MAX_PARTS)) out.push({ code: c, verified_in_doc: true });
 
-  return { brand, rows: out.slice(0, MAX_PARTS), text: fullText };
+  const tableList = Array.isArray(docai?.tables) ? docai.tables : [];
+  const codeList = codes.slice(0, MAX_PARTS);
+
+  return {
+    brand,
+    rows: out.slice(0, MAX_PARTS),
+    text: fullText,
+    tables: tableList,
+    codes: codeList,
+    mpn_list: codeList,
+  };
 }
 
 module.exports = { extractPartsAndSpecsFromPdf };

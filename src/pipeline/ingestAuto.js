@@ -27,22 +27,42 @@ const BASE_KEYS = new Set([
   'cover','verified_in_doc','updated_at'
 ]);
 
+const PN_CANDIDATE_RE = /\b[A-Z0-9][A-Z0-9\-_/\.]{3,29}[A-Z0-9]\b/gi;
+const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
+
+function escapeRegex(str) {
+  return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function textContainsExact(text, pn) {
+  if (!text || !pn) return false;
+  const pattern = escapeRegex(String(pn).trim());
+  if (!pattern) return false;
+  const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
+  return re.test(String(text));
+}
+
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
 
 function harvestMpnCandidates(text, series){
-  const hay = String(text||'');
+  const hay = String(text || '');
   if (!hay) return [];
-  const ser = String(series||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
-  const lines = hay.split(/\n+/);
-  const near = [];
-  for (const ln of lines){
-    if (/ordering|part\s*number|order code|品番|型番/i.test(ln)) near.push(ln);
+  const ser = String(series || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const seen = new Set();
+  const out = [];
+  PN_CANDIDATE_RE.lastIndex = 0;
+  let match;
+  while ((match = PN_CANDIDATE_RE.exec(hay)) != null) {
+    const raw = match[0];
+    if (!raw) continue;
+    if (PN_BLACKLIST_RE.test(raw)) continue;
+    const norm = raw.toUpperCase();
+    if (ser && norm && !norm.startsWith(ser)) continue;
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    out.push(raw.trim());
   }
-  const src = (near.length? near.join(' ') : hay).toUpperCase();
-  const rx = ser ? new RegExp(`\\b${ser}[A-Z0-9\\-]+\\b`,'g') : /\b[A-Z][A-Z0-9\-]{3,}\b/g;
-  const set = new Set();
-  let m; while((m = rx.exec(src))) set.add(m[0]);
-  return [...set];
+  return out;
 }
 
 // DB 컬럼 타입 조회 (fallback용)
@@ -78,54 +98,94 @@ function coerceNumeric(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-function pickSkuListFromTables(extracted = {}) {
-  const out = new Set();
-  const HEAD_RE = /(part\s*no\.?|ordering\s*information|part\s*number)/i;
-  for (const t of (extracted.tables || [])) {
-    if (!t) continue;
-    const headers = Array.isArray(t.headers) ? t.headers : [];
-    const head = headers.join(' ').trim();
-    if (!HEAD_RE.test(head)) continue;
-    let partIdx = 0;
-    const idx = headers.findIndex((h) => /part\s*no\.?/i.test(String(h || '')));
-    if (idx >= 0) partIdx = idx;
-    for (const row of (t.rows || [])) {
-      if (!Array.isArray(row)) continue;
-      const cand = String(row[partIdx] || '').trim();
-      if (/^[A-Z0-9][A-Z0-9\-_/\.]{3,}$/i.test(cand)) out.add(cand);
-    }
-  }
-  return [...out];
+function normTableText(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .replace(/[–—−]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-function expandFromCodeSystem(extracted, bp) {
+function pickSkuListFromTables(extracted = {}) {
+  const tables = Array.isArray(extracted.tables) ? extracted.tables : [];
+  if (!tables.length) return [];
+
+  const PN_HEADER = /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|catalog\s*(?:no\.?|number)|model|品番|型式|형명|주문\s*번호|order(?:ing)?\s*code)/i;
+  const TABLE_HINT = /(ordering|part\s*number|type\s*number|catalog|selection|list\s*of\s*types|品番|型式|형명)/i;
+
+  const set = new Set();
+  for (const table of tables) {
+    if (!table || typeof table !== 'object') continue;
+    const headers = Array.isArray(table.headers) ? table.headers : [];
+    if (!headers.length) continue;
+    const headerNorms = headers.map((h) => normTableText(h));
+    if (!headerNorms.length) continue;
+    const headerText = headerNorms.join(' ');
+    if (!TABLE_HINT.test(headerText) && !headerNorms.some((h) => PN_HEADER.test(h))) continue;
+
+    const pnIndexes = headerNorms
+      .map((h, idx) => (PN_HEADER.test(h) ? idx : -1))
+      .filter((idx) => idx >= 0);
+    if (!pnIndexes.length) continue;
+
+    for (const row of Array.isArray(table.rows) ? table.rows : []) {
+      if (!Array.isArray(row)) continue;
+      for (const idx of pnIndexes) {
+        const cell = normTableText(row[idx]);
+        if (!cell) continue;
+        PN_CANDIDATE_RE.lastIndex = 0;
+        let m;
+        while ((m = PN_CANDIDATE_RE.exec(cell)) != null) {
+          const raw = m[0];
+          if (!raw) continue;
+          if (PN_BLACKLIST_RE.test(raw)) continue;
+          set.add(raw.trim());
+        }
+      }
+    }
+  }
+
+  return Array.from(set);
+}
+
+function expandFromCodeSystem(extracted, bp, docText = '') {
   const tpl = bp?.fields?.code_template;
   const vars = bp?.fields?.code_vars;
   if (!tpl || !vars) return [];
+  const haystack = String(docText || '');
+  if (!haystack.trim()) return [];
 
   const keys = Object.keys(vars);
-  const out = [];
+  const out = new Set();
+  const MAX_EXPANSION = 400;
   function dfs(i, ctx) {
     if (i >= keys.length) {
       let code = tpl;
       for (const k of Object.keys(ctx)) {
         const v = ctx[k];
-        code = code.replace(new RegExp(`\\{${k}(:[^}]*)?\\}`,'g'), (_, fmt) => {
+        code = code.replace(new RegExp(`\\{${k}(:[^}]*)?\\}`, 'g'), (_, fmt) => {
           if (!fmt) return String(v);
           const m = fmt.match(/^:0(\d+)d$/);
           if (m) return String(v).padStart(Number(m[1]), '0');
           return String(v);
         });
       }
-      out.push(code);
+      const cleaned = String(code || '').trim();
+      if (!cleaned) return;
+      if (!textContainsExact(haystack, cleaned)) return;
+      if (PN_BLACKLIST_RE.test(cleaned)) return;
+      out.add(cleaned);
       return;
     }
     const k = keys[i];
     const list = Array.isArray(vars[k]) ? vars[k] : [];
-    for (const v of list) dfs(i + 1, { ...ctx, [k]: v });
+    for (const v of list) {
+      if (out.size >= MAX_EXPANSION) break;
+      dfs(i + 1, { ...ctx, [k]: v });
+    }
   }
   dfs(0, {});
-  return out;
+  return Array.from(out).slice(0, MAX_EXPANSION);
 }
 
 function applyCodeRules(code, out, rules, colTypes) {
@@ -506,7 +566,8 @@ async function runAutoIngest(input = {}) {
   let codes = [];
   if (!code) {
     const skuFromTable = pickSkuListFromTables(extracted);
-    codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint);
+    const docText = extracted?.text || previewText || '';
+    codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint, docText);
     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);

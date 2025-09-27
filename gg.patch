@@ -1,104 +1,132 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 7c30be2ea0520173522e9b53807170a38a5ab1d9..f887d805d8a7e12340fd1e73f739c99586849219 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -644,87 +644,97 @@ async function runAutoIngest({
-       seenSeed.add(normed);
-       seeds.push(str);
-     };
-     pushSeed(row.code);
-     pushSeed(row.mpn);
-     pushSeed(row.part_number);
-     pushSeed(row.part_no);
+diff --git a/server.js b/server.js
+index 8364d0fe380ec90a8030b914aa788b9f1d9dd01f..d31951c5034012b6cad9cdb5dc8c88d651290050 100644
+--- a/server.js
++++ b/server.js
+@@ -28,52 +28,52 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
+  let _queuePath = null;
+  function getTasks() {
+    if (!_tasks) {
+     // 글로벌 엔드포인트 + REST fallback(HTTP/1)
+     _tasks = new CloudTasksClient({ fallback: true });
+      _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
+    }
+    return { tasks: _tasks, queuePath: _queuePath };
+  }
  
-     let mpn = seeds.length ? seeds[0] : '';
-     if (!mpn && candidateMap.length) mpn = candidateMap[0].raw;
-     mpn = String(mpn || '').trim();
-     if (!mpn) continue;
-     const mpnNorm = normalizeCode(mpn);
-     if (!mpnNorm || seenCodes.has(mpnNorm)) continue;
-     seenCodes.add(mpnNorm);
+  async function enqueueIngestRun(payload) {
+    const { tasks, queuePath } = getTasks();
+      if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
+    const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
  
-     const rec = {};
-     rec.brand = row.brand || brandName;
-     rec.code = mpn;
-     rec.series_code = row.series_code ?? row.series ?? baseSeries ?? null;
-     if (row.series != null && physicalCols.has('series')) rec.series = row.series;
-     rec.datasheet_uri = row.datasheet_uri || gcsUri;
-     if (row.datasheet_url) rec.datasheet_url = row.datasheet_url;
-     else if (rec.datasheet_uri && rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
-     if (row.mfr_full != null) rec.mfr_full = row.mfr_full;
--    const verified = row.verified_in_doc ?? (candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm));
-+    let verified;
-+    if (row.verified_in_doc != null) {
-+      if (typeof row.verified_in_doc === 'string') {
-+        verified = row.verified_in_doc.trim().toLowerCase() === 'true';
-+      } else {
-+        verified = Boolean(row.verified_in_doc);
-+      }
-+    } else {
-+      verified = candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm);
-+    }
-     rec.verified_in_doc = Boolean(verified);
-     rec.image_uri = row.image_uri || coverUri || null;
-     if (coverUri && rec.cover == null) rec.cover = coverUri;
-     const displayName = row.display_name || row.displayname || `${rec.brand} ${mpn}`;
-     rec.display_name = displayName;
-     if (rec.displayname == null && displayName != null) rec.displayname = displayName;
-     rec.updated_at = now;
+   const task = {
+     httpRequest: {
+       httpMethod: 'POST',
+       url: WORKER_TASK_URL,
+       headers: { 'Content-Type': 'application/json' },
+       body: Buffer.from(JSON.stringify(payload)).toString('base64'),
+       ...(TASKS_INVOKER_SA
+         ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
+         : {}),
+     },
+-    // Cloud Tasks REST Duration 문자열(15분) — HTTP 타스크 허용 범위 내 고정 값
+-    dispatchDeadline: '900s',
++    // Cloud Tasks gRPC Duration 객체(15분) — HTTP 타스크 허용 범위 내 고정 값
++    dispatchDeadline: { seconds: 900 },
+   };
  
-     for (const [rawKey, rawValue] of Object.entries(row)) {
-       const key = String(rawKey || '').trim();
-       if (!key) continue;
-       const lower = key.toLowerCase();
-       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
-       if (physicalCols.has(lower) || allowedSet.has(lower) || variantSet.has(lower)) {
-         rec[lower] = rawValue;
+    // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
+    await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
+  }
+ 
+ 
+ const app = express();
+ 
+ /* ---------------- Mount modular routers (keep existing) ---------------- */
+ try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
+ try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
+ try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
+ try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
+ try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
+ try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
+ try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
+ 
+ 
+ 
+ /* NOTE: The parts router already exists in your repo; keep it mounted. */
+ try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
+ 
+ app.use(bodyParser.json({ limit: '25mb' }));
+ app.use(bodyParser.urlencoded({ extended: true }));
+diff --git a/server.js b/server.js
+index 8364d0fe380ec90a8030b914aa788b9f1d9dd01f..d31951c5034012b6cad9cdb5dc8c88d651290050 100644
+--- a/server.js
++++ b/server.js
+@@ -415,57 +415,63 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
+       await ensureSpecsTable(table, it.fields || {});
+       const row = await upsertByBrandCode(table, {
+         brand: it.brand, code: it.code, series: it.series, display_name: it.display_name,
+         family_slug: it.family_slug, datasheet_uri: it.datasheet_uri, cover: it.cover,
+         source_gcs_uri: it.source_gcs_uri, raw_json: it.raw_json || null,
+         ...(it.values || {}),
+       });
+       out.push({ table, row });
+     }
+     res.json({ ok:true, count: out.length, items: out });
+   } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'bulk ingest failed', detail:String(e?.message || e) }); }
+ });
+ 
+ app.post('/ingest/auto', requireSession, async (req, res) => {
+   try {
+     const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name, family_slug } = req.body || {};
+     const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
+     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
+     const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
+     res.json(result);
+   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
+ });
+ 
+ async function handleWorkerIngest(req, res) {
+   const startedAt = Date.now();
+-  const taskName = req.get('X-Cloud-Tasks-TaskName') || null;
+-  const retryCnt = Number(req.get('X-Cloud-Tasks-TaskRetryCount') || 0);
++  const taskName =
++    req.get('X-CloudTasks-TaskName') ||
++    req.get('X-Cloud-Tasks-TaskName') ||
++    null;
++  const retryCnt = Number(
++    req.get('X-CloudTasks-TaskRetryCount') ||
++    req.get('X-Cloud-Tasks-TaskRetryCount') ||
++    0
++  );
+   const payload = req.body || {};
+-  const runIdFromPayload = payload.runId || null;
+-  const isTaskInvocation = Boolean(taskName) || runIdFromPayload != null;
++  const fromTasks = Boolean(taskName);
+ 
+-  if (!isTaskInvocation) {
++  if (!fromTasks) {
+     try {
+       const { gcsUri, gcsPdfUri, brand, code, series, display_name, family_slug = null } = payload;
+       const uri = gcsUri || gcsPdfUri;
+       if (!uri || !/^gs:\/\//i.test(uri)) {
+         await db.query(
+           `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status, error_message)
+              VALUES ($1,$2,$3,'FAILED',$4)`,
+           [taskName, retryCnt, uri || '', 'gcsUri required (gs://...)']
+         );
+         return res.status(400).json({ ok:false, error:'gcsUri required (gs://...)' });
        }
-     }
  
-     if (blueprint?.code_rules) applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
-     records.push(rec);
-   }
+       const { rows: logRows } = await db.query(
+         `INSERT INTO public.ingest_run_logs (task_name, retry_count, gcs_uri, status)
+            VALUES ($1,$2,$3,'PROCESSING') RETURNING id`,
+         [taskName, retryCnt, uri]
+       );
+       const runId = logRows[0]?.id;
  
-   if (!records.length && candidateMap.length) {
-     const fallbackSeries = baseSeries || null;
-     for (const cand of candidateMap) {
-       const norm = cand.norm;
-       if (seenCodes.has(norm)) continue;
-       seenCodes.add(norm);
-+      const verified = mpnNormFromDoc.has(norm);
-       const rec = {
-         brand: brandName,
-         code: cand.raw,
-         series_code: fallbackSeries,
-         datasheet_uri: gcsUri,
-         image_uri: coverUri || null,
-         display_name: `${brandName} ${cand.raw}`,
--        verified_in_doc: true,
-+        verified_in_doc: verified,
-         updated_at: now,
-       };
-       if (coverUri) rec.cover = coverUri;
-       if (physicalCols.has('series') && fallbackSeries != null) rec.series = fallbackSeries;
-       if (rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
-       if (rec.display_name != null && rec.displayname == null) rec.displayname = rec.display_name;
-       records.push(rec);
-     }
-   }
+       res.status(202).json({ ok: true, run_id: runId });
  
-   // 최후 폴백 줄이기
-   if (!records.length) {
-     const tmp = 'TMP_' + (Math.random().toString(16).slice(2, 8)).toUpperCase();
-     records.push({
-       family_slug: family,
-       brand: brand || extracted.brand || 'unknown',
-       code: tmp,
-       series_code: series || code || null,
-       datasheet_uri: gcsUri,
-       image_uri: coverUri || null,
-       cover: coverUri || null,
-       display_name: `${brand || extracted.brand || 'unknown'} ${tmp}`,
-       displayname: `${brand || extracted.brand || 'unknown'} ${tmp}`,
-       datasheet_url: gcsUri,
-       verified_in_doc: false,
+       enqueueIngestRun({ runId, gcsUri: uri, brand, code, series, display_name, family_slug })
+         .catch(async (err) => {
+           try {
+             await db.query(

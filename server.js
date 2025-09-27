@@ -50,8 +50,8 @@ const { runAutoIngest } = require('./src/pipeline/ingestAuto');
         ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
         : {}),
     },
-    // Cloud Tasks REST Duration 문자열(15분) — HTTP 타스크 허용 범위 내 고정 값
-    dispatchDeadline: '900s',
+    // Cloud Tasks gRPC Duration 객체(15분) — HTTP 타스크 허용 범위 내 고정 값
+    dispatchDeadline: { seconds: 900 },
   };
 
    // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
@@ -437,13 +437,19 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
 
 async function handleWorkerIngest(req, res) {
   const startedAt = Date.now();
-  const taskName = req.get('X-Cloud-Tasks-TaskName') || null;
-  const retryCnt = Number(req.get('X-Cloud-Tasks-TaskRetryCount') || 0);
+  const taskName =
+    req.get('X-CloudTasks-TaskName') ||
+    req.get('X-Cloud-Tasks-TaskName') ||
+    null;
+  const retryCnt = Number(
+    req.get('X-CloudTasks-TaskRetryCount') ||
+    req.get('X-Cloud-Tasks-TaskRetryCount') ||
+    0
+  );
   const payload = req.body || {};
-  const runIdFromPayload = payload.runId || null;
-  const isTaskInvocation = Boolean(taskName) || runIdFromPayload != null;
+  const fromTasks = Boolean(taskName);
 
-  if (!isTaskInvocation) {
+  if (!fromTasks) {
     try {
       const { gcsUri, gcsPdfUri, brand, code, series, display_name, family_slug = null } = payload;
       const uri = gcsUri || gcsPdfUri;

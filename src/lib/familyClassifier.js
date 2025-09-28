@@ -57,7 +57,11 @@ async function decideFamily({ db, docText, familyHint = 'auto' }) {
 
   // 2) 후보 로딩(임베딩+키워드)
   const { rows } = await db.query(`
-    SELECT d.family_slug, d.embedding::text AS emb, d.keywords, d.negative_keywords
+    SELECT d.family_slug,
+           d.confusion_group,
+           d.embedding::text AS emb,
+           d.keywords,
+           d.negative_keywords
       FROM public.component_family_descriptor d
      WHERE d.embedding IS NOT NULL
   `);
@@ -83,11 +87,9 @@ async function decideFamily({ db, docText, familyHint = 'auto' }) {
   let top1 = scored[0], top2 = scored[1];
 
   // 4) 마진 부족 시, "릴레이 계열" 제한 재분류(1회)
-  const looksLikeRelay = /relay/i.test(docText);
-  const isRelayTop = top1.family_slug.startsWith('relay_');
-  if ((top1.score - top2.score) < MARGIN_MIN && (looksLikeRelay || isRelayTop)) {
-    const relayOnly = rows.filter(r => r.family_slug.startsWith('relay_'));
-    const rescored = scoreAll(relayOnly);
+  if ((top1.score - top2.score) < MARGIN_MIN && top1.confusion_group) {
+    const sameGroup = rows.filter(r => r.confusion_group === top1.confusion_group);
+    const rescored = scoreAll(sameGroup);
     const t1 = rescored[0], t2 = rescored[1];
     if (t1 && (t1.score - (t2?.score ?? -999)) >= (top1.score - top2.score)) {
       scored = rescored; top1 = t1; top2 = t2;

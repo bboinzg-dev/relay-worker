@@ -1,153 +1,116 @@
-diff --git a/src/utils/extract.js b/src/utils/extract.js
-index a166fd08726e03e788f1d1eab8f8f47865b96c3e..b60c40ba5921a28304b765263750f324c4d9211c 100644
---- a/src/utils/extract.js
-+++ b/src/utils/extract.js
-@@ -1,65 +1,135 @@
- 'use strict';
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index db4f8e1f5e405928f7e4b4d098aa6ba3463fee49..b75a0332f1b5c725fb4f91fc43a03b34a8a2ea33 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -6,51 +6,51 @@ const { getColumnsOf } = require('./ensure-spec-columns');
+ const META_KEYS = new Set([
+   'family_slug',
+   'brand',
+   'brand_norm',
+   'pn',
+   'pn_norm',
+   'code',
+   'code_norm',
+   'mfr_full',
+   'datasheet_uri',
+   'verified_in_doc',
+   'display_name',
+   'displayname',
+   'image_uri',
+   'cover',
+   'series',
+   'series_code',
+   'raw_json',
+   'created_at',
+   'updated_at',
+ ]);
  
- const { Storage } = require('@google-cloud/storage');
- const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
+ const CONFLICT_KEYS = ['brand_norm', 'code_norm'];
  
-+let pdfParse;
-+try { pdfParse = require('pdf-parse'); } catch (_) { pdfParse = null; }
-+
- const storage = new Storage();
+ const CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._\-/]{1,127}$/;
+-const CODE_FORBIDDEN_RE = /(sample|prototype|dummy|test|pdf|font|xref)/i;
++const CODE_FORBIDDEN_RE = /(sample|prototype|dummy|test|pdf|font|xref|type0|dfonttype0c|aesv2|y62)/i;
  
-+const EXTRACT_TIMEOUT_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 60_000);
-+const INLINE_PAGE_LIMIT = Number(process.env.MAX_DOC_PAGES_INLINE || 15);
-+
- function parseGsUri(gsUri) {
-   const m = String(gsUri).match(/^gs:\/\/([^/]+)\/(.+)$/);
-   if (!m) throw new Error('invalid gcs uri: ' + gsUri);
-   return { bucket: m[1], name: m[2] };
+ const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const SCALE_MAP = {
+   k: 1e3,
+   m: 1e-3,
+   g: 1e9,
+   'µ': 1e-6,
+   u: 1e-6,
+   n: 1e-9,
+   p: 1e-12,
+ };
+ 
+ function normKey(key) {
+   return String(key || '')
+     .trim()
+     .toLowerCase();
  }
  
- async function downloadGcs(gsUri) {
-   const { bucket, name } = parseGsUri(gsUri);
-   const [buf] = await storage.bucket(bucket).file(name).download();
-   return buf;
- }
+ function isNumericType(type = '') {
+   const t = String(type || '').toLowerCase();
+   return (
+     t.includes('int') ||
+     t.includes('numeric') ||
+     t.includes('decimal') ||
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index db4f8e1f5e405928f7e4b4d098aa6ba3463fee49..b75a0332f1b5c725fb4f91fc43a03b34a8a2ea33 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -417,50 +417,54 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+       const rec = {};
+       for (const [key, value] of Object.entries(row || {})) {
+         rec[normKey(key)] = value;
+       }
  
- function samplePages(total, k) {
--  if (!Number.isFinite(total) || total <= 0) return Array.from({ length: k }, (_,i)=>i+1);
--  if (total <= k) return Array.from({ length: total }, (_,i)=>i+1);
--  const pick = new Set([1,2,3, total-1, total]);
-+  if (!Number.isFinite(total) || total <= 0) return Array.from({ length: k }, (_, i) => i + 1);
-+  if (total <= k) return Array.from({ length: total }, (_, i) => i + 1);
-+  const pick = new Set([1, 2, 3, total - 1, total]);
-   while (pick.size < k) {
--    const pos = Math.max(1, Math.min(total, Math.round((pick.size/(k+1))*total)));
-+    const pos = Math.max(1, Math.min(total, Math.round((pick.size / (k + 1)) * total)));
-     pick.add(pos);
-   }
--  return Array.from(pick).sort((a,b)=>a-b).slice(0,k);
-+  return Array.from(pick).sort((a, b) => a - b).slice(0, k);
-+}
-+
-+function withTimeout(promise, timeoutMs, label) {
-+  const ms = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : EXTRACT_TIMEOUT_MS;
-+  return Promise.race([
-+    promise,
-+    new Promise((_, reject) => {
-+      const t = setTimeout(() => {
-+        clearTimeout(t);
-+        reject(new Error(`${label || 'operation'}_timeout`));
-+      }, ms);
-+    }),
-+  ]);
-+}
-+
-+async function tryInlineExtract(gsUri, { maxPages = INLINE_PAGE_LIMIT } = {}) {
-+  let pages = 0;
-+  if (!gsUri) return { text: '', pages, note: 'missing_uri' };
-+
-+  try {
-+    const buf = await downloadGcs(gsUri);
-+    if (!pdfParse) {
-+      return { text: '', pages, note: 'pdf_parse_unavailable' };
-+    }
-+
-+    const parsed = await withTimeout(pdfParse(buf), EXTRACT_TIMEOUT_MS, 'pdf_parse');
-+    const pageCount = Number(parsed?.numpages || 0);
-+    pages = Number.isFinite(pageCount) ? pageCount : 0;
-+
-+    const raw = String(parsed?.text || '');
-+    if (!raw) {
-+      return { text: '', pages, note: 'empty-inline' };
-+    }
-+
-+    const limit = Number.isFinite(maxPages) && maxPages > 0 ? maxPages : INLINE_PAGE_LIMIT;
-+    if (!limit || !pages || pages <= limit) {
-+      return { text: raw, pages, note: 'inline_pdf_parse' };
-+    }
-+
-+    const segments = raw.split('\f');
-+    const clipped = segments.slice(0, limit).join('\n');
-+    return { text: clipped || raw, pages, note: 'inline_pdf_parse_truncated' };
-+  } catch (err) {
-+    return { text: '', pages, note: `inline_error:${err?.message || err}` };
-+  }
- }
+       const brandInfo = normalizeBrandValue(rec.brand ?? rec.brand_norm ?? '', aliasMap);
+       if (!brandInfo.ok) {
+         if (brandInfo.reason === 'brand_not_allowed' && brandInfo.detail) {
+           console.warn('[persist] brand alias not found:', brandInfo.detail);
+         }
+         result.skipped.push({ reason: brandInfo.reason, detail: brandInfo.detail || null });
+         continue;
+       }
+       rec.brand = brandInfo.brand;
+       rec.brand_norm = brandInfo.brandNorm;
  
- // DocAI online imageless: 30p까지, 초과 에러 시 15p 샘플링
- async function docaiProcessSmart(gsUri) {
--  const project   = process.env.DOCAI_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
--  const location  = process.env.DOCAI_LOCATION || 'us';
-+  const project = process.env.DOCAI_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-+  const location = process.env.DOCAI_LOCATION || 'us';
-   const processor = process.env.DOCAI_PROCESSOR_ID;
-   if (!project || !processor) throw new Error('DocAI env missing');
+       buildPnIfMissing(rec, pnTemplate);
  
-   const client = new DocumentProcessorServiceClient({ apiEndpoint: `${location}-documentai.googleapis.com` });
-   const name = `projects/${project}/locations/${location}/processors/${processor}`;
- 
-   const buf = await downloadGcs(gsUri);
-   try {
--    const [r] = await client.processDocument({ name, rawDocument: { content: buf, mimeType: 'application/pdf' }, imagelessMode: true, skipHumanReview: true });
--    return { text: r?.document?.text || '', pages: r?.document?.pages || [] };
-+    const [r] = await client.processDocument({
-+      name,
-+      rawDocument: { content: buf, mimeType: 'application/pdf' },
-+      imagelessMode: true,
-+      skipHumanReview: true,
-+    });
-+    return { text: r?.document?.text || '', pages: r?.document?.pages || [], note: 'docai_imageless' };
-   } catch (e) {
-     const msg = String(e?.message || e);
-     if (!/supports up to 15 pages|exceed the limit: 15/i.test(msg)) throw e;
-     let total = 0;
--    try { const pdf = require('pdf-parse'); const p = await pdf(buf); total = Number(p?.numpages || 0); } catch {}
-+    try {
-+      if (pdfParse) {
-+        const parsed = await pdfParse(buf);
-+        total = Number(parsed?.numpages || 0);
+       let codeValue = rec.code ?? rec.pn ?? null;
+       if (typeof codeValue === 'string') codeValue = codeValue.trim();
+       else codeValue = codeValue == null ? '' : String(codeValue).trim();
+       if (!codeValue) {
+         result.skipped.push({ reason: 'missing_code' });
+         continue;
+       }
++      if (/^[0-9A-F]{12,}$/i.test(codeValue)) {
++        result.skipped.push({ reason: 'invalid_code' });
++        continue;
 +      }
-+    } catch (_) {}
-     const pages = samplePages(total || 30, 15);
-     const [r2] = await client.processDocument({
-       name,
-       rawDocument: { content: buf, mimeType: 'application/pdf' },
-       processOptions: { individualPageSelector: { pages } },
-       skipHumanReview: true,
-     });
--    return { text: r2?.document?.text || '', pages: r2?.document?.pages || [] };
-+    return { text: r2?.document?.text || '', pages: r2?.document?.pages || [], note: 'docai_sampled' };
-   }
- }
+       if (!CODE_PATTERN.test(codeValue) || CODE_FORBIDDEN_RE.test(codeValue)) {
+         result.skipped.push({ reason: 'invalid_code' });
+         continue;
+       }
+       rec.code = codeValue;
+       const codeNorm = normKey(codeValue);
+       if (!codeNorm) {
+         result.skipped.push({ reason: 'invalid_code' });
+         continue;
+       }
+       rec.code_norm = codeNorm;
  
-+async function processWithDocAI(gsUri, { timeoutMs = EXTRACT_TIMEOUT_MS } = {}) {
-+  return withTimeout(docaiProcessSmart(gsUri), timeoutMs, 'docai_process');
-+}
-+
- async function extractText(gsUri) {
--  return await docaiProcessSmart(gsUri);
-+  const inline = await tryInlineExtract(gsUri, { maxPages: INLINE_PAGE_LIMIT });
-+  const textContent = inline?.text || '';
-+  if (!textContent || textContent.length < 1000 || /empty-text|no_rows_extracted/i.test(String(inline?.note || ''))) {
-+    return await processWithDocAI(gsUri, { timeoutMs: EXTRACT_TIMEOUT_MS });
-+  }
-+  return inline;
- }
+       let pnValue = String(rec.pn || '').trim();
+       if (!pnValue) {
+         rec.pn = codeValue;
+         pnValue = codeValue;
+       }
+       rec.pn = pnValue;
+       const pnNorm = normKey(rec.pn);
+       if (!pnNorm) {
+         result.skipped.push({ reason: 'missing_pn' });
+         continue;
+       }
+       if (physicalCols.has('pn_norm')) rec.pn_norm = pnNorm;
  
--module.exports = { extractText, parseGsUri };
-+module.exports = { extractText, parseGsUri, tryInlineExtract, processWithDocAI };

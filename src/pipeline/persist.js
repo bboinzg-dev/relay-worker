@@ -28,7 +28,7 @@ const META_KEYS = new Set([
 const CONFLICT_KEYS = ['brand_norm', 'code_norm'];
 
 const CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._\-/]{1,127}$/;
-const CODE_FORBIDDEN_RE = /(sample|prototype|dummy|test|pdf|font|xref)/i;
+const CODE_FORBIDDEN_RE = /(sample|prototype|dummy|test|pdf|font|xref|type0|dfonttype0c|aesv2|y62)/i;
 
 const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
 const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
@@ -437,6 +437,10 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       else codeValue = codeValue == null ? '' : String(codeValue).trim();
       if (!codeValue) {
         result.skipped.push({ reason: 'missing_code' });
+        continue;
+      }
+      if (/^[0-9A-F]{12,}$/i.test(codeValue)) {
+        result.skipped.push({ reason: 'invalid_code' });
         continue;
       }
       if (!CODE_PATTERN.test(codeValue) || CODE_FORBIDDEN_RE.test(codeValue)) {

@@ -9,6 +9,7 @@ const execFileP = promisify(execFile);
 
 const db = require('../utils/db');
 const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
+const { extractText } = require('../utils/extract');
 const { getBlueprint } = require('../utils/blueprint');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
@@ -537,6 +538,12 @@ async function runAutoIngest(input = {}) {
   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
   let previewText = '';
   try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
+  if (!previewText || previewText.length < 1000) {
+    try {
+      const r = await extractText(gcsUri);
+      previewText = r?.text || previewText;
+    } catch {}
+  }
   let candidates = [];
   try {
     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
@@ -553,7 +560,7 @@ async function runAutoIngest(input = {}) {
           try { raw = await readText(gcsUri, PREVIEW_BYTES); } catch { raw = ''; }
         }
         if (raw && raw.length > 1000) {
-          const fieldsJson = Object.fromEntries((allowedKeys||[]).map(k => [k, 'text']));
+          const fieldsJson = blueprint?.fields || {};
           const vals = await extractFields(raw, code || '', fieldsJson);
           extracted = {
             brand: brand || 'unknown',

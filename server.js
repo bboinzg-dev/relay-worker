@@ -306,9 +306,20 @@ app.get('/parts/detail', async (req, res) => {
 
   try {
     if (family) {
-      const r = await db.query(`SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]);
-      if (!r.rows[0]?.specs_table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
-      const row = await db.query(`SELECT * FROM public.${table} WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`, [brand, code]);
+      const r = await db.query(
+        `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+        [family]
+      );
+      const table = r.rows[0]?.specs_table;
+      if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
+      if (!/^[a-zA-Z0-9_]+$/.test(table)) {
+        console.error('[parts/detail] invalid table name', { table });
+        return res.status(500).json({ ok:false, error:'INVALID_TABLE' });
+      }
+      const row = await db.query(
+        `SELECT * FROM public.${table} WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
+        [brand, code]
+      );
       return row.rows[0]
         ? res.json({ ok:true, item: row.rows[0] })
         : res.status(404).json({ ok:false, error:'NOT_FOUND' });

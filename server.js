@@ -68,20 +68,6 @@ async function enqueueIngestRun(payload = {}) {
 
 const app = express();
 
-/* ---------------- Mount modular routers (keep existing) ---------------- */
-try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
-try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
-try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
-try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
-try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
-try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
-try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
-
-
-
-/* NOTE: The parts router already exists in your repo; keep it mounted. */
-try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
-
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.disable('x-powered-by');
@@ -150,6 +136,18 @@ app.use('/auth', authRouter);
 
 // (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
 app.post('/login', loginHandler);
+
+/* ---------------- Mount modular routers (after global middleware) ---------------- */
+try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
+try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
+try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
+try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
+try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
+try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
+try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
+
+/* NOTE: The parts router already exists in your repo; keep it mounted. */
+try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
 
 
 /* ---------------- Upload ---------------- */

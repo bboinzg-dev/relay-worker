@@ -510,6 +510,21 @@ async function runAutoIngest(input = {}) {
     : (Array.isArray(blueprint?.variant_keys)
       ? blueprint.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
       : []);
+  const pnTemplate = blueprint?.ingestOptions?.pn_template || blueprint?.ingestOptions?.pnTemplate || null;
+  const requiredFields = [];
+  if (blueprint?.fields && typeof blueprint.fields === 'object') {
+    for (const [fieldKey, meta] of Object.entries(blueprint.fields)) {
+      const isRequired = meta && typeof meta === 'object' && Boolean(meta.required);
+      if (!isRequired) continue;
+      const normalized = String(fieldKey || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, '');
+      if (normalized && !requiredFields.includes(normalized)) {
+        requiredFields.push(normalized);
+      }
+    }
+  }
 
   // -------- 공용 강제정규화 유틸 --------
 
@@ -813,7 +828,11 @@ async function runAutoIngest(input = {}) {
 
   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
   if (records.length) {
-    persistResult = await saveExtractedSpecs(qualified, family, records) || persistResult;
+    persistResult = await saveExtractedSpecs(qualified, family, records, {
+      pnTemplate,
+      requiredKeys: requiredFields,
+      coreSpecKeys: requiredFields,
+    }) || persistResult;
   } else {
     persistResult.skipped = [{ reason: 'missing_pn' }];
   }

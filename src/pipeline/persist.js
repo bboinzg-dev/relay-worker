@@ -25,7 +25,10 @@ const META_KEYS = new Set([
   'updated_at',
 ]);
 
-const CONFLICT_KEYS = ['brand_norm', 'pn'];
+const CONFLICT_KEYS = ['brand_norm', 'code_norm'];
+
+const CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._\-/]{1,127}$/;
+const CODE_FORBIDDEN_RE = /(sample|prototype|dummy|test|pdf|font|xref)/i;
 
 const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
 const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
@@ -108,6 +111,118 @@ function findRangeColumn(columnTypes, base, kind) {
     }
   }
   return null;
+}
+
+function normalizeBrandValue(raw, aliasMap) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) {
+    return { ok: false, brand: 'unknown', brandNorm: null, reason: 'missing_brand' };
+  }
+  const canonical = aliasMap.get(trimmed.toLowerCase());
+  if (!canonical) {
+    return { ok: false, brand: 'unknown', brandNorm: null, reason: 'brand_not_allowed', detail: trimmed };
+  }
+  const brand = String(canonical || '').trim();
+  const norm = normKey(brand);
+  if (!norm) {
+    return { ok: false, brand: 'unknown', brandNorm: null, reason: 'missing_brand' };
+  }
+  return { ok: true, brand, brandNorm: norm };
+}
+
+function applyPnTemplateOptions(value, optionStr) {
+  if (value == null) return value;
+  if (!optionStr) return value;
+  let out = String(value);
+  for (const token of String(optionStr).split(',').map((t) => t.trim()).filter(Boolean)) {
+    const [key, rawVal] = token.split('=').map((t) => t.trim());
+    if (!key) continue;
+    if (key === 'pad') {
+      const width = Number(rawVal);
+      if (Number.isFinite(width) && width > 0) out = out.padStart(width, '0');
+    }
+  }
+  return out;
+}
+
+function renderPnTemplate(template, record = {}) {
+  if (!template) return null;
+  let used = false;
+  const rendered = String(template).replace(/\{\{\s*([^}|]+?)(?:\|([^}]+))?\s*\}\}/g, (_, key, options) => {
+    const field = String(key || '').trim();
+    if (!field) return '';
+    const value = record[field];
+    if (value == null || value === '') return '';
+    used = true;
+    const applied = applyPnTemplateOptions(String(value), options);
+    return applied == null ? '' : String(applied);
+  });
+  const cleaned = rendered.replace(/\s+/g, '');
+  if (!used || !cleaned.trim()) return null;
+  return cleaned.trim();
+}
+
+function buildPnIfMissing(record = {}, pnTemplate) {
+  const existing = String(record.pn || '').trim();
+  if (existing) return;
+  const fromTemplate = renderPnTemplate(pnTemplate, record);
+  if (fromTemplate) {
+    record.pn = fromTemplate;
+    if (!record.code) record.code = fromTemplate;
+    return;
+  }
+  const code = String(record.code || '').trim();
+  if (code) record.pn = code;
+}
+
+function hasCoreSpecValue(value) {
+  if (value == null) return false;
+  if (Array.isArray(value)) return value.some((v) => hasCoreSpecValue(v));
+  if (typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  const str = String(value).trim();
+  return Boolean(str);
+}
+
+function hasCoreSpec(row, keys = [], candidateKeys = []) {
+  const primary = Array.isArray(keys) ? keys.filter(Boolean) : [];
+  const fallback = Array.isArray(candidateKeys) ? candidateKeys.filter(Boolean) : [];
+  const list = primary.length ? primary : fallback;
+  if (!list.length) {
+    for (const key of Object.keys(row || {})) {
+      const norm = normKey(key);
+      if (!norm || META_KEYS.has(norm)) continue;
+      if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
+    }
+    return false;
+  }
+  for (const key of list) {
+    const norm = normKey(key);
+    if (!norm) continue;
+    if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
+  }
+  return false;
+}
+
+function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
+  if (!row || typeof row !== 'object') {
+    return { ok: false, reason: 'empty_row' };
+  }
+  const brand = String(row.brand || '').trim().toLowerCase();
+  if (!brand || brand === 'unknown') {
+    return { ok: false, reason: 'missing_brand' };
+  }
+  const code = String(row.code || row.pn || '').trim();
+  if (!code) {
+    return { ok: false, reason: 'missing_code' };
+  }
+  if (!CODE_PATTERN.test(code) || CODE_FORBIDDEN_RE.test(code)) {
+    return { ok: false, reason: 'invalid_code' };
+  }
+  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys)) {
+    return { ok: false, reason: 'missing_core_spec' };
+  }
+  return { ok: true };
 }
 
 async function getColumnTypes(targetTable) {
@@ -220,7 +335,7 @@ async function ensureSchemaGuards(familySlug) {
   return { ok: true };
 }
 
-async function saveExtractedSpecs(targetTable, familySlug, rows = []) {
+async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = {}) {
   const result = { processed: 0, upserts: 0, written: [], skipped: [], warnings: [] };
   if (!rows.length) return result;
 
@@ -236,13 +351,22 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = []) {
     return result;
   }
 
-  if (!physicalCols.has('pn') || !physicalCols.has('brand_norm')) {
+  if (!physicalCols.has('pn') || !physicalCols.has('brand_norm') || !physicalCols.has('code_norm')) {
     result.skipped.push({ reason: 'schema_not_ready' });
     return result;
   }
 
   const columnTypes = await getColumnTypes(targetTable);
   const aliasMap = await loadManufacturerAliasMap();
+  const pnTemplate = typeof options.pnTemplate === 'string' && options.pnTemplate ? options.pnTemplate : null;
+  const requiredKeys = Array.isArray(options.requiredKeys)
+    ? options.requiredKeys.map((k) => normKey(k)).filter(Boolean)
+    : [];
+  const explicitCoreKeys = Array.isArray(options.coreSpecKeys)
+    ? options.coreSpecKeys.map((k) => normKey(k)).filter(Boolean)
+    : [];
+  const guardKeys = explicitCoreKeys.length ? explicitCoreKeys : requiredKeys;
+  let candidateSpecKeys = [];
 
   const allKeys = new Set();
   for (const meta of META_KEYS) {
@@ -267,6 +391,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = []) {
   }
 
   const colList = Array.from(allKeys).sort();
+  candidateSpecKeys = colList.filter((key) => !META_KEYS.has(key) && key !== 'raw_json');
   const placeholders = colList.map((_, i) => `$${i + 1}`).join(',');
 
   const updateCols = colList.filter((col) => !CONFLICT_KEYS.includes(col));
@@ -277,7 +402,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = []) {
   const sql = [
     `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
     `VALUES (${placeholders})`,
-    'ON CONFLICT (brand_norm, pn)',
+    'ON CONFLICT (brand_norm, code_norm)',
     updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
     'RETURNING pn',
   ].join('\n');
@@ -294,48 +419,67 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = []) {
         rec[normKey(key)] = value;
       }
 
-      const brandRaw = rec.brand ?? rec.brand_norm ?? '';
-      const brandTrim = String(brandRaw || '').trim();
-      if (!brandTrim || brandTrim.toLowerCase() === 'unknown') {
-        result.skipped.push({ reason: 'missing_brand' });
+      const brandInfo = normalizeBrandValue(rec.brand ?? rec.brand_norm ?? '', aliasMap);
+      if (!brandInfo.ok) {
+        if (brandInfo.reason === 'brand_not_allowed' && brandInfo.detail) {
+          console.warn('[persist] brand alias not found:', brandInfo.detail);
+        }
+        result.skipped.push({ reason: brandInfo.reason, detail: brandInfo.detail || null });
         continue;
       }
+      rec.brand = brandInfo.brand;
+      rec.brand_norm = brandInfo.brandNorm;
 
-      const canonical = aliasMap.get(brandTrim.toLowerCase()) || brandTrim;
-      rec.brand = canonical;
-      rec.brand_norm = normKey(canonical);
-      if (!rec.brand_norm) {
-        result.skipped.push({ reason: 'missing_brand' });
-        continue;
-      }
+      buildPnIfMissing(rec, pnTemplate);
 
-      const pnRaw = rec.pn ?? rec.code ?? null;
-      const pnTrim = typeof pnRaw === 'string' ? pnRaw.trim() : '';
-      if (!pnTrim) {
-        result.skipped.push({ reason: 'missing_pn' });
+      let codeValue = rec.code ?? rec.pn ?? null;
+      if (typeof codeValue === 'string') codeValue = codeValue.trim();
+      else codeValue = codeValue == null ? '' : String(codeValue).trim();
+      if (!codeValue) {
+        result.skipped.push({ reason: 'missing_code' });
         continue;
       }
-      rec.pn = pnTrim;
-      const pnNorm = normKey(pnTrim);
+      if (!CODE_PATTERN.test(codeValue) || CODE_FORBIDDEN_RE.test(codeValue)) {
+        result.skipped.push({ reason: 'invalid_code' });
+        continue;
+      }
+      rec.code = codeValue;
+      const codeNorm = normKey(codeValue);
+      if (!codeNorm) {
+        result.skipped.push({ reason: 'invalid_code' });
+        continue;
+      }
+      rec.code_norm = codeNorm;
+
+      let pnValue = String(rec.pn || '').trim();
+      if (!pnValue) {
+        rec.pn = codeValue;
+        pnValue = codeValue;
+      }
+      rec.pn = pnValue;
+      const pnNorm = normKey(rec.pn);
       if (!pnNorm) {
         result.skipped.push({ reason: 'missing_pn' });
         continue;
       }
+      if (physicalCols.has('pn_norm')) rec.pn_norm = pnNorm;
 
-      const naturalKey = `${rec.brand_norm}::${pnNorm}`;
+      const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });
+      if (!guard.ok) {
+        result.skipped.push({ reason: guard.reason, detail: guard.detail || null });
+        continue;
+      }
+
+      const naturalKey = `${rec.brand_norm}::${codeNorm}`;
       if (seenNatural.has(naturalKey)) {
         result.skipped.push({ reason: 'duplicate_code' });
         continue;
       }
       seenNatural.add(naturalKey);
 
-      if (physicalCols.has('pn_norm')) rec.pn_norm = pnNorm;
-      if (rec.code == null) rec.code = pnTrim;
-      if (physicalCols.has('code_norm')) rec.code_norm = normKey(rec.code);
-
       rec.family_slug = familySlug;
 
-      const display = rec.display_name || `${rec.brand} ${pnTrim}`;
+      const display = rec.display_name || `${rec.brand} ${rec.pn}`;
       rec.display_name = display;
       if (rec.displayname == null) rec.displayname = display;
 

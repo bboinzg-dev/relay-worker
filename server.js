@@ -24,6 +24,9 @@ const { generateRunId } = require('./src/utils/run-id');
  const WORKER_TASK_URL  = process.env.WORKER_TASK_URL  || 'https://<YOUR-RUN-URL>/api/worker/ingest';
  const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
 
+
+ try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
+
  // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
  let _tasks = null;
  let _queuePath = null;

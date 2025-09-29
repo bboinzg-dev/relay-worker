@@ -55,7 +55,7 @@ async function enqueueWorkerStep(payload = {}) {
   const scheduleDelaySeconds = Number.isFinite(Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
     ? Math.max(0, Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
     : 5;
-  const scheduledSeconds = Math.floor(Date.now() / 1000) + scheduleDelaySeconds;
+  const scheduledSeconds = Math.floor(Date.now() / 1000) + Math.max(scheduleDelaySeconds, 5);
 
   const task = {
     httpRequest: {
@@ -68,7 +68,7 @@ async function enqueueWorkerStep(payload = {}) {
         : {}),
     },
     dispatchDeadline,
-    scheduleTime: { seconds: scheduledSeconds },
+    scheduleTime: { seconds: scheduledSeconds }, // cold start buffer
     retryConfig: {
       maxAttempts: 12,
       minBackoff: { seconds: 1 },

@@ -712,6 +712,7 @@ async function runAutoIngest(input = {}) {
 
   // 레코드 구성
   const records = [];
+  const extractedText = extracted?.text || previewText || '';
   const now = new Date();
   const brandName = effectiveBrand || extracted.brand || 'unknown';
   const baseSeries = series || code || null;
@@ -884,7 +885,7 @@ async function runAutoIngest(input = {}) {
     if (rec.displayname == null && displayName != null) rec.displayname = displayName;
     rec.updated_at = now;
     // persist에서 브랜드 정규화할 때 쓰도록 원문 텍스트 전달
-    rec._doc_text = (extracted?.text || previewText || '');
+    rec._doc_text = extractedText;
     if (row.raw_json != null) rec.raw_json = row.raw_json;
 
     for (const [rawKey, rawValue] of Object.entries(row)) {
@@ -947,6 +948,7 @@ async function runAutoIngest(input = {}) {
     requiredFields,
     coverUri,
     records,
+    rows: records,
     mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
     extractedBrand: extracted?.brand || null,
     brandName,
@@ -955,6 +957,8 @@ async function runAutoIngest(input = {}) {
     run_id: runId,
     jobId,
     job_id: jobId,
+    text: extractedText,
+    brand: extracted?.brand ?? null,
   };
 
   if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
@@ -996,12 +1000,41 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     pnTemplate = null,
     requiredFields = [],
     coverUri = null,
-    records = [],
+    records: initialRecords = [],
+    rows: processedRowsInput = [],
     mpnList = [],
     extractedBrand = null,
     brandName = null,
     baseSeries = null,
+    text: processedText = null,
+    brand: processedBrand = null,
   } = processed || {};
+
+  const recordsSource = Array.isArray(initialRecords) && initialRecords.length
+    ? initialRecords
+    : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
+  const records = Array.isArray(recordsSource) ? recordsSource : [];
+  const docText = typeof processedText === 'string'
+    ? processedText
+    : (processedText != null ? String(processedText) : '');
+  const brandSeed = (processedBrand && String(processedBrand).trim().toLowerCase() !== 'unknown')
+    ? processedBrand
+    : null;
+  if ((docText && docText.length) || brandSeed) {
+    const applyRowHints = (row) => {
+      if (!row || typeof row !== 'object') return;
+      if (docText && (row._doc_text == null || row._doc_text === '')) {
+        row._doc_text = docText;
+      }
+      if (brandSeed && (!row.brand || !String(row.brand).trim())) {
+        row.brand = brandSeed;
+      }
+    };
+    for (const row of records) applyRowHints(row);
+    if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+      for (const row of processedRowsInput) applyRowHints(row);
+    }
+  }
 
   const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
   const runId = processed?.runId ?? processed?.run_id ?? overrides?.runId ?? overrides?.run_id ?? null;

@@ -1,8 +1,11 @@
 diff --git a/server.js b/server.js
-index 3c770444f76bb50d73d8a6c015fb73c8784e88c8..2c32e158cab5a7abdfcf613ae04cae9944c94b37 100644
+index 2c32e158cab5a7abdfcf613ae04cae9944c94b37..f94a02b2e6e9758f9053112170bb175d72f1b4f8 100644
 --- a/server.js
 +++ b/server.js
-@@ -33,64 +33,64 @@ const { generateRunId } = require('./src/utils/run-id');
+@@ -29,51 +29,63 @@ const { generateRunId } = require('./src/utils/run-id');
+  try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
+  // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
+  let _tasks = null;
   let _queuePath = null;
   function getTasks() {
     if (!_tasks) {
@@ -24,12 +27,24 @@ index 3c770444f76bb50d73d8a6c015fb73c8784e88c8..2c32e158cab5a7abdfcf613ae04cae99
    bodyPayload.run_id = runId;
  
    const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
-   const dispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE || '150s';
+-  const dispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE || '150s';
++  const rawDispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE;
++  const parsedDispatchDeadline = Number.parseFloat(
++    typeof rawDispatchDeadline === 'string'
++      ? rawDispatchDeadline.replace(/s$/i, '')
++      : rawDispatchDeadline
++  );
++  const dispatchDeadlineSeconds = Number.isFinite(parsedDispatchDeadline)
++    ? parsedDispatchDeadline
++    : 150;
++  const dispatchDeadline = {
++    seconds: Math.min(Math.max(0, Math.ceil(dispatchDeadlineSeconds)), 1800),
++    nanos: 0,
++  };
    const scheduleDelaySeconds = Number.isFinite(Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
      ? Math.max(0, Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
      : 5;
--  const scheduledSeconds = Math.floor(Date.now() / 1000) + scheduleDelaySeconds;
-+  const scheduledSeconds = Math.floor(Date.now() / 1000) + Math.max(scheduleDelaySeconds, 5);
+   const scheduledSeconds = Math.floor(Date.now() / 1000) + Math.max(scheduleDelaySeconds, 5);
  
    const task = {
      httpRequest: {
@@ -42,8 +57,7 @@ index 3c770444f76bb50d73d8a6c015fb73c8784e88c8..2c32e158cab5a7abdfcf613ae04cae99
          : {}),
      },
      dispatchDeadline,
--    scheduleTime: { seconds: scheduledSeconds },
-+    scheduleTime: { seconds: scheduledSeconds }, // cold start buffer
+     scheduleTime: { seconds: scheduledSeconds }, // cold start buffer
      retryConfig: {
        maxAttempts: 12,
        minBackoff: { seconds: 1 },
@@ -52,20 +66,3 @@ index 3c770444f76bb50d73d8a6c015fb73c8784e88c8..2c32e158cab5a7abdfcf613ae04cae99
      },
    };
  
-   // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
-   await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
-   return runId;
- }
- 
- 
- const app = express();
- 
- app.use(bodyParser.json({ limit: '25mb' }));
- app.use(bodyParser.urlencoded({ extended: true }));
- app.disable('x-powered-by');
- 
- /* ---------------- Env / Config ---------------- */
- const PORT = process.env.PORT || 8080;
- const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
- 
- function parseCorsOrigins(envStr) {

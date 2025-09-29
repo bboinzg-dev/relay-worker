@@ -51,7 +51,19 @@ async function enqueueWorkerStep(payload = {}) {
   bodyPayload.run_id = runId;
 
   const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
-  const dispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE || '150s';
+  const rawDispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE;
+  const parsedDispatchDeadline = Number.parseFloat(
+    typeof rawDispatchDeadline === 'string'
+      ? rawDispatchDeadline.replace(/s$/i, '')
+      : rawDispatchDeadline
+  );
+  const dispatchDeadlineSeconds = Number.isFinite(parsedDispatchDeadline)
+    ? parsedDispatchDeadline
+    : 150;
+  const dispatchDeadline = {
+    seconds: Math.min(Math.max(0, Math.ceil(dispatchDeadlineSeconds)), 1800),
+    nanos: 0,
+  };
   const scheduleDelaySeconds = Number.isFinite(Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
     ? Math.max(0, Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
     : 5;

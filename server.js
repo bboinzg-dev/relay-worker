@@ -21,8 +21,12 @@ const { generateRunId } = require('./src/utils/run-id');
  const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
  const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
  const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
- const RAW_WORKER_STEP_URL = process.env.WORKER_STEP_URL  || process.env.WORKER_TASK_URL  || 'https://<YOUR-RUN-URL>/api/worker/step';
- const WORKER_STEP_URL = RAW_WORKER_STEP_URL.replace(/\/api\/worker\/ingest(?:\/run)?$/i, '/api/worker/step');
+ const RAW_WORKER_INGEST_URL =
+   process.env.WORKER_INGEST_URL ||
+   process.env.WORKER_TASK_URL ||
+   process.env.WORKER_STEP_URL ||
+   'https://<YOUR-RUN-URL>/api/worker/ingest';
+ const WORKER_INGEST_URL = RAW_WORKER_INGEST_URL.replace(/\/api\/worker\/step\/?$/i, '/api/worker/ingest');
  const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
 
 
@@ -40,10 +44,10 @@ const { generateRunId } = require('./src/utils/run-id');
    return { tasks: _tasks, queuePath: _queuePath };
  }
 
-async function enqueueWorkerStep(payload = {}) {
+async function enqueueWorkerIngest(payload = {}) {
   const { tasks, queuePath } = getTasks();
   if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
-  const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_STEP_URL).origin;
+  const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_INGEST_URL).origin;
 
   const bodyPayload = { ...payload };
   const runId = bodyPayload.runId || bodyPayload.run_id || generateRunId();
@@ -72,7 +76,7 @@ async function enqueueWorkerStep(payload = {}) {
   const task = {
     httpRequest: {
       httpMethod: 'POST',
-      url: WORKER_STEP_URL,
+      url: WORKER_INGEST_URL,
       headers: { 'Content-Type': 'application/json' },
       body,
       ...(TASKS_INVOKER_SA
@@ -548,7 +552,7 @@ async function handleWorkerIngest(req, res) {
       phase: 'process',
     };
 
-    enqueueWorkerStep(ingestPayload).catch(async (err) => {
+    enqueueWorkerIngest(ingestPayload).catch(async (err) => {
       try {
         await db.query(
           `UPDATE public.ingest_run_logs
@@ -581,7 +585,7 @@ async function handleWorkerIngest(req, res) {
   }
 }
 
-async function handleWorkerStep(req, res) {
+async function handleWorkerIngestTask(req, res) {
   const startedAt = Date.now();
   const taskName =
     req.get('X-CloudTasks-TaskName') ||
@@ -611,7 +615,7 @@ async function handleWorkerStep(req, res) {
     .find(Boolean) || null;
   if (!runId) {
     runId = generateRunId();
-    console.warn('[ingest-step] runId missing -> created', { runId, taskName, phase });
+    console.warn('[ingest-task] runId missing -> created', { runId, taskName, phase });
   }
 
   const respondNoContent = () => {
@@ -688,7 +692,7 @@ async function handleWorkerStep(req, res) {
         [ runId, ms, taskName, retryCnt, errMsg ]
       );
     } catch (err) {
-      console.error('[ingest-step markFailed]', err?.message || err);
+      console.error('[ingest-task markFailed]', err?.message || err);
     }
   };
 
@@ -717,12 +721,12 @@ async function handleWorkerStep(req, res) {
           out?.datasheet_uri || uri || null ]
       );
     } catch (err) {
-      console.error('[ingest-step markSucceeded]', err?.message || err);
+      console.error('[ingest-task markSucceeded]', err?.message || err);
     }
   };
 
   if (!phase) {
-    console.warn('[ingest-step] missing phase', { runId, taskName });
+    console.warn('[ingest-task] missing phase', { runId, taskName });
     return respondNoContent();
   }
 
@@ -783,7 +787,7 @@ async function handleWorkerStep(req, res) {
       };
 
       try {
-        await enqueueWorkerStep(nextPayload);
+        await enqueueWorkerIngest(nextPayload);
       } catch (err) {
         await markFailed(`persist enqueue failed: ${String(err?.message || err)}`, Date.now() - startedAt);
         if (!res.headersSent) return res.status(500).json({ ok:false, error:String(err?.message || err) });
@@ -837,17 +841,30 @@ async function handleWorkerStep(req, res) {
       return respondNoContent();
     }
 
-    console.warn('[ingest-step] unknown phase', { phase, runId, taskName });
+    console.warn('[ingest-task] unknown phase', { phase, runId, taskName });
     return respondNoContent();
   } finally {
     if (killer) clearTimeout(killer);
   }
 }
 
-const workerIngestMiddlewares = [requireSession, handleWorkerIngest];
-const workerStepMiddlewares = [requireSession, handleWorkerStep];
-app.post('/api/worker/ingest', workerIngestMiddlewares);
-app.post('/api/worker/step', workerStepMiddlewares);
+app.post('/api/worker/ingest', requireSession, async (req, res, next) => {
+  const isTaskRequest = Boolean(
+    req.get('X-CloudTasks-TaskName') ||
+    req.get('X-Cloud-Tasks-TaskName') ||
+    (req.body && typeof req.body === 'object' && req.body.phase)
+  );
+
+  try {
+    if (isTaskRequest) {
+      await handleWorkerIngestTask(req, res);
+    } else {
+      await handleWorkerIngest(req, res);
+    }
+  } catch (err) {
+    next(err);
+  }
+});
 
 async function seedManufacturerAliases() {
   try {

@@ -1,8 +1,42 @@
 diff --git a/server.js b/server.js
-index 2c32e158cab5a7abdfcf613ae04cae9944c94b37..f94a02b2e6e9758f9053112170bb175d72f1b4f8 100644
+index f94a02b2e6e9758f9053112170bb175d72f1b4f8..b56e9f2a812323d8c0a20126e51bbd4f3043b82d 100644
 --- a/server.js
 +++ b/server.js
-@@ -29,51 +29,63 @@ const { generateRunId } = require('./src/utils/run-id');
+@@ -1,100 +1,104 @@
+ /* server.js */
+ 'use strict';
+ 
+ const express = require('express');
+ const cors = require('cors');
+ const bodyParser = require('body-parser');
+ const multer = require('multer');
+ const crypto = require('crypto');
+ const jwt = require('jsonwebtoken');
+ 
+ const db = require('./src/utils/db');
+ const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
+ const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
+ const { runAutoIngest, persistProcessedData } = require('./src/pipeline/ingestAuto');
+ const { generateRunId } = require('./src/utils/run-id');
+ 
+ 
+ 
+ // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
+  const { CloudTasksClient } = require('@google-cloud/tasks');
+  const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+  const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
+  const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
+- const RAW_WORKER_STEP_URL = process.env.WORKER_STEP_URL  || process.env.WORKER_TASK_URL  || 'https://<YOUR-RUN-URL>/api/worker/step';
+- const WORKER_STEP_URL = RAW_WORKER_STEP_URL.replace(/\/api\/worker\/ingest(?:\/run)?$/i, '/api/worker/step');
++ const RAW_WORKER_INGEST_URL =
++   process.env.WORKER_INGEST_URL ||
++   process.env.WORKER_TASK_URL ||
++   process.env.WORKER_STEP_URL ||
++   'https://<YOUR-RUN-URL>/api/worker/ingest';
++ const WORKER_INGEST_URL = RAW_WORKER_INGEST_URL.replace(/\/api\/worker\/step\/?$/i, '/api/worker/ingest');
+  const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
+ 
+ 
   try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
  
   // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
@@ -17,10 +51,12 @@ index 2c32e158cab5a7abdfcf613ae04cae9944c94b37..f94a02b2e6e9758f9053112170bb175d
     return { tasks: _tasks, queuePath: _queuePath };
   }
  
- async function enqueueWorkerStep(payload = {}) {
+-async function enqueueWorkerStep(payload = {}) {
++async function enqueueWorkerIngest(payload = {}) {
    const { tasks, queuePath } = getTasks();
    if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
-   const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_STEP_URL).origin;
+-  const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_STEP_URL).origin;
++  const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_INGEST_URL).origin;
  
    const bodyPayload = { ...payload };
    const runId = bodyPayload.runId || bodyPayload.run_id || generateRunId();
@@ -28,20 +64,19 @@ index 2c32e158cab5a7abdfcf613ae04cae9944c94b37..f94a02b2e6e9758f9053112170bb175d
    bodyPayload.run_id = runId;
  
    const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
--  const dispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE || '150s';
-+  const rawDispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE;
-+  const parsedDispatchDeadline = Number.parseFloat(
-+    typeof rawDispatchDeadline === 'string'
-+      ? rawDispatchDeadline.replace(/s$/i, '')
-+      : rawDispatchDeadline
-+  );
-+  const dispatchDeadlineSeconds = Number.isFinite(parsedDispatchDeadline)
-+    ? parsedDispatchDeadline
-+    : 150;
-+  const dispatchDeadline = {
-+    seconds: Math.min(Math.max(0, Math.ceil(dispatchDeadlineSeconds)), 1800),
-+    nanos: 0,
-+  };
+   const rawDispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE;
+   const parsedDispatchDeadline = Number.parseFloat(
+     typeof rawDispatchDeadline === 'string'
+       ? rawDispatchDeadline.replace(/s$/i, '')
+       : rawDispatchDeadline
+   );
+   const dispatchDeadlineSeconds = Number.isFinite(parsedDispatchDeadline)
+     ? parsedDispatchDeadline
+     : 150;
+   const dispatchDeadline = {
+     seconds: Math.min(Math.max(0, Math.ceil(dispatchDeadlineSeconds)), 1800),
+     nanos: 0,
+   };
    const scheduleDelaySeconds = Number.isFinite(Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
      ? Math.max(0, Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
      : 5;
@@ -50,7 +85,8 @@ index 2c32e158cab5a7abdfcf613ae04cae9944c94b37..f94a02b2e6e9758f9053112170bb175d
    const task = {
      httpRequest: {
        httpMethod: 'POST',
-       url: WORKER_STEP_URL,
+-      url: WORKER_STEP_URL,
++      url: WORKER_INGEST_URL,
        headers: { 'Content-Type': 'application/json' },
        body,
        ...(TASKS_INVOKER_SA
@@ -67,3 +103,368 @@ index 2c32e158cab5a7abdfcf613ae04cae9944c94b37..f94a02b2e6e9758f9053112170bb175d
      },
    };
  
+   // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
+   await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
+   return runId;
+ }
+ 
+ 
+ const app = express();
+ 
+ app.use(bodyParser.json({ limit: '25mb' }));
+diff --git a/server.js b/server.js
+index f94a02b2e6e9758f9053112170bb175d72f1b4f8..b56e9f2a812323d8c0a20126e51bbd4f3043b82d 100644
+--- a/server.js
++++ b/server.js
+@@ -526,114 +530,114 @@ async function handleWorkerIngest(req, res) {
+   const runId = generateRunId();
+ 
+   try {
+     await db.query(
+       `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
+          VALUES ($1,$2,$3,$4,'RUNNING')`,
+       [runId, 'phase:process', 0, gcsUri]
+     );
+ 
+     res.status(202).json({ ok: true, runId, run_id: runId });
+ 
+     const ingestPayload = {
+       runId,
+       run_id: runId,
+       gcsUri,
+       gcs_uri: gcsUri,
+       family_slug: familySlug,
+       brand,
+       code,
+       series,
+       display_name: displayName,
+       uploader_id: uploaderId,
+       phase: 'process',
+     };
+ 
+-    enqueueWorkerStep(ingestPayload).catch(async (err) => {
++    enqueueWorkerIngest(ingestPayload).catch(async (err) => {
+       try {
+         await db.query(
+           `UPDATE public.ingest_run_logs
+               SET finished_at = now(),
+                   duration_ms = $2,
+                   status = 'FAILED',
+                   error_message = $3
+             WHERE id = $1`,
+           [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
+         );
+       } catch (_) {}
+       console.error('[ingest enqueue failed]', err?.message || err);
+     });
+   } catch (e) {
+     try {
+       await db.query(
+         `UPDATE public.ingest_run_logs
+            SET finished_at = now(),
+                duration_ms = $2,
+                status = 'FAILED',
+                error_message = $3
+          WHERE id = $1`,
+         [ runId, Date.now() - startedAt, String(e?.message || e) ]
+       );
+     } catch (_) {}
+     console.error('[ingest init failed]', e?.message || e);
+     if (!res.headersSent) {
+       return res.status(500).json({ ok:false, error:String(e?.message || e) });
+     }
+   }
+ }
+ 
+-async function handleWorkerStep(req, res) {
++async function handleWorkerIngestTask(req, res) {
+   const startedAt = Date.now();
+   const taskName =
+     req.get('X-CloudTasks-TaskName') ||
+     req.get('X-Cloud-Tasks-TaskName') ||
+     null;
+   const retryCnt = Number(
+     req.get('X-CloudTasks-TaskRetryCount') ||
+     req.get('X-Cloud-Tasks-TaskRetryCount') ||
+     0
+   );
+   const payload = (req.body && typeof req.body === 'object') ? req.body : {};
+   const phase = String(payload?.phase || '').trim().toLowerCase();
+ 
+   const rawUri = [
+     payload?.gcsUri,
+     payload?.gcs_uri,
+     payload?.gsUri,
+     payload?.gcsPdfUri,
+     payload?.gcs_pdf_uri,
+     payload?.uri,
+     payload?.url,
+   ].map((value) => (typeof value === 'string' ? value.trim() : '')).find((value) => !!value);
+   const gcsUri = rawUri || '';
+ 
+   let runId = [payload?.runId, payload?.run_id]
+     .map((val) => (typeof val === 'string' && val.trim()) ? val.trim() : null)
+     .find(Boolean) || null;
+   if (!runId) {
+     runId = generateRunId();
+-    console.warn('[ingest-step] runId missing -> created', { runId, taskName, phase });
++    console.warn('[ingest-task] runId missing -> created', { runId, taskName, phase });
+   }
+ 
+   const respondNoContent = () => {
+     if (!res.headersSent) res.status(204).send();
+   };
+ 
+   const markProcessing = async () => {
+     const update = await db.query(
+       `UPDATE public.ingest_run_logs
+           SET status = 'RUNNING',
+               task_name = $2,
+               retry_count = $3,
+               gcs_uri = COALESCE($4, gcs_uri),
+               error_message = NULL,
+               finished_at = NULL,
+               duration_ms = NULL,
+               final_table = NULL,
+               final_family = NULL,
+               final_brand = NULL,
+               final_code = NULL,
+               final_datasheet = NULL
+         WHERE id = $1`,
+       [ runId, taskName, retryCnt, gcsUri ]
+     );
+     if (!update.rowCount) {
+diff --git a/server.js b/server.js
+index f94a02b2e6e9758f9053112170bb175d72f1b4f8..b56e9f2a812323d8c0a20126e51bbd4f3043b82d 100644
+--- a/server.js
++++ b/server.js
+@@ -666,85 +670,85 @@ async function handleWorkerStep(req, res) {
+     if (!update.rowCount) {
+       await db.query(
+         `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
+            VALUES ($1,$2,$3,$4,'RUNNING')`,
+         [ runId, taskName, retryCnt, gcsUri ]
+       );
+     }
+   };
+ 
+   const markFailed = async (message, durationMs) => {
+     const errMsg = String(message || 'ingest_failed');
+     const ms = Number.isFinite(durationMs) ? durationMs : (Date.now() - startedAt);
+     try {
+       await db.query(
+         `UPDATE public.ingest_run_logs
+             SET finished_at = now(),
+                 duration_ms = $2,
+                 status = 'FAILED',
+                 task_name = $3,
+                 retry_count = $4,
+                 error_message = $5
+           WHERE id = $1`,
+         [ runId, ms, taskName, retryCnt, errMsg ]
+       );
+     } catch (err) {
+-      console.error('[ingest-step markFailed]', err?.message || err);
++      console.error('[ingest-task markFailed]', err?.message || err);
+     }
+   };
+ 
+   const markSucceeded = async (out, uri, durationMs) => {
+     const ms = Number.isFinite(durationMs) ? durationMs : (Date.now() - startedAt);
+     try {
+       await db.query(
+         `UPDATE public.ingest_run_logs
+             SET finished_at = now(),
+                 duration_ms = $2,
+                 status = 'SUCCEEDED',
+                 task_name = $3,
+                 retry_count = $4,
+                 final_table = $5,
+                 final_family = $6,
+                 final_brand = $7,
+                 final_code  = $8,
+                 final_datasheet = $9,
+                 error_message = NULL
+           WHERE id = $1`,
+         [ runId, ms, taskName, retryCnt,
+           out?.specs_table || null,
+           out?.family || out?.family_slug || payload?.family_slug || null,
+           out?.brand || null,
+           (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
+           out?.datasheet_uri || uri || null ]
+       );
+     } catch (err) {
+-      console.error('[ingest-step markSucceeded]', err?.message || err);
++      console.error('[ingest-task markSucceeded]', err?.message || err);
+     }
+   };
+ 
+   if (!phase) {
+-    console.warn('[ingest-step] missing phase', { runId, taskName });
++    console.warn('[ingest-task] missing phase', { runId, taskName });
+     return respondNoContent();
+   }
+ 
+   let killer;
+   try {
+     const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
+     killer = setTimeout(() => {
+       if (!res.headersSent) {
+         try { res.status(202).json({ ok: true, timeout: true }); } catch {}
+       }
+     }, deadlineMs);
+ 
+     if (phase === 'process') {
+       await markProcessing();
+       const label = `[ingest-process] ${runId}`;
+       console.time(label);
+       let result;
+       try {
+         result = await runAutoIngest({
+           ...payload,
+           runId,
+           run_id: runId,
+           gcsUri,
+           gcs_uri: gcsUri,
+           skipPersist: true,
+diff --git a/server.js b/server.js
+index f94a02b2e6e9758f9053112170bb175d72f1b4f8..b56e9f2a812323d8c0a20126e51bbd4f3043b82d 100644
+--- a/server.js
++++ b/server.js
+@@ -761,51 +765,51 @@ async function handleWorkerStep(req, res) {
+       const processed = result?.processed;
+       if (!processed || !Array.isArray(processed.records)) {
+         await markFailed('process_no_records', Date.now() - startedAt);
+         if (!res.headersSent) return res.status(500).json({ ok:false, error:'process_no_records' });
+         return;
+       }
+ 
+       await markPersisting();
+ 
+       const nextPayload = {
+         runId,
+         run_id: runId,
+         gcsUri,
+         gcs_uri: gcsUri,
+         family_slug: payload?.family_slug ?? null,
+         brand: payload?.brand ?? null,
+         code: payload?.code ?? null,
+         series: payload?.series ?? null,
+         display_name: payload?.display_name ?? null,
+         uploader_id: payload?.uploader_id ?? null,
+         phase: 'persist',
+         processed,
+       };
+ 
+       try {
+-        await enqueueWorkerStep(nextPayload);
++        await enqueueWorkerIngest(nextPayload);
+       } catch (err) {
+         await markFailed(`persist enqueue failed: ${String(err?.message || err)}`, Date.now() - startedAt);
+         if (!res.headersSent) return res.status(500).json({ ok:false, error:String(err?.message || err) });
+         console.warn('[ingest process enqueue persist failed]', String(err?.message || err));
+         return;
+       }
+ 
+       return respondNoContent();
+     }
+ 
+     if (phase === 'persist') {
+       await markPersisting();
+       const label = `[ingest-persist] ${runId}`;
+       console.time(label);
+       let out;
+       try {
+         out = await persistProcessedData(payload?.processed || {}, {
+           brand: payload?.brand ?? null,
+           code: payload?.code ?? null,
+           series: payload?.series ?? null,
+           display_name: payload?.display_name ?? null,
+         });
+       } catch (err) {
+         console.timeEnd(label);
+         await markFailed(err?.message || err, Date.now() - startedAt);
+diff --git a/server.js b/server.js
+index f94a02b2e6e9758f9053112170bb175d72f1b4f8..b56e9f2a812323d8c0a20126e51bbd4f3043b82d 100644
+--- a/server.js
++++ b/server.js
+@@ -815,61 +819,74 @@ async function handleWorkerStep(req, res) {
+       }
+       console.timeEnd(label);
+ 
+       const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
+       const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
+ 
+       if (!out?.ok) {
+         const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
+         const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
+         await markFailed(message, out?.ms ?? (Date.now() - startedAt));
+         if (!res.headersSent) {
+           return res.status(200).json({
+             ok: false,
+             run_id: runId,
+             reject_reasons: reasonList,
+             warnings: Array.from(warningReasons),
+           });
+         }
+         return;
+       }
+ 
+       await markSucceeded(out, gcsUri, out?.ms ?? (Date.now() - startedAt));
+       return respondNoContent();
+     }
+ 
+-    console.warn('[ingest-step] unknown phase', { phase, runId, taskName });
++    console.warn('[ingest-task] unknown phase', { phase, runId, taskName });
+     return respondNoContent();
+   } finally {
+     if (killer) clearTimeout(killer);
+   }
+ }
+ 
+-const workerIngestMiddlewares = [requireSession, handleWorkerIngest];
+-const workerStepMiddlewares = [requireSession, handleWorkerStep];
+-app.post('/api/worker/ingest', workerIngestMiddlewares);
+-app.post('/api/worker/step', workerStepMiddlewares);
++app.post('/api/worker/ingest', requireSession, async (req, res, next) => {
++  const isTaskRequest = Boolean(
++    req.get('X-CloudTasks-TaskName') ||
++    req.get('X-Cloud-Tasks-TaskName') ||
++    (req.body && typeof req.body === 'object' && req.body.phase)
++  );
++
++  try {
++    if (isTaskRequest) {
++      await handleWorkerIngestTask(req, res);
++    } else {
++      await handleWorkerIngest(req, res);
++    }
++  } catch (err) {
++    next(err);
++  }
++});
+ 
+ async function seedManufacturerAliases() {
+   try {
+     const { rows } = await db.query(
+       `SELECT lower(column_name) AS column
+          FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'manufacturer_alias'`
+     );
+     const available = new Set(rows.map((r) => r.column));
+     if (!available.has('brand') || !available.has('alias')) return;
+ 
+     const seeds = [
+       { brand: 'Panasonic', alias: 'Matsushita' },
+       { brand: 'OMRON', alias: 'Omron Corporation' },
+       { brand: 'TE Connectivity', alias: 'Tyco Electronics' },
+       { brand: 'Finder', alias: 'Finder Relays' },
+       { brand: 'Schneider Electric', alias: 'Square D' },
+     ];
+ 
+     for (const { brand, alias } of seeds) {
+       await db.query(
+         `INSERT INTO public.manufacturer_alias (brand, alias)
+          VALUES ($1,$2)
+          ON CONFLICT DO NOTHING`,
+         [brand, alias]

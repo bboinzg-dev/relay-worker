@@ -34,6 +34,22 @@ async function guessBrandFromText(q) {
   return null;
 }
 
+// --- helper: 코드 prefix로 시리즈/브랜드 유추(예: APAN → Panasonic)
+async function brandFromSeriesPrefix(q) {
+  const m = String(q||'').toUpperCase().match(/^([A-Z]{3,})\d/);
+  if (!m) return null;
+  const prefix = m[1];
+  try {
+    const { rows } = await pool.query(
+      `SELECT brand_norm FROM public.manufacturer_series_catalog
+       WHERE series_norm = lower($1) LIMIT 1`, [prefix]
+    );
+    return rows[0]?.brand_norm || null;
+  } catch {
+    return null;
+  }
+}
+
 // DB 텍스트 검색 top1 (기존 /parts/search 로직 폴백)
 async function searchTop1(q) {
   const text = `%${String(q||'').toLowerCase()}%`;
@@ -101,6 +117,7 @@ router.get('/api/ai/resolve', async (req, res) => {
 
   // 2) 폴백들
   if (!brand) brand = await guessBrandFromText(q);
+  if (!brand) brand = await brandFromSeriesPrefix(q);
   let code = codes[0] || '';
 
   // 3) DB로 최종 검증/보정

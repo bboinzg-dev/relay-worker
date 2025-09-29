@@ -155,6 +155,7 @@ app.use('/auth', authRouter);
 app.post('/login', loginHandler);
 
 /* ---------------- Mount modular routers (after global middleware) ---------------- */
+try { app.use(require('./server.ai')); console.log('[BOOT] mounted /api/ai/resolve'); } catch (e) { console.error('[BOOT] ai/resolve mount error', e?.message||e); }
 try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
 try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
 try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}

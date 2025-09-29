@@ -17,6 +17,7 @@ const { saveExtractedSpecs } = require('./persist');
 const { explodeToRows } = require('../ingest/mpn-exploder');
 const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
 const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
+const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
 
 const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
 const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
@@ -494,19 +495,13 @@ async function runAutoIngest(input = {}) {
   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
   const qualified = table.startsWith('public.')? table : `public.${table}`;
 
-  const blueprint = await getBlueprint(family);
-
-  // 스키마 보장 (DB 함수) + 컬럼 자동 보강 후 타입 확보
-  if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
-    await ensureSpecsTableByFamily(family);
-    await ensureBlueprintVariantColumns(family);
-  }
-  await ensureSpecColumnsForBlueprint(qualified, blueprint);
-  const colTypes = await getColumnTypes(qualified);
+  let blueprint = await getBlueprint(family);
 
   // 블루프린트 허용 키
-  const allowedKeys = blueprint?.allowedKeys || [];
-  const variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+  let allowedKeys = Array.isArray(blueprint?.allowedKeys)
+    ? [...blueprint.allowedKeys]
+    : [];
+  let variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
     ? blueprint.ingestOptions.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
     : (Array.isArray(blueprint?.variant_keys)
       ? blueprint.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
@@ -526,6 +521,9 @@ async function runAutoIngest(input = {}) {
       }
     }
   }
+
+  let colTypes;
+  const disableEnsure = /^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0');
 
   // -------- 공용 강제정규화 유틸 --------
 
@@ -684,6 +682,77 @@ async function runAutoIngest(input = {}) {
   const now = new Date();
   const brandName = brand || extracted.brand || 'unknown';
   const baseSeries = series || code || null;
+
+  let variantColumnsEnsured = false;
+  try {
+    const { detected: inferredKeys = [], newKeys: freshKeys = [] } = await inferVariantKeys({
+      family,
+      brand: brandName,
+      series: baseSeries,
+      blueprint,
+      extracted,
+    });
+
+    if (Array.isArray(inferredKeys) && inferredKeys.length) {
+      const brandSlug = normalizeSlug(brandName);
+      const seriesSlug = normalizeSlug(baseSeries);
+      try {
+        await db.query(
+          `SELECT public.upsert_variant_keys($1,$2,$3,$4::jsonb)`,
+          [family, brandSlug, seriesSlug, JSON.stringify(inferredKeys)],
+        );
+      } catch (err) {
+        console.warn('[variant] upsert_variant_keys failed:', err?.message || err);
+      }
+
+      const mergedVariant = new Set(variantKeys);
+      for (const key of inferredKeys) mergedVariant.add(key);
+      variantKeys = Array.from(mergedVariant);
+
+      const mergedAllowed = new Set(allowedKeys);
+      for (const key of variantKeys) mergedAllowed.add(key);
+      allowedKeys = Array.from(mergedAllowed);
+
+      if (!blueprint.ingestOptions || typeof blueprint.ingestOptions !== 'object') {
+        blueprint.ingestOptions = {};
+      }
+      blueprint.ingestOptions.variant_keys = variantKeys;
+      blueprint.variant_keys = variantKeys;
+      blueprint.allowedKeys = Array.isArray(blueprint.allowedKeys)
+        ? Array.from(new Set([...blueprint.allowedKeys, ...variantKeys]))
+        : [...allowedKeys];
+
+      if (!disableEnsure) {
+        try {
+          await ensureBlueprintVariantColumns(family);
+          variantColumnsEnsured = true;
+        } catch (err) {
+          console.warn('[variant] ensure_blueprint_variant_columns failed:', err?.message || err);
+        }
+      }
+    }
+
+    if (Array.isArray(freshKeys) && freshKeys.length) {
+      console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
+    }
+  } catch (err) {
+    console.warn('[variant] inferVariantKeys failed:', err?.message || err);
+  }
+
+  if (!disableEnsure) {
+    await ensureSpecsTableByFamily(family);
+    if (!variantColumnsEnsured) {
+      try {
+        await ensureBlueprintVariantColumns(family);
+        variantColumnsEnsured = true;
+      } catch (err) {
+        console.warn('[variant] ensure_blueprint_variant_columns fallback failed:', err?.message || err);
+      }
+    }
+  }
+
+  await ensureSpecColumnsForBlueprint(qualified, blueprint);
+  colTypes = await getColumnTypes(qualified);
 
   const mpnsFromDoc = harvestMpnCandidates(
     extracted?.text ?? '',

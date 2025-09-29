@@ -95,10 +95,20 @@ router.post('/upload', upload.single('file'), async (req, res) => {
         headers: { 'Content-Type': 'application/json' },
         body,
       };
-      const task = { httpRequest };
       if (invokerSA) {
-        task.httpRequest.oidcToken = { serviceAccountEmail: invokerSA, audience };
+        httpRequest.oidcToken = { serviceAccountEmail: invokerSA, audience };
       }
+      const task = {
+        httpRequest,
+        dispatchDeadline: process.env.TASKS_DISPATCH_DEADLINE || '150s',
+        scheduleTime: { seconds: Math.floor(Date.now() / 1000) + 5 },
+        retryConfig: {
+          maxAttempts: 12,
+          minBackoff: { seconds: 1 },
+          maxBackoff: { seconds: 60 },
+          maxDoublings: 4,
+        },
+      };
 
       const [resp] = await client.createTask({ parent, task });
       return res.json({ ok: true, gcsUri, enqueued: true, task: resp.name, run_id: runId });

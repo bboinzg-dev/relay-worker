@@ -636,7 +636,7 @@ async function handleWorkerStep(req, res) {
   const markPersisting = async () => {
     const update = await db.query(
       `UPDATE public.ingest_run_logs
-          SET status = 'PERSISTING',
+          SET status = 'RUNNING',
               task_name = $2,
               retry_count = $3,
               gcs_uri = COALESCE($4, gcs_uri),
@@ -654,7 +654,7 @@ async function handleWorkerStep(req, res) {
     if (!update.rowCount) {
       await db.query(
         `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
-           VALUES ($1,$2,$3,$4,'PERSISTING')`,
+           VALUES ($1,$2,$3,$4,'RUNNING')`,
         [ runId, taskName, retryCnt, gcsUri ]
       );
     }
@@ -949,7 +949,7 @@ app.use((err, req, res, next) => {
         started_at timestamptz DEFAULT now(), finished_at timestamptz
       )
     `);
-    await db.query(`UPDATE public.ingest_run_logs SET status='RUNNING' WHERE status='PROCESSING'`);
+    await db.query(`UPDATE public.ingest_run_logs SET status='RUNNING' WHERE lower(status)='processing'`);
     await db.query(`ALTER TABLE public.ingest_run_logs DROP CONSTRAINT IF EXISTS ingest_run_logs_status_check`);
     await db.query(`ALTER TABLE public.ingest_run_logs ADD CONSTRAINT ingest_run_logs_status_check CHECK (status IN ('RUNNING','SUCCEEDED','FAILED'))`);
     await db.query(`ALTER TABLE public.ingest_run_logs ALTER COLUMN status SET DEFAULT 'RUNNING'`);

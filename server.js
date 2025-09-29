@@ -21,12 +21,10 @@ const { generateRunId } = require('./src/utils/run-id');
  const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
  const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
  const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
- const RAW_WORKER_INGEST_URL =
-   process.env.WORKER_INGEST_URL ||
-   process.env.WORKER_TASK_URL ||
-   process.env.WORKER_STEP_URL ||
-   'https://<YOUR-RUN-URL>/api/worker/ingest';
- const WORKER_INGEST_URL = RAW_WORKER_INGEST_URL.replace(/\/api\/worker\/step\/?$/i, '/api/worker/ingest');
+ // step 라우트 폐지 → ingest 하나로 통일
+ const WORKER_TASK_URL = process.env.WORKER_TASK_URL || (
+   process.env.WORKER_URL ? `${process.env.WORKER_URL.replace(/\/+$/,'')}/api/worker/ingest` :
+   'https://<YOUR-RUN-URL>/api/worker/ingest');
  const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
 
 
@@ -44,58 +42,46 @@ const { generateRunId } = require('./src/utils/run-id');
    return { tasks: _tasks, queuePath: _queuePath };
  }
 
-async function enqueueWorkerIngest(payload = {}) {
+async function enqueueIngestTask(payload = {}) {
   const { tasks, queuePath } = getTasks();
   if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
-  const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_INGEST_URL).origin;
+  const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
 
-  const bodyPayload = { ...payload };
-  const runId = bodyPayload.runId || bodyPayload.run_id || generateRunId();
-  bodyPayload.runId = runId;
-  bodyPayload.run_id = runId;
-
-  const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
-  const rawDispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE;
-  const parsedDispatchDeadline = Number.parseFloat(
-    typeof rawDispatchDeadline === 'string'
-      ? rawDispatchDeadline.replace(/s$/i, '')
-      : rawDispatchDeadline
-  );
-  const dispatchDeadlineSeconds = Number.isFinite(parsedDispatchDeadline)
-    ? parsedDispatchDeadline
-    : 150;
-  const dispatchDeadline = {
-    seconds: Math.min(Math.max(0, Math.ceil(dispatchDeadlineSeconds)), 1800),
-    nanos: 0,
+  const bodyPayload = {
+    fromTasks: true,
+    payload,
   };
-  const scheduleDelaySeconds = Number.isFinite(Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
-    ? Math.max(0, Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
-    : 5;
-  const scheduledSeconds = Math.floor(Date.now() / 1000) + Math.max(scheduleDelaySeconds, 5);
+  const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const deadlineSeconds = Number(process.env.TASKS_DEADLINE_SEC || 150);
+  const delaySeconds = Number(process.env.TASKS_DELAY_SEC || 5);
+  const maxAttempts = Number(process.env.TASKS_MAX_ATTEMPTS || 12);
+  const minBackoffSeconds = Number(process.env.TASKS_MIN_BACKOFF_SEC || 1);
+  const maxBackoffSeconds = Number(process.env.TASKS_MAX_BACKOFF_SEC || 60);
+  const maxDoublings = Number(process.env.TASKS_MAX_DOUBLINGS || 4);
 
   const task = {
     httpRequest: {
       httpMethod: 'POST',
-      url: WORKER_INGEST_URL,
+      url: WORKER_TASK_URL,            // ★ ingest 하나로 통일
       headers: { 'Content-Type': 'application/json' },
       body,
-      ...(TASKS_INVOKER_SA
-        ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
-        : {}),
+      ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } } : {}),
     },
-    dispatchDeadline,
-    scheduleTime: { seconds: scheduledSeconds }, // cold start buffer
+    // gRPC Duration 객체 (REST가 아님)
+    dispatchDeadline: { seconds: deadlineSeconds, nanos: 0 },
+    // 콜드스타트/일시 에러 완충
+    scheduleTime: { seconds: nowSeconds + delaySeconds },
     retryConfig: {
-      maxAttempts: 12,
-      minBackoff: { seconds: 1 },
-      maxBackoff: { seconds: 60 },
-      maxDoublings: 4,
+      maxAttempts,
+      minBackoff: { seconds: minBackoffSeconds },
+      maxBackoff: { seconds: maxBackoffSeconds },
+      maxDoublings,
     },
   };
 
-  // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
   await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
-  return runId;
 }
 
 
@@ -498,252 +484,196 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
 });
 
-async function handleWorkerIngest(req, res) {
-  const startedAt = Date.now();
-  const payload = (req.body && typeof req.body === 'object') ? req.body : {};
-
-  const rawUri = [
-    payload?.gcsUri,
-    payload?.gcs_uri,
-    payload?.gsUri,
-    payload?.gcsPdfUri,
-    payload?.gcs_pdf_uri,
-    payload?.uri,
-    payload?.url,
-  ].map((value) => (typeof value === 'string' ? value.trim() : '')).find((value) => !!value);
-  const gcsUri = rawUri || '';
-
-  if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
-    console.warn('[ingest-init] bad payload', {
-      keys: Object.keys(payload || {}),
-    });
-    return res.status(400).json({ ok: false, error: 'gcsUri required' });
+function pickFirstString(...values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
   }
+  return null;
+}
 
-  const familySlug = payload?.family_slug ?? null;
-  const brand = payload?.brand ?? null;
-  const code = payload?.code ?? null;
-  const series = payload?.series ?? null;
-  const displayName = payload?.display_name ?? null;
-  const uploaderId = payload?.uploader_id ?? null;
-
-  const runId = generateRunId();
-
-  // Cloud Tasks 여부와 상관없이 runId가 생성되면 즉시 ACK
-  res.status(202).json({ ok: true, runId, run_id: runId });
-
-  const ingestPayload = {
-    runId,
-    run_id: runId,
-    gcsUri,
-    gcs_uri: gcsUri,
-    family_slug: familySlug,
-    brand,
-    code,
-    series,
-    display_name: displayName,
-    uploader_id: uploaderId,
-    phase: 'process',
+function getTaskContext(req, phase) {
+  const headerName = req.get('X-CloudTasks-TaskName') || req.get('X-Cloud-Tasks-TaskName') || null;
+  const retryHeader = req.get('X-CloudTasks-TaskRetryCount') || req.get('X-Cloud-Tasks-TaskRetryCount');
+  const parsedRetry = Number(retryHeader);
+  return {
+    taskName: headerName || `phase:${phase}`,
+    retryCount: Number.isFinite(parsedRetry) ? parsedRetry : 0,
   };
+}
 
-  try {
+async function markRunningState({ runId, gcsUri, taskName, retryCount }) {
+  const safeRetryCount = Number.isFinite(retryCount) ? retryCount : 0;
+  const update = await db.query(
+    `UPDATE public.ingest_run_logs
+        SET status = 'RUNNING',
+            task_name = $2,
+            retry_count = $3,
+            gcs_uri = COALESCE($4, gcs_uri),
+            error_message = NULL,
+            finished_at = NULL,
+            duration_ms = NULL,
+            final_table = NULL,
+            final_family = NULL,
+            final_brand = NULL,
+            final_code = NULL,
+            final_datasheet = NULL
+      WHERE id = $1`,
+    [runId, taskName || null, safeRetryCount, gcsUri || null]
+  );
+  if (!update.rowCount) {
     await db.query(
       `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
-         VALUES ($1,$2,$3,$4,'RUNNING')`,
-      [runId, 'phase:process', 0, gcsUri]
+         VALUES ($1,$2,$3,$4,'RUNNING')
+         ON CONFLICT (id) DO NOTHING`,
+      [runId, taskName || null, safeRetryCount, gcsUri || null]
     );
-
-    enqueueWorkerIngest(ingestPayload).catch(async (err) => {
-      try {
-        await db.query(
-          `UPDATE public.ingest_run_logs
-              SET finished_at = now(),
-                  duration_ms = $2,
-                  status = 'FAILED',
-                  error_message = $3
-            WHERE id = $1`,
-          [ runId, Date.now() - startedAt, `enqueue failed: ${String(err?.message || err)}` ]
-        );
-      } catch (_) {}
-      console.error('[ingest enqueue failed]', err?.message || err);
-    });
-  } catch (e) {
-    try {
-      await db.query(
-        `UPDATE public.ingest_run_logs
-           SET finished_at = now(),
-               duration_ms = $2,
-               status = 'FAILED',
-               error_message = $3
-         WHERE id = $1`,
-        [ runId, Date.now() - startedAt, String(e?.message || e) ]
-      );
-    } catch (_) {}
-    console.error('[ingest init failed]', e?.message || e);
   }
 }
 
-async function handleWorkerIngestTask(req, res) {
-  const startedAt = Date.now();
-  const taskName =
-    req.get('X-CloudTasks-TaskName') ||
-    req.get('X-Cloud-Tasks-TaskName') ||
-    null;
-  const retryCnt = Number(
-    req.get('X-CloudTasks-TaskRetryCount') ||
-    req.get('X-Cloud-Tasks-TaskRetryCount') ||
-    0
-  );
-  const payload = (req.body && typeof req.body === 'object') ? req.body : {};
-  const phase = String(payload?.phase || '').trim().toLowerCase();
+async function markRunningOrInsert(context) {
+  return markRunningState(context);
+}
 
-  const rawUri = [
-    payload?.gcsUri,
-    payload?.gcs_uri,
-    payload?.gsUri,
-    payload?.gcsPdfUri,
-    payload?.gcs_pdf_uri,
-    payload?.uri,
-    payload?.url,
-  ].map((value) => (typeof value === 'string' ? value.trim() : '')).find((value) => !!value);
-  const gcsUri = rawUri || '';
+async function markProcessing(context) {
+  return markRunningState(context);
+}
 
-  let runId = [payload?.runId, payload?.run_id]
-    .map((val) => (typeof val === 'string' && val.trim()) ? val.trim() : null)
-    .find(Boolean) || null;
-  if (!runId) {
-    runId = generateRunId();
-    console.warn('[ingest-task] runId missing -> created', { runId, taskName, phase });
-  }
+async function markPersisting(context) {
+  return markRunningState(context);
+}
 
-  const respondNoContent = () => {
-    if (!res.headersSent) res.status(204).send();
-  };
+async function markRunning(context) {
+  return markRunningState(context);
+}
 
-  const markProcessing = async () => {
-    const update = await db.query(
-      `UPDATE public.ingest_run_logs
-          SET status = 'RUNNING',
-              task_name = $2,
-              retry_count = $3,
-              gcs_uri = COALESCE($4, gcs_uri),
-              error_message = NULL,
-              finished_at = NULL,
-              duration_ms = NULL,
-              final_table = NULL,
-              final_family = NULL,
-              final_brand = NULL,
-              final_code = NULL,
-              final_datasheet = NULL
-        WHERE id = $1`,
-      [ runId, taskName, retryCnt, gcsUri ]
-    );
-    if (!update.rowCount) {
-      await db.query(
-        `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
-           VALUES ($1,$2,$3,$4,'RUNNING')`,
-        [ runId, taskName, retryCnt, gcsUri ]
-      );
-    }
-  };
-
-  const markPersisting = async () => {
-    const update = await db.query(
-      `UPDATE public.ingest_run_logs
-          SET status = 'RUNNING',
-              task_name = $2,
-              retry_count = $3,
-              gcs_uri = COALESCE($4, gcs_uri),
-              error_message = NULL,
-              finished_at = NULL,
-              duration_ms = NULL,
-              final_table = NULL,
-              final_family = NULL,
-              final_brand = NULL,
-              final_code = NULL,
-              final_datasheet = NULL
-        WHERE id = $1`,
-      [ runId, taskName, retryCnt, gcsUri ]
-    );
-    if (!update.rowCount) {
-      await db.query(
-        `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
-           VALUES ($1,$2,$3,$4,'RUNNING')`,
-        [ runId, taskName, retryCnt, gcsUri ]
-      );
-    }
-  };
-
-  const markFailed = async (message, durationMs) => {
-    const errMsg = String(message || 'ingest_failed');
-    const ms = Number.isFinite(durationMs) ? durationMs : (Date.now() - startedAt);
-    try {
-      await db.query(
-        `UPDATE public.ingest_run_logs
-            SET finished_at = now(),
-                duration_ms = $2,
-                status = 'FAILED',
-                task_name = $3,
-                retry_count = $4,
-                error_message = $5
-          WHERE id = $1`,
-        [ runId, ms, taskName, retryCnt, errMsg ]
-      );
-    } catch (err) {
-      console.error('[ingest-task markFailed]', err?.message || err);
-    }
-  };
-
-  const markSucceeded = async (out, uri, durationMs) => {
-    const ms = Number.isFinite(durationMs) ? durationMs : (Date.now() - startedAt);
-    try {
-      await db.query(
-        `UPDATE public.ingest_run_logs
-            SET finished_at = now(),
-                duration_ms = $2,
-                status = 'SUCCEEDED',
-                task_name = $3,
-                retry_count = $4,
-                final_table = $5,
-                final_family = $6,
-                final_brand = $7,
-                final_code  = $8,
-                final_datasheet = $9,
-                error_message = NULL
-          WHERE id = $1`,
-        [ runId, ms, taskName, retryCnt,
-          out?.specs_table || null,
-          out?.family || out?.family_slug || payload?.family_slug || null,
-          out?.brand || null,
-          (Array.isArray(out?.codes) ? out.codes[0] : out?.code) || null,
-          out?.datasheet_uri || uri || null ]
-      );
-    } catch (err) {
-      console.error('[ingest-task markSucceeded]', err?.message || err);
-    }
-  };
-
-  if (!phase) {
-    console.warn('[ingest-task] missing phase', { runId, taskName });
-    return respondNoContent();
-  }
-
-  let killer;
+async function markFailed({ runId, taskName, retryCount, error, durationMs }) {
+  const errMsg = String(error || 'ingest_failed');
+  const safeRetryCount = Number.isFinite(retryCount) ? retryCount : 0;
+  const ms = Number.isFinite(durationMs) ? durationMs : 0;
   try {
-    const deadlineMs = Number(process.env.INGEST_BUDGET_MS || 120000) + 15000;
-    killer = setTimeout(() => {
-      if (!res.headersSent) {
-        try { res.status(202).json({ ok: true, timeout: true }); } catch {}
-      }
-    }, deadlineMs);
+    await db.query(
+      `UPDATE public.ingest_run_logs
+          SET finished_at = now(),
+              duration_ms = $2,
+              status = 'FAILED',
+              task_name = $3,
+              retry_count = $4,
+              error_message = $5
+        WHERE id = $1`,
+      [runId, ms, taskName || null, safeRetryCount, errMsg]
+    );
+  } catch (err) {
+    console.error('[ingest markFailed]', err?.message || err);
+  }
+}
 
-    if (phase === 'process') {
-      await markProcessing();
-      const label = `[ingest-process] ${runId}`;
-      console.time(label);
-      let result;
-      try {
-        result = await runAutoIngest({
+async function markSucceeded({ runId, taskName, retryCount, result, gcsUri, durationMs, meta }) {
+  const safeRetryCount = Number.isFinite(retryCount) ? retryCount : 0;
+  const ms = Number.isFinite(durationMs) ? durationMs : 0;
+  const family = result?.family || result?.family_slug || meta?.family_slug || meta?.family || null;
+  const brand = result?.brand || meta?.brand || null;
+  const code = (Array.isArray(result?.codes) ? result.codes[0] : result?.code) || meta?.code || null;
+  const datasheet = result?.datasheet_uri || gcsUri || meta?.datasheet_uri || null;
+  try {
+    await db.query(
+      `UPDATE public.ingest_run_logs
+          SET finished_at = now(),
+              duration_ms = $2,
+              status = 'SUCCEEDED',
+              task_name = $3,
+              retry_count = $4,
+              final_table = $5,
+              final_family = $6,
+              final_brand = $7,
+              final_code  = $8,
+              final_datasheet = $9,
+              error_message = NULL
+        WHERE id = $1`,
+      [ runId, ms, taskName || null, safeRetryCount,
+        result?.specs_table || null,
+        family,
+        brand,
+        code,
+        datasheet ]
+    );
+  } catch (err) {
+    console.error('[ingest markSucceeded]', err?.message || err);
+  }
+}
+
+app.post('/api/worker/ingest', requireSession, async (req, res) => {
+  const rawBody = (req.body && typeof req.body === 'object') ? req.body : {};
+  const payload = rawBody.fromTasks && rawBody.payload && typeof rawBody.payload === 'object'
+    ? rawBody.payload
+    : rawBody;
+
+  const phaseInput = String(payload.phase || rawBody.phase || 'start').toLowerCase();
+  const knownPhases = new Set(['start', 'process', 'persist']);
+  const phase = knownPhases.has(phaseInput) ? phaseInput : 'start';
+  const runId = pickFirstString(payload.runId, payload.run_id, rawBody.runId, rawBody.run_id) || generateRunId();
+  const gcsUri = pickFirstString(
+    payload.gcsUri,
+    payload.gcs_uri,
+    payload.gsUri,
+    payload.gcsPdfUri,
+    payload.gcs_pdf_uri,
+    payload.uri,
+    payload.url,
+    rawBody.gcsUri,
+    rawBody.gcs_uri,
+    rawBody.gsUri,
+    rawBody.gcsPdfUri,
+    rawBody.uri,
+    rawBody.url
+  );
+
+  if (!res.headersSent) {
+    res.status(202).json({ ok: true, run_id: runId, runId, phase });
+  }
+
+  const { taskName, retryCount } = getTaskContext(req, phase);
+
+  setImmediate(async () => {
+    const startedAt = Date.now();
+    const baseContext = { runId, gcsUri, taskName, retryCount };
+
+    try {
+      if (phase === 'start') {
+        await markRunningOrInsert(baseContext);
+
+        if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
+          throw new Error('gcsUri required');
+        }
+
+        const nextPayload = {
+          runId,
+          run_id: runId,
+          gcsUri,
+          gcs_uri: gcsUri,
+          family_slug: payload?.family_slug ?? null,
+          brand: payload?.brand ?? null,
+          code: payload?.code ?? null,
+          series: payload?.series ?? null,
+          display_name: payload?.display_name ?? null,
+          uploader_id: payload?.uploader_id ?? null,
+          phase: 'process',
+        };
+
+        try {
+          await enqueueIngestTask(nextPayload);
+        } catch (err) {
+          throw new Error(`enqueue failed: ${String(err?.message || err)}`);
+        }
+
+        return;
+      }
+
+      if (phase === 'process') {
+        await markProcessing(baseContext);
+
+        const result = await runAutoIngest({
           ...payload,
           runId,
           run_id: runId,
@@ -751,117 +681,87 @@ async function handleWorkerIngestTask(req, res) {
           gcs_uri: gcsUri,
           skipPersist: true,
         });
-      } catch (err) {
-        console.timeEnd(label);
-        await markFailed(err?.message || err, Date.now() - startedAt);
-        if (!res.headersSent) return res.status(500).json({ ok:false, error:String(err?.message || err) });
-        console.warn('[ingest process post-ACK error]', String(err?.message || err));
-        return;
-      }
-      console.timeEnd(label);
 
-      const processed = result?.processed;
-      if (!processed || !Array.isArray(processed.records)) {
-        await markFailed('process_no_records', Date.now() - startedAt);
-        if (!res.headersSent) return res.status(500).json({ ok:false, error:'process_no_records' });
-        return;
-      }
+        const processed = result?.processed;
+        if (!processed || !Array.isArray(processed.records)) {
+          throw new Error('process_no_records');
+        }
 
-      await markPersisting();
+        await markRunning(baseContext);
 
-      const nextPayload = {
-        runId,
-        run_id: runId,
-        gcsUri,
-        gcs_uri: gcsUri,
-        family_slug: payload?.family_slug ?? null,
-        brand: payload?.brand ?? null,
-        code: payload?.code ?? null,
-        series: payload?.series ?? null,
-        display_name: payload?.display_name ?? null,
-        uploader_id: payload?.uploader_id ?? null,
-        phase: 'persist',
-        processed,
-      };
+        const nextPayload = {
+          runId,
+          run_id: runId,
+          gcsUri,
+          gcs_uri: gcsUri,
+          family_slug: payload?.family_slug ?? null,
+          brand: payload?.brand ?? null,
+          code: payload?.code ?? null,
+          series: payload?.series ?? null,
+          display_name: payload?.display_name ?? null,
+          uploader_id: payload?.uploader_id ?? null,
+          phase: 'persist',
+          processed,
+        };
 
-      try {
-        await enqueueWorkerIngest(nextPayload);
-      } catch (err) {
-        await markFailed(`persist enqueue failed: ${String(err?.message || err)}`, Date.now() - startedAt);
-        if (!res.headersSent) return res.status(500).json({ ok:false, error:String(err?.message || err) });
-        console.warn('[ingest process enqueue persist failed]', String(err?.message || err));
+        try {
+          await enqueueIngestTask(nextPayload);
+        } catch (err) {
+          throw new Error(`persist enqueue failed: ${String(err?.message || err)}`);
+        }
+
         return;
       }
 
-      return respondNoContent();
-    }
+      if (phase === 'persist') {
+        await markPersisting(baseContext);
 
-    if (phase === 'persist') {
-      await markPersisting();
-      const label = `[ingest-persist] ${runId}`;
-      console.time(label);
-      let out;
-      try {
-        out = await persistProcessedData(payload?.processed || {}, {
+        const out = await persistProcessedData(payload?.processed || {}, {
           brand: payload?.brand ?? null,
           code: payload?.code ?? null,
           series: payload?.series ?? null,
           display_name: payload?.display_name ?? null,
         });
-      } catch (err) {
-        console.timeEnd(label);
-        await markFailed(err?.message || err, Date.now() - startedAt);
-        if (!res.headersSent) return res.status(500).json({ ok:false, error:String(err?.message || err) });
-        console.warn('[ingest persist post-ACK error]', String(err?.message || err));
-        return;
-      }
-      console.timeEnd(label);
 
-      const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
-      const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
+        const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
+        const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
 
-      if (!out?.ok) {
-        const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
-        const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
-        await markFailed(message, out?.ms ?? (Date.now() - startedAt));
-        if (!res.headersSent) {
-          return res.status(200).json({
-            ok: false,
-            run_id: runId,
-            reject_reasons: reasonList,
-            warnings: Array.from(warningReasons),
+        if (!out?.ok) {
+          const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
+          const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
+          await markFailed({
+            ...baseContext,
+            error: message,
+            durationMs: out?.ms ?? (Date.now() - startedAt),
           });
+          return;
         }
+
+        await markSucceeded({
+          ...baseContext,
+          result: out,
+          gcsUri,
+          durationMs: out?.ms ?? (Date.now() - startedAt),
+          meta: payload,
+        });
         return;
       }
 
-      await markSucceeded(out, gcsUri, out?.ms ?? (Date.now() - startedAt));
-      return respondNoContent();
+      console.warn('[ingest] unknown phase', { phase, runId, taskName });
+      await markFailed({ ...baseContext, error: 'unknown_phase', durationMs: Date.now() - startedAt });
+    } catch (err) {
+      console.error('[ingest async error]', err?.message || err);
+      try {
+        await markFailed({
+          ...baseContext,
+          error: err?.message || err,
+          durationMs: Date.now() - startedAt,
+        });
+      } catch (innerErr) {
+        console.error('[ingest async error][markFailed]', innerErr?.message || innerErr);
+      }
     }
-
-    console.warn('[ingest-task] unknown phase', { phase, runId, taskName });
-    return respondNoContent();
-  } finally {
-    if (killer) clearTimeout(killer);
-  }
-}
-
-app.post('/api/worker/ingest', requireSession, async (req, res, next) => {
-  const isTaskRequest = Boolean(
-    req.get('X-CloudTasks-TaskName') ||
-    req.get('X-Cloud-Tasks-TaskName') ||
-    (req.body && typeof req.body === 'object' && req.body.phase)
-  );
-
-  try {
-    if (isTaskRequest) {
-      await handleWorkerIngestTask(req, res);
-    } else {
-      await handleWorkerIngest(req, res);
-    }
-  } catch (err) {
-    next(err);
-  }
+  });
 });
 
 async function seedManufacturerAliases() {

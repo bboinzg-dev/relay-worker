@@ -29,7 +29,7 @@ const BASE_KEYS = new Set([
   'cover','verified_in_doc','updated_at'
 ]);
 
-const PN_CANDIDATE_RE = /\b[A-Z0-9][A-Z0-9\-_/\.]{3,29}[A-Z0-9]\b/gi;
+const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
 const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
 
 function escapeRegex(str) {
@@ -990,7 +990,8 @@ async function persistProcessedData(processed = {}, overrides = {}) {
 
   const ms = Number.isFinite(processed?.ms) ? processed.ms : (typeof started === 'number' ? Date.now() - started : null);
   const upsertsCount = typeof persistResult.upserts === 'number' ? persistResult.upserts : 0;
-  const ok = upsertsCount > 0;
+  const affected = typeof persistResult.affected === 'number' ? persistResult.affected : upsertsCount;
+  const ok = affected > 0;
 
   const fallbackBrand = overrides.brand || brandName || extractedBrand || null;
   const primaryRecord = records[0] || null;
@@ -1012,7 +1013,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     code: finalCode,
     datasheet_uri: gcsUri,
     cover: coverUri || primaryRecord?.image_uri || null,
-    rows: upsertsCount,        // 실제 반영된 개수만 기록
+    rows: affected,        // 실제 반영된 개수만 기록
     codes: Array.from(persistedCodes),  // 표시는 그대로
     mpn_list: mergedMpns,
     reject_reasons: Array.from(rejectReasons),
@@ -1027,6 +1028,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     response.code = baseSeries;
   }
 
+  response.affected = affected;
   return response;
 }
 

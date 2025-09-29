@@ -162,6 +162,60 @@ try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bo
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
 try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
+try {
+  const aiRouter = express.Router();
+  const { VertexAI } = require('@google-cloud/vertexai');
+
+  aiRouter.get('/api/ai/resolve', async (req, res) => {
+    try {
+      const q = String(req.query.q || '').trim();
+      if (!q) return res.status(400).json({ ok: false, error: 'q required' });
+
+      const v = new VertexAI({
+        project: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID,
+        location: process.env.VERTEX_LOCATION || 'asia-northeast3',
+      });
+      const mdl = v.getGenerativeModel({
+        model: process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash',
+        systemInstruction: {
+          parts: [{ text: 'Parse an electronics part query. Return STRICT JSON: {"brand": string|null, "codes": string[]}.' }],
+        },
+      });
+      const out = await mdl.generateContent({
+        contents: [{ role: 'user', parts: [{ text: `query: ${q}` }] }],
+        generationConfig: {
+          temperature: 0.2,
+          responseMimeType: 'application/json',
+          maxOutputTokens: 512,
+        },
+      });
+
+      let parsed = {};
+      try {
+        parsed = JSON.parse(out?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
+      } catch {}
+
+      const brand = typeof parsed?.brand === 'string' ? parsed.brand.trim() : '';
+      const codes = Array.isArray(parsed?.codes)
+        ? parsed.codes.map(x => String(x || '').trim()).filter(Boolean)
+        : [];
+
+      if (!brand || !codes.length) {
+        return res.status(404).json({ ok: false, error: 'cannot resolve' });
+      }
+
+      return res.json({ ok: true, brand, code: codes[0] });
+    } catch (e) {
+      console.error('[ai.resolve]', e);
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+
+  app.use(aiRouter);
+  console.log('[BOOT] mounted /api/ai/resolve');
+} catch (e) {
+  console.error(e);
+}
 
 /* NOTE: The parts router already exists in your repo; keep it mounted. */
 try { app.use('/api/parts', require('./src/routes/parts')); } catch {}

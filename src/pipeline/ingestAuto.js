@@ -46,6 +46,42 @@ function textContainsExact(text, pn) {
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
 
+// --- 브랜드 자동 감지 (manufacturer_alias 기반) ---
+async function detectBrandFromText(text = '', fileName = '') {
+  const hay = `${String(fileName || '')} ${String(text || '')}`.toLowerCase();
+  if (!hay.trim()) return null;
+  try {
+    const { rows } = await db.query(
+      `SELECT brand, brand_norm, alias, aliases FROM public.manufacturer_alias`
+    );
+    for (const row of rows) {
+      if (!row) continue;
+      const tokens = new Set();
+      if (row.brand) tokens.add(String(row.brand));
+      if (row.brand_norm) tokens.add(String(row.brand_norm));
+      if (row.alias) tokens.add(String(row.alias));
+      if (Array.isArray(row.aliases)) {
+        for (const a of row.aliases) tokens.add(String(a));
+      } else if (typeof row.aliases === 'string') {
+        tokens.add(row.aliases);
+      }
+      for (const token of tokens) {
+        const trimmed = String(token || '').trim();
+        if (!trimmed) continue;
+        if (trimmed.toLowerCase() === 'unknown') continue;
+        if (trimmed.length < 2) continue;
+        const pattern = escapeRegex(trimmed.toLowerCase());
+        if (!pattern) continue;
+        const re = new RegExp(`(^|[^a-z0-9])${pattern}([^a-z0-9]|$)`, 'i');
+        if (re.test(hay)) return String(row.brand || trimmed).trim();
+      }
+    }
+  } catch (err) {
+    console.warn('[brand detect] failed:', err?.message || err);
+  }
+  return null;
+}
+
 function harvestMpnCandidates(text, series){
   const hay = String(text || '');
   if (!hay) return [];
@@ -458,6 +494,7 @@ async function runAutoIngest(input = {}) {
   const overridesBrand = input?.overrides?.brand ?? null;
   const overridesSeries = input?.overrides?.series ?? null;
   const effectiveBrand = overridesBrand || brand || null;
+  let detectedBrand = null;
   if (overridesSeries != null && (series == null || series === '')) series = overridesSeries;
 
   const gcsUri = (rawGcsUri || rawGsUri || '').trim();
@@ -573,13 +610,21 @@ async function runAutoIngest(input = {}) {
       previewText = r?.text || previewText;
     } catch {}
   }
+  if (!effectiveBrand) {
+    try {
+      detectedBrand = await detectBrandFromText(previewText, fileName);
+    } catch (err) {
+      console.warn('[brand detect] preview failed:', err?.message || err);
+    }
+  }
   let candidates = [];
   try {
     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
   } catch { candidates = []; }
 
   // PDF → 품번/스펙 추출
-  let extracted = { brand: effectiveBrand || 'unknown', rows: [] };
+  const brandHint = effectiveBrand || detectedBrand || null;
+  let extracted = { brand: brandHint || 'unknown', rows: [] };
   if (!effectiveBrand || !code) {
     try {
       if (FAST) {
@@ -591,7 +636,7 @@ async function runAutoIngest(input = {}) {
         if (raw && raw.length > 1000) {
           const fieldsJson = blueprint?.fields || {};
           const vals = await extractFields(raw, code || '', fieldsJson);
-          const fallbackBrand = effectiveBrand || 'unknown';
+          const fallbackBrand = brandHint || 'unknown';
           extracted = {
             brand: fallbackBrand,
             rows: [{ brand: fallbackBrand, code: code || (path.parse(fileName).name), ...(vals||{}) }],
@@ -599,19 +644,35 @@ async function runAutoIngest(input = {}) {
         } else {
           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
           extracted = await withTimeout(
-            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: effectiveBrand || null }),
+            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
             EXTRACT_HARD_CAP_MS,
             'extract',
           );
         }
       } else {
         extracted = await withTimeout(
-          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: effectiveBrand || null }),
+          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
           EXTRACT_HARD_CAP_MS,
           'extract',
         );
       }
     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
+  }
+
+  if (detectedBrand && extracted && typeof extracted === 'object') {
+    const brandValue = String(extracted.brand || '').trim().toLowerCase();
+    if (!brandValue || brandValue === 'unknown') {
+      extracted.brand = detectedBrand;
+    }
+    if (Array.isArray(extracted.rows)) {
+      for (const row of extracted.rows) {
+        if (!row || typeof row !== 'object') continue;
+        const rowBrand = String(row.brand || '').trim().toLowerCase();
+        if (!rowBrand || rowBrand === 'unknown') {
+          row.brand = detectedBrand;
+        }
+      }
+    }
   }
 
   // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
@@ -959,6 +1020,7 @@ async function runAutoIngest(input = {}) {
     job_id: jobId,
     text: extractedText,
     brand: extracted?.brand ?? null,
+    brand_detected: detectedBrand || null,
   };
 
   if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
@@ -971,7 +1033,7 @@ async function runAutoIngest(input = {}) {
   }
 
   const persistOverrides = {
-    brand: effectiveBrand,
+    brand: effectiveBrand || detectedBrand || null,
     code,
     series: overridesSeries ?? series,
     display_name,
@@ -1008,6 +1070,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     baseSeries = null,
     text: processedText = null,
     brand: processedBrand = null,
+    brand_detected: processedDetected = null,
   } = processed || {};
 
   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
@@ -1017,9 +1080,14 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   const docText = typeof processedText === 'string'
     ? processedText
     : (processedText != null ? String(processedText) : '');
-  const brandSeed = (processedBrand && String(processedBrand).trim().toLowerCase() !== 'unknown')
-    ? processedBrand
-    : null;
+  const normalizeSeedBrand = (value) => {
+    if (value == null) return null;
+    const trimmed = String(value).trim();
+    if (!trimmed) return null;
+    if (trimmed.toLowerCase() === 'unknown') return null;
+    return trimmed;
+  };
+  const brandSeed = normalizeSeedBrand(processedBrand) || normalizeSeedBrand(processedDetected) || null;
   if ((docText && docText.length) || brandSeed) {
     const applyRowHints = (row) => {
       if (!row || typeof row !== 'object') return;
@@ -1046,7 +1114,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     const requiredList = Array.isArray(requiredFields) ? requiredFields : [];
     const effectiveRequired = allowMinimal ? [] : requiredList;
 
-    const normalizeBrand = (value) => {
+    const safeBrand = (value) => {
       if (value == null) return null;
       const trimmed = String(value).trim();
       if (!trimmed) return null;
@@ -1054,11 +1122,45 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       return trimmed;
     };
 
-    const brandOverride = normalizeBrand(overrides?.brand)
-      || normalizeBrand(processedBrand)
-      || normalizeBrand(brandName)
-      || normalizeBrand(extractedBrand)
+    let brandOverride = safeBrand(overrides?.brand)
+      || safeBrand(processedBrand)
+      || safeBrand(brandName)
+      || safeBrand(extractedBrand)
+      || safeBrand(processedDetected)
       || null;
+
+    if (!brandOverride) {
+      let baseName = '';
+      try {
+        const { name } = parseGcsUri(gcsUri || '');
+        baseName = path.basename(name || '');
+      } catch {}
+      try {
+        const guessed = await detectBrandFromText(docText || '', baseName);
+        if (safeBrand(guessed)) brandOverride = guessed;
+      } catch (err) {
+        console.warn('[brand detect] persist retry failed:', err?.message || err);
+      }
+    }
+
+    if (brandOverride) {
+      for (const row of records) {
+        if (!row || typeof row !== 'object') continue;
+        const current = String(row.brand || '').trim();
+        if (!current || current.toLowerCase() === 'unknown') {
+          row.brand = brandOverride;
+        }
+      }
+      if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+        for (const row of processedRowsInput) {
+          if (!row || typeof row !== 'object') continue;
+          const current = String(row.brand || '').trim();
+          if (!current || current.toLowerCase() === 'unknown') {
+            row.brand = brandOverride;
+          }
+        }
+      }
+    }
 
     persistResult = await saveExtractedSpecs(qualified, family, records, {
       brand: brandOverride,

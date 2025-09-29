@@ -17,30 +17,28 @@ const { generateRunId } = require('./src/utils/run-id');
 
 
 // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
- const { CloudTasksClient } = require('@google-cloud/tasks');
- const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
- const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
- const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
- // step 라우트 폐지 → ingest 하나로 통일
- const WORKER_TASK_URL = process.env.WORKER_TASK_URL || (
-   process.env.WORKER_URL ? `${process.env.WORKER_URL.replace(/\/+$/,'')}/api/worker/ingest` :
-   'https://<YOUR-RUN-URL>/api/worker/ingest');
- const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
+const { CloudTasksClient } = require('@google-cloud/tasks');
+const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
+const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
+// step 라우트 폐지 → ingest 하나로 통일
+const WORKER_TASK_URL = process.env.WORKER_TASK_URL || process.env.WORKER_STEP_URL || 'https://<YOUR-RUN-URL>/api/worker/ingest';
+const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
 
 
- try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
+try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
 
- // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
- let _tasks = null;
- let _queuePath = null;
- function getTasks() {
-   if (!_tasks) {
+// lazy init: gRPC 문제 대비 regional endpoint + REST fallback
+let _tasks = null;
+let _queuePath = null;
+function getTasks() {
+  if (!_tasks) {
     // 글로벌 엔드포인트 + REST fallback(HTTP/1)
     _tasks = new CloudTasksClient({ fallback: true });
-     _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
-   }
-   return { tasks: _tasks, queuePath: _queuePath };
- }
+    _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
+  }
+  return { tasks: _tasks, queuePath: _queuePath };
+}
 
 async function enqueueIngestTask(payload = {}) {
   const { tasks, queuePath } = getTasks();

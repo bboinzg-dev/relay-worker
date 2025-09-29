@@ -1,65 +1,93 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index f88f1e5fee61eed54f3e085a89966219b5458cab..e67d9d4ab30c7d0dba28ae72fd860b1b6f3093e8 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -545,58 +545,58 @@ async function runAutoIngest(input = {}) {
-   let candidates = [];
-   try {
-     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
-   } catch { candidates = []; }
+diff --git a/server.js b/server.js
+index 2564617319c34a152f695fa01c1cd4eba6965603..726effb89ec8c30acda8d3bdd231879fd29a5ab5 100644
+--- a/server.js
++++ b/server.js
+@@ -1,68 +1,66 @@
+ /* server.js */
+ 'use strict';
  
-   // PDF → 품번/스펙 추출
-   let extracted = { brand: brand || 'unknown', rows: [] };
-   if (!brand || !code) {
-     try {
-       if (FAST) {
-         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
-         let raw = previewText;
-         if (!raw) {
-           try { raw = await readText(gcsUri, PREVIEW_BYTES); } catch { raw = ''; }
-         }
-         if (raw && raw.length > 1000) {
-           const fieldsJson = blueprint?.fields || {};
-           const vals = await extractFields(raw, code || '', fieldsJson);
-           extracted = {
-             brand: brand || 'unknown',
-             rows: [{ brand: brand || 'unknown', code: code || (path.parse(fileName).name), ...(vals||{}) }],
-           };
-         } else {
-           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
-           extracted = await withTimeout(
--            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
-+            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: brand || null }),
-             EXTRACT_HARD_CAP_MS,
-             'extract',
-           );
-         }
-       } else {
-         extracted = await withTimeout(
--          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
-+          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: brand || null }),
-           EXTRACT_HARD_CAP_MS,
-           'extract',
-         );
-       }
-     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
-   }
+ const express = require('express');
+ const cors = require('cors');
+ const bodyParser = require('body-parser');
+ const multer = require('multer');
+ const crypto = require('crypto');
+ const jwt = require('jsonwebtoken');
  
-   // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
-   let codes = [];
-   if (!code) {
-     const skuFromTable = pickSkuListFromTables(extracted);
-     const docText = extracted?.text || previewText || '';
-     codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint, docText);
-     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
-     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
-     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
-   }
+ const db = require('./src/utils/db');
+ const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
+ const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
+ const { runAutoIngest, persistProcessedData } = require('./src/pipeline/ingestAuto');
+ const { generateRunId } = require('./src/utils/run-id');
  
-   // 🔹 후보(candidates)가 아직 비었고, 방금 수집한 codes가 있으면 candidates로 승격
-   if (!candidates.length && codes.length) {
-     const merged = [];
-     const seen = new Set();
-     for (const raw of codes) {
-       const trimmed = typeof raw === 'string' ? raw.trim() : String(raw || '');
-       if (!trimmed) continue;
+ 
+ 
+ // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
+- const { CloudTasksClient } = require('@google-cloud/tasks');
+- const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+- const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
+- const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
+- // step 라우트 폐지 → ingest 하나로 통일
+- const WORKER_TASK_URL = process.env.WORKER_TASK_URL || (
+-   process.env.WORKER_URL ? `${process.env.WORKER_URL.replace(/\/+$/,'')}/api/worker/ingest` :
+-   'https://<YOUR-RUN-URL>/api/worker/ingest');
+- const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
+-
+-
+- try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
+-
+- // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
+- let _tasks = null;
+- let _queuePath = null;
+- function getTasks() {
+-   if (!_tasks) {
++const { CloudTasksClient } = require('@google-cloud/tasks');
++const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
++const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
++const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
++// step 라우트 폐지 → ingest 하나로 통일
++const WORKER_TASK_URL = process.env.WORKER_TASK_URL || process.env.WORKER_STEP_URL || 'https://<YOUR-RUN-URL>/api/worker/ingest';
++const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
++
++
++try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
++
++// lazy init: gRPC 문제 대비 regional endpoint + REST fallback
++let _tasks = null;
++let _queuePath = null;
++function getTasks() {
++  if (!_tasks) {
+     // 글로벌 엔드포인트 + REST fallback(HTTP/1)
+     _tasks = new CloudTasksClient({ fallback: true });
+-     _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
+-   }
+-   return { tasks: _tasks, queuePath: _queuePath };
+- }
++    _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
++  }
++  return { tasks: _tasks, queuePath: _queuePath };
++}
+ 
+ async function enqueueIngestTask(payload = {}) {
+   const { tasks, queuePath } = getTasks();
+   if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
+   const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
+ 
+   const bodyPayload = {
+     fromTasks: true,
+     payload,
+   };
+   const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
+ 
+   const nowSeconds = Math.floor(Date.now() / 1000);
+   const deadlineSeconds = Number(process.env.TASKS_DEADLINE_SEC || 150);
+   const delaySeconds = Number(process.env.TASKS_DELAY_SEC || 5);
+   const maxAttempts = Number(process.env.TASKS_MAX_ATTEMPTS || 12);
+   const minBackoffSeconds = Number(process.env.TASKS_MIN_BACKOFF_SEC || 1);
+   const maxBackoffSeconds = Number(process.env.TASKS_MAX_BACKOFF_SEC || 60);
+   const maxDoublings = Number(process.env.TASKS_MAX_DOUBLINGS || 4);
+ 
+   const task = {
+     httpRequest: {
+       httpMethod: 'POST',
+       url: WORKER_TASK_URL,            // ★ ingest 하나로 통일
+       headers: { 'Content-Type': 'application/json' },

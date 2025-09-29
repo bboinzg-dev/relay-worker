@@ -172,12 +172,16 @@ try {
       const q = String(req.query.q || '').trim();
       if (!q) return res.status(400).json({ ok: false, error: 'q required' });
 
+      const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID;
+      const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
+      const modelId = process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash';
+
       const v = new VertexAI({
-        project: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID,
-        location: process.env.VERTEX_LOCATION || 'asia-northeast3',
+        project: projectId,
+        location,
       });
       const mdl = v.getGenerativeModel({
-        model: process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash',
+        model: modelId,
         systemInstruction: {
           parts: [{ text: 'Parse an electronics part query. Return STRICT JSON: {"brand": string|null, "codes": string[]}.' }],
         },

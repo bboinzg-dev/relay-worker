@@ -1,477 +1,68 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index f5fd4174d4c5191bfa29f1f06f35e1f8d59df942..133793a42419dcc9dc08eb7861d5c0ef696747bd 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -24,50 +24,86 @@ const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지
+diff --git a/server.js b/server.js
+index e3f62990eedd0c1bf661eb2f2b977e44ab988146..b9cd0c04222fe35e4ec47af74556b744e3f38592 100644
+--- a/server.js
++++ b/server.js
+@@ -150,56 +150,60 @@ authRouter.post('/logout', (_req, res) => res.json({ ok: true }));
  
- const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
- const BASE_KEYS = new Set([
-   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
-   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
-   'cover','verified_in_doc','updated_at'
- ]);
+ // ✅ /auth/* 경로로 확정 마운트 (항상 가장 먼저 잡히게)
+ app.use('/auth', authRouter);
  
- const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
- const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
+ // (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
+ app.post('/login', loginHandler);
  
- function escapeRegex(str) {
-   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
- }
+ /* ---------------- Mount modular routers (after global middleware) ---------------- */
+ try { app.use(require('./server.ai')); console.log('[BOOT] mounted /api/ai/resolve'); } catch (e) { console.error('[BOOT] ai/resolve mount error', e?.message||e); }
+ try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
+ try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
+ try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
+ try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
+ try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
+ try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
+ try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
+ try {
+   const aiRouter = express.Router();
+   const { VertexAI } = require('@google-cloud/vertexai');
  
- function textContainsExact(text, pn) {
-   if (!text || !pn) return false;
-   const pattern = escapeRegex(String(pn).trim());
-   if (!pattern) return false;
-   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
-   return re.test(String(text));
- }
- 
- function normLower(s){ return String(s||'').trim().toLowerCase(); }
- 
-+// --- 브랜드 자동 감지 (manufacturer_alias 기반) ---
-+async function detectBrandFromText(text = '', fileName = '') {
-+  const hay = `${String(fileName || '')} ${String(text || '')}`.toLowerCase();
-+  if (!hay.trim()) return null;
-+  try {
-+    const { rows } = await db.query(
-+      `SELECT brand, brand_norm, alias, aliases FROM public.manufacturer_alias`
-+    );
-+    for (const row of rows) {
-+      if (!row) continue;
-+      const tokens = new Set();
-+      if (row.brand) tokens.add(String(row.brand));
-+      if (row.brand_norm) tokens.add(String(row.brand_norm));
-+      if (row.alias) tokens.add(String(row.alias));
-+      if (Array.isArray(row.aliases)) {
-+        for (const a of row.aliases) tokens.add(String(a));
-+      } else if (typeof row.aliases === 'string') {
-+        tokens.add(row.aliases);
-+      }
-+      for (const token of tokens) {
-+        const trimmed = String(token || '').trim();
-+        if (!trimmed) continue;
-+        if (trimmed.toLowerCase() === 'unknown') continue;
-+        if (trimmed.length < 2) continue;
-+        const pattern = escapeRegex(trimmed.toLowerCase());
-+        if (!pattern) continue;
-+        const re = new RegExp(`(^|[^a-z0-9])${pattern}([^a-z0-9]|$)`, 'i');
-+        if (re.test(hay)) return String(row.brand || trimmed).trim();
-+      }
-+    }
-+  } catch (err) {
-+    console.warn('[brand detect] failed:', err?.message || err);
-+  }
-+  return null;
-+}
-+
- function harvestMpnCandidates(text, series){
-   const hay = String(text || '');
-   if (!hay) return [];
-   const ser = String(series || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-   const seen = new Set();
-   const out = [];
-   PN_CANDIDATE_RE.lastIndex = 0;
-   let match;
-   while ((match = PN_CANDIDATE_RE.exec(hay)) != null) {
-     const raw = match[0];
-     if (!raw) continue;
-     if (PN_BLACKLIST_RE.test(raw)) continue;
-     const norm = raw.toUpperCase();
-     if (ser && norm && !norm.startsWith(ser)) continue;
-     if (seen.has(norm)) continue;
-     seen.add(norm);
-     out.push(raw.trim());
-   }
-   return out;
- }
- 
- // DB 컬럼 타입 조회 (fallback용)
- async function getColumnTypes(qualified) {
-   const [schema, table] = qualified.includes('.') ? qualified.split('.') : ['public', qualified];
-   const q = `
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index f5fd4174d4c5191bfa29f1f06f35e1f8d59df942..133793a42419dcc9dc08eb7861d5c0ef696747bd 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -436,50 +472,51 @@ async function extractPartNumbersFromText(text, { series } = {}) {
-   };
- 
-   for (const { code } of extractPartNumbersFromTypesTables(src, 200)) push(code);
-   for (const { code } of rankPartNumbersFromOrderingSections(src, 200)) push(code);
-   for (const { code } of extractPartNumbersBySeriesHeuristic(src, 200)) push(code);
- 
-   return out;
- }
- 
- 
- 
- async function runAutoIngest(input = {}) {
-   let {
-     gcsUri: rawGcsUri = null,
-     gsUri: rawGsUri = null,
-     family_slug = null,
-     brand = null,
-     code = null,
-     series = null,
-     display_name = null,
-   } = input;
- 
-   const overridesBrand = input?.overrides?.brand ?? null;
-   const overridesSeries = input?.overrides?.series ?? null;
-   const effectiveBrand = overridesBrand || brand || null;
-+  let detectedBrand = null;
-   if (overridesSeries != null && (series == null || series === '')) series = overridesSeries;
- 
-   const gcsUri = (rawGcsUri || rawGsUri || '').trim();
-   const runId = input?.runId ?? input?.run_id ?? null;
-   const jobId = input?.jobId ?? input?.job_id ?? null;
- 
-   const started = Date.now();
-   if (!gcsUri) throw new Error('gcsUri/gsUri required');
-   // 기본 2분 하드캡 (ENV로 조정 가능)
-   const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
-   const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
-   const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || 262144);
-   const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
-   const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
- 
-   let lockAcquired = false;
-   if (runId) {
+   aiRouter.get('/api/ai/resolve', async (req, res) => {
      try {
-       await db.query('SELECT pg_advisory_lock(hashtext($1))', [runId]);
-       lockAcquired = true;
-     } catch (err) {
-       console.warn('[ingest] advisory lock failed:', err?.message || err);
-     }
-   }
+       const q = String(req.query.q || '').trim();
+       if (!q) return res.status(400).json({ ok: false, error: 'q required' });
  
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index f5fd4174d4c5191bfa29f1f06f35e1f8d59df942..133793a42419dcc9dc08eb7861d5c0ef696747bd 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -551,91 +588,115 @@ async function runAutoIngest(input = {}) {
-         requiredFields.push(normalized);
-       }
-     }
-   }
- 
-   let colTypes;
-   const disableEnsure = /^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0');
- 
-   // -------- 공용 강제정규화 유틸 --------
- 
-   if (code && !/\d/.test(String(code))) {
-     // "AGN","TQ" 처럼 숫자 없는 시리즈는 series로 넘기고 code는 비움
-     series = code; code = null;
-   }
- 
- 
-   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
-   let previewText = '';
-   try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
-   if (!previewText || previewText.length < 1000) {
-     try {
-       const r = await extractText(gcsUri);
-       previewText = r?.text || previewText;
-     } catch {}
-   }
-+  if (!effectiveBrand) {
-+    try {
-+      detectedBrand = await detectBrandFromText(previewText, fileName);
-+    } catch (err) {
-+      console.warn('[brand detect] preview failed:', err?.message || err);
-+    }
-+  }
-   let candidates = [];
-   try {
-     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
-   } catch { candidates = []; }
- 
-   // PDF → 품번/스펙 추출
--  let extracted = { brand: effectiveBrand || 'unknown', rows: [] };
-+  const brandHint = effectiveBrand || detectedBrand || null;
-+  let extracted = { brand: brandHint || 'unknown', rows: [] };
-   if (!effectiveBrand || !code) {
-     try {
-       if (FAST) {
-         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
-         let raw = previewText;
-         if (!raw) {
-           try { raw = await readText(gcsUri, PREVIEW_BYTES); } catch { raw = ''; }
-         }
-         if (raw && raw.length > 1000) {
-           const fieldsJson = blueprint?.fields || {};
-           const vals = await extractFields(raw, code || '', fieldsJson);
--          const fallbackBrand = effectiveBrand || 'unknown';
-+          const fallbackBrand = brandHint || 'unknown';
-           extracted = {
-             brand: fallbackBrand,
-             rows: [{ brand: fallbackBrand, code: code || (path.parse(fileName).name), ...(vals||{}) }],
-           };
-         } else {
-           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
-           extracted = await withTimeout(
--            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: effectiveBrand || null }),
-+            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
-             EXTRACT_HARD_CAP_MS,
-             'extract',
-           );
-         }
-       } else {
-         extracted = await withTimeout(
--          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: effectiveBrand || null }),
-+          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
-           EXTRACT_HARD_CAP_MS,
-           'extract',
-         );
-       }
-     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
-   }
- 
-+  if (detectedBrand && extracted && typeof extracted === 'object') {
-+    const brandValue = String(extracted.brand || '').trim().toLowerCase();
-+    if (!brandValue || brandValue === 'unknown') {
-+      extracted.brand = detectedBrand;
-+    }
-+    if (Array.isArray(extracted.rows)) {
-+      for (const row of extracted.rows) {
-+        if (!row || typeof row !== 'object') continue;
-+        const rowBrand = String(row.brand || '').trim().toLowerCase();
-+        if (!rowBrand || rowBrand === 'unknown') {
-+          row.brand = detectedBrand;
-+        }
-+      }
-+    }
-+  }
++      const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID;
++      const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
++      const modelId = process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash';
 +
-   // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
-   let codes = [];
-   if (!code) {
-     const skuFromTable = pickSkuListFromTables(extracted);
-     const docText = extracted?.text || previewText || '';
-     codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint, docText);
-     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
-     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
-     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
-   }
+       const v = new VertexAI({
+-        project: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID,
+-        location: process.env.VERTEX_LOCATION || 'asia-northeast3',
++        project: projectId,
++        location,
+       });
+       const mdl = v.getGenerativeModel({
+-        model: process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash',
++        model: modelId,
+         systemInstruction: {
+           parts: [{ text: 'Parse an electronics part query. Return STRICT JSON: {"brand": string|null, "codes": string[]}.' }],
+         },
+       });
+       const out = await mdl.generateContent({
+         contents: [{ role: 'user', parts: [{ text: `query: ${q}` }] }],
+         generationConfig: {
+           temperature: 0.2,
+           responseMimeType: 'application/json',
+           maxOutputTokens: 512,
+         },
+       });
  
-   // 🔹 후보(candidates)가 아직 비었고, 방금 수집한 codes가 있으면 candidates로 승격
-   if (!candidates.length && codes.length) {
-     const merged = [];
-     const seen = new Set();
-     for (const raw of codes) {
-       const trimmed = typeof raw === 'string' ? raw.trim() : String(raw || '');
-       if (!trimmed) continue;
-       const norm = normalizeCode(trimmed);
-       if (seen.has(norm)) continue;
-       seen.add(norm);
-       merged.push(trimmed);
-     }
-     if (merged.length) candidates = merged;
-   }
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index f5fd4174d4c5191bfa29f1f06f35e1f8d59df942..133793a42419dcc9dc08eb7861d5c0ef696747bd 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -937,151 +998,192 @@ async function runAutoIngest(input = {}) {
-     recs: records.length,
-     colsSanitized: colTypes?.size || 0,
-   });
+       let parsed = {};
+       try {
+         parsed = JSON.parse(out?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
+       } catch {}
  
-   const processedPayload = {
-     started,
-     gcsUri,
-     family,
-     table,
-     qualified,
-     pnTemplate,
-     requiredFields,
-     coverUri,
-     records,
-     rows: records,
-     mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
-     extractedBrand: extracted?.brand || null,
-     brandName,
-     baseSeries,
-     runId,
-     run_id: runId,
-     jobId,
-     job_id: jobId,
-     text: extractedText,
-     brand: extracted?.brand ?? null,
-+    brand_detected: detectedBrand || null,
-   };
+       const brand = typeof parsed?.brand === 'string' ? parsed.brand.trim() : '';
+       const codes = Array.isArray(parsed?.codes)
+         ? parsed.codes.map(x => String(x || '').trim()).filter(Boolean)
+         : [];
  
-   if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
-   if (display_name != null) processedPayload.display_name = display_name;
-   if (code != null) processedPayload.code = code;
-   if (series != null) processedPayload.series = series;
- 
-   if (input && typeof input === 'object' && input.skipPersist) {
-     return { ok: true, phase: 'process', processed: processedPayload };
-   }
- 
-   const persistOverrides = {
--    brand: effectiveBrand,
-+    brand: effectiveBrand || detectedBrand || null,
-     code,
-     series: overridesSeries ?? series,
-     display_name,
-     runId,
-     run_id: runId,
-     jobId,
-     job_id: jobId,
-   };
-   return persistProcessedData(processedPayload, persistOverrides);
-   })();
- 
-   try {
-     return await runnerPromise;
-   } finally {
-     await releaseLock();
-   }
- }
- 
- async function persistProcessedData(processed = {}, overrides = {}) {
-   const {
-     started = Date.now(),
-     gcsUri = null,
-     family = null,
-     table = null,
-     qualified: qualifiedInput = null,
-     pnTemplate = null,
-     requiredFields = [],
-     coverUri = null,
-     records: initialRecords = [],
-     rows: processedRowsInput = [],
-     mpnList = [],
-     extractedBrand = null,
-     brandName = null,
-     baseSeries = null,
-     text: processedText = null,
-     brand: processedBrand = null,
-+    brand_detected: processedDetected = null,
-   } = processed || {};
- 
-   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
-     ? initialRecords
-     : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
-   const records = Array.isArray(recordsSource) ? recordsSource : [];
-   const docText = typeof processedText === 'string'
-     ? processedText
-     : (processedText != null ? String(processedText) : '');
--  const brandSeed = (processedBrand && String(processedBrand).trim().toLowerCase() !== 'unknown')
--    ? processedBrand
--    : null;
-+  const normalizeSeedBrand = (value) => {
-+    if (value == null) return null;
-+    const trimmed = String(value).trim();
-+    if (!trimmed) return null;
-+    if (trimmed.toLowerCase() === 'unknown') return null;
-+    return trimmed;
-+  };
-+  const brandSeed = normalizeSeedBrand(processedBrand) || normalizeSeedBrand(processedDetected) || null;
-   if ((docText && docText.length) || brandSeed) {
-     const applyRowHints = (row) => {
-       if (!row || typeof row !== 'object') return;
-       if (docText && (row._doc_text == null || row._doc_text === '')) {
-         row._doc_text = docText;
-       }
-       if (brandSeed && (!row.brand || !String(row.brand).trim())) {
-         row.brand = brandSeed;
-       }
-     };
-     for (const row of records) applyRowHints(row);
-     if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
-       for (const row of processedRowsInput) applyRowHints(row);
-     }
-   }
- 
-   const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
-   const runId = processed?.runId ?? processed?.run_id ?? overrides?.runId ?? overrides?.run_id ?? null;
-   const jobId = processed?.jobId ?? processed?.job_id ?? overrides?.jobId ?? overrides?.job_id ?? null;
- 
-   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
-   if (qualified && family && records.length) {
-     const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
-     const requiredList = Array.isArray(requiredFields) ? requiredFields : [];
-     const effectiveRequired = allowMinimal ? [] : requiredList;
- 
--    const normalizeBrand = (value) => {
-+    const safeBrand = (value) => {
-       if (value == null) return null;
-       const trimmed = String(value).trim();
-       if (!trimmed) return null;
-       if (trimmed.toLowerCase() === 'unknown') return null;
-       return trimmed;
-     };
- 
--    const brandOverride = normalizeBrand(overrides?.brand)
--      || normalizeBrand(processedBrand)
--      || normalizeBrand(brandName)
--      || normalizeBrand(extractedBrand)
-+    let brandOverride = safeBrand(overrides?.brand)
-+      || safeBrand(processedBrand)
-+      || safeBrand(brandName)
-+      || safeBrand(extractedBrand)
-+      || safeBrand(processedDetected)
-       || null;
- 
-+    if (!brandOverride) {
-+      let baseName = '';
-+      try {
-+        const { name } = parseGcsUri(gcsUri || '');
-+        baseName = path.basename(name || '');
-+      } catch {}
-+      try {
-+        const guessed = await detectBrandFromText(docText || '', baseName);
-+        if (safeBrand(guessed)) brandOverride = guessed;
-+      } catch (err) {
-+        console.warn('[brand detect] persist retry failed:', err?.message || err);
-+      }
-+    }
-+
-+    if (brandOverride) {
-+      for (const row of records) {
-+        if (!row || typeof row !== 'object') continue;
-+        const current = String(row.brand || '').trim();
-+        if (!current || current.toLowerCase() === 'unknown') {
-+          row.brand = brandOverride;
-+        }
-+      }
-+      if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
-+        for (const row of processedRowsInput) {
-+          if (!row || typeof row !== 'object') continue;
-+          const current = String(row.brand || '').trim();
-+          if (!current || current.toLowerCase() === 'unknown') {
-+            row.brand = brandOverride;
-+          }
-+        }
-+      }
-+    }
-+
-     persistResult = await saveExtractedSpecs(qualified, family, records, {
-       brand: brandOverride,
-       pnTemplate,
-       requiredKeys: effectiveRequired,
-       coreSpecKeys: effectiveRequired,
-       runId,
-       run_id: runId,
-       jobId,
-       job_id: jobId,
-     }) || persistResult;
-   } else if (!records.length) {
-     persistResult.skipped = [{ reason: 'missing_pn' }];
-   }
- 
-   const persistedCodes = new Set(
-     (persistResult.written || [])
-       .map((pn) => String(pn || '').trim())
-       .filter(Boolean)
-   );
- 
-   if (!persistedCodes.size && records.length) {
-     for (const rec of records) {
-       const pn = String(rec.pn || rec.code || '').trim();
-       if (pn) persistedCodes.add(pn);
-     }
+       if (!brand || !codes.length) {
+         return res.status(404).json({ ok: false, error: 'cannot resolve' });

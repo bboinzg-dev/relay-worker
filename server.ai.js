@@ -68,12 +68,16 @@ router.get('/api/ai/resolve', async (req, res) => {
   // 1) Vertex로 brand/codes 추정 (Cloud Run은 ADC 있으므로 OK)
   let brand = null, codes = [];
   try {
+    const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID;
+    const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
+    const modelId = process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash';
+
     const v = new VertexAI({
-      project: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID,
-      location: process.env.VERTEX_LOCATION || 'asia-northeast3',
+      project: projectId,
+      location,
     });
     const mdl = v.getGenerativeModel({
-      model: process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash',
+      model: modelId,
       systemInstruction: { parts: [{ text:
         [
           'Parse an electronics part query.',

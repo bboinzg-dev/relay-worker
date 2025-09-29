@@ -143,11 +143,23 @@ async function loadAliasRows() {
     return aliasRowsCache;
   }
   try {
-    const { rows } = await pool.query(BRAND_ALIAS_SCAN_SQL);
+    let { rows } = await pool.query(BRAND_ALIAS_SCAN_SQL);
     aliasRowsCache = Array.isArray(rows) ? rows : [];
     aliasRowsFetchedAt = now;
   } catch (err) {
-    aliasRowsCache = [];
+    // Fallback: aliases 컬럼이 없으면 alias 단일값을 배열로 대체
+    try {
+      const { rows } = await pool.query(
+        `SELECT brand_norm, alias FROM public.manufacturer_alias`
+      );
+      aliasRowsCache = rows.map((r) => ({
+        brand_norm: String(r.brand_norm || '').toLowerCase(),
+        aliases: r.alias ? [String(r.alias)] : [],
+      }));
+    } catch (e2) {
+      aliasRowsCache = [];
+      console.warn('[persist] alias scan fallback failed:', e2?.message || e2);
+    }
     aliasRowsFetchedAt = now;
     console.warn('[persist] normalizeBrand alias scan failed:', err?.message || err);
   }
@@ -288,7 +300,8 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   }
   row.pn = pn;
   if (row.code == null || String(row.code).trim() === '') row.code = pn;
-  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys)) {
+  const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
+  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !allowMinimal) {
     return { ok: false, reason: 'missing_core_spec' };
   }
   return { ok: true };

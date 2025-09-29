@@ -1,106 +1,8 @@
 diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 33cfd572268e94af75595c9a3c437c3c5a0652d2..39e0609ec415d043401f9d34b91676f6f7258a5e 100644
+index 39e0609ec415d043401f9d34b91676f6f7258a5e..4c618be16090edbac87ab0d3f1a8dd8b684e8e15 100644
 --- a/src/pipeline/persist.js
 +++ b/src/pipeline/persist.js
-@@ -7,76 +7,74 @@ const META_KEYS = new Set([
-   'family_slug',
-   'brand',
-   'brand_norm',
-   'pn',
-   'pn_norm',
-   'code',
-   'code_norm',
-   'mfr_full',
-   'datasheet_uri',
-   'verified_in_doc',
-   'display_name',
-   'displayname',
-   'image_uri',
-   'cover',
-   'series',
-   'series_code',
-   'raw_json',
-   'last_error',
-   'created_at',
-   'updated_at',
- ]);
- 
- const CONFLICT_KEYS = ['brand_norm', 'code_norm'];
- 
- const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
--const STRICT_PN_RE = /^[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]$/i;
--const FORBIDDEN_RE = /(sample|prototype|dummy|test|pdf|font|xref|type0|dfonttype0c|aesv2|y62)/i;
-+const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
- 
- const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
- const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
- const SCALE_MAP = {
-   k: 1e3,
-   m: 1e-3,
-   g: 1e9,
-   'µ': 1e-6,
-   u: 1e-6,
-   n: 1e-9,
-   p: 1e-12,
- };
- 
- function normKey(key) {
-   return String(key || '')
-     .trim()
-     .toLowerCase();
- }
- 
- function isValidPnValue(value) {
-   const trimmed = String(value || '').trim();
-   if (!trimmed) return false;
--  if (PN_RE.test(trimmed)) return true;
--  return STRICT_PN_RE.test(trimmed);
-+  return PN_RE.test(trimmed);
- }
- 
- function isNumericType(type = '') {
-   const t = String(type || '').toLowerCase();
-   return (
-     t.includes('int') ||
-     t.includes('numeric') ||
-     t.includes('decimal') ||
-     t.includes('real') ||
-     t.includes('double')
-   );
- }
- 
- function parseNumberToken(token, suffix) {
-   if (!token) return null;
-   const cleaned = token.replace(/,/g, '');
-   const base = Number(cleaned);
-   if (!Number.isFinite(base)) return null;
-   if (!suffix) return base;
-   const scale = SCALE_MAP[suffix.toLowerCase()];
-   return scale != null ? base * scale : base;
- }
- 
- function parseNumericOrRange(value) {
-   if (value == null || value === '') return { value: null };
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 33cfd572268e94af75595c9a3c437c3c5a0652d2..39e0609ec415d043401f9d34b91676f6f7258a5e 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -108,74 +106,117 @@ function deriveRangePrefixes(base) {
-   const prefixes = new Set([lower]);
-   const stripped = lower.replace(/_(vdc|vac|v|a|ma|ua|pa|ohm|ω)$/g, '');
-   if (stripped && stripped !== lower) prefixes.add(stripped);
-   return Array.from(prefixes);
- }
- 
- function findRangeColumn(columnTypes, base, kind) {
-   const prefixes = deriveRangePrefixes(base);
-   for (const prefix of prefixes) {
-     const re = new RegExp(`^${prefix}_${kind}(?:_[a-z0-9]+)?$`);
-     for (const col of columnTypes.keys()) {
-       if (re.test(col)) return col;
-     }
-   }
-   return null;
+@@ -121,55 +121,67 @@ function findRangeColumn(columnTypes, base, kind) {
  }
  
  const BRAND_LOOKUP_SQL = `
@@ -111,34 +13,47 @@ index 33cfd572268e94af75595c9a3c437c3c5a0652d2..39e0609ec415d043401f9d34b91676f6
     LIMIT 1
  `;
  
-+const BRAND_ALIAS_SCAN_SQL = `
-+  SELECT brand_norm, aliases
-+    FROM public.manufacturer_alias
-+`;
-+
- const brandCache = new Map();
-+let aliasRowsCache = null;
-+let aliasRowsFetchedAt = 0;
+ const BRAND_ALIAS_SCAN_SQL = `
+   SELECT brand_norm, aliases
+     FROM public.manufacturer_alias
+ `;
  
--async function normalizeBrand(raw) {
-+async function loadAliasRows() {
-+  const now = Date.now();
-+  if (aliasRowsCache && now - aliasRowsFetchedAt < 60_000) {
-+    return aliasRowsCache;
-+  }
-+  try {
-+    const { rows } = await pool.query(BRAND_ALIAS_SCAN_SQL);
-+    aliasRowsCache = Array.isArray(rows) ? rows : [];
-+    aliasRowsFetchedAt = now;
-+  } catch (err) {
-+    aliasRowsCache = [];
-+    aliasRowsFetchedAt = now;
-+    console.warn('[persist] normalizeBrand alias scan failed:', err?.message || err);
-+  }
-+  return aliasRowsCache;
-+}
-+
-+async function normalizeBrand(raw, docTextLower = '') {
+ const brandCache = new Map();
+ let aliasRowsCache = null;
+ let aliasRowsFetchedAt = 0;
+ 
+ async function loadAliasRows() {
+   const now = Date.now();
+   if (aliasRowsCache && now - aliasRowsFetchedAt < 60_000) {
+     return aliasRowsCache;
+   }
+   try {
+-    const { rows } = await pool.query(BRAND_ALIAS_SCAN_SQL);
++    let { rows } = await pool.query(BRAND_ALIAS_SCAN_SQL);
+     aliasRowsCache = Array.isArray(rows) ? rows : [];
+     aliasRowsFetchedAt = now;
+   } catch (err) {
+-    aliasRowsCache = [];
++    // Fallback: aliases 컬럼이 없으면 alias 단일값을 배열로 대체
++    try {
++      const { rows } = await pool.query(
++        `SELECT brand_norm, alias FROM public.manufacturer_alias`
++      );
++      aliasRowsCache = rows.map((r) => ({
++        brand_norm: String(r.brand_norm || '').toLowerCase(),
++        aliases: r.alias ? [String(r.alias)] : [],
++      }));
++    } catch (e2) {
++      aliasRowsCache = [];
++      console.warn('[persist] alias scan fallback failed:', e2?.message || e2);
++    }
+     aliasRowsFetchedAt = now;
+     console.warn('[persist] normalizeBrand alias scan failed:', err?.message || err);
+   }
+   return aliasRowsCache;
+ }
+ 
+ async function normalizeBrand(raw, docTextLower = '') {
    const trimmed = String(raw || '').trim();
    if (!trimmed) return null;
    const key = trimmed.toLowerCase();
@@ -149,193 +64,69 @@ index 33cfd572268e94af75595c9a3c437c3c5a0652d2..39e0609ec415d043401f9d34b91676f6
      const { rows } = await pool.query(BRAND_LOOKUP_SQL, [trimmed]);
      const row = rows?.[0];
      if (row?.brand_norm) {
--      const brandNorm = String(row.brand_norm).trim().toLowerCase();
--      const brand = String(row.brand || '').trim() || trimmed;
--      resolved = { brand, brandNorm };
--      brandCache.set(brandNorm, resolved);
--      brandCache.set(brand.toLowerCase(), resolved);
-+      resolved = String(row.brand_norm).trim().toLowerCase();
+       resolved = String(row.brand_norm).trim().toLowerCase();
      }
    } catch (err) {
      console.warn('[persist] normalizeBrand query failed:', err?.message || err);
    }
  
--  brandCache.set(key, resolved);
-+  const docLower = String(docTextLower || '').toLowerCase();
-+  if (!resolved && docLower) {
-+    const aliasRows = await loadAliasRows();
-+    const lowerRaw = key;
-+    for (const row of aliasRows) {
-+      const brandNorm = String(row?.brand_norm || '').trim().toLowerCase();
-+      if (!brandNorm) continue;
-+      const aliases = Array.isArray(row?.aliases) ? row.aliases : [];
-+      const rawMatch = lowerRaw.includes(brandNorm);
-+      const docMatch = docLower.includes(brandNorm) || aliases.some((alias) => {
-+        const lowerAlias = String(alias || '').trim().toLowerCase();
-+        return lowerAlias && docLower.includes(lowerAlias);
-+      });
-+      if (rawMatch || docMatch) {
-+        resolved = brandNorm;
-+        break;
-+      }
-+    }
-+  }
-+
-+  if (resolved) {
-+    brandCache.set(key, resolved);
-+    brandCache.set(resolved, resolved);
-+  }
-   return resolved;
- }
- 
- function applyPnTemplateOptions(value, optionStr) {
-   if (value == null) return value;
-   if (!optionStr) return value;
-   let out = String(value);
-   for (const token of String(optionStr).split(',').map((t) => t.trim()).filter(Boolean)) {
-     const [key, rawVal] = token.split('=').map((t) => t.trim());
-     if (!key) continue;
-     if (key === 'pad') {
-       const width = Number(rawVal);
-       if (Number.isFinite(width) && width > 0) out = out.padStart(width, '0');
-     }
-   }
-   return out;
- }
- 
- function renderPnTemplate(template, record = {}) {
-   if (!template) return null;
-   let used = false;
-   const rendered = String(template).replace(/\{\{\s*([^}|]+?)(?:\|([^}]+))?\s*\}\}/g, (_, key, options) => {
-     const field = String(key || '').trim();
-     if (!field) return '';
-     const value = record[field];
+   const docLower = String(docTextLower || '').toLowerCase();
+   if (!resolved && docLower) {
 diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 33cfd572268e94af75595c9a3c437c3c5a0652d2..39e0609ec415d043401f9d34b91676f6f7258a5e 100644
+index 39e0609ec415d043401f9d34b91676f6f7258a5e..4c618be16090edbac87ab0d3f1a8dd8b684e8e15 100644
 --- a/src/pipeline/persist.js
 +++ b/src/pipeline/persist.js
-@@ -418,102 +459,104 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+@@ -266,51 +278,52 @@ function hasCoreSpec(row, keys = [], candidateKeys = []) {
+   }
+   for (const key of list) {
+     const norm = normKey(key);
+     if (!norm) continue;
+     if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
+   }
+   return false;
+ }
  
-   const sql = [
-     `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
-     `VALUES (${placeholders})`,
-     'ON CONFLICT (brand_norm, code_norm)',
-     updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
-     'RETURNING pn',
-   ].join('\n');
+ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
+   if (!row || typeof row !== 'object') {
+     return { ok: false, reason: 'empty_row' };
+   }
+   const brand = String(row.brand || '').trim().toLowerCase();
+   if (!brand || brand === 'unknown') {
+     if (row && typeof row === 'object') row.last_error = 'missing_brand';
+     return { ok: false, reason: 'missing_brand' };
+   }
+   const pn = String(row.pn || row.code || '').trim();
+   if (!isValidPnValue(pn) || FORBIDDEN_RE.test(pn)) {
+     if (row && typeof row === 'object') row.last_error = 'invalid_code';
+     return { ok: false, reason: 'invalid_code' };
+   }
+   row.pn = pn;
+   if (row.code == null || String(row.code).trim() === '') row.code = pn;
+-  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys)) {
++  const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
++  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !allowMinimal) {
+     return { ok: false, reason: 'missing_core_spec' };
+   }
+   return { ok: true };
+ }
  
-   const client = await pool.connect();
-   const warnings = new Set();
-   const seenNatural = new Set();
+ async function getColumnTypes(targetTable) {
+   const [schema, table] = targetTable.includes('.')
+     ? targetTable.split('.', 2)
+     : ['public', targetTable];
  
-   try {
-     for (const row of rows) {
-       result.processed += 1;
-       const rec = {};
-       for (const [key, value] of Object.entries(row || {})) {
-         rec[normKey(key)] = value;
-       }
+   const { rows } = await pool.query(
+     `SELECT lower(column_name) AS column, data_type
+        FROM information_schema.columns
+       WHERE table_schema = $1
+         AND table_name   = $2`,
+     [schema, table],
+   );
  
-       if ((!rec.brand || String(rec.brand).trim() === '') && options?.brand) {
-         rec.brand = options.brand;
-       }
+   const map = new Map();
+   for (const row of rows) {
+     map.set(row.column, String(row.data_type || '').toLowerCase());
+   }
+   return map;
+ }
  
--      const brandCandidates = [rec.brand, rec.brand_norm, options?.brand];
--      let brandInfo = null;
-+      const docTextLower = String(rec._doc_text || '').toLowerCase();
-+      const brandCandidates = [options?.brand, rec.brand, rec.brand_norm];
-+      let brandKey = null;
-       for (const candidate of brandCandidates) {
-         if (!candidate) continue;
--        brandInfo = await normalizeBrand(candidate);
--        if (brandInfo) break;
-+        const trimmed = String(candidate).trim();
-+        if (!trimmed) continue;
-+        brandKey = await normalizeBrand(trimmed, docTextLower);
-+        if (brandKey) break;
-       }
--      if (!brandInfo) {
--        const detail = String(rec.brand || options?.brand || '').trim() || null;
-+      if (!brandKey) {
-+        const skippedCode = String(rec.code || rec.pn || options?.code || '').trim() || '(no-code)';
-         if (physicalCols.has('last_error')) rec.last_error = 'missing_brand';
--        result.skipped.push({ reason: 'missing_brand', detail, last_error: 'missing_brand' });
-+        result.skipped.push({ reason: 'missing_brand', code: skippedCode, last_error: 'missing_brand' });
-         continue;
-       }
--      rec.brand = brandInfo.brand;
--      rec.brand_norm = brandInfo.brandNorm;
-+      if (!rec.brand || !String(rec.brand).trim()) {
-+        rec.brand = options?.brand || brandKey;
-+      }
-+      rec.brand_norm = brandKey;
-       if (physicalCols.has('last_error')) rec.last_error = null;
- 
-       buildPnIfMissing(rec, pnTemplate);
- 
-       const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });
-       if (!guard.ok) {
-         const skip = { reason: guard.reason, detail: guard.detail || null };
-         if (rec.last_error) skip.last_error = rec.last_error;
-         result.skipped.push(skip);
-         continue;
-       }
- 
--      const pnValue = String(rec.pn || '').trim();
--      const codeValue = String(rec.code || '').trim() || pnValue;
--      if (/^[0-9A-F]{12,}$/i.test(pnValue) || /^[0-9A-F]{12,}$/i.test(codeValue)) {
-+      const pnValue = String(rec.pn || rec.code || '').trim();
-+      if (!pnValue || !isValidPnValue(pnValue) || FORBIDDEN_RE.test(pnValue)) {
-+        const skippedCode = pnValue || String(rec.code || rec.pn || '').trim() || '(no-code)';
-         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
--        result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });
--        continue;
--      }
--      if (!isValidPnValue(pnValue) || !isValidPnValue(codeValue) || FORBIDDEN_RE.test(pnValue) || FORBIDDEN_RE.test(codeValue)) {
--        if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
--        result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });
-+        result.skipped.push({ reason: 'invalid_code', code: skippedCode, last_error: 'invalid_code' });
-         continue;
-       }
- 
-       rec.pn = pnValue;
--      rec.code = codeValue;
-+      if (rec.code == null || String(rec.code).trim() === '') {
-+        rec.code = pnValue;
-+      }
- 
-       const pnNorm = normKey(pnValue);
-       if (!pnNorm) {
-         if (physicalCols.has('last_error')) rec.last_error = 'missing_pn';
-         result.skipped.push({ reason: 'missing_pn', last_error: 'missing_pn' });
-         continue;
-       }
-       if (physicalCols.has('pn_norm')) rec.pn_norm = pnNorm;
- 
--      const codeNorm = normKey(codeValue);
-+      const codeNorm = normKey(rec.code);
-       if (!codeNorm) {
-         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
-         result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });
-         continue;
-       }
-       rec.code_norm = codeNorm;
- 
-       const naturalKey = `${rec.brand_norm}::${codeNorm}`;
-       if (seenNatural.has(naturalKey)) {
-         result.skipped.push({ reason: 'duplicate_code' });
-         continue;
-       }
-       seenNatural.add(naturalKey);
- 
-       rec.family_slug = familySlug;
- 
-       const display = rec.display_name || `${rec.brand} ${rec.pn}`;
-       rec.display_name = display;
-       if (rec.displayname == null) rec.displayname = display;
- 
-       let rawJson = {};
-       if (rec.raw_json && typeof rec.raw_json === 'object' && !Array.isArray(rec.raw_json)) {
-         rawJson = { ...rec.raw_json };
-       } else if (typeof rec.raw_json === 'string') {
-         try {

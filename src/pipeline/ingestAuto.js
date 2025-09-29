@@ -883,6 +883,8 @@ async function runAutoIngest(input = {}) {
     rec.display_name = displayName;
     if (rec.displayname == null && displayName != null) rec.displayname = displayName;
     rec.updated_at = now;
+    // persist에서 브랜드 정규화할 때 쓰도록 원문 텍스트 전달
+    rec._doc_text = (extracted?.text || previewText || '');
     if (row.raw_json != null) rec.raw_json = row.raw_json;
 
     for (const [rawKey, rawValue] of Object.entries(row)) {

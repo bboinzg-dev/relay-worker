@@ -1,226 +1,155 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 48f77518ffbc338d76c2fd18bcaa7fa4e485b0cd..f88f1e5fee61eed54f3e085a89966219b5458cab 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -423,51 +423,51 @@ async function extractPartNumbersFromText(text, { series } = {}) {
-   const prefix = series ? normalizeCode(series) : null;
-   const seen = new Set();
-   const out = [];
+diff --git a/server.js b/server.js
+index 0f2855f5b065180ce028fb7dfac2d95bda14724e..e68ed0c5f4cf1606a3eb019c1de95ed878fd705b 100644
+--- a/server.js
++++ b/server.js
+@@ -29,61 +29,74 @@ const { generateRunId } = require('./src/utils/run-id');
+  try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
  
-   const push = (raw) => {
-     if (!raw) return;
-     const norm = normalizeCode(raw);
-     if (!norm) return;
-     if (prefix && !norm.startsWith(prefix)) return;
-     if (seen.has(norm)) return;
-     seen.add(norm);
-     const cleaned = typeof raw === 'string' ? raw.trim() : String(raw || '');
-     out.push(cleaned || norm);
+  // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
+  let _tasks = null;
+  let _queuePath = null;
+  function getTasks() {
+    if (!_tasks) {
+     // 글로벌 엔드포인트 + REST fallback(HTTP/1)
+     _tasks = new CloudTasksClient({ fallback: true });
+      _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
+    }
+    return { tasks: _tasks, queuePath: _queuePath };
+  }
+ 
+ async function enqueueWorkerStep(payload = {}) {
+   const { tasks, queuePath } = getTasks();
+   if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
+   const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_STEP_URL).origin;
+ 
+   const bodyPayload = { ...payload };
+   const runId = bodyPayload.runId || bodyPayload.run_id || generateRunId();
+   bodyPayload.runId = runId;
+   bodyPayload.run_id = runId;
+ 
+   const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
++  const dispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE || '150s';
++  const scheduleDelaySeconds = Number.isFinite(Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
++    ? Math.max(0, Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
++    : 5;
++  const scheduledSeconds = Math.floor(Date.now() / 1000) + scheduleDelaySeconds;
+ 
+   const task = {
+     httpRequest: {
+       httpMethod: 'POST',
+       url: WORKER_STEP_URL,
+       headers: { 'Content-Type': 'application/json' },
+       body,
+       ...(TASKS_INVOKER_SA
+         ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
+         : {}),
+     },
++    dispatchDeadline,
++    scheduleTime: { seconds: scheduledSeconds },
++    retryConfig: {
++      maxAttempts: 12,
++      minBackoff: { seconds: 1 },
++      maxBackoff: { seconds: 60 },
++      maxDoublings: 4,
++    },
    };
  
-   for (const { code } of extractPartNumbersFromTypesTables(src, 200)) push(code);
-   for (const { code } of rankPartNumbersFromOrderingSections(src, 200)) push(code);
-   for (const { code } of extractPartNumbersBySeriesHeuristic(src, 200)) push(code);
- 
-   return out;
+   // (선택) 10초로 RPC 타임아웃 단축 — 실패 시 바로 catch → DB만 FAILED 마킹
+   await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
+   return runId;
  }
  
  
+ const app = express();
  
- async function runAutoIngest(input = {}) {
--  const {
-+  let {
-     gcsUri: rawGcsUri = null,
-     gsUri: rawGsUri = null,
-     family_slug = null,
-     brand = null,
-     code = null,
-     series = null,
-     display_name = null,
-   } = input;
+ app.use(bodyParser.json({ limit: '25mb' }));
+ app.use(bodyParser.urlencoded({ extended: true }));
+ app.disable('x-powered-by');
  
-   const gcsUri = (rawGcsUri || rawGsUri || '').trim();
+ /* ---------------- Env / Config ---------------- */
+ const PORT = process.env.PORT || 8080;
+ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
  
-   const started = Date.now();
-   if (!gcsUri) throw new Error('gcsUri/gsUri required');
-    // 기본 2분로 단축 (원하면 ENV로 재조정)
-   const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
-   const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
-   const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || (FAST ? 32768 : 65536));
-   const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || (FAST ? 30000 : Math.round(BUDGET * 0.6)));
-   const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
+ function parseCorsOrigins(envStr) {
+   if (!envStr) return null;
+   const items = envStr.split(',').map(s => s.trim()).filter(Boolean);
+   return items.map(p => {
+     if (p.startsWith('/') && p.endsWith('/')) {
+       const body = p.slice(1, -1);
+       return new RegExp(body);
+diff --git a/server.js b/server.js
+index 0f2855f5b065180ce028fb7dfac2d95bda14724e..e68ed0c5f4cf1606a3eb019c1de95ed878fd705b 100644
+--- a/server.js
++++ b/server.js
+@@ -574,69 +587,69 @@ async function handleWorkerStep(req, res) {
+     payload?.gcsUri,
+     payload?.gcs_uri,
+     payload?.gsUri,
+     payload?.gcsPdfUri,
+     payload?.gcs_pdf_uri,
+     payload?.uri,
+     payload?.url,
+   ].map((value) => (typeof value === 'string' ? value.trim() : '')).find((value) => !!value);
+   const gcsUri = rawUri || '';
  
-   const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
-     const timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
-     Promise.resolve(p)
-       .then((val) => { clearTimeout(timer); resolve(val); })
-       .catch((err) => { clearTimeout(timer); reject(err); });
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 48f77518ffbc338d76c2fd18bcaa7fa4e485b0cd..f88f1e5fee61eed54f3e085a89966219b5458cab 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -880,82 +880,152 @@ async function runAutoIngest(input = {}) {
-         pn: cand.raw,
-         code: cand.raw,
-         series_code: fallbackSeries,
-         datasheet_uri: gcsUri,
-         image_uri: coverUri || null,
-         display_name: `${brandName} ${cand.raw}`,
-         verified_in_doc: verified,
-         updated_at: now,
-       };
-       if (coverUri) rec.cover = coverUri;
-       if (physicalCols.has('series') && fallbackSeries != null) rec.series = fallbackSeries;
-       if (rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
-       if (rec.display_name != null && rec.displayname == null) rec.displayname = rec.display_name;
-       records.push(rec);
-     }
+   let runId = [payload?.runId, payload?.run_id]
+     .map((val) => (typeof val === 'string' && val.trim()) ? val.trim() : null)
+     .find(Boolean) || null;
+   if (!runId) {
+     runId = generateRunId();
+     console.warn('[ingest-step] runId missing -> created', { runId, taskName, phase });
    }
  
-   console.log('[MPNDBG]', {
-     picks: candidateMap.length,
-     vkeys: Array.isArray(blueprint?.ingestOptions?.variant_keys) ? blueprint.ingestOptions.variant_keys : [],
-     expanded: explodedRows.length,
-     recs: records.length,
-     colsSanitized: colTypes?.size || 0,
-   });
- 
-+  const processedPayload = {
-+    started,
-+    gcsUri,
-+    family,
-+    table,
-+    qualified,
-+    pnTemplate,
-+    requiredFields,
-+    coverUri,
-+    records,
-+    mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
-+    extractedBrand: extracted?.brand || null,
-+    brandName,
-+    baseSeries,
-+  };
-+
-+  if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
-+  if (display_name != null) processedPayload.display_name = display_name;
-+  if (code != null) processedPayload.code = code;
-+  if (series != null) processedPayload.series = series;
-+
-+  if (input && typeof input === 'object' && input.skipPersist) {
-+    return { ok: true, phase: 'process', processed: processedPayload };
-+  }
-+
-+  const persistOverrides = { brand, code, series, display_name };
-+  return persistProcessedData(processedPayload, persistOverrides);
-+}
-+
-+async function persistProcessedData(processed = {}, overrides = {}) {
-+  const {
-+    started = Date.now(),
-+    gcsUri = null,
-+    family = null,
-+    table = null,
-+    qualified: qualifiedInput = null,
-+    pnTemplate = null,
-+    requiredFields = [],
-+    coverUri = null,
-+    records = [],
-+    mpnList = [],
-+    extractedBrand = null,
-+    brandName = null,
-+    baseSeries = null,
-+  } = processed || {};
-+
-+  const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
-+
-   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
--  if (records.length) {
-+  if (qualified && family && records.length) {
-     persistResult = await saveExtractedSpecs(qualified, family, records, {
-       pnTemplate,
--      requiredKeys: requiredFields,
--      coreSpecKeys: requiredFields,
-+      requiredKeys: Array.isArray(requiredFields) ? requiredFields : [],
-+      coreSpecKeys: Array.isArray(requiredFields) ? requiredFields : [],
-     }) || persistResult;
--  } else {
-+  } else if (!records.length) {
-     persistResult.skipped = [{ reason: 'missing_pn' }];
-   }
- 
-   const persistedCodes = new Set(
-     (persistResult.written || [])
-       .map((pn) => String(pn || '').trim())
-       .filter(Boolean)
-   );
-+
-   if (!persistedCodes.size && records.length) {
-     for (const rec of records) {
-       const pn = String(rec.pn || rec.code || '').trim();
-       if (pn) persistedCodes.add(pn);
-     }
-   }
- 
-   const persistedList = Array.from(persistedCodes);
--  const mpnList = Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [];
--  const mergedMpns = Array.from(new Set([...persistedList, ...mpnList]));
-+  const mpnListSafe = Array.isArray(mpnList) ? mpnList : [];
-+  const mergedMpns = Array.from(new Set([...persistedList, ...mpnListSafe]));
- 
-   const rejectReasons = new Set(
-     (persistResult.skipped || [])
-       .map((it) => (it && typeof it === 'object' ? it.reason : it))
-       .filter(Boolean)
-   );
-   const warningReasons = new Set(
-     (persistResult.warnings || []).filter(Boolean)
-   );
- 
-+  const ms = Number.isFinite(processed?.ms) ? processed.ms : (typeof started === 'number' ? Date.now() - started : null);
-   const ok = persistedList.length > 0;
- 
--  return {
-+  const fallbackBrand = overrides.brand || brandName || extractedBrand || null;
-+  const primaryRecord = records[0] || null;
-+  const finalBrand = primaryRecord?.brand || fallbackBrand;
-+  const finalCode =
-+    persistedList[0] ||
-+    primaryRecord?.pn ||
-+    primaryRecord?.code ||
-+    overrides.code ||
-+    null;
-+
-+  const response = {
-     ok,
--    ms: Date.now() - started,
-+    ms,
-     family,
-     final_table: table,
-     specs_table: table,
--    brand: records[0]?.brand || extracted?.brand || brand || null,
--    code:  persistedList[0] || records[0]?.pn || records[0]?.code || null,
-+    brand: finalBrand,
-+    code: finalCode,
-     datasheet_uri: gcsUri,
--    cover: coverUri || records[0]?.image_uri || null,
-+    cover: coverUri || primaryRecord?.image_uri || null,
-     rows: persistResult.upserts || persistedList.length,
-     codes: persistedList,
-     mpn_list: mergedMpns,
-     reject_reasons: Array.from(rejectReasons),
-     warnings: Array.from(warningReasons),
+   const respondNoContent = () => {
+     if (!res.headersSent) res.status(204).send();
    };
-+
-+  if (response.code == null && Array.isArray(processed?.candidateCodes) && processed.candidateCodes.length) {
-+    response.code = processed.candidateCodes[0];
-+  }
-+
-+  if (response.code == null && baseSeries != null) {
-+    response.code = baseSeries;
-+  }
-+
-+  return response;
- }
  
--module.exports = { runAutoIngest };
-+module.exports = { runAutoIngest, persistProcessedData };
+   const markProcessing = async () => {
+     const update = await db.query(
+       `UPDATE public.ingest_run_logs
+-          SET status = 'PROCESSING',
++          SET status = 'RUNNING',
+               task_name = $2,
+               retry_count = $3,
+               gcs_uri = COALESCE($4, gcs_uri),
+               error_message = NULL,
+               finished_at = NULL,
+               duration_ms = NULL,
+               final_table = NULL,
+               final_family = NULL,
+               final_brand = NULL,
+               final_code = NULL,
+               final_datasheet = NULL
+         WHERE id = $1`,
+       [ runId, taskName, retryCnt, gcsUri ]
+     );
+     if (!update.rowCount) {
+       await db.query(
+         `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
+-           VALUES ($1,$2,$3,$4,'PROCESSING')`,
++           VALUES ($1,$2,$3,$4,'RUNNING')`,
+         [ runId, taskName, retryCnt, gcsUri ]
+       );
+     }
+   };
+ 
+   const markPersisting = async () => {
+     const update = await db.query(
+       `UPDATE public.ingest_run_logs
+           SET status = 'PERSISTING',
+               task_name = $2,
+               retry_count = $3,
+               gcs_uri = COALESCE($4, gcs_uri),
+               error_message = NULL,
+               finished_at = NULL,
+               duration_ms = NULL,
+               final_table = NULL,
+               final_family = NULL,
+               final_brand = NULL,
+               final_code = NULL,
+               final_datasheet = NULL
+         WHERE id = $1`,
+       [ runId, taskName, retryCnt, gcsUri ]
+     );
+     if (!update.rowCount) {
+       await db.query(

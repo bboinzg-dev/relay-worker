@@ -51,6 +51,11 @@ async function enqueueWorkerStep(payload = {}) {
   bodyPayload.run_id = runId;
 
   const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
+  const dispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE || '150s';
+  const scheduleDelaySeconds = Number.isFinite(Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
+    ? Math.max(0, Number(process.env.TASKS_SCHEDULE_DELAY_SECONDS))
+    : 5;
+  const scheduledSeconds = Math.floor(Date.now() / 1000) + scheduleDelaySeconds;
 
   const task = {
     httpRequest: {
@@ -61,6 +66,14 @@ async function enqueueWorkerStep(payload = {}) {
       ...(TASKS_INVOKER_SA
         ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } }
         : {}),
+    },
+    dispatchDeadline,
+    scheduleTime: { seconds: scheduledSeconds },
+    retryConfig: {
+      maxAttempts: 12,
+      minBackoff: { seconds: 1 },
+      maxBackoff: { seconds: 60 },
+      maxDoublings: 4,
     },
   };
 
@@ -596,7 +609,7 @@ async function handleWorkerStep(req, res) {
   const markProcessing = async () => {
     const update = await db.query(
       `UPDATE public.ingest_run_logs
-          SET status = 'PROCESSING',
+          SET status = 'RUNNING',
               task_name = $2,
               retry_count = $3,
               gcs_uri = COALESCE($4, gcs_uri),
@@ -614,7 +627,7 @@ async function handleWorkerStep(req, res) {
     if (!update.rowCount) {
       await db.query(
         `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
-           VALUES ($1,$2,$3,$4,'PROCESSING')`,
+           VALUES ($1,$2,$3,$4,'RUNNING')`,
         [ runId, taskName, retryCnt, gcsUri ]
       );
     }

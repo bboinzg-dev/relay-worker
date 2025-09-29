@@ -240,7 +240,7 @@ async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText,
 }
 
 /* -------------------- Public: main extractor -------------------- */
-async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint = null }) {
+async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null, brandHint = null }) {
   let docai = await processWithDocAI(gcsUri);
   let fullText = docai?.fullText || '';
   if (!fullText) fullText = await parseTextWithPdfParse(gcsUri);
@@ -264,7 +264,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint = nu
 
   // Gemini로 values 매핑(블루프린트 키만)
   const mapped = await geminiMapValues({
-    family: null,
+    family,
     brandHint: brand,
     codes: codes.slice(0, MAX_PARTS),
     allowedKeys,

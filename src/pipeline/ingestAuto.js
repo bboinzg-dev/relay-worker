@@ -567,14 +567,14 @@ async function runAutoIngest(input = {}) {
         } else {
           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
           extracted = await withTimeout(
-            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
+            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: brand || null }),
             EXTRACT_HARD_CAP_MS,
             'extract',
           );
         }
       } else {
         extracted = await withTimeout(
-          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, brandHint: brand || null }),
+          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: brand || null }),
           EXTRACT_HARD_CAP_MS,
           'extract',
         );

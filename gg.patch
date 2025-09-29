@@ -1,246 +1,59 @@
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 7661d8cd455a030a39227aaf4f4e0a0783465755..cdd75999317172da9671f8992b0b7f99e7d3a850 100644
+index cdd75999317172da9671f8992b0b7f99e7d3a850..f5fd4174d4c5191bfa29f1f06f35e1f8d59df942 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -690,50 +690,51 @@ async function runAutoIngest(input = {}) {
-   let coverUri = null;
-   if (/^(1|true|on)$/i.test(process.env.COVER_CAPTURE || '0')) {
-     try {
-       const bForCover = effectiveBrand || extracted.brand || 'unknown';
-       const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
-       coverUri = await withTimeout(
-         extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
-         Math.min(30000, Math.round(BUDGET * 0.15)),
-         'cover',
-       );
-     } catch (e) { console.warn('[cover fail]', e?.message || e); }
-   }
- 
-   if (code) {
-     const trimmedCode = String(code || '').trim();
-     if (trimmedCode) {
-       const norm = normalizeCode(trimmedCode);
-       if (!candidates.some((c) => normalizeCode(c) === norm)) {
-         candidates = [trimmedCode, ...candidates];
+@@ -1020,55 +1020,73 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+   const brandSeed = (processedBrand && String(processedBrand).trim().toLowerCase() !== 'unknown')
+     ? processedBrand
+     : null;
+   if ((docText && docText.length) || brandSeed) {
+     const applyRowHints = (row) => {
+       if (!row || typeof row !== 'object') return;
+       if (docText && (row._doc_text == null || row._doc_text === '')) {
+         row._doc_text = docText;
        }
+       if (brandSeed && (!row.brand || !String(row.brand).trim())) {
+         row.brand = brandSeed;
+       }
+     };
+     for (const row of records) applyRowHints(row);
+     if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+       for (const row of processedRowsInput) applyRowHints(row);
      }
    }
  
-   // 레코드 구성
-   const records = [];
-+  const extractedText = extracted?.text || previewText || '';
-   const now = new Date();
-   const brandName = effectiveBrand || extracted.brand || 'unknown';
-   const baseSeries = series || code || null;
- 
-   let variantColumnsEnsured = false;
-   try {
-     const { detected: inferredKeys = [], newKeys: freshKeys = [] } = await inferVariantKeys({
-       family,
-       brand: brandName,
-       series: baseSeries,
-       blueprint,
-       extracted,
-     });
- 
-     if (Array.isArray(inferredKeys) && inferredKeys.length) {
-       const brandSlug = normalizeSlug(brandName);
-       const seriesSlug = normalizeSlug(baseSeries);
-       try {
-         await db.query(
-           `SELECT public.upsert_variant_keys($1,$2,$3,$4::jsonb)`,
-           [family, brandSlug, seriesSlug, JSON.stringify(inferredKeys)],
-         );
-       } catch (err) {
-         console.warn('[variant] upsert_variant_keys failed:', err?.message || err);
-       }
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 7661d8cd455a030a39227aaf4f4e0a0783465755..cdd75999317172da9671f8992b0b7f99e7d3a850 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -862,51 +863,51 @@ async function runAutoIngest(input = {}) {
-     if (!rec.code) rec.code = mpn;
-     rec.series_code = row.series_code ?? row.series ?? baseSeries ?? null;
-     if (row.series != null && physicalCols.has('series')) rec.series = row.series;
-     rec.datasheet_uri = row.datasheet_uri || gcsUri;
-     if (row.datasheet_url) rec.datasheet_url = row.datasheet_url;
-     else if (rec.datasheet_uri && rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
-     if (row.mfr_full != null) rec.mfr_full = row.mfr_full;
-     let verified;
-     if (row.verified_in_doc != null) {
-       if (typeof row.verified_in_doc === 'string') {
-         verified = row.verified_in_doc.trim().toLowerCase() === 'true';
-       } else {
-         verified = Boolean(row.verified_in_doc);
-       }
-     } else {
-       verified = candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm);
-     }
-     rec.verified_in_doc = Boolean(verified);
-     rec.image_uri = row.image_uri || coverUri || null;
-     if (coverUri && rec.cover == null) rec.cover = coverUri;
-     const displayName = row.display_name || row.displayname || `${rec.brand} ${mpn}`;
-     rec.display_name = displayName;
-     if (rec.displayname == null && displayName != null) rec.displayname = displayName;
-     rec.updated_at = now;
-     // persist에서 브랜드 정규화할 때 쓰도록 원문 텍스트 전달
--    rec._doc_text = (extracted?.text || previewText || '');
-+    rec._doc_text = extractedText;
-     if (row.raw_json != null) rec.raw_json = row.raw_json;
- 
-     for (const [rawKey, rawValue] of Object.entries(row)) {
-       const key = String(rawKey || '').trim();
-       if (!key) continue;
-       const lower = key.toLowerCase();
-       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
-       if (physicalCols.has(lower) || allowedSet.has(lower) || variantSet.has(lower)) {
-         rec[lower] = rawValue;
-       }
-     }
- 
-     if (blueprint?.code_rules) applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
-     records.push(rec);
-   }
- 
-   if (candidateMap.length) {
-     const fallbackSeries = baseSeries || null;
-     for (const cand of candidateMap) {
-       const norm = cand.norm;
-       const naturalKey = `${normLower(brandName)}::${norm}`;
-       if (seenCodes.has(naturalKey)) continue;
-       seenCodes.add(naturalKey);
-       const verified = mpnNormFromDoc.has(norm);
-       const rec = {
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 7661d8cd455a030a39227aaf4f4e0a0783465755..cdd75999317172da9671f8992b0b7f99e7d3a850 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -925,106 +926,138 @@ async function runAutoIngest(input = {}) {
-       if (physicalCols.has('series') && fallbackSeries != null) rec.series = fallbackSeries;
-       if (rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
-       if (rec.display_name != null && rec.displayname == null) rec.displayname = rec.display_name;
-       records.push(rec);
-     }
-   }
- 
-   console.log('[MPNDBG]', {
-     picks: candidateMap.length,
-     vkeys: Array.isArray(blueprint?.ingestOptions?.variant_keys) ? blueprint.ingestOptions.variant_keys : [],
-     expanded: explodedRows.length,
-     recs: records.length,
-     colsSanitized: colTypes?.size || 0,
-   });
- 
-   const processedPayload = {
-     started,
-     gcsUri,
-     family,
-     table,
-     qualified,
-     pnTemplate,
-     requiredFields,
-     coverUri,
-     records,
-+    rows: records,
-     mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
-     extractedBrand: extracted?.brand || null,
-     brandName,
-     baseSeries,
-     runId,
-     run_id: runId,
-     jobId,
-     job_id: jobId,
-+    text: extractedText,
-+    brand: extracted?.brand ?? null,
-   };
- 
-   if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
-   if (display_name != null) processedPayload.display_name = display_name;
-   if (code != null) processedPayload.code = code;
-   if (series != null) processedPayload.series = series;
- 
-   if (input && typeof input === 'object' && input.skipPersist) {
-     return { ok: true, phase: 'process', processed: processedPayload };
-   }
- 
-   const persistOverrides = {
-     brand: effectiveBrand,
-     code,
-     series: overridesSeries ?? series,
-     display_name,
-     runId,
-     run_id: runId,
-     jobId,
-     job_id: jobId,
-   };
-   return persistProcessedData(processedPayload, persistOverrides);
-   })();
- 
-   try {
-     return await runnerPromise;
-   } finally {
-     await releaseLock();
-   }
- }
- 
- async function persistProcessedData(processed = {}, overrides = {}) {
-   const {
-     started = Date.now(),
-     gcsUri = null,
-     family = null,
-     table = null,
-     qualified: qualifiedInput = null,
-     pnTemplate = null,
-     requiredFields = [],
-     coverUri = null,
--    records = [],
-+    records: initialRecords = [],
-+    rows: processedRowsInput = [],
-     mpnList = [],
-     extractedBrand = null,
-     brandName = null,
-     baseSeries = null,
-+    text: processedText = null,
-+    brand: processedBrand = null,
-   } = processed || {};
- 
-+  const recordsSource = Array.isArray(initialRecords) && initialRecords.length
-+    ? initialRecords
-+    : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
-+  const records = Array.isArray(recordsSource) ? recordsSource : [];
-+  const docText = typeof processedText === 'string'
-+    ? processedText
-+    : (processedText != null ? String(processedText) : '');
-+  const brandSeed = (processedBrand && String(processedBrand).trim().toLowerCase() !== 'unknown')
-+    ? processedBrand
-+    : null;
-+  if ((docText && docText.length) || brandSeed) {
-+    const applyRowHints = (row) => {
-+      if (!row || typeof row !== 'object') return;
-+      if (docText && (row._doc_text == null || row._doc_text === '')) {
-+        row._doc_text = docText;
-+      }
-+      if (brandSeed && (!row.brand || !String(row.brand).trim())) {
-+        row.brand = brandSeed;
-+      }
-+    };
-+    for (const row of records) applyRowHints(row);
-+    if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
-+      for (const row of processedRowsInput) applyRowHints(row);
-+    }
-+  }
-+
    const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
    const runId = processed?.runId ?? processed?.run_id ?? overrides?.runId ?? overrides?.run_id ?? null;
    const jobId = processed?.jobId ?? processed?.job_id ?? overrides?.jobId ?? overrides?.job_id ?? null;
  
    let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
    if (qualified && family && records.length) {
++    const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
++    const requiredList = Array.isArray(requiredFields) ? requiredFields : [];
++    const effectiveRequired = allowMinimal ? [] : requiredList;
++
++    const normalizeBrand = (value) => {
++      if (value == null) return null;
++      const trimmed = String(value).trim();
++      if (!trimmed) return null;
++      if (trimmed.toLowerCase() === 'unknown') return null;
++      return trimmed;
++    };
++
++    const brandOverride = normalizeBrand(overrides?.brand)
++      || normalizeBrand(processedBrand)
++      || normalizeBrand(brandName)
++      || normalizeBrand(extractedBrand)
++      || null;
++
      persistResult = await saveExtractedSpecs(qualified, family, records, {
-       brand: overrides?.brand ?? null, // 폼/페이로드 브랜드 우선 활용
+-      brand: overrides?.brand ?? null, // 폼/페이로드 브랜드 우선 활용
++      brand: brandOverride,
        pnTemplate,
-       requiredKeys: Array.isArray(requiredFields) ? requiredFields : [],
-       coreSpecKeys: Array.isArray(requiredFields) ? requiredFields : [],
+-      requiredKeys: Array.isArray(requiredFields) ? requiredFields : [],
+-      coreSpecKeys: Array.isArray(requiredFields) ? requiredFields : [],
++      requiredKeys: effectiveRequired,
++      coreSpecKeys: effectiveRequired,
        runId,
        run_id: runId,
        jobId,
@@ -255,3 +68,14 @@ index 7661d8cd455a030a39227aaf4f4e0a0783465755..cdd75999317172da9671f8992b0b7f99
        .map((pn) => String(pn || '').trim())
        .filter(Boolean)
    );
+ 
+   if (!persistedCodes.size && records.length) {
+     for (const rec of records) {
+       const pn = String(rec.pn || rec.code || '').trim();
+       if (pn) persistedCodes.add(pn);
+     }
+   }
+ 
+   const persistedList = Array.from(persistedCodes);
+   const mpnListSafe = Array.isArray(mpnList) ? mpnList : [];
+   const mergedMpns = Array.from(new Set([...persistedList, ...mpnListSafe]));

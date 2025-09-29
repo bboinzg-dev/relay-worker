@@ -1042,11 +1042,29 @@ async function persistProcessedData(processed = {}, overrides = {}) {
 
   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
   if (qualified && family && records.length) {
+    const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
+    const requiredList = Array.isArray(requiredFields) ? requiredFields : [];
+    const effectiveRequired = allowMinimal ? [] : requiredList;
+
+    const normalizeBrand = (value) => {
+      if (value == null) return null;
+      const trimmed = String(value).trim();
+      if (!trimmed) return null;
+      if (trimmed.toLowerCase() === 'unknown') return null;
+      return trimmed;
+    };
+
+    const brandOverride = normalizeBrand(overrides?.brand)
+      || normalizeBrand(processedBrand)
+      || normalizeBrand(brandName)
+      || normalizeBrand(extractedBrand)
+      || null;
+
     persistResult = await saveExtractedSpecs(qualified, family, records, {
-      brand: overrides?.brand ?? null, // 폼/페이로드 브랜드 우선 활용
+      brand: brandOverride,
       pnTemplate,
-      requiredKeys: Array.isArray(requiredFields) ? requiredFields : [],
-      coreSpecKeys: Array.isArray(requiredFields) ? requiredFields : [],
+      requiredKeys: effectiveRequired,
+      coreSpecKeys: effectiveRequired,
       runId,
       run_id: runId,
       jobId,

@@ -781,11 +781,18 @@ async function seedManufacturerAliases() {
     ];
 
     for (const { brand, alias } of seeds) {
+      const brandNorm = brand.toLowerCase();
       await db.query(
-        `INSERT INTO public.manufacturer_alias (brand, alias)
-         VALUES ($1,$2)
+        `INSERT INTO public.manufacturer_alias (brand, alias, brand_norm)
+         VALUES ($1,$2,$3)
          ON CONFLICT DO NOTHING`,
-        [brand, alias]
+        [brand, alias, brandNorm]
+      );
+      await db.query(
+        `INSERT INTO public.manufacturer_alias (brand, alias, brand_norm)
+         VALUES ($1,'',$2)
+         ON CONFLICT DO NOTHING`,
+        [brand, brandNorm]
       );
     }
   } catch (err) {

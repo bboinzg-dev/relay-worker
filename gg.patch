@@ -1,93 +1,70 @@
-diff --git a/server.js b/server.js
-index 2564617319c34a152f695fa01c1cd4eba6965603..726effb89ec8c30acda8d3bdd231879fd29a5ab5 100644
---- a/server.js
-+++ b/server.js
-@@ -1,68 +1,66 @@
- /* server.js */
- 'use strict';
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index b75a0332f1b5c725fb4f91fc43a03b34a8a2ea33..4e31c6cf98e1c20e71ca391994758a70a97f445a 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -397,51 +397,64 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+   const updateCols = colList.filter((col) => !CONFLICT_KEYS.includes(col));
+   const updateSql = updateCols.length
+     ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ')
+     : null;
  
- const express = require('express');
- const cors = require('cors');
- const bodyParser = require('body-parser');
- const multer = require('multer');
- const crypto = require('crypto');
- const jwt = require('jsonwebtoken');
+   const sql = [
+     `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
+     `VALUES (${placeholders})`,
+     'ON CONFLICT (brand_norm, code_norm)',
+     updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
+     'RETURNING pn',
+   ].join('\n');
  
- const db = require('./src/utils/db');
- const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
- const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
- const { runAutoIngest, persistProcessedData } = require('./src/pipeline/ingestAuto');
- const { generateRunId } = require('./src/utils/run-id');
+   const client = await pool.connect();
+   const warnings = new Set();
+   const seenNatural = new Set();
  
+   try {
+     for (const row of rows) {
+       result.processed += 1;
+       const rec = {};
+       for (const [key, value] of Object.entries(row || {})) {
+         rec[normKey(key)] = value;
+       }
  
- 
- // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
-- const { CloudTasksClient } = require('@google-cloud/tasks');
-- const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-- const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
-- const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
-- // step 라우트 폐지 → ingest 하나로 통일
-- const WORKER_TASK_URL = process.env.WORKER_TASK_URL || (
--   process.env.WORKER_URL ? `${process.env.WORKER_URL.replace(/\/+$/,'')}/api/worker/ingest` :
--   'https://<YOUR-RUN-URL>/api/worker/ingest');
-- const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
--
--
-- try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
--
-- // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
-- let _tasks = null;
-- let _queuePath = null;
-- function getTasks() {
--   if (!_tasks) {
-+const { CloudTasksClient } = require('@google-cloud/tasks');
-+const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-+const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
-+const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
-+// step 라우트 폐지 → ingest 하나로 통일
-+const WORKER_TASK_URL = process.env.WORKER_TASK_URL || process.env.WORKER_STEP_URL || 'https://<YOUR-RUN-URL>/api/worker/ingest';
-+const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
+-      const brandInfo = normalizeBrandValue(rec.brand ?? rec.brand_norm ?? '', aliasMap);
++      if ((!rec.brand || String(rec.brand).trim() === '') && options?.brand) {
++        rec.brand = options.brand;
++      }
 +
-+
-+try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
-+
-+// lazy init: gRPC 문제 대비 regional endpoint + REST fallback
-+let _tasks = null;
-+let _queuePath = null;
-+function getTasks() {
-+  if (!_tasks) {
-     // 글로벌 엔드포인트 + REST fallback(HTTP/1)
-     _tasks = new CloudTasksClient({ fallback: true });
--     _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
--   }
--   return { tasks: _tasks, queuePath: _queuePath };
-- }
-+    _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
-+  }
-+  return { tasks: _tasks, queuePath: _queuePath };
-+}
++      let brandInfo = normalizeBrandValue(rec.brand ?? rec.brand_norm ?? '', aliasMap);
++      if (!brandInfo.ok && options?.brand) {
++        brandInfo = normalizeBrandValue(options.brand, aliasMap);
++      }
++      if (!brandInfo.ok) {
++        const fallbackBrand = String(rec.brand || options?.brand || '').trim();
++        if (fallbackBrand) {
++          brandInfo = { ok: true, brand: fallbackBrand, brandNorm: fallbackBrand.toLowerCase() };
++        }
++      }
+       if (!brandInfo.ok) {
+         if (brandInfo.reason === 'brand_not_allowed' && brandInfo.detail) {
+           console.warn('[persist] brand alias not found:', brandInfo.detail);
+         }
+         result.skipped.push({ reason: brandInfo.reason, detail: brandInfo.detail || null });
+         continue;
+       }
+       rec.brand = brandInfo.brand;
+       rec.brand_norm = brandInfo.brandNorm;
  
- async function enqueueIngestTask(payload = {}) {
-   const { tasks, queuePath } = getTasks();
-   if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
-   const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
+       buildPnIfMissing(rec, pnTemplate);
  
-   const bodyPayload = {
-     fromTasks: true,
-     payload,
-   };
-   const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
- 
-   const nowSeconds = Math.floor(Date.now() / 1000);
-   const deadlineSeconds = Number(process.env.TASKS_DEADLINE_SEC || 150);
-   const delaySeconds = Number(process.env.TASKS_DELAY_SEC || 5);
-   const maxAttempts = Number(process.env.TASKS_MAX_ATTEMPTS || 12);
-   const minBackoffSeconds = Number(process.env.TASKS_MIN_BACKOFF_SEC || 1);
-   const maxBackoffSeconds = Number(process.env.TASKS_MAX_BACKOFF_SEC || 60);
-   const maxDoublings = Number(process.env.TASKS_MAX_DOUBLINGS || 4);
- 
-   const task = {
-     httpRequest: {
-       httpMethod: 'POST',
-       url: WORKER_TASK_URL,            // ★ ingest 하나로 통일
-       headers: { 'Content-Type': 'application/json' },
+       let codeValue = rec.code ?? rec.pn ?? null;
+       if (typeof codeValue === 'string') codeValue = codeValue.trim();
+       else codeValue = codeValue == null ? '' : String(codeValue).trim();
+       if (!codeValue) {
+         result.skipped.push({ reason: 'missing_code' });
+         continue;
+       }
+       if (/^[0-9A-F]{12,}$/i.test(codeValue)) {
+         result.skipped.push({ reason: 'invalid_code' });
+         continue;
+       }
+       if (!CODE_PATTERN.test(codeValue) || CODE_FORBIDDEN_RE.test(codeValue)) {
+         result.skipped.push({ reason: 'invalid_code' });

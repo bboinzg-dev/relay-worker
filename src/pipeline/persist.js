@@ -419,7 +419,20 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         rec[normKey(key)] = value;
       }
 
-      const brandInfo = normalizeBrandValue(rec.brand ?? rec.brand_norm ?? '', aliasMap);
+      if ((!rec.brand || String(rec.brand).trim() === '') && options?.brand) {
+        rec.brand = options.brand;
+      }
+
+      let brandInfo = normalizeBrandValue(rec.brand ?? rec.brand_norm ?? '', aliasMap);
+      if (!brandInfo.ok && options?.brand) {
+        brandInfo = normalizeBrandValue(options.brand, aliasMap);
+      }
+      if (!brandInfo.ok) {
+        const fallbackBrand = String(rec.brand || options?.brand || '').trim();
+        if (fallbackBrand) {
+          brandInfo = { ok: true, brand: fallbackBrand, brandNorm: fallbackBrand.toLowerCase() };
+        }
+      }
       if (!brandInfo.ok) {
         if (brandInfo.reason === 'brand_not_allowed' && brandInfo.detail) {
           console.warn('[persist] brand alias not found:', brandInfo.detail);

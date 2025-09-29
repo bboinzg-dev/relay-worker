@@ -241,8 +241,18 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
     const displayName = req.body?.display_name || null;
 
     try {
+      const overrides = {
+        brand: brand || null,
+        series: series || null,
+      };
       const out = await runAutoIngest({
-        gcsUri, family_slug, brand, code, series, display_name: displayName,
+        gcsUri,
+        family_slug,
+        brand,
+        code,
+        series,
+        display_name: displayName,
+        overrides,
       });
       // 인제스트까지 완료한 결과 반환
       return res.json({ ok:true, gcsUri, ingest: out });
@@ -477,7 +487,19 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
     const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name, family_slug } = req.body || {};
     const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
-    const result = await runAutoIngest({ gcsUri: uri, family_slug, brand, code, series, display_name });
+    const overrides = {
+      brand: brand || null,
+      series: series || null,
+    };
+    const result = await runAutoIngest({
+      gcsUri: uri,
+      family_slug,
+      brand,
+      code,
+      series,
+      display_name,
+      overrides,
+    });
     res.json(result);
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
 });
@@ -645,6 +667,14 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
           throw new Error('gcsUri required');
         }
 
+        const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+        const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+        const nextOverrides = {
+          ...(payload?.overrides || {}),
+          brand: overrideBrand,
+          series: overrideSeries,
+        };
+
         const nextPayload = {
           runId,
           run_id: runId,
@@ -656,6 +686,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
           series: payload?.series ?? null,
           display_name: payload?.display_name ?? null,
           uploader_id: payload?.uploader_id ?? null,
+          overrides: nextOverrides,
           phase: 'process',
         };
 
@@ -671,6 +702,14 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       if (phase === 'process') {
         await markProcessing(baseContext);
 
+        const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+        const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+        const nextOverrides = {
+          ...(payload?.overrides || {}),
+          brand: overrideBrand,
+          series: overrideSeries,
+        };
+
         const result = await runAutoIngest({
           ...payload,
           runId,
@@ -678,6 +717,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
           gcsUri,
           gcs_uri: gcsUri,
           skipPersist: true,
+          overrides: nextOverrides,
         });
 
         const processed = result?.processed;
@@ -700,6 +740,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
           uploader_id: payload?.uploader_id ?? null,
           phase: 'persist',
           processed,
+          overrides: nextOverrides,
         };
 
         try {
@@ -714,10 +755,13 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       if (phase === 'persist') {
         await markPersisting(baseContext);
 
+        const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+        const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+
         const out = await persistProcessedData(payload?.processed || {}, {
-          brand: payload?.brand ?? null,
+          brand: overrideBrand,
           code: payload?.code ?? null,
-          series: payload?.series ?? null,
+          series: overrideSeries,
           display_name: payload?.display_name ?? null,
         });
 

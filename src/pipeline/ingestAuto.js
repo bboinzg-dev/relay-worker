@@ -455,17 +455,22 @@ async function runAutoIngest(input = {}) {
     display_name = null,
   } = input;
 
+  const overridesBrand = input?.overrides?.brand ?? null;
+  const overridesSeries = input?.overrides?.series ?? null;
+  const effectiveBrand = overridesBrand || brand || null;
+  if (overridesSeries != null && (series == null || series === '')) series = overridesSeries;
+
   const gcsUri = (rawGcsUri || rawGsUri || '').trim();
   const runId = input?.runId ?? input?.run_id ?? null;
   const jobId = input?.jobId ?? input?.job_id ?? null;
 
   const started = Date.now();
   if (!gcsUri) throw new Error('gcsUri/gsUri required');
-   // 기본 2분로 단축 (원하면 ENV로 재조정)
+  // 기본 2분 하드캡 (ENV로 조정 가능)
   const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
   const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
-  const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || (FAST ? 32768 : 65536));
-  const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || (FAST ? 30000 : Math.round(BUDGET * 0.6)));
+  const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || 262144);
+  const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
   const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
 
   let lockAcquired = false;
@@ -510,8 +515,8 @@ async function runAutoIngest(input = {}) {
    } catch { family = 'relay_power'; }
   }
 
-  const overrideBrandLog = input?.overrides?.brand ?? brand ?? '';
-  console.log(`[PATH] extractor=TABLE_FIRST runId=${runId || ''} family=${family} overrides.brand=${overrideBrandLog || ''}`);
+  const overrideBrandLog = overridesBrand ?? brand ?? '';
+  console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''} brand_effective=${effectiveBrand || ''}`);
 
 // 목적 테이블
   const reg = await db.query(
@@ -574,8 +579,8 @@ async function runAutoIngest(input = {}) {
   } catch { candidates = []; }
 
   // PDF → 품번/스펙 추출
-  let extracted = { brand: brand || 'unknown', rows: [] };
-  if (!brand || !code) {
+  let extracted = { brand: effectiveBrand || 'unknown', rows: [] };
+  if (!effectiveBrand || !code) {
     try {
       if (FAST) {
         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
@@ -586,21 +591,22 @@ async function runAutoIngest(input = {}) {
         if (raw && raw.length > 1000) {
           const fieldsJson = blueprint?.fields || {};
           const vals = await extractFields(raw, code || '', fieldsJson);
+          const fallbackBrand = effectiveBrand || 'unknown';
           extracted = {
-            brand: brand || 'unknown',
-            rows: [{ brand: brand || 'unknown', code: code || (path.parse(fileName).name), ...(vals||{}) }],
+            brand: fallbackBrand,
+            rows: [{ brand: fallbackBrand, code: code || (path.parse(fileName).name), ...(vals||{}) }],
           };
         } else {
           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
           extracted = await withTimeout(
-            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: brand || null }),
+            extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: effectiveBrand || null }),
             EXTRACT_HARD_CAP_MS,
             'extract',
           );
         }
       } else {
         extracted = await withTimeout(
-          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: brand || null }),
+          extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint: effectiveBrand || null }),
           EXTRACT_HARD_CAP_MS,
           'extract',
         );
@@ -684,7 +690,7 @@ async function runAutoIngest(input = {}) {
   let coverUri = null;
   if (/^(1|true|on)$/i.test(process.env.COVER_CAPTURE || '0')) {
     try {
-      const bForCover = brand || extracted.brand || 'unknown';
+      const bForCover = effectiveBrand || extracted.brand || 'unknown';
       const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
       coverUri = await withTimeout(
         extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
@@ -707,7 +713,7 @@ async function runAutoIngest(input = {}) {
   // 레코드 구성
   const records = [];
   const now = new Date();
-  const brandName = brand || extracted.brand || 'unknown';
+  const brandName = effectiveBrand || extracted.brand || 'unknown';
   const baseSeries = series || code || null;
 
   let variantColumnsEnsured = false;
@@ -959,9 +965,9 @@ async function runAutoIngest(input = {}) {
   }
 
   const persistOverrides = {
-    brand,
+    brand: effectiveBrand,
     code,
-    series,
+    series: overridesSeries ?? series,
     display_name,
     runId,
     run_id: runId,

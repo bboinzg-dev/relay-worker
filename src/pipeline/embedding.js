@@ -18,7 +18,7 @@ async function updateRowEmbedding(specsTable, row) {
   if (!sig) return false;
   const vec = await embedText(sig);
   const vecLit = toVectorLiteral(vec);
-  await db.query(`UPDATE public/${specsTable} SET embedding = $1::vector WHERE brand_norm=$2 AND code_norm=$3`, [vecLit, row.brand_norm, row.code_norm]);
+  await db.query(`UPDATE public.${specsTable} SET embedding = $1::vector WHERE brand_norm=$2 AND code_norm=$3`, [vecLit, row.brand_norm, row.code_norm]);
   // best-effort index
   try {
     await db.query(`

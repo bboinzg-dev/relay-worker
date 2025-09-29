@@ -29,8 +29,7 @@ const META_KEYS = new Set([
 const CONFLICT_KEYS = ['brand_norm', 'code_norm'];
 
 const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
-const STRICT_PN_RE = /^[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]$/i;
-const FORBIDDEN_RE = /(sample|prototype|dummy|test|pdf|font|xref|type0|dfonttype0c|aesv2|y62)/i;
+const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
 
 const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
 const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
@@ -53,8 +52,7 @@ function normKey(key) {
 function isValidPnValue(value) {
   const trimmed = String(value || '').trim();
   if (!trimmed) return false;
-  if (PN_RE.test(trimmed)) return true;
-  return STRICT_PN_RE.test(trimmed);
+  return PN_RE.test(trimmed);
 }
 
 function isNumericType(type = '') {
@@ -130,9 +128,33 @@ const BRAND_LOOKUP_SQL = `
    LIMIT 1
 `;
 
-const brandCache = new Map();
+const BRAND_ALIAS_SCAN_SQL = `
+  SELECT brand_norm, aliases
+    FROM public.manufacturer_alias
+`;
 
-async function normalizeBrand(raw) {
+const brandCache = new Map();
+let aliasRowsCache = null;
+let aliasRowsFetchedAt = 0;
+
+async function loadAliasRows() {
+  const now = Date.now();
+  if (aliasRowsCache && now - aliasRowsFetchedAt < 60_000) {
+    return aliasRowsCache;
+  }
+  try {
+    const { rows } = await pool.query(BRAND_ALIAS_SCAN_SQL);
+    aliasRowsCache = Array.isArray(rows) ? rows : [];
+    aliasRowsFetchedAt = now;
+  } catch (err) {
+    aliasRowsCache = [];
+    aliasRowsFetchedAt = now;
+    console.warn('[persist] normalizeBrand alias scan failed:', err?.message || err);
+  }
+  return aliasRowsCache;
+}
+
+async function normalizeBrand(raw, docTextLower = '') {
   const trimmed = String(raw || '').trim();
   if (!trimmed) return null;
   const key = trimmed.toLowerCase();
@@ -143,17 +165,36 @@ async function normalizeBrand(raw) {
     const { rows } = await pool.query(BRAND_LOOKUP_SQL, [trimmed]);
     const row = rows?.[0];
     if (row?.brand_norm) {
-      const brandNorm = String(row.brand_norm).trim().toLowerCase();
-      const brand = String(row.brand || '').trim() || trimmed;
-      resolved = { brand, brandNorm };
-      brandCache.set(brandNorm, resolved);
-      brandCache.set(brand.toLowerCase(), resolved);
+      resolved = String(row.brand_norm).trim().toLowerCase();
     }
   } catch (err) {
     console.warn('[persist] normalizeBrand query failed:', err?.message || err);
   }
 
-  brandCache.set(key, resolved);
+  const docLower = String(docTextLower || '').toLowerCase();
+  if (!resolved && docLower) {
+    const aliasRows = await loadAliasRows();
+    const lowerRaw = key;
+    for (const row of aliasRows) {
+      const brandNorm = String(row?.brand_norm || '').trim().toLowerCase();
+      if (!brandNorm) continue;
+      const aliases = Array.isArray(row?.aliases) ? row.aliases : [];
+      const rawMatch = lowerRaw.includes(brandNorm);
+      const docMatch = docLower.includes(brandNorm) || aliases.some((alias) => {
+        const lowerAlias = String(alias || '').trim().toLowerCase();
+        return lowerAlias && docLower.includes(lowerAlias);
+      });
+      if (rawMatch || docMatch) {
+        resolved = brandNorm;
+        break;
+      }
+    }
+  }
+
+  if (resolved) {
+    brandCache.set(key, resolved);
+    brandCache.set(resolved, resolved);
+  }
   return resolved;
 }
 
@@ -440,21 +481,26 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         rec.brand = options.brand;
       }
 
-      const brandCandidates = [rec.brand, rec.brand_norm, options?.brand];
-      let brandInfo = null;
+      const docTextLower = String(rec._doc_text || '').toLowerCase();
+      const brandCandidates = [options?.brand, rec.brand, rec.brand_norm];
+      let brandKey = null;
       for (const candidate of brandCandidates) {
         if (!candidate) continue;
-        brandInfo = await normalizeBrand(candidate);
-        if (brandInfo) break;
+        const trimmed = String(candidate).trim();
+        if (!trimmed) continue;
+        brandKey = await normalizeBrand(trimmed, docTextLower);
+        if (brandKey) break;
       }
-      if (!brandInfo) {
-        const detail = String(rec.brand || options?.brand || '').trim() || null;
+      if (!brandKey) {
+        const skippedCode = String(rec.code || rec.pn || options?.code || '').trim() || '(no-code)';
         if (physicalCols.has('last_error')) rec.last_error = 'missing_brand';
-        result.skipped.push({ reason: 'missing_brand', detail, last_error: 'missing_brand' });
+        result.skipped.push({ reason: 'missing_brand', code: skippedCode, last_error: 'missing_brand' });
         continue;
       }
-      rec.brand = brandInfo.brand;
-      rec.brand_norm = brandInfo.brandNorm;
+      if (!rec.brand || !String(rec.brand).trim()) {
+        rec.brand = options?.brand || brandKey;
+      }
+      rec.brand_norm = brandKey;
       if (physicalCols.has('last_error')) rec.last_error = null;
 
       buildPnIfMissing(rec, pnTemplate);
@@ -467,21 +513,18 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         continue;
       }
 
-      const pnValue = String(rec.pn || '').trim();
-      const codeValue = String(rec.code || '').trim() || pnValue;
-      if (/^[0-9A-F]{12,}$/i.test(pnValue) || /^[0-9A-F]{12,}$/i.test(codeValue)) {
+      const pnValue = String(rec.pn || rec.code || '').trim();
+      if (!pnValue || !isValidPnValue(pnValue) || FORBIDDEN_RE.test(pnValue)) {
+        const skippedCode = pnValue || String(rec.code || rec.pn || '').trim() || '(no-code)';
         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
-        result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });
-        continue;
-      }
-      if (!isValidPnValue(pnValue) || !isValidPnValue(codeValue) || FORBIDDEN_RE.test(pnValue) || FORBIDDEN_RE.test(codeValue)) {
-        if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
-        result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });
+        result.skipped.push({ reason: 'invalid_code', code: skippedCode, last_error: 'invalid_code' });
         continue;
       }
 
       rec.pn = pnValue;
-      rec.code = codeValue;
+      if (rec.code == null || String(rec.code).trim() === '') {
+        rec.code = pnValue;
+      }
 
       const pnNorm = normKey(pnValue);
       if (!pnNorm) {
@@ -491,7 +534,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
       if (physicalCols.has('pn_norm')) rec.pn_norm = pnNorm;
 
-      const codeNorm = normKey(codeValue);
+      const codeNorm = normKey(rec.code);
       if (!codeNorm) {
         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
         result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });

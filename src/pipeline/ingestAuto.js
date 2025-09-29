@@ -953,6 +953,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
   if (qualified && family && records.length) {
     persistResult = await saveExtractedSpecs(qualified, family, records, {
+      brand: overrides?.brand ?? null, // 폼/페이로드 브랜드 우선 활용
       pnTemplate,
       requiredKeys: Array.isArray(requiredFields) ? requiredFields : [],
       coreSpecKeys: Array.isArray(requiredFields) ? requiredFields : [],
@@ -988,7 +989,8 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   );
 
   const ms = Number.isFinite(processed?.ms) ? processed.ms : (typeof started === 'number' ? Date.now() - started : null);
-  const ok = persistedList.length > 0;
+  const upsertsCount = typeof persistResult.upserts === 'number' ? persistResult.upserts : 0;
+  const ok = upsertsCount > 0;
 
   const fallbackBrand = overrides.brand || brandName || extractedBrand || null;
   const primaryRecord = records[0] || null;
@@ -1010,8 +1012,8 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     code: finalCode,
     datasheet_uri: gcsUri,
     cover: coverUri || primaryRecord?.image_uri || null,
-    rows: persistResult.upserts || persistedList.length,
-    codes: persistedList,
+    rows: upsertsCount,        // 실제 반영된 개수만 기록
+    codes: Array.from(persistedCodes),  // 표시는 그대로
     mpn_list: mergedMpns,
     reject_reasons: Array.from(rejectReasons),
     warnings: Array.from(warningReasons),

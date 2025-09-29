@@ -1,70 +1,111 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index b75a0332f1b5c725fb4f91fc43a03b34a8a2ea33..4e31c6cf98e1c20e71ca391994758a70a97f445a 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -397,51 +397,64 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
-   const updateCols = colList.filter((col) => !CONFLICT_KEYS.includes(col));
-   const updateSql = updateCols.length
-     ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ')
-     : null;
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index e67d9d4ab30c7d0dba28ae72fd860b1b6f3093e8..1e4e213f4ec530f1c2f107edca346929c193f2d5 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -931,101 +931,103 @@ async function runAutoIngest(input = {}) {
+   return persistProcessedData(processedPayload, persistOverrides);
+ }
  
-   const sql = [
-     `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
-     `VALUES (${placeholders})`,
-     'ON CONFLICT (brand_norm, code_norm)',
-     updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
-     'RETURNING pn',
-   ].join('\n');
+ async function persistProcessedData(processed = {}, overrides = {}) {
+   const {
+     started = Date.now(),
+     gcsUri = null,
+     family = null,
+     table = null,
+     qualified: qualifiedInput = null,
+     pnTemplate = null,
+     requiredFields = [],
+     coverUri = null,
+     records = [],
+     mpnList = [],
+     extractedBrand = null,
+     brandName = null,
+     baseSeries = null,
+   } = processed || {};
  
-   const client = await pool.connect();
-   const warnings = new Set();
-   const seenNatural = new Set();
+   const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
  
-   try {
-     for (const row of rows) {
-       result.processed += 1;
-       const rec = {};
-       for (const [key, value] of Object.entries(row || {})) {
-         rec[normKey(key)] = value;
-       }
+   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
+   if (qualified && family && records.length) {
+     persistResult = await saveExtractedSpecs(qualified, family, records, {
++      brand: overrides?.brand ?? null, // 폼/페이로드 브랜드 우선 활용
+       pnTemplate,
+       requiredKeys: Array.isArray(requiredFields) ? requiredFields : [],
+       coreSpecKeys: Array.isArray(requiredFields) ? requiredFields : [],
+     }) || persistResult;
+   } else if (!records.length) {
+     persistResult.skipped = [{ reason: 'missing_pn' }];
+   }
  
--      const brandInfo = normalizeBrandValue(rec.brand ?? rec.brand_norm ?? '', aliasMap);
-+      if ((!rec.brand || String(rec.brand).trim() === '') && options?.brand) {
-+        rec.brand = options.brand;
-+      }
-+
-+      let brandInfo = normalizeBrandValue(rec.brand ?? rec.brand_norm ?? '', aliasMap);
-+      if (!brandInfo.ok && options?.brand) {
-+        brandInfo = normalizeBrandValue(options.brand, aliasMap);
-+      }
-+      if (!brandInfo.ok) {
-+        const fallbackBrand = String(rec.brand || options?.brand || '').trim();
-+        if (fallbackBrand) {
-+          brandInfo = { ok: true, brand: fallbackBrand, brandNorm: fallbackBrand.toLowerCase() };
-+        }
-+      }
-       if (!brandInfo.ok) {
-         if (brandInfo.reason === 'brand_not_allowed' && brandInfo.detail) {
-           console.warn('[persist] brand alias not found:', brandInfo.detail);
-         }
-         result.skipped.push({ reason: brandInfo.reason, detail: brandInfo.detail || null });
-         continue;
-       }
-       rec.brand = brandInfo.brand;
-       rec.brand_norm = brandInfo.brandNorm;
+   const persistedCodes = new Set(
+     (persistResult.written || [])
+       .map((pn) => String(pn || '').trim())
+       .filter(Boolean)
+   );
  
-       buildPnIfMissing(rec, pnTemplate);
+   if (!persistedCodes.size && records.length) {
+     for (const rec of records) {
+       const pn = String(rec.pn || rec.code || '').trim();
+       if (pn) persistedCodes.add(pn);
+     }
+   }
  
-       let codeValue = rec.code ?? rec.pn ?? null;
-       if (typeof codeValue === 'string') codeValue = codeValue.trim();
-       else codeValue = codeValue == null ? '' : String(codeValue).trim();
-       if (!codeValue) {
-         result.skipped.push({ reason: 'missing_code' });
-         continue;
-       }
-       if (/^[0-9A-F]{12,}$/i.test(codeValue)) {
-         result.skipped.push({ reason: 'invalid_code' });
-         continue;
-       }
-       if (!CODE_PATTERN.test(codeValue) || CODE_FORBIDDEN_RE.test(codeValue)) {
-         result.skipped.push({ reason: 'invalid_code' });
+   const persistedList = Array.from(persistedCodes);
+   const mpnListSafe = Array.isArray(mpnList) ? mpnList : [];
+   const mergedMpns = Array.from(new Set([...persistedList, ...mpnListSafe]));
+ 
+   const rejectReasons = new Set(
+     (persistResult.skipped || [])
+       .map((it) => (it && typeof it === 'object' ? it.reason : it))
+       .filter(Boolean)
+   );
+   const warningReasons = new Set(
+     (persistResult.warnings || []).filter(Boolean)
+   );
+ 
+   const ms = Number.isFinite(processed?.ms) ? processed.ms : (typeof started === 'number' ? Date.now() - started : null);
+-  const ok = persistedList.length > 0;
++  const upsertsCount = typeof persistResult.upserts === 'number' ? persistResult.upserts : 0;
++  const ok = upsertsCount > 0;
+ 
+   const fallbackBrand = overrides.brand || brandName || extractedBrand || null;
+   const primaryRecord = records[0] || null;
+   const finalBrand = primaryRecord?.brand || fallbackBrand;
+   const finalCode =
+     persistedList[0] ||
+     primaryRecord?.pn ||
+     primaryRecord?.code ||
+     overrides.code ||
+     null;
+ 
+   const response = {
+     ok,
+     ms,
+     family,
+     final_table: table,
+     specs_table: table,
+     brand: finalBrand,
+     code: finalCode,
+     datasheet_uri: gcsUri,
+     cover: coverUri || primaryRecord?.image_uri || null,
+-    rows: persistResult.upserts || persistedList.length,
+-    codes: persistedList,
++    rows: upsertsCount,        // 실제 반영된 개수만 기록
++    codes: Array.from(persistedCodes),  // 표시는 그대로
+     mpn_list: mergedMpns,
+     reject_reasons: Array.from(rejectReasons),
+     warnings: Array.from(warningReasons),
+   };
+ 
+   if (response.code == null && Array.isArray(processed?.candidateCodes) && processed.candidateCodes.length) {
+     response.code = processed.candidateCodes[0];
+   }
+ 
+   if (response.code == null && baseSeries != null) {
+     response.code = baseSeries;
+   }
+ 
+   return response;
+ }
+ 
+ module.exports = { runAutoIngest, persistProcessedData };

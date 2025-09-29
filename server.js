@@ -529,28 +529,29 @@ async function handleWorkerIngest(req, res) {
 
   const runId = generateRunId();
 
+  // Cloud Tasks 여부와 상관없이 runId가 생성되면 즉시 ACK
+  res.status(202).json({ ok: true, runId, run_id: runId });
+
+  const ingestPayload = {
+    runId,
+    run_id: runId,
+    gcsUri,
+    gcs_uri: gcsUri,
+    family_slug: familySlug,
+    brand,
+    code,
+    series,
+    display_name: displayName,
+    uploader_id: uploaderId,
+    phase: 'process',
+  };
+
   try {
     await db.query(
       `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
          VALUES ($1,$2,$3,$4,'RUNNING')`,
       [runId, 'phase:process', 0, gcsUri]
     );
-
-    res.status(202).json({ ok: true, runId, run_id: runId });
-
-    const ingestPayload = {
-      runId,
-      run_id: runId,
-      gcsUri,
-      gcs_uri: gcsUri,
-      family_slug: familySlug,
-      brand,
-      code,
-      series,
-      display_name: displayName,
-      uploader_id: uploaderId,
-      phase: 'process',
-    };
 
     enqueueWorkerIngest(ingestPayload).catch(async (err) => {
       try {
@@ -579,9 +580,6 @@ async function handleWorkerIngest(req, res) {
       );
     } catch (_) {}
     console.error('[ingest init failed]', e?.message || e);
-    if (!res.headersSent) {
-      return res.status(500).json({ ok:false, error:String(e?.message || e) });
-    }
   }
 }
 

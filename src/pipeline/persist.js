@@ -348,6 +348,15 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   const result = { processed: 0, upserts: 0, affected: 0, written: [], skipped: [], warnings: [] };
   if (!rows.length) return result;
 
+  console.log(`[PATH] persist family=${familySlug} rows=${rows.length} brand_override=${options?.brand || ''}`);
+
+  const runId = options?.runId ?? options?.run_id ?? null;
+  const jobId = options?.jobId ?? options?.job_id ?? null;
+  const suffixParts = [];
+  if (runId) suffixParts.push(`run:${runId}`);
+  if (jobId) suffixParts.push(`job:${jobId}`);
+  const appNameSuffix = suffixParts.length ? ` ${suffixParts.join(' ')}` : '';
+
   const guard = await ensureSchemaGuards(familySlug);
   if (!guard.ok) {
     result.skipped.push({ reason: guard.reason || 'schema_not_ready', detail: guard.detail || null });
@@ -530,12 +539,21 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       });
 
       try {
+        await client.query('BEGIN');
+        if (appNameSuffix) {
+          await client.query(
+            `SET LOCAL application_name = current_setting('application_name', true) || $1`,
+            [appNameSuffix],
+          );
+        }
         const res = await client.query(sql, vals);
+        await client.query('COMMIT');
         const delta = res.rowCount || 0;
         result.upserts += delta;
         result.affected += delta;
         if (res.rows?.[0]?.pn) result.written.push(res.rows[0].pn);
       } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
         result.skipped.push({ reason: 'db_error', detail: err?.message || String(err) });
       }
     }

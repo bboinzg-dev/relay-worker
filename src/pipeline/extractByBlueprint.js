@@ -1,4 +1,5 @@
 'use strict';
+console.log(`[PATH] entered:${__filename}`);
 const { VertexAI } = require('@google-cloud/vertexai');
 const { safeJsonParse } = require('../utils/safe-json');
 

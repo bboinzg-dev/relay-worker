@@ -1,4 +1,5 @@
 'use strict';
+console.log(`[PATH] entered:${__filename}`);
 const { toJsonSchema, callLLM } = require('../llm/structured');
 const { safeJsonParse } = require('../utils/safe-json');
 const { pool } = require('../utils/db'); // 기존 db 유틸

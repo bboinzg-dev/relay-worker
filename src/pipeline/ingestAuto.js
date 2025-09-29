@@ -456,6 +456,8 @@ async function runAutoIngest(input = {}) {
   } = input;
 
   const gcsUri = (rawGcsUri || rawGsUri || '').trim();
+  const runId = input?.runId ?? input?.run_id ?? null;
+  const jobId = input?.jobId ?? input?.job_id ?? null;
 
   const started = Date.now();
   if (!gcsUri) throw new Error('gcsUri/gsUri required');
@@ -466,6 +468,26 @@ async function runAutoIngest(input = {}) {
   const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || (FAST ? 30000 : Math.round(BUDGET * 0.6)));
   const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
 
+  let lockAcquired = false;
+  if (runId) {
+    try {
+      await db.query('SELECT pg_advisory_lock(hashtext($1))', [runId]);
+      lockAcquired = true;
+    } catch (err) {
+      console.warn('[ingest] advisory lock failed:', err?.message || err);
+    }
+  }
+
+  const releaseLock = async () => {
+    if (!lockAcquired || !runId) return;
+    lockAcquired = false;
+    try {
+      await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]);
+    } catch (err) {
+      console.warn('[ingest] advisory unlock failed:', err?.message || err);
+    }
+  };
+
   const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
     Promise.resolve(p)
@@ -473,6 +495,7 @@ async function runAutoIngest(input = {}) {
       .catch((err) => { clearTimeout(timer); reject(err); });
   });
 
+  const runnerPromise = (async () => {
 
     // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
   let fileName = '';
@@ -486,6 +509,9 @@ async function runAutoIngest(input = {}) {
      if (/subminiature\s+signal\s+relay|signal\s+relay/i.test(text)) family = 'relay_signal';
    } catch { family = 'relay_power'; }
   }
+
+  const overrideBrandLog = input?.overrides?.brand ?? brand ?? '';
+  console.log(`[PATH] extractor=TABLE_FIRST runId=${runId || ''} family=${family} overrides.brand=${overrideBrandLog || ''}`);
 
 // 목적 테이블
   const reg = await db.query(
@@ -622,6 +648,7 @@ async function runAutoIngest(input = {}) {
     const fromTypes  = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
     const fromOrder  = rankPartNumbersFromOrderingSections(fullText, FIRST_PASS_CODES);
     const fromSeries = extractPartNumbersBySeriesHeuristic(fullText, FIRST_PASS_CODES * 4);
+    console.log(`[PATH] pns={tables:${fromTypes.length}, body:${fromOrder.length}} combos=0`);
     // 가장 신뢰 높은 순서로 병합
     const picks = fromTypes.length ? fromTypes : (fromOrder.length ? fromOrder : fromSeries);
 
@@ -916,6 +943,10 @@ async function runAutoIngest(input = {}) {
     extractedBrand: extracted?.brand || null,
     brandName,
     baseSeries,
+    runId,
+    run_id: runId,
+    jobId,
+    job_id: jobId,
   };
 
   if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
@@ -927,8 +958,24 @@ async function runAutoIngest(input = {}) {
     return { ok: true, phase: 'process', processed: processedPayload };
   }
 
-  const persistOverrides = { brand, code, series, display_name };
+  const persistOverrides = {
+    brand,
+    code,
+    series,
+    display_name,
+    runId,
+    run_id: runId,
+    jobId,
+    job_id: jobId,
+  };
   return persistProcessedData(processedPayload, persistOverrides);
+  })();
+
+  try {
+    return await runnerPromise;
+  } finally {
+    await releaseLock();
+  }
 }
 
 async function persistProcessedData(processed = {}, overrides = {}) {
@@ -949,6 +996,8 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   } = processed || {};
 
   const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
+  const runId = processed?.runId ?? processed?.run_id ?? overrides?.runId ?? overrides?.run_id ?? null;
+  const jobId = processed?.jobId ?? processed?.job_id ?? overrides?.jobId ?? overrides?.job_id ?? null;
 
   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
   if (qualified && family && records.length) {
@@ -957,6 +1006,10 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       pnTemplate,
       requiredKeys: Array.isArray(requiredFields) ? requiredFields : [],
       coreSpecKeys: Array.isArray(requiredFields) ? requiredFields : [],
+      runId,
+      run_id: runId,
+      jobId,
+      job_id: jobId,
     }) || persistResult;
   } else if (!records.length) {
     persistResult.skipped = [{ reason: 'missing_pn' }];

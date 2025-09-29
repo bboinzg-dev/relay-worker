@@ -1,272 +1,226 @@
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index f1d29c7c9c2881c93d9570374fa5d5399690393c..48f77518ffbc338d76c2fd18bcaa7fa4e485b0cd 100644
+index 48f77518ffbc338d76c2fd18bcaa7fa4e485b0cd..f88f1e5fee61eed54f3e085a89966219b5458cab 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -1,44 +1,45 @@
- 'use strict';
+@@ -423,51 +423,51 @@ async function extractPartNumbersFromText(text, { series } = {}) {
+   const prefix = series ? normalizeCode(series) : null;
+   const seen = new Set();
+   const out = [];
  
- const path = require('node:path');
- const fs = require('node:fs/promises');
- const os = require('node:os');
- const { execFile } = require('node:child_process');
- const { promisify } = require('node:util');
- const execFileP = promisify(execFile);
+   const push = (raw) => {
+     if (!raw) return;
+     const norm = normalizeCode(raw);
+     if (!norm) return;
+     if (prefix && !norm.startsWith(prefix)) return;
+     if (seen.has(norm)) return;
+     seen.add(norm);
+     const cleaned = typeof raw === 'string' ? raw.trim() : String(raw || '');
+     out.push(cleaned || norm);
+   };
  
- const db = require('../utils/db');
- const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
- const { extractText } = require('../utils/extract');
- const { getBlueprint } = require('../utils/blueprint');
- const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
- const { extractFields } = require('./extractByBlueprint');
- const { saveExtractedSpecs } = require('./persist');
- const { explodeToRows } = require('../ingest/mpn-exploder');
- const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
- const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
-+const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
+   for (const { code } of extractPartNumbersFromTypesTables(src, 200)) push(code);
+   for (const { code } of rankPartNumbersFromOrderingSections(src, 200)) push(code);
+   for (const { code } of extractPartNumbersBySeriesHeuristic(src, 200)) push(code);
  
- const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
- const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
- 
- const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
- const BASE_KEYS = new Set([
-   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
-   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
-   'cover','verified_in_doc','updated_at'
- ]);
- 
- const PN_CANDIDATE_RE = /\b[A-Z0-9][A-Z0-9\-_/\.]{3,29}[A-Z0-9]\b/gi;
- const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
- 
- function escapeRegex(str) {
-   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+   return out;
  }
  
- function textContainsExact(text, pn) {
-   if (!text || !pn) return false;
-   const pattern = escapeRegex(String(pn).trim());
-   if (!pattern) return false;
-   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
-   return re.test(String(text));
- }
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index f1d29c7c9c2881c93d9570374fa5d5399690393c..48f77518ffbc338d76c2fd18bcaa7fa4e485b0cd 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -472,83 +473,80 @@ async function runAutoIngest(input = {}) {
+ 
+ 
+ async function runAutoIngest(input = {}) {
+-  const {
++  let {
+     gcsUri: rawGcsUri = null,
+     gsUri: rawGsUri = null,
+     family_slug = null,
+     brand = null,
+     code = null,
+     series = null,
+     display_name = null,
+   } = input;
+ 
+   const gcsUri = (rawGcsUri || rawGsUri || '').trim();
+ 
+   const started = Date.now();
+   if (!gcsUri) throw new Error('gcsUri/gsUri required');
+    // 기본 2분로 단축 (원하면 ENV로 재조정)
+   const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
+   const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
+   const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || (FAST ? 32768 : 65536));
+   const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || (FAST ? 30000 : Math.round(BUDGET * 0.6)));
+   const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
+ 
+   const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
+     const timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
+     Promise.resolve(p)
+       .then((val) => { clearTimeout(timer); resolve(val); })
        .catch((err) => { clearTimeout(timer); reject(err); });
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 48f77518ffbc338d76c2fd18bcaa7fa4e485b0cd..f88f1e5fee61eed54f3e085a89966219b5458cab 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -880,82 +880,152 @@ async function runAutoIngest(input = {}) {
+         pn: cand.raw,
+         code: cand.raw,
+         series_code: fallbackSeries,
+         datasheet_uri: gcsUri,
+         image_uri: coverUri || null,
+         display_name: `${brandName} ${cand.raw}`,
+         verified_in_doc: verified,
+         updated_at: now,
+       };
+       if (coverUri) rec.cover = coverUri;
+       if (physicalCols.has('series') && fallbackSeries != null) rec.series = fallbackSeries;
+       if (rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
+       if (rec.display_name != null && rec.displayname == null) rec.displayname = rec.display_name;
+       records.push(rec);
+     }
+   }
+ 
+   console.log('[MPNDBG]', {
+     picks: candidateMap.length,
+     vkeys: Array.isArray(blueprint?.ingestOptions?.variant_keys) ? blueprint.ingestOptions.variant_keys : [],
+     expanded: explodedRows.length,
+     recs: records.length,
+     colsSanitized: colTypes?.size || 0,
    });
  
- 
-     // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
-   let fileName = '';
-   try { const { name } = parseGcsUri(gcsUri); fileName = path.basename(name); } catch {}
-   let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
-   if (!family && !FAST) {
-     try {
-      const text = await readText(gcsUri, 256*1024);
-      family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
-      // ★ 강제 보정: 제목/본문에 Signal Relay가 있으면 무조건 signal로
-      if (/subminiature\s+signal\s+relay|signal\s+relay/i.test(text)) family = 'relay_signal';
-    } catch { family = 'relay_power'; }
++  const processedPayload = {
++    started,
++    gcsUri,
++    family,
++    table,
++    qualified,
++    pnTemplate,
++    requiredFields,
++    coverUri,
++    records,
++    mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
++    extractedBrand: extracted?.brand || null,
++    brandName,
++    baseSeries,
++  };
++
++  if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
++  if (display_name != null) processedPayload.display_name = display_name;
++  if (code != null) processedPayload.code = code;
++  if (series != null) processedPayload.series = series;
++
++  if (input && typeof input === 'object' && input.skipPersist) {
++    return { ok: true, phase: 'process', processed: processedPayload };
++  }
++
++  const persistOverrides = { brand, code, series, display_name };
++  return persistProcessedData(processedPayload, persistOverrides);
++}
++
++async function persistProcessedData(processed = {}, overrides = {}) {
++  const {
++    started = Date.now(),
++    gcsUri = null,
++    family = null,
++    table = null,
++    qualified: qualifiedInput = null,
++    pnTemplate = null,
++    requiredFields = [],
++    coverUri = null,
++    records = [],
++    mpnList = [],
++    extractedBrand = null,
++    brandName = null,
++    baseSeries = null,
++  } = processed || {};
++
++  const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
++
+   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
+-  if (records.length) {
++  if (qualified && family && records.length) {
+     persistResult = await saveExtractedSpecs(qualified, family, records, {
+       pnTemplate,
+-      requiredKeys: requiredFields,
+-      coreSpecKeys: requiredFields,
++      requiredKeys: Array.isArray(requiredFields) ? requiredFields : [],
++      coreSpecKeys: Array.isArray(requiredFields) ? requiredFields : [],
+     }) || persistResult;
+-  } else {
++  } else if (!records.length) {
+     persistResult.skipped = [{ reason: 'missing_pn' }];
    }
  
- // 목적 테이블
-   const reg = await db.query(
-     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
-     [family]
+   const persistedCodes = new Set(
+     (persistResult.written || [])
+       .map((pn) => String(pn || '').trim())
+       .filter(Boolean)
    );
-   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
-   const qualified = table.startsWith('public.')? table : `public.${table}`;
- 
--  const blueprint = await getBlueprint(family);
--
--  // 스키마 보장 (DB 함수) + 컬럼 자동 보강 후 타입 확보
--  if (!/^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0')) {
--    await ensureSpecsTableByFamily(family);
--    await ensureBlueprintVariantColumns(family);
--  }
--  await ensureSpecColumnsForBlueprint(qualified, blueprint);
--  const colTypes = await getColumnTypes(qualified);
-+  let blueprint = await getBlueprint(family);
- 
-   // 블루프린트 허용 키
--  const allowedKeys = blueprint?.allowedKeys || [];
--  const variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-+  let allowedKeys = Array.isArray(blueprint?.allowedKeys)
-+    ? [...blueprint.allowedKeys]
-+    : [];
-+  let variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-     ? blueprint.ingestOptions.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-     : (Array.isArray(blueprint?.variant_keys)
-       ? blueprint.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-       : []);
-   const pnTemplate = blueprint?.ingestOptions?.pn_template || blueprint?.ingestOptions?.pnTemplate || null;
-   const requiredFields = [];
-   if (blueprint?.fields && typeof blueprint.fields === 'object') {
-     for (const [fieldKey, meta] of Object.entries(blueprint.fields)) {
-       const isRequired = meta && typeof meta === 'object' && Boolean(meta.required);
-       if (!isRequired) continue;
-       const normalized = String(fieldKey || '')
-         .trim()
-         .toLowerCase()
-         .replace(/[^a-z0-9_]/g, '');
-       if (normalized && !requiredFields.includes(normalized)) {
-         requiredFields.push(normalized);
-       }
++
+   if (!persistedCodes.size && records.length) {
+     for (const rec of records) {
+       const pn = String(rec.pn || rec.code || '').trim();
+       if (pn) persistedCodes.add(pn);
      }
    }
  
-+  let colTypes;
-+  const disableEnsure = /^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0');
-+
-   // -------- 공용 강제정규화 유틸 --------
+   const persistedList = Array.from(persistedCodes);
+-  const mpnList = Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [];
+-  const mergedMpns = Array.from(new Set([...persistedList, ...mpnList]));
++  const mpnListSafe = Array.isArray(mpnList) ? mpnList : [];
++  const mergedMpns = Array.from(new Set([...persistedList, ...mpnListSafe]));
  
-   if (code && !/\d/.test(String(code))) {
-     // "AGN","TQ" 처럼 숫자 없는 시리즈는 series로 넘기고 code는 비움
-     series = code; code = null;
-   }
- 
- 
-   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
-   let previewText = '';
-   try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
-   if (!previewText || previewText.length < 1000) {
-     try {
-       const r = await extractText(gcsUri);
-       previewText = r?.text || previewText;
-     } catch {}
-   }
-   let candidates = [];
-   try {
-     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
-   } catch { candidates = []; }
- 
-   // PDF → 품번/스펙 추출
-   let extracted = { brand: brand || 'unknown', rows: [] };
-   if (!brand || !code) {
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index f1d29c7c9c2881c93d9570374fa5d5399690393c..48f77518ffbc338d76c2fd18bcaa7fa4e485b0cd 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -663,50 +661,121 @@ async function runAutoIngest(input = {}) {
-       const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
-       coverUri = await withTimeout(
-         extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
-         Math.min(30000, Math.round(BUDGET * 0.15)),
-         'cover',
-       );
-     } catch (e) { console.warn('[cover fail]', e?.message || e); }
-   }
- 
-   if (code) {
-     const trimmedCode = String(code || '').trim();
-     if (trimmedCode) {
-       const norm = normalizeCode(trimmedCode);
-       if (!candidates.some((c) => normalizeCode(c) === norm)) {
-         candidates = [trimmedCode, ...candidates];
-       }
-     }
-   }
- 
-   // 레코드 구성
-   const records = [];
-   const now = new Date();
-   const brandName = brand || extracted.brand || 'unknown';
-   const baseSeries = series || code || null;
- 
-+  let variantColumnsEnsured = false;
-+  try {
-+    const { detected: inferredKeys = [], newKeys: freshKeys = [] } = await inferVariantKeys({
-+      family,
-+      brand: brandName,
-+      series: baseSeries,
-+      blueprint,
-+      extracted,
-+    });
-+
-+    if (Array.isArray(inferredKeys) && inferredKeys.length) {
-+      const brandSlug = normalizeSlug(brandName);
-+      const seriesSlug = normalizeSlug(baseSeries);
-+      try {
-+        await db.query(
-+          `SELECT public.upsert_variant_keys($1,$2,$3,$4::jsonb)`,
-+          [family, brandSlug, seriesSlug, JSON.stringify(inferredKeys)],
-+        );
-+      } catch (err) {
-+        console.warn('[variant] upsert_variant_keys failed:', err?.message || err);
-+      }
-+
-+      const mergedVariant = new Set(variantKeys);
-+      for (const key of inferredKeys) mergedVariant.add(key);
-+      variantKeys = Array.from(mergedVariant);
-+
-+      const mergedAllowed = new Set(allowedKeys);
-+      for (const key of variantKeys) mergedAllowed.add(key);
-+      allowedKeys = Array.from(mergedAllowed);
-+
-+      if (!blueprint.ingestOptions || typeof blueprint.ingestOptions !== 'object') {
-+        blueprint.ingestOptions = {};
-+      }
-+      blueprint.ingestOptions.variant_keys = variantKeys;
-+      blueprint.variant_keys = variantKeys;
-+      blueprint.allowedKeys = Array.isArray(blueprint.allowedKeys)
-+        ? Array.from(new Set([...blueprint.allowedKeys, ...variantKeys]))
-+        : [...allowedKeys];
-+
-+      if (!disableEnsure) {
-+        try {
-+          await ensureBlueprintVariantColumns(family);
-+          variantColumnsEnsured = true;
-+        } catch (err) {
-+          console.warn('[variant] ensure_blueprint_variant_columns failed:', err?.message || err);
-+        }
-+      }
-+    }
-+
-+    if (Array.isArray(freshKeys) && freshKeys.length) {
-+      console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
-+    }
-+  } catch (err) {
-+    console.warn('[variant] inferVariantKeys failed:', err?.message || err);
-+  }
-+
-+  if (!disableEnsure) {
-+    await ensureSpecsTableByFamily(family);
-+    if (!variantColumnsEnsured) {
-+      try {
-+        await ensureBlueprintVariantColumns(family);
-+        variantColumnsEnsured = true;
-+      } catch (err) {
-+        console.warn('[variant] ensure_blueprint_variant_columns fallback failed:', err?.message || err);
-+      }
-+    }
-+  }
-+
-+  await ensureSpecColumnsForBlueprint(qualified, blueprint);
-+  colTypes = await getColumnTypes(qualified);
-+
-   const mpnsFromDoc = harvestMpnCandidates(
-     extracted?.text ?? '',
-     (baseSeries || series || code || '')
+   const rejectReasons = new Set(
+     (persistResult.skipped || [])
+       .map((it) => (it && typeof it === 'object' ? it.reason : it))
+       .filter(Boolean)
    );
-   const mpnNormFromDoc = new Set(mpnsFromDoc.map((m) => normalizeCode(m)).filter(Boolean));
+   const warningReasons = new Set(
+     (persistResult.warnings || []).filter(Boolean)
+   );
  
-   const candidateMap = [];
-   const candidateNormSet = new Set();
-   for (const cand of candidates) {
-     const trimmed = typeof cand === 'string' ? cand.trim() : String(cand || '');
-     if (!trimmed) continue;
-     const norm = normalizeCode(trimmed);
-     if (!norm || candidateNormSet.has(norm)) continue;
-     candidateNormSet.add(norm);
-     candidateMap.push({ raw: trimmed, norm });
-   }
++  const ms = Number.isFinite(processed?.ms) ? processed.ms : (typeof started === 'number' ? Date.now() - started : null);
+   const ok = persistedList.length > 0;
  
-   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
-   const baseRows = (rawRows.length ? rawRows : [{}]).map((row) => {
-     const obj = row && typeof row === 'object' ? { ...row } : {};
-     if (obj.brand == null) obj.brand = brandName;
-     const fallbackSeries = obj.series_code || obj.series || baseSeries || null;
-     if (fallbackSeries != null) {
-       if (obj.series == null) obj.series = fallbackSeries;
-       if (obj.series_code == null) obj.series_code = fallbackSeries;
+-  return {
++  const fallbackBrand = overrides.brand || brandName || extractedBrand || null;
++  const primaryRecord = records[0] || null;
++  const finalBrand = primaryRecord?.brand || fallbackBrand;
++  const finalCode =
++    persistedList[0] ||
++    primaryRecord?.pn ||
++    primaryRecord?.code ||
++    overrides.code ||
++    null;
++
++  const response = {
+     ok,
+-    ms: Date.now() - started,
++    ms,
+     family,
+     final_table: table,
+     specs_table: table,
+-    brand: records[0]?.brand || extracted?.brand || brand || null,
+-    code:  persistedList[0] || records[0]?.pn || records[0]?.code || null,
++    brand: finalBrand,
++    code: finalCode,
+     datasheet_uri: gcsUri,
+-    cover: coverUri || records[0]?.image_uri || null,
++    cover: coverUri || primaryRecord?.image_uri || null,
+     rows: persistResult.upserts || persistedList.length,
+     codes: persistedList,
+     mpn_list: mergedMpns,
+     reject_reasons: Array.from(rejectReasons),
+     warnings: Array.from(warningReasons),
+   };
++
++  if (response.code == null && Array.isArray(processed?.candidateCodes) && processed.candidateCodes.length) {
++    response.code = processed.candidateCodes[0];
++  }
++
++  if (response.code == null && baseSeries != null) {
++    response.code = baseSeries;
++  }
++
++  return response;
+ }
+ 
+-module.exports = { runAutoIngest };
++module.exports = { runAutoIngest, persistProcessedData };

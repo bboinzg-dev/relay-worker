@@ -445,7 +445,7 @@ async function extractPartNumbersFromText(text, { series } = {}) {
 
 
 async function runAutoIngest(input = {}) {
-  const {
+  let {
     gcsUri: rawGcsUri = null,
     gsUri: rawGsUri = null,
     family_slug = null,
@@ -902,14 +902,62 @@ async function runAutoIngest(input = {}) {
     colsSanitized: colTypes?.size || 0,
   });
 
+  const processedPayload = {
+    started,
+    gcsUri,
+    family,
+    table,
+    qualified,
+    pnTemplate,
+    requiredFields,
+    coverUri,
+    records,
+    mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
+    extractedBrand: extracted?.brand || null,
+    brandName,
+    baseSeries,
+  };
+
+  if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
+  if (display_name != null) processedPayload.display_name = display_name;
+  if (code != null) processedPayload.code = code;
+  if (series != null) processedPayload.series = series;
+
+  if (input && typeof input === 'object' && input.skipPersist) {
+    return { ok: true, phase: 'process', processed: processedPayload };
+  }
+
+  const persistOverrides = { brand, code, series, display_name };
+  return persistProcessedData(processedPayload, persistOverrides);
+}
+
+async function persistProcessedData(processed = {}, overrides = {}) {
+  const {
+    started = Date.now(),
+    gcsUri = null,
+    family = null,
+    table = null,
+    qualified: qualifiedInput = null,
+    pnTemplate = null,
+    requiredFields = [],
+    coverUri = null,
+    records = [],
+    mpnList = [],
+    extractedBrand = null,
+    brandName = null,
+    baseSeries = null,
+  } = processed || {};
+
+  const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
+
   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
-  if (records.length) {
+  if (qualified && family && records.length) {
     persistResult = await saveExtractedSpecs(qualified, family, records, {
       pnTemplate,
-      requiredKeys: requiredFields,
-      coreSpecKeys: requiredFields,
+      requiredKeys: Array.isArray(requiredFields) ? requiredFields : [],
+      coreSpecKeys: Array.isArray(requiredFields) ? requiredFields : [],
     }) || persistResult;
-  } else {
+  } else if (!records.length) {
     persistResult.skipped = [{ reason: 'missing_pn' }];
   }
 
@@ -918,6 +966,7 @@ async function runAutoIngest(input = {}) {
       .map((pn) => String(pn || '').trim())
       .filter(Boolean)
   );
+
   if (!persistedCodes.size && records.length) {
     for (const rec of records) {
       const pn = String(rec.pn || rec.code || '').trim();
@@ -926,8 +975,8 @@ async function runAutoIngest(input = {}) {
   }
 
   const persistedList = Array.from(persistedCodes);
-  const mpnList = Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [];
-  const mergedMpns = Array.from(new Set([...persistedList, ...mpnList]));
+  const mpnListSafe = Array.isArray(mpnList) ? mpnList : [];
+  const mergedMpns = Array.from(new Set([...persistedList, ...mpnListSafe]));
 
   const rejectReasons = new Set(
     (persistResult.skipped || [])
@@ -938,24 +987,45 @@ async function runAutoIngest(input = {}) {
     (persistResult.warnings || []).filter(Boolean)
   );
 
+  const ms = Number.isFinite(processed?.ms) ? processed.ms : (typeof started === 'number' ? Date.now() - started : null);
   const ok = persistedList.length > 0;
 
-  return {
+  const fallbackBrand = overrides.brand || brandName || extractedBrand || null;
+  const primaryRecord = records[0] || null;
+  const finalBrand = primaryRecord?.brand || fallbackBrand;
+  const finalCode =
+    persistedList[0] ||
+    primaryRecord?.pn ||
+    primaryRecord?.code ||
+    overrides.code ||
+    null;
+
+  const response = {
     ok,
-    ms: Date.now() - started,
+    ms,
     family,
     final_table: table,
     specs_table: table,
-    brand: records[0]?.brand || extracted?.brand || brand || null,
-    code:  persistedList[0] || records[0]?.pn || records[0]?.code || null,
+    brand: finalBrand,
+    code: finalCode,
     datasheet_uri: gcsUri,
-    cover: coverUri || records[0]?.image_uri || null,
+    cover: coverUri || primaryRecord?.image_uri || null,
     rows: persistResult.upserts || persistedList.length,
     codes: persistedList,
     mpn_list: mergedMpns,
     reject_reasons: Array.from(rejectReasons),
     warnings: Array.from(warningReasons),
   };
+
+  if (response.code == null && Array.isArray(processed?.candidateCodes) && processed.candidateCodes.length) {
+    response.code = processed.candidateCodes[0];
+  }
+
+  if (response.code == null && baseSeries != null) {
+    response.code = baseSeries;
+  }
+
+  return response;
 }
 
-module.exports = { runAutoIngest };
+module.exports = { runAutoIngest, persistProcessedData };

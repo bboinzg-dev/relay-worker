@@ -37,8 +37,8 @@ module.exports = {
 
   // 추출/기타
   MAX_DOC_PAGES_INLINE: parseInt(opt('MAX_DOC_PAGES_INLINE', '15'), 10),
-  GEMINI_MODEL_CLASSIFY: req('GEMINI_MODEL_CLASSIFY'),
-  GEMINI_MODEL_EXTRACT:  req('GEMINI_MODEL_EXTRACT'),
+  GEMINI_MODEL_CLASSIFY: opt('GEMINI_MODEL_CLASSIFY', 'gemini-2.5-flash'),
+  GEMINI_MODEL_EXTRACT:  opt('GEMINI_MODEL_EXTRACT', 'gemini-2.5-flash'),
   VERTEX_PAGE_PICK_MODEL: opt('VERTEX_PAGE_PICK_MODEL', 'gemini-2.5-flash'),
   VERTEX_EMBED_TEXT:      opt('VERTEX_EMBED_TEXT', 'text-embedding-005'),
 };

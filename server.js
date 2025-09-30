@@ -1,6 +1,30 @@
 /* server.js */
 'use strict';
 
+process.on('uncaughtException', (e) => {
+  console.error('[FATAL][uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));
+  process.exit(1);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('[FATAL][unhandledRejection]', e);
+  process.exit(1);
+});
+
+// 필수 env 스모크 로그(민감값 제외)
+(() => {
+  const pick = (k) => (process.env[k] || '').toString();
+  console.log('[BOOT env check]', {
+    GCP_PROJECT_ID: !!pick('GCP_PROJECT_ID'),
+    VERTEX_LOCATION: pick('VERTEX_LOCATION'),
+    DOCAI_PROCESSOR_ID: !!pick('DOCAI_PROCESSOR_ID'),
+    GCS_BUCKET: pick('GCS_BUCKET'),
+    QUEUE_NAME: pick('QUEUE_NAME'),
+    TASKS_LOCATION: pick('TASKS_LOCATION'),
+    GEMINI_MODEL_CLASSIFY: pick('GEMINI_MODEL_CLASSIFY'),
+    GEMINI_MODEL_EXTRACT: pick('GEMINI_MODEL_EXTRACT'),
+  });
+})();
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -85,6 +109,13 @@ async function enqueueIngestTask(payload = {}) {
 
 const app = express();
 
+try {
+  app.use(require('./server.health'));
+  console.log('[BOOT] mounted /api/health');
+} catch (e) {
+  console.error('[BOOT] health mount failed', e);
+}
+
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.disable('x-powered-by');
@@ -156,7 +187,6 @@ app.post('/login', loginHandler);
 
 /* ---------------- Mount modular routers (after global middleware) ---------------- */
 try { app.use(require('./server.ai')); console.log('[BOOT] mounted /api/ai/resolve'); } catch (e) { console.error('[BOOT] ai/resolve mount error', e?.message||e); }
-try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
 try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
 try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
 try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}

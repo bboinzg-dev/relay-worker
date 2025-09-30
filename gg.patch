@@ -1,114 +1,37 @@
-diff --git a/server.js b/server.js
-index b9cd0c04222fe35e4ec47af74556b744e3f38592..35b26894eabc31c54651eb544553e6c47dfc92ac 100644
---- a/server.js
-+++ b/server.js
-@@ -141,108 +141,51 @@ function loginHandler(req, res) {
-   }
+diff --git a/src/config/env.js b/src/config/env.js
+index d84c68a912b898a6218c2664a2561f3aa802a409..9a6730ecc3c9357734d8dbbcc41357178fa396cc 100644
+--- a/src/config/env.js
++++ b/src/config/env.js
+@@ -15,30 +15,30 @@ function bucketName(v) {
+   return v;
  }
  
- const authRouter = express.Router();
- // 헬스(선택)
- authRouter.get('/health', (_req, res) => res.json({ ok: true, stub: true }));
- // 로그인/로그아웃
- authRouter.post('/login', loginHandler);
- authRouter.post('/logout', (_req, res) => res.json({ ok: true }));
+ module.exports = {
+   // 프로젝트/리전
+   PROJECT_ID:        req('GCP_PROJECT_ID'),
+   VERTEX_LOCATION:   req('VERTEX_LOCATION'),
  
- // ✅ /auth/* 경로로 확정 마운트 (항상 가장 먼저 잡히게)
- app.use('/auth', authRouter);
+   // DocAI
+   DOCAI_PROJECT_ID:  opt('DOCAI_PROJECT_ID', req('GCP_PROJECT_ID')),
+   DOCAI_LOCATION:    opt('DOCAI_LOCATION', 'us'),
+   DOCAI_PROCESSOR_ID:req('DOCAI_PROCESSOR_ID'),
+   DOCAI_OUTPUT_URI:  opt('DOCAI_OUTPUT_BUCKET'),
  
- // (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
- app.post('/login', loginHandler);
+   // GCS
+   GCS_BUCKET:        bucketName(req('GCS_BUCKET')),
+   RESULT_BUCKET:     bucketName(opt('RESULT_BUCKET', req('GCS_BUCKET'))),
  
- /* ---------------- Mount modular routers (after global middleware) ---------------- */
- try { app.use(require('./server.ai')); console.log('[BOOT] mounted /api/ai/resolve'); } catch (e) { console.error('[BOOT] ai/resolve mount error', e?.message||e); }
- try { app.use(require('./server.health'));   console.log('[BOOT] mounted /api/health'); } catch {}
- try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
- try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
- try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
- try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
- try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
- try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
--try {
--  const aiRouter = express.Router();
--  const { VertexAI } = require('@google-cloud/vertexai');
--
--  aiRouter.get('/api/ai/resolve', async (req, res) => {
--    try {
--      const q = String(req.query.q || '').trim();
--      if (!q) return res.status(400).json({ ok: false, error: 'q required' });
--
--      const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID;
--      const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
--      const modelId = process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash';
--
--      const v = new VertexAI({
--        project: projectId,
--        location,
--      });
--      const mdl = v.getGenerativeModel({
--        model: modelId,
--        systemInstruction: {
--          parts: [{ text: 'Parse an electronics part query. Return STRICT JSON: {"brand": string|null, "codes": string[]}.' }],
--        },
--      });
--      const out = await mdl.generateContent({
--        contents: [{ role: 'user', parts: [{ text: `query: ${q}` }] }],
--        generationConfig: {
--          temperature: 0.2,
--          responseMimeType: 'application/json',
--          maxOutputTokens: 512,
--        },
--      });
--
--      let parsed = {};
--      try {
--        parsed = JSON.parse(out?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
--      } catch {}
--
--      const brand = typeof parsed?.brand === 'string' ? parsed.brand.trim() : '';
--      const codes = Array.isArray(parsed?.codes)
--        ? parsed.codes.map(x => String(x || '').trim()).filter(Boolean)
--        : [];
--
--      if (!brand || !codes.length) {
--        return res.status(404).json({ ok: false, error: 'cannot resolve' });
--      }
--
--      return res.json({ ok: true, brand, code: codes[0] });
--    } catch (e) {
--      console.error('[ai.resolve]', e);
--      return res.status(500).json({ ok: false, error: String(e?.message || e) });
--    }
--  });
--
--  app.use(aiRouter);
--  console.log('[BOOT] mounted /api/ai/resolve');
--} catch (e) {
--  console.error(e);
--}
-+// 인라인 AI 라우터(간소 버전)는 제거 — server.ai.js 하나만 유지
+   // Tasks
+   QUEUE_NAME:        req('QUEUE_NAME'),
+   TASKS_LOCATION:    req('TASKS_LOCATION'),
+   WORKER_TASK_URL:   opt('WORKER_TASK_URL', '/api/worker/ingest'),
  
- /* NOTE: The parts router already exists in your repo; keep it mounted. */
- try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
- 
- 
- /* ---------------- Upload ---------------- */
- const upload = multer({ storage: multer.memoryStorage() });
- 
- /* Session helpers (Cloud Run Bearer 또는 pp_session 쿠키 허용) */
- function parseCookie(name, cookieHeader) {
-   if (!cookieHeader) return null;
-   const m = new RegExp('(?:^|;\\s*)' + name + '=([^;]+)').exec(cookieHeader);
-   return m ? decodeURIComponent(m[1]) : null;
- }
- function verifyJwtCookie(cookieHeader) {
-   const raw = parseCookie('pp_session', cookieHeader);
-   if (!raw) return null;
-   try { return jwt.verify(raw, JWT_SECRET); } catch { return null; }
- }
- async function requireSession(req, res, next) {
-   const auth = String(req.headers.authorization || '');
-   if (/^Bearer\s+.+/i.test(auth)) return next(); // Cloud Run/IAP
-   const claims = verifyJwtCookie(req.headers.cookie || '');
-   if (claims) { req.user = claims; return next(); }
-   return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+   // 추출/기타
+   MAX_DOC_PAGES_INLINE: parseInt(opt('MAX_DOC_PAGES_INLINE', '15'), 10),
+-  GEMINI_MODEL_CLASSIFY: req('GEMINI_MODEL_CLASSIFY'),
+-  GEMINI_MODEL_EXTRACT:  req('GEMINI_MODEL_EXTRACT'),
++  GEMINI_MODEL_CLASSIFY: opt('GEMINI_MODEL_CLASSIFY', 'gemini-2.5-flash'),
++  GEMINI_MODEL_EXTRACT:  opt('GEMINI_MODEL_EXTRACT', 'gemini-2.5-flash'),
+   VERTEX_PAGE_PICK_MODEL: opt('VERTEX_PAGE_PICK_MODEL', 'gemini-2.5-flash'),
+   VERTEX_EMBED_TEXT:      opt('VERTEX_EMBED_TEXT', 'text-embedding-005'),
+ };

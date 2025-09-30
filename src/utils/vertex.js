@@ -2,20 +2,26 @@
 
 const { VertexAI } = require('@google-cloud/vertexai');
 const { safeJsonParse } = require('./safe-json');
+const env = require('../config/env');
 
-const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT_ID;
-const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
-const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
+const DEFAULT_MODEL_ID = env.GEMINI_MODEL_EXTRACT || env.VERTEX_MODEL_ID;
 
-const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+let vertexInstance;
+
+function getVertex() {
+  if (!vertexInstance) {
+    vertexInstance = new VertexAI({ project: env.PROJECT_ID, location: env.VERTEX_LOCATION });
+  }
+  return vertexInstance;
+}
 
 // Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용
-function getModel(systemText, modelId = MODEL_ID) {
+function getModel(systemText, modelId = DEFAULT_MODEL_ID) {
   const cfg = { model: modelId };
   if (systemText && String(systemText).trim()) {
     cfg.systemInstruction = { parts: [{ text: String(systemText) }] };
   }
-  return vertex.getGenerativeModel(cfg);
+  return getVertex().getGenerativeModel(cfg);
 }
 
 async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
@@ -39,4 +45,4 @@ async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 
   }
 }
 
-module.exports = { getModel, callModelJson };
+module.exports = { getVertex, getModel, callModelJson };

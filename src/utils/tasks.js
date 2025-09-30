@@ -1,10 +1,11 @@
 const { CloudTasksClient } = require('@google-cloud/tasks');
+const env = require('../config/env');
 
-const PROJECT = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
-const LOCATION = process.env.TASKS_LOCATION || process.env.VERTEX_LOCATION || 'us-central1';
-const QUEUE = process.env.TASKS_NOTIFY_QUEUE || 'notify-queue';
-const HANDLER_URL = process.env.NOTIFY_HANDLER_URL; // e.g., https://worker-xxxxx.run.app/_tasks/notify
-const SA_EMAIL = process.env.TASKS_SERVICE_ACCOUNT_EMAIL; // has roles/run.invoker on worker
+const PROJECT = env.PROJECT_ID;
+const LOCATION = env.TASKS_LOCATION;
+const QUEUE = env.NOTIFY_QUEUE_NAME || 'notify-queue';
+const HANDLER_URL = env.NOTIFY_HANDLER_URL;
+const SA_EMAIL = env.TASKS_SERVICE_ACCOUNT_EMAIL;
 
 const client = new CloudTasksClient();
 

@@ -184,7 +184,6 @@ app.use('/auth', authRouter);
 app.post('/login', loginHandler);
 
 /* ---------------- Mount modular routers (after global middleware) ---------------- */
-try { app.use(require('./server.ai')); console.log('[BOOT] mounted /api/ai/resolve'); } catch (e) { console.error('[BOOT] ai/resolve mount error', e?.message||e); }
 try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
 try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
 try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
@@ -196,6 +195,46 @@ try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounte
 
 /* NOTE: The parts router already exists in your repo; keep it mounted. */
 try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
+
+// --- AI routes mount: export 타입(함수/Router)에 관계없이 안전하게 ---
+try {
+  const ai = require('./server.ai');
+  if (typeof ai === 'function') {
+    ai(app);
+    console.log('[BOOT] mounted AI routes via function(export)');
+  } else if (ai && typeof ai === 'object') {
+    app.use('/api', ai);
+    console.log('[BOOT] mounted AI routes at /api/* (router export)');
+  } else {
+    console.warn('[BOOT] server.ai export type not supported:', typeof ai);
+  }
+} catch (e) {
+  console.error('[BOOT] ai mount failed', e?.message || e);
+}
+
+if (process.env.ROUTE_DEBUG === '1') {
+  app.get('/_routes', (req, res) => {
+    try {
+      const list = [];
+      app._router.stack.forEach((m) => {
+        if (m.route && m.route.path) {
+          const methods = Object.keys(m.route.methods).join(',').toUpperCase();
+          list.push(`${methods.padEnd(6)} ${m.route.path}`);
+        } else if (m.name === 'router' && m.handle?.stack) {
+          m.handle.stack.forEach((h) => {
+            const p = h.route?.path;
+            const ms = h.route ? Object.keys(h.route.methods).join(',').toUpperCase() : '';
+            if (p) list.push(`${ms.padEnd(6)} ${m.regexp?.toString() || ''}${p}`);
+          });
+        }
+      });
+      res.type('text/plain').send(list.join('\n'));
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+  console.log('[BOOT] route debug at /_routes');
+}
 
 
 /* ---------------- Upload ---------------- */

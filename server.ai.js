@@ -77,7 +77,7 @@ async function searchTop1(q) {
 }
 
 // ───────────────── route ─────────────────
-router.get('/api/ai/resolve', async (req, res) => {
+router.get('/ai/resolve', async (req, res) => {
   const q = clean(req.query.q);
   if (!q) return res.status(400).json({ ok:false, error:'q required' });
 

@@ -1,7 +1,9 @@
 // server.health.js (CJS) — 단순/안전 헬스 엔드포인트 전용
 'use strict';
 const express = require('express');
-const db = require('./src/utils/db'); // { query, ping, ... }
+// server.health.js 맨 위
+const db = require('./db');  // ✅ 루트 db.js로 통일
+
 
 const router = express.Router();
 

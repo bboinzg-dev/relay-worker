@@ -1,6 +1,9 @@
 /* server.js */
 'use strict';
 
+// ───────── 외부콜 차단 플래그 (배포 시 EXT_CALLS_OFF=1 이면 부팅 중 외부 HTTPS 호출 스킵)
+const EXT_CALLS_OFF = process.env.EXT_CALLS_OFF === '1';
+
 process.on('uncaughtException', (e) => {
   console.error('[FATAL][uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));
   process.exit(1);
@@ -49,8 +52,10 @@ const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
 const WORKER_TASK_URL = process.env.WORKER_TASK_URL || process.env.WORKER_STEP_URL || 'https://<YOUR-RUN-URL>/api/worker/ingest';
 const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
 
-
-try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
+// ⚠️ 외부 API(예: Vertex/HTTP) 가능성이 있는 부팅 태스크는 가드 안에서만 실행
+//   → 아래 부팅 IIFE 내부의  if (!EXT_CALLS_OFF)  블록으로 이동
+//try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
+@
 
 // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
 let _tasks = null;
@@ -945,6 +950,24 @@ async function seedExtractionRecipe() {
     await seedManufacturerAliases();
     await seedExtractionRecipe();
     console.log('[BOOT] ensured ingest_run_logs');
+    
+    // ───────── 부팅 시 외부 HTTPS/Vertex 호출은 여기서만 (가드 적용)
+    if (!EXT_CALLS_OFF) {
+      try {
+        // 예) 임베딩 워밍업, 외부 웹훅 통지, 지표 전송 등
+        // 실제 존재하는 태스크만 남기고, 없으면 주석 그대로 두세요.
+        const runEmbedWarmup = require('./src/tasks/embedFamilies')?.run;
+        if (typeof runEmbedWarmup === 'function') {
+          console.log('[BOOT] embed warmup start');
+          await runEmbedWarmup().catch((e) => console.warn('[BOOT] embed warmup skipped:', e?.message || e));
+        }
+        // TODO: notifyWarmup / ensureIngestRunLogs 등 외부콜 루틴이 있다면 여기에서만 실행
+      } catch (e) {
+        console.warn('[BOOT] external init skipped:', e?.message || e);
+      }
+    } else {
+      console.log('[BOOT] EXT_CALLS_OFF=1 → external warmups skipped');
+    }
   } catch (e) {
     console.warn('[BOOT] ensure ingest_run_logs failed:', e?.message || e);
   }

@@ -5,6 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
+    "start": "node server.js",
+    "syntax-check": "node scripts/check-syntax.js"
   },
   "dependencies": {
     "@google-cloud/documentai": "^9.4.0",

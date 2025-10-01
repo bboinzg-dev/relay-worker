@@ -958,7 +958,7 @@ app.use((err, req, res, next) => {
 })();
 
 try { app.use(require('./server.health')); console.log('[BOOT] mounted /api/health (simple)'); } catch (e) { console.error('[BOOT] health mount failed', e); }
-(C) 인라인 헬스 제거(충돌 원인)
+// (C) 인라인 헬스 제거(충돌 원인)
 
 /* ---------------- Listen ---------------- */
 app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));

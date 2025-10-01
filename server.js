@@ -193,6 +193,8 @@ try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bo
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
 try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
+try { app.use(require('./server.health')); console.log('[BOOT] mounted /api/health'); } catch {}
+
 // 인라인 AI 라우터(간소 버전)는 제거 — server.ai.js 하나만 유지
 
 /* NOTE: The parts router already exists in your repo; keep it mounted. */

@@ -1,5 +1,5 @@
 # Dockerfile
-FROM asia-northeast3-docker.pkg.dev/partsplan/dockerhub-remote/node:20-slim
+FROM node:20-slim
 
 # pdfimages (poppler-utils) is used for cover extraction. If the package is not available,
 # the pipeline still works (cover extraction is skipped).

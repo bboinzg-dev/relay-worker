@@ -32,7 +32,7 @@ const multer = require('multer');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
-const db = require('./src/utils/db');
+const db = require('./db'); // 루트 db.js (TLS 우회 포함)
 const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
 const { runAutoIngest, persistProcessedData } = require('./src/pipeline/ingestAuto');
@@ -109,12 +109,6 @@ async function enqueueIngestTask(payload = {}) {
 
 const app = express();
 
-try {
-  app.use(require('./server.health'));
-  console.log('[BOOT] mounted /api/health');
-} catch (e) {
-  console.error('[BOOT] health mount failed', e);
-}
 
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -193,7 +187,6 @@ try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bo
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
 try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
-try { app.use(require('./server.health')); console.log('[BOOT] mounted /api/health'); } catch {}
 
 // 인라인 AI 라우터(간소 버전)는 제거 — server.ai.js 하나만 유지
 
@@ -222,19 +215,6 @@ async function requireSession(req, res, next) {
   if (claims) { req.user = claims; return next(); }
   return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
 }
-
-/* ---------------- Health & Env ---------------- */
-app.get('/_healthz', (_req, res) => res.type('text/plain').send('ok'));
-app.get('/api/health', async (_req, res) => {
-  try { await db.query('SELECT 1'); res.json({ ok: true }); }
-  catch (e) { res.status(500).json({ ok:false, error:String(e?.message || e) }); }
-});
-app.get('/_env', (_req, res) => {
-  res.json({
-    node: process.version,
-    has_db: !!process.env.DATABASE_URL,
-  });
-});
 
 /* ---------------- Files: upload / signed url / move ---------------- */
 app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (req, res) => {
@@ -976,6 +956,9 @@ app.use((err, req, res, next) => {
     console.warn('[BOOT] ensure ingest_run_logs failed:', e?.message || e);
   }
 })();
+
+try { app.use(require('./server.health')); console.log('[BOOT] mounted /api/health (simple)'); } catch (e) { console.error('[BOOT] health mount failed', e); }
+(C) 인라인 헬스 제거(충돌 원인)
 
 /* ---------------- Listen ---------------- */
 app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));

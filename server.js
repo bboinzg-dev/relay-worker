@@ -55,7 +55,6 @@ const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
 // ⚠️ 외부 API(예: Vertex/HTTP) 가능성이 있는 부팅 태스크는 가드 안에서만 실행
 //   → 아래 부팅 IIFE 내부의  if (!EXT_CALLS_OFF)  블록으로 이동
 //try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
-@
 
 // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
 let _tasks = null;

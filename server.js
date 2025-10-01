@@ -918,13 +918,6 @@ async function seedExtractionRecipe() {
   }
 }
 
-/* ---------------- 404 / error ---------------- */
-app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));
-app.use((err, req, res, next) => {
-  try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
-  res.status(500).json({ ok:false, error:'internal error' });
-});
-
 /* ---------------- Boot-time setup ---------------- */
 (async () => {
   try {
@@ -957,7 +950,23 @@ app.use((err, req, res, next) => {
   }
 })();
 
-try { app.use(require('./server.health')); console.log('[BOOT] mounted /api/health (simple)'); } catch (e) { console.error('[BOOT] health mount failed', e); }
+// ✅ 헬스 라우터는 404보다 "위"에, 맨 마지막에 1번만 마운트
+try {
+  const healthRouter = require('./server.health');
+  console.log('[BOOT] health resolve =', require.resolve('./server.health'));
+  app.use(healthRouter);
+  console.log('[BOOT] mounted /_healthz, /_env, /api/health (simple=%s)', process.env.HEALTH_SIMPLE);
+} catch (e) {
+  console.error('[BOOT] health mount failed', e);
+}
+
+/* ---------------- 404 / error ---------------- */
+app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));
+app.use((err, req, res, next) => {
+  try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
+  res.status(500).json({ ok:false, error:'internal error' });
+});
+
 // (C) 인라인 헬스 제거(충돌 원인)
 
 /* ---------------- Listen ---------------- */

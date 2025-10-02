@@ -125,4 +125,38 @@ router.get('/api/ingest/:key', async (req, res) => {
       if (!logs.length) {
         by = 'log_id';
         const rows = await loadLogsById(key);
-        if (rows.len
+        if (rows.length) {
+          const r0 = rows[0];
+          logs = r0.run_id ? await loadLogsByRunId(r0.run_id) : rows;
+          by = r0.run_id ? 'run_id' : 'log_id';
+        }
+      }
+    } else {
+      // job id 조회 시도(있을 때만)
+      job = await loadJobById(key);
+      status = job?.status || 'UNKNOWN';
+    }
+
+    // Status 추정
+    if (logs.length) {
+      status = pickStatusFromRows(logs);
+    }
+
+    // 간단 요약
+    const counts = { SUCCEEDED:0, FAILED:0, RUNNING:0, OTHER:0 };
+    for (const r of logs) {
+      const s = (r.status || r.event || '').toString().toUpperCase();
+      if (s.includes('SUCCEEDED') || s === 'SUCCEEDED') counts.SUCCEEDED++;
+      else if (s.includes('FAILED') || s === 'FAILED') counts.FAILED++;
+      else if (s.includes('RUNNING') || s.includes('PROCESS') || s.includes('START')) counts.RUNNING++;
+      else counts.OTHER++;
+    }
+
+    return res.json({ ok:true, by, key, status, job, counts, logs });
+  } catch (e) {
+    console.error('[ingest status]', e);
+    return res.status(500).json({ ok:false, error:'status_query_failed' });
+  }
+});
+
+module.exports = router;

@@ -10,10 +10,10 @@ const { safeJsonParse } = require('../utils/safe-json');
 const router = express.Router();
 
 // ==== ENV ====
-const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || 'partsplan';
+const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || 'partsplan-473810';
 const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
 const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
-const BUCKET     = process.env.GCS_BUCKET || 'partsplan-docai-us';
+const BUCKET     = process.env.GCS_BUCKET || 'partsplan-473810-docai-us';
 const MAX_PHOTO  = +(process.env.MAX_PHOTO_SIZE || 12 * 1024 * 1024);
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
 const API_KEY    = process.env.INGEST_API_KEY || '';

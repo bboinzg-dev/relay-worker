@@ -5,6 +5,13 @@ function req(name) {
   if (!v) throw new Error(`ENV ${name} is required`);
   return v;
 }
+function reqAny(names = []) {
+  for (const name of names) {
+    const v = process.env[name];
+    if (v) return v;
+  }
+  throw new Error(`ENV ${names.join('/') || '(none)'} is required`);
+}
 function opt(name, def = undefined) {
   const v = process.env[name];
   return (v === undefined || v === '') ? def : v;
@@ -15,20 +22,23 @@ function bucketName(v) {
   return v;
 }
 
+const PROJECT_ID = reqAny(['GCP_PROJECT_ID', 'GOOGLE_CLOUD_PROJECT']);
+const GCS_BUCKET = req('GCS_BUCKET');
+
 module.exports = {
   // 프로젝트/리전
-  PROJECT_ID:        req('GCP_PROJECT_ID'),
+  PROJECT_ID,
   VERTEX_LOCATION:   req('VERTEX_LOCATION'),
 
   // DocAI
-  DOCAI_PROJECT_ID:  opt('DOCAI_PROJECT_ID', req('GCP_PROJECT_ID')),
+  DOCAI_PROJECT_ID:  opt('DOCAI_PROJECT_ID', PROJECT_ID),
   DOCAI_LOCATION:    opt('DOCAI_LOCATION', 'us'),
-  DOCAI_PROCESSOR_ID:req('DOCAI_PROCESSOR_ID'),
+  DOCAI_PROCESSOR_ID: opt('DOCAI_PROCESSOR_ID'),
   DOCAI_OUTPUT_URI:  opt('DOCAI_OUTPUT_BUCKET'),
 
   // GCS
-  GCS_BUCKET:        bucketName(req('GCS_BUCKET')),
-  RESULT_BUCKET:     bucketName(opt('RESULT_BUCKET', req('GCS_BUCKET'))),
+  GCS_BUCKET:        bucketName(GCS_BUCKET),
+  RESULT_BUCKET:     bucketName(opt('RESULT_BUCKET', GCS_BUCKET)),
 
   // Tasks
   QUEUE_NAME:        req('QUEUE_NAME'),

@@ -12,7 +12,6 @@ ORDER_JSON=$(curl -s -X POST "$SITE/api/proxy/checkout/create" -H 'content-type:
 echo "$ORDER_JSON" | jq .order.id
 
 echo "[4] cover render (if missing)"
-curl -s -X POST "$SITE/api/proxy/render/cover" -H 'content-type: application/json'     -d '{"brand":"omron","code":"g2r-1a","gcsPdfUri":"gs://partsplan-docai-us/datasheets/g2r-1a.pdf"}' | jq .
-
+curl -s -X POST "$SITE/api/proxy/render/cover" -H 'content-type: application/json'     -d '{"brand":"omron","code":"g2r-1a","gcsPdfUri":"gs://partsplan-473810-docai-us/datasheets/g2r-1a.pdf"}' | jq .
 echo "[5] quality scan relay"
 curl -s -X POST "$SITE/api/proxy/quality/run" -H 'content-type: application/json' -H 'X-Actor-Roles: admin' -d '{"family":"relay"}' | jq .

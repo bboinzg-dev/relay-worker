@@ -43,7 +43,8 @@ async function handleOne(ev){
     const brand = (p.brand||'').toString(), code=(p.code||'').toString();
     const ds = (p.datasheet_url||'').toString();
     if (!brand || !code || !ds) return { ok:false, error:'missing brand/code/datasheet_url' };
-    const cover = `gs://${process.env.GCS_BUCKET || 'partsplan-docai-us'}/images/${brand.toLowerCase()}/${code.toLowerCase()}/cover.png`;
+    const coverBucket = process.env.GCS_BUCKET || 'partsplan-473810-docai-us';
+    const cover = `gs://${coverBucket}/images/${brand.toLowerCase()}/${code.toLowerCase()}/cover.png`;
     await db.query(`UPDATE public.relay_specs SET cover=$3 WHERE lower(brand)=lower($1) AND lower(code)=lower($2) AND (cover IS NULL OR cover='')`, [brand, code, cover]);
     return { ok: true, cover };
   }

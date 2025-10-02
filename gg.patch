@@ -1,332 +1,48 @@
-diff --git a/server.js b/server.js
-index 2a2992aead9c16a945faff7e0a3496e8e6a5b62f..315a59a8ab59595bad991a3cc360c42a8e1d59cd 100644
---- a/server.js
-+++ b/server.js
-@@ -13,76 +13,104 @@ process.on('unhandledRejection', (e) => {
-   process.exit(1);
- });
- 
- // 필수 env 스모크 로그(민감값 제외)
- (() => {
-   const pick = (k) => (process.env[k] || '').toString();
-   console.log('[BOOT env check]', {
-     GCP_PROJECT_ID: !!pick('GCP_PROJECT_ID'),
-     VERTEX_LOCATION: pick('VERTEX_LOCATION'),
-     DOCAI_PROCESSOR_ID: !!pick('DOCAI_PROCESSOR_ID'),
-     GCS_BUCKET: pick('GCS_BUCKET'),
-     QUEUE_NAME: pick('QUEUE_NAME'),
-     TASKS_LOCATION: pick('TASKS_LOCATION'),
-     GEMINI_MODEL_CLASSIFY: pick('GEMINI_MODEL_CLASSIFY'),
-     GEMINI_MODEL_EXTRACT: pick('GEMINI_MODEL_EXTRACT'),
-   });
- })();
+diff --git a/src/routes/vision.upload.js b/src/routes/vision.upload.js
+index e30b20b6f38b83d2160b22e3a36c7d67b7a885f7..d6a117dc9749c9ce649a4003674af58914c845c5 100644
+--- a/src/routes/vision.upload.js
++++ b/src/routes/vision.upload.js
+@@ -1,41 +1,41 @@
+ 'use strict';
  
  const express = require('express');
- const cors = require('cors');
- const bodyParser = require('body-parser');
  const multer = require('multer');
  const crypto = require('crypto');
- const jwt = require('jsonwebtoken');
+ const { Storage } = require('@google-cloud/storage');
+ const { GoogleAuth } = require('google-auth-library');
+ const { safeJsonParse } = require('../utils/safe-json');
  
--const db = require('./db'); // 루트 db.js (TLS 우회 포함)
-+// 1) DB 모듈: 로드 실패해도 서버는 떠야 함
-+let db;
-+try {
-+  db = require('./db');                    // 루트 경로
-+} catch (e1) {
-+  try { db = require('./src/utils/db'); }  // 예전 경로 호환
-+  catch (e2) {
-+    console.error('[BOOT] db load failed:', e2?.message || e1?.message);
-+    db = { query: async () => { throw new Error('DB_UNAVAILABLE'); } };
-+  }
-+}
- const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
- const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
--const { runAutoIngest, persistProcessedData } = require('./src/pipeline/ingestAuto');
-+// 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
-+let __INGEST_MOD__ = null;
-+function getIngest() {
-+  if (__INGEST_MOD__) return __INGEST_MOD__;
-+  try {
-+    __INGEST_MOD__ = require('./src/pipeline/ingestAuto');
-+  } catch (e) {
-+    console.error('[INGEST] module load failed:', e?.message || e);
-+    __INGEST_MOD__ = {
-+      runAutoIngest: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
-+      persistProcessedData: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
-+    };
-+  }
-+  return __INGEST_MOD__;
-+}
- const { generateRunId } = require('./src/utils/run-id');
+ const router = express.Router();
  
+ // ==== ENV ====
+-const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || 'partsplan';
++const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || 'partsplan-473810';
+ const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
+ const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
+-const BUCKET     = process.env.GCS_BUCKET || 'partsplan-docai-us';
++const BUCKET     = process.env.GCS_BUCKET || 'partsplan-473810-docai-us';
+ const MAX_PHOTO  = +(process.env.MAX_PHOTO_SIZE || 12 * 1024 * 1024);
+ const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
+ const API_KEY    = process.env.INGEST_API_KEY || '';
  
+ const storage = new Storage();
+ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_PHOTO } });
  
- // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
--const { CloudTasksClient } = require('@google-cloud/tasks');
-+// 2) Cloud Tasks: 런타임에 없으면 비활성화
-+let CloudTasksClient;
-+try { ({ CloudTasksClient } = require('@google-cloud/tasks')); }
-+catch (e) { console.warn('[BOOT] @google-cloud/tasks unavailable:', e?.message || e); }
- const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
- const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
- const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
- // step 라우트 폐지 → ingest 하나로 통일
- const WORKER_TASK_URL = process.env.WORKER_TASK_URL || process.env.WORKER_STEP_URL || 'https://<YOUR-RUN-URL>/api/worker/ingest';
- const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
+ // ---------- CORS ----------
+ router.use('/api/vision/guess', (req, res, next) => {
+   res.setHeader('Access-Control-Allow-Origin', ALLOW_ORIGIN);
+   res.setHeader('Vary', 'Origin');
+   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+   if (req.method === 'OPTIONS') return res.status(204).end();
+   next();
+ });
  
- // ⚠️ 외부 API(예: Vertex/HTTP) 가능성이 있는 부팅 태스크는 가드 안에서만 실행
- //   → 아래 부팅 IIFE 내부의  if (!EXT_CALLS_OFF)  블록으로 이동
- //try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
- 
- // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
- let _tasks = null;
- let _queuePath = null;
- function getTasks() {
-   if (!_tasks) {
-+    if (!CloudTasksClient) throw new Error('@google-cloud/tasks unavailable');
-     // 글로벌 엔드포인트 + REST fallback(HTTP/1)
-     _tasks = new CloudTasksClient({ fallback: true });
-     _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
-   }
-   return { tasks: _tasks, queuePath: _queuePath };
+ function ext(name) {
+   const s = String(name || '');
+   const i = s.lastIndexOf('.');
+   if (i < 0) return '';
+   const e = s.slice(i + 1).toLowerCase();
+   return e && e.length <= 5 ? '.' + e : '';
  }
  
- async function enqueueIngestTask(payload = {}) {
-   const { tasks, queuePath } = getTasks();
-   if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
-   const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
- 
-   const bodyPayload = {
-     fromTasks: true,
-     payload,
-   };
-   const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
- 
-   const nowSeconds = Math.floor(Date.now() / 1000);
-   const deadlineSeconds = Number(process.env.TASKS_DEADLINE_SEC || 150);
-   const delaySeconds = Number(process.env.TASKS_DELAY_SEC || 5);
-   const maxAttempts = Number(process.env.TASKS_MAX_ATTEMPTS || 12);
-   const minBackoffSeconds = Number(process.env.TASKS_MIN_BACKOFF_SEC || 1);
-   const maxBackoffSeconds = Number(process.env.TASKS_MAX_BACKOFF_SEC || 60);
-   const maxDoublings = Number(process.env.TASKS_MAX_DOUBLINGS || 4);
-diff --git a/server.js b/server.js
-index 2a2992aead9c16a945faff7e0a3496e8e6a5b62f..315a59a8ab59595bad991a3cc360c42a8e1d59cd 100644
---- a/server.js
-+++ b/server.js
-@@ -324,51 +352,51 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
-     });
- 
-      const gcsUri = `gs://${defaultBucket}/${object}`;
- 
-  // ✅ 여기부터: 옵션 자동 인제스트 (multer가 form 필드를 req.body로 넣어줌)
-     const ingestWanted =
-       String(req.body?.ingest || req.query?.ingest || '').trim() === '1';
- 
-     if (!ingestWanted) {
-       // 평소처럼 업로드 결과만 반환
-       return res.json({ ok:true, gcsUri });
-     }
- 
-     // 폼으로 넘어온 메타(있으면 사용, 없으면 추정)
-     const family_slug = req.body?.family_slug || null;
-     const brand       = req.body?.brand || null;
-     const code        = req.body?.code  || null;
-     const series      = req.body?.series || null;
-     const displayName = req.body?.display_name || null;
- 
-     try {
-       const overrides = {
-         brand: brand || null,
-         series: series || null,
-       };
--      const out = await runAutoIngest({
-+      const out = await getIngest().runAutoIngest({
-         gcsUri,
-         family_slug,
-         brand,
-         code,
-         series,
-         display_name: displayName,
-         overrides,
-       });
-       // 인제스트까지 완료한 결과 반환
-       return res.json({ ok:true, gcsUri, ingest: out });
-     } catch (e) {
-       // 인제스트 실패해도 업로드는 성공 → 본문에 결과만 첨부
-       return res.json({ ok:true, gcsUri, ingest: { ok:false, error: String(e?.message || e) }});
-     }
-   } catch (e) {
-     console.error('[upload]', e);
-     return res.status(400).json({ ok:false, error:String(e?.message || e) });
-   }
- });
- 
- 
- app.get('/api/files/signed-url', requireSession, async (req, res) => {
-   try {
-     const gcsUri = req.query.gcsUri;
-     const minutes = Number(req.query.minutes || 15);
-diff --git a/server.js b/server.js
-index 2a2992aead9c16a945faff7e0a3496e8e6a5b62f..315a59a8ab59595bad991a3cc360c42a8e1d59cd 100644
---- a/server.js
-+++ b/server.js
-@@ -570,51 +598,51 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
-         pn: it.pn || it.code,
-         series: it.series,
-         display_name: it.display_name || (it.brand && it.code ? `${it.brand} ${it.code}` : null),
-         family_slug: it.family_slug,
-         datasheet_uri: it.datasheet_uri,
-         cover: it.cover,
-         source_gcs_uri: it.source_gcs_uri,
-         raw_json: it.raw_json || null,
-         ...(it.values || {}),
-       });
-       out.push({ table, row });
-     }
-     res.json({ ok:true, count: out.length, items: out });
-   } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'bulk ingest failed', detail:String(e?.message || e) }); }
- });
- 
- app.post('/ingest/auto', requireSession, async (req, res) => {
-   try {
-     const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name, family_slug } = req.body || {};
-     const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
-     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
-     const overrides = {
-       brand: brand || null,
-       series: series || null,
-     };
--    const result = await runAutoIngest({
-+    const result = await getIngest().runAutoIngest({
-       gcsUri: uri,
-       family_slug,
-       brand,
-       code,
-       series,
-       display_name,
-       overrides,
-     });
-     res.json(result);
-   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
- });
- 
- function pickFirstString(...values) {
-   for (const value of values) {
-     if (typeof value === 'string' && value.trim()) {
-       return value.trim();
-     }
-   }
-   return null;
- }
- 
- function getTaskContext(req, phase) {
-   const headerName = req.get('X-CloudTasks-TaskName') || req.get('X-Cloud-Tasks-TaskName') || null;
-   const retryHeader = req.get('X-CloudTasks-TaskRetryCount') || req.get('X-Cloud-Tasks-TaskRetryCount');
-   const parsedRetry = Number(retryHeader);
-diff --git a/server.js b/server.js
-index 2a2992aead9c16a945faff7e0a3496e8e6a5b62f..315a59a8ab59595bad991a3cc360c42a8e1d59cd 100644
---- a/server.js
-+++ b/server.js
-@@ -789,99 +817,99 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
-           uploader_id: payload?.uploader_id ?? null,
-           overrides: nextOverrides,
-           phase: 'process',
-         };
- 
-         try {
-           await enqueueIngestTask(nextPayload);
-         } catch (err) {
-           throw new Error(`enqueue failed: ${String(err?.message || err)}`);
-         }
- 
-         return;
-       }
- 
-       if (phase === 'process') {
-         await markProcessing(baseContext);
- 
-         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
-         const nextOverrides = {
-           ...(payload?.overrides || {}),
-           brand: overrideBrand,
-           series: overrideSeries,
-         };
- 
--        const result = await runAutoIngest({
-+        const result = await getIngest().runAutoIngest({
-           ...payload,
-           runId,
-           run_id: runId,
-           gcsUri,
-           gcs_uri: gcsUri,
-           skipPersist: true,
-           overrides: nextOverrides,
-         });
- 
-         const processed = result?.processed;
-         if (!processed || !Array.isArray(processed.records)) {
-           throw new Error('process_no_records');
-         }
- 
-         await markRunning(baseContext);
- 
-         const nextPayload = {
-           runId,
-           run_id: runId,
-           gcsUri,
-           gcs_uri: gcsUri,
-           family_slug: payload?.family_slug ?? null,
-           brand: payload?.brand ?? null,
-           code: payload?.code ?? null,
-           series: payload?.series ?? null,
-           display_name: payload?.display_name ?? null,
-           uploader_id: payload?.uploader_id ?? null,
-           phase: 'persist',
-           processed,
-           overrides: nextOverrides,
-         };
- 
-         try {
-           await enqueueIngestTask(nextPayload);
-         } catch (err) {
-           throw new Error(`persist enqueue failed: ${String(err?.message || err)}`);
-         }
- 
-         return;
-       }
- 
-       if (phase === 'persist') {
-         await markPersisting(baseContext);
- 
-         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
- 
--        const out = await persistProcessedData(payload?.processed || {}, {
-+        const out = await getIngest().persistProcessedData(payload?.processed || {}, {
-           brand: overrideBrand,
-           code: payload?.code ?? null,
-           series: overrideSeries,
-           display_name: payload?.display_name ?? null,
-         });
- 
-         const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
-         const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
- 
-         if (!out?.ok) {
-           const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
-           const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
-           await markFailed({
-             ...baseContext,
-             error: message,
-             durationMs: out?.ms ?? (Date.now() - startedAt),
-           });
-           return;
-         }
- 
-         await markSucceeded({
-           ...baseContext,
-           result: out,
-           gcsUri,
-           durationMs: out?.ms ?? (Date.now() - startedAt),

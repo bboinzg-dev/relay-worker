@@ -1,9 +1,27 @@
 *** a/server.js
 --- b/server.js
 @@
- // (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
- app.post('/login', loginHandler);
- // --- AI routes mount (export 타입 자동 처리) ---
+ const express = require('express');
+ const cors = require('cors');
+ const bodyParser = require('body-parser');
+ const multer = require('multer');
+ const crypto = require('crypto');
+ const jwt = require('jsonwebtoken');
+@@
+ const app = express();
+ 
++/* ---------- ALWAYS-ON BOOT LOG ---------- */
++try {
++  console.log('[BOOT] server.js starting:', { filename: __filename, node: process.version });
++} catch {}
++
+ /* ---------------- Global middleware (keep existing) ---------------- */
+ app.use(cors());
+ app.use(bodyParser.json({ limit: '20mb' }));
+ app.use(bodyParser.urlencoded({ extended: true, limit: '20mb' }));
+@@
+-// --- AI routes mount (export 타입 자동 처리) ---
++// --- AI routes mount (export 타입 자동 처리) ---
  try {
    const ai = require('./server.ai');
    if (ai && typeof ai === 'object') {
@@ -20,7 +38,7 @@
  } catch (e) {
 -  console.error('[BOOT] ai mount failed', e?.message || e);
 +  console.error('[BOOT] ai mount failed', e?.message || e);
-+  // 🔰 Fallback: server.ai.js 로딩 실패/누락 시에도 즉시 동작하도록 최소 라우트 제공
++  // 🔰 ALWAYS-ON FALLBACK: server.ai.js 로딩 실패/누락 시에도 최소 라우트 제공(404 방지)
 +  const express = require('express');
 +  const fb = express.Router();
 +  fb.get('/ai/ping', (_req, res) => res.json({ ok: true, fallback: true }));
@@ -30,50 +48,72 @@
 +  console.warn('[BOOT] fallback AI routes mounted at /api/*');
  }
  
- /* ---------------- Mount modular routers (after global middleware) ---------------- */
- try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
- try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
 @@
- try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
- 
--// --- AI routes mount: export 타입(함수/Router)에 관계없이 안전하게 ---
--try {
--  const ai = require('./server.ai');
--  if (typeof ai === 'function') {
--    ai(app);
--    console.log('[BOOT] mounted AI routes via function(export)');
--  } else if (ai && typeof ai === 'object') {
--    app.use('/api', ai);
--    console.log('[BOOT] mounted AI routes at /api/* (router export)');
--  } else {
--    console.warn('[BOOT] server.ai export type not supported:', typeof ai);
--  }
--} catch (e) {
--  console.error('[BOOT] ai mount failed', e?.message || e);
+-// 라우트 덤프 & 파일 리스트: 디버깅에 매우 유용 → ROUTE_DEBUG=1 일 때 활성화
+-if (process.env.ROUTE_DEBUG === '1') {
+-  app.get('/_routes', (req, res) => {
+-    try {
+-      const out = [];
+-      const walk = (stack, base='') => {
+-        stack.forEach((s) => {
+-          if (s.route && s.route.path) {
+-            const methods = Object.keys(s.route.methods).join(',').toUpperCase();
+-            out.push(`${methods.padEnd(6)} ${base}${s.route.path}`);
+-          } else if (s.name === 'router' && s.handle?.stack) {
+-            // express.Router() 내부
+-            walk(s.handle.stack, base);
+-          }
+-        });
+-      };
+-      walk(app._router.stack, '');
+-      res.type('text/plain').send(out.join('\n') || 'no-routes');
+-    } catch (e) {
+-      res.status(500).json({ ok: false, error: String(e?.message || e) });
+-    }
+-  });
+-  console.log('[BOOT] route debug at /_routes');
+-  // 🔍 컨테이너 내 파일 확인: server*.js 포함 여부 즉시 점검
+-  const fs = require('fs');
+-  app.get('/_ls', (_req, res) => {
+-    try {
+-      const here = fs.readdirSync(__dirname).sort();
+-      res.json({ dir: __dirname, files: here.filter(f => f.startsWith('server')) });
+-    } catch (e) {
+-      res.status(500).json({ ok:false, error: String(e?.message || e) });
+-    }
+-  });
 -}
--
- if (process.env.ROUTE_DEBUG === '1') {
-   app.get('/_routes', (req, res) => {
-     try {
-       const list = [];
-       app._router.stack.forEach((m) => {
-@@
-       });
-       res.type('text/plain').send(list.join('\n'));
-     } catch (e) {
-       res.status(500).json({ ok: false, error: String(e?.message || e) });
-     }
-   });
-   console.log('[BOOT] route debug at /_routes');
-+  // 🔍 컨테이너 내 파일 확인용: server.ai.js 포함 여부 즉시 점검
-+  const fs = require('fs');
-+  const path = require('path');
-+  app.get('/_ls', (_req, res) => {
-+    try {
-+      const here = fs.readdirSync(__dirname).sort();
-+      res.json({ dir: __dirname, files: here.filter(f => f.startsWith('server')) });
-+    } catch (e) {
-+      res.status(500).json({ ok:false, error: String(e?.message || e) });
++// 🔎 ALWAYS-ON DEBUG: 디버그 라우트는 환경변수와 무관하게 항상 노출
++app.get('/_routes', (req, res) => {
++  try {
++    const out = [];
++    const walk = (stack, base='') => {
++      stack.forEach((s) => {
++        if (s.route && s.route.path) {
++          const methods = Object.keys(s.route.methods).join(',').toUpperCase();
++          out.push(`${methods.padEnd(6)} ${base}${s.route.path}`);
++        } else if (s.name === 'router' && s.handle?.stack) {
++          walk(s.handle.stack, base);
++        }
++      });
++    };
++    if (app && app._router && app._router.stack) {
++      walk(app._router.stack, '');
 +    }
-+  });
- }
++    res.type('text/plain').send(out.join('\n') || 'no-routes');
++  } catch (e) {
++    res.status(500).json({ ok: false, error: String(e?.message || e) });
++  }
++});
++console.log('[BOOT] ALWAYS-ON route debug at /_routes');
++
++app.get('/_ls', (_req, res) => {
++  try {
++    const fs = require('fs');
++    const here = fs.readdirSync(__dirname).sort();
++    res.json({ dir: __dirname, files: here.filter(f => f.startsWith('server')) });
++  } catch (e) {
++    res.status(500).json({ ok:false, error: String(e?.message || e) });
++  }
++});
++console.log('[BOOT] ALWAYS-ON file lister at /_ls');

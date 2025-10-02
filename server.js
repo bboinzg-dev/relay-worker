@@ -63,7 +63,7 @@ function getIngest() {
   }
   return __INGEST_MOD__;
 }
-const { generateRunId } = require('./src/utils/run-id');
+const { enqueueIngest } = require('./src/utils/enqueue');
 
 
 
@@ -661,6 +661,7 @@ async function markRunningState({ runId, gcsUri, taskName, retryCount }) {
             task_name = $2,
             retry_count = $3,
             gcs_uri = COALESCE($4, gcs_uri),
+            run_id = COALESCE(run_id, $5)
             error_message = NULL,
             finished_at = NULL,
             duration_ms = NULL,
@@ -670,14 +671,14 @@ async function markRunningState({ runId, gcsUri, taskName, retryCount }) {
             final_code = NULL,
             final_datasheet = NULL
       WHERE id = $1`,
-    [runId, taskName || null, safeRetryCount, gcsUri || null]
+    [runId, taskName || null, safeRetryCount, gcsUri || null, runId]
   );
   if (!update.rowCount) {
     await db.query(
-      `INSERT INTO public.ingest_run_logs (id, task_name, retry_count, gcs_uri, status)
-         VALUES ($1,$2,$3,$4,'RUNNING')
+      `INSERT INTO public.ingest_run_logs (id, run_id, task_name, retry_count, gcs_uri, status)
+         VALUES ($1,$2,$3,$4,$5,'RUNNING')
          ON CONFLICT (id) DO NOTHING`,
-      [runId, taskName || null, safeRetryCount, gcsUri || null]
+      [runId, runId, taskName || null, safeRetryCount, gcsUri || null]
     );
   }
 }
@@ -821,8 +822,13 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
         };
 
         try {
-          await enqueueIngestTask(nextPayload);
+          await enqueueIngest(nextPayload);
         } catch (err) {
+          console.error(
+            '[enqueue error]',
+            err?.code || err?.response?.status || err?.message,
+            err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
+          );
           throw new Error(`enqueue failed: ${String(err?.message || err)}`);
         }
 
@@ -874,11 +880,15 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
         };
 
         try {
-          await enqueueIngestTask(nextPayload);
+          await enqueueIngest(nextPayload);
         } catch (err) {
+          console.error(
+            '[enqueue error]',
+            err?.code || err?.response?.status || err?.message,
+            err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
+          );
           throw new Error(`persist enqueue failed: ${String(err?.message || err)}`);
         }
-
         return;
       }
 

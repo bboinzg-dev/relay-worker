@@ -1,19 +1,26 @@
-# cloudbuild.yaml
-substitutions:
-  _SERVICE: worker
-  _REGION: asia-northeast3
-  _REPO: worker
-  _IMAGE: relay-worker
-
 steps:
-- name: 'gcr.io/cloud-builders/docker'
-  args: ['build','-t','asia-northeast3-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA','.']
+  # 1) Docker build
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'asia-northeast3-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/worker:$SHORT_SHA', '.']
 
-- name: 'gcr.io/cloud-builders/docker'
-  args: ['push','asia-northeast3-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA']
+  # 2) Push to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'asia-northeast3-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/worker:$SHORT_SHA']
 
-- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-  entrypoint: gcloud
-  args: ['run','deploy','${_SERVICE}',
-         '--image=asia-northeast3-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA',
-         '--region=${_REGION}','--platform=managed','--quiet']
+  # 3) Deploy to Cloud Run (digest 배포)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        DIGEST=$(gcloud artifacts docker images describe \
+          asia-northeast3-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/worker:$SHORT_SHA \
+          --format="value(image_summary.digest)")
+        gcloud run deploy worker \
+          --region=asia-northeast3 \
+          --image=asia-northeast3-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/worker@${DIGEST} \
+          --service-account=svc-run-worker@${PROJECT_ID}.iam.gserviceaccount.com \
+          --quiet
+
+images:
+  - 'asia-northeast3-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/worker:$SHORT_SHA'

@@ -1,15 +1,50 @@
-// server.ingest.status.js (새 파일)
+// server.ingest.status.js (drop-in replace)
 'use strict';
 const express = require('express');
 const router = express.Router();
-const db = require('./src/utils/db'); // 프로젝트 경로에 맞게
+const db = require('./src/utils/db');
 
-router.get('/api/ingest/:id', async (req, res) => {
-  const id = req.params.id;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+router.get('/api/ingest/:key', async (req, res) => {
+  const key = String(req.params.key || '').trim();
+  if (!key) return res.status(400).json({ ok:false, error:'EMPTY_KEY' });
+
   try {
-    const { rows } = await db.query('SELECT * FROM public.ingest_jobs WHERE id=$1', [id]);
-    if (!rows.length) return res.status(404).json({ ok:false, error:'not_found' });
-    return res.json({ ok:true, job: rows[0] });
+    let by = 'job_id';
+    let job = null;
+    let logs = [];
+    let status = 'UNKNOWN';
+
+    if (UUID_RE.test(key)) {
+      by = 'run_id';
+      const { rows } = await db.query(
+        `select id, run_id, event, detail, ts
+           from public.ingest_run_logs
+          where run_id = $1
+          order by ts desc
+          limit 50`, [key]
+      );
+      logs = rows || [];
+      if (logs[0]?.event) {
+        const ev = String(logs[0].event).toUpperCase();
+        if (ev.includes('FAILED')) status = 'FAILED';
+        else if (ev.includes('SUCCEEDED') || ev.includes('DONE')) status = 'SUCCEEDED';
+        else if (ev.includes('PROCESS') || ev.includes('START')) status = 'PROCESSING';
+      }
+    } else {
+      // job id 조회
+      const { rows } = await db.query(
+        `select id, status, source_type, gcs_pdf_uri, last_error, created_at, updated_at
+           from public.ingest_jobs
+          where id = $1`, [key]
+      );
+      job = rows?.[0] || null;
+      status = job?.status || 'UNKNOWN';
+      // 관련 로그가 run_id 기준으로만 있다면, 필요 시 job->run_id 컬럼 도입/조인으로 확장
+    }
+
+    return res.json({ ok:true, by, key, status, job, logs });
   } catch (e) {
     console.error('[ingest status]', e);
     return res.status(500).json({ ok:false, error:'status_query_failed' });

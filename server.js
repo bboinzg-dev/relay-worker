@@ -661,7 +661,7 @@ async function markRunningState({ runId, gcsUri, taskName, retryCount }) {
             task_name = $2,
             retry_count = $3,
             gcs_uri = COALESCE($4, gcs_uri),
-            run_id = COALESCE(run_id, $5)
+            run_id = COALESCE(run_id, $5),
             error_message = NULL,
             finished_at = NULL,
             duration_ms = NULL,

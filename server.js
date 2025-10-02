@@ -267,6 +267,7 @@ try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bo
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
 try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
+try { app.use(require('./server.ingest.status')); console.log('[BOOT] mounted /api/ingest/:id'); } catch {}
 
 // 인라인 AI 라우터(간소 버전)는 제거 — server.ai.js 하나만 유지
 

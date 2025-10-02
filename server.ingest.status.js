@@ -1,4 +1,4 @@
-// server.ingest.status.js (drop-in replace)
+// server.ingest.status.js
 'use strict';
 const express = require('express');
 const router = express.Router();
@@ -33,7 +33,6 @@ router.get('/api/ingest/:key', async (req, res) => {
         else if (ev.includes('PROCESS') || ev.includes('START')) status = 'PROCESSING';
       }
     } else {
-      // job id 조회
       const { rows } = await db.query(
         `select id, status, source_type, gcs_pdf_uri, last_error, created_at, updated_at
            from public.ingest_jobs
@@ -41,7 +40,6 @@ router.get('/api/ingest/:key', async (req, res) => {
       );
       job = rows?.[0] || null;
       status = job?.status || 'UNKNOWN';
-      // 관련 로그가 run_id 기준으로만 있다면, 필요 시 job->run_id 컬럼 도입/조인으로 확장
     }
 
     return res.json({ ok:true, by, key, status, job, logs });

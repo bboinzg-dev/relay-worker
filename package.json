@@ -1,13 +1,9 @@
-{
+﻿{
   "name": "relay-worker",
   "version": "0.4.0",
   "type": "commonjs",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-    "start": "node server.js",
-    "syntax-check": "node scripts/check-syntax.js"
-  },
+  "scripts": { "start": "node server.js", "dev": "node server.js", "build": "echo no-build" },
   "dependencies": {
     "@google-cloud/documentai": "^9.4.0",
     "@google-cloud/storage": "^7.13.0",

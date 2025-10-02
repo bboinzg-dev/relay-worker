@@ -113,6 +113,30 @@ async function enqueueIngestTask(payload = {}) {
 
 const app = express();
 
+// ✅ 항상 찍히는 부팅 로그 + 간단 헬스/정보
+console.log('[BOOT] server.js starting', {
+  file: __filename,
+  node: process.version,
+  ROUTE_DEBUG: process.env.ROUTE_DEBUG || null,
+  revision: process.env.K_REVISION || null,
+});
+
+// 가장 가벼운 핑
+app.get('/_ping', (_req, res) => res.json({ ok: true, rev: process.env.K_REVISION || null }));
+
+// 현재 실행 중인 엔트리/디렉토리 확인 (정말 server.js가 실행되는지 확인)
+app.get('/_whoami', (_req, res) => {
+  try {
+    res.json({
+      main: require.main && require.main.filename,
+      dir: __dirname,
+      ROUTE_DEBUG: process.env.ROUTE_DEBUG || null
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -221,41 +245,40 @@ try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounte
 /* NOTE: The parts router already exists in your repo; keep it mounted. */
 try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
 
-if (process.env.ROUTE_DEBUG === '1') {
-  app.get('/_routes', (req, res) => {
-    try {
-      const list = [];
-      app._router.stack.forEach((m) => {
-        if (m.route && m.route.path) {
-          const methods = Object.keys(m.route.methods).join(',').toUpperCase();
-          list.push(`${methods.padEnd(6)} ${m.route.path}`);
-        } else if (m.name === 'router' && m.handle?.stack) {
-          m.handle.stack.forEach((h) => {
-            const p = h.route?.path;
-            const ms = h.route ? Object.keys(h.route.methods).join(',').toUpperCase() : '';
-            if (p) list.push(`${ms.padEnd(6)} ${m.regexp?.toString() || ''}${p}`);
-          });
-        }
-      });
-      res.type('text/plain').send(list.join('\n'));
-    } catch (e) {
-      res.status(500).json({ ok: false, error: String(e?.message || e) });
-    }
-  });
-  console.log('[BOOT] route debug at /_routes');
+// ✅ ALWAYS-ON 디버그 엔드포인트 (환경변수와 무관하게 항상 열림)
+app.get('/_routes', (req, res) => {
+  try {
+    const list = [];
+    app._router.stack.forEach((m) => {
+      if (m.route && m.route.path) {
+        const methods = Object.keys(m.route.methods).join(',').toUpperCase();
+        list.push(`${methods.padEnd(6)} ${m.route.path}`);
+      } else if (m.name === 'router' && m.handle?.stack) {
+        m.handle.stack.forEach((h) => {
+          const p = h.route?.path;
+          const ms = h.route ? Object.keys(h.route.methods).join(',').toUpperCase() : '';
+          if (p) list.push(`${ms.padEnd(6)} ${m.regexp?.toString() || ''}${p}`);
+        });
+      }
+    });
+    res.type('text/plain').send(list.join('\n') || 'no-routes');
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+console.log('[BOOT] ALWAYS-ON route debug at /_routes');
 
-  // 🔍 컨테이너 내 파일 확인용: server.ai.js 포함 여부 즉시 점검
-  const fs = require('fs');
-  const path = require('path');
-  app.get('/_ls', (_req, res) => {
-    try {
-      const here = fs.readdirSync(__dirname).sort();
-      res.json({ dir: __dirname, files: here.filter(f => f.startsWith('server')) });
-    } catch (e) {
-      res.status(500).json({ ok:false, error: String(e?.message || e) });
-    }
-  });
-}
+// 🔍 컨테이너 내 파일 확인: server*.js 포함 여부 즉시 점검
+const fs = require('fs');
+app.get('/_ls', (_req, res) => {
+  try {
+    const here = fs.readdirSync(__dirname).sort();
+    res.json({ dir: __dirname, files: here.filter(f => f.startsWith('server')) });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: String(e?.message || e) });
+  }
+});
+console.log('[BOOT] ALWAYS-ON file lister at /_ls');
 
 
 /* ---------------- Upload ---------------- */

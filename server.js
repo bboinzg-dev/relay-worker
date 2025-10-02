@@ -182,6 +182,23 @@ app.use('/auth', authRouter);
 
 // (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
 app.post('/login', loginHandler);
+// --- AI routes mount (export 타입 자동 처리) ---
+try {
+  const ai = require('./server.ai');
+  if (ai && typeof ai === 'object') {
+    // server.ai.js 가 express.Router()를 export 하는 형태
+    app.use('/api', ai);  // ==> 최종 경로: /api/ai/...
+    console.log('[BOOT] mounted AI routes at /api/* (router export)');
+  } else if (typeof ai === 'function') {
+    // 만약 server.ai.js 가 (app)=>{ app.post('/api/ai/resolve', ...) } 로 export 한다면
+    ai(app);
+    console.log('[BOOT] mounted AI routes via function(export)');
+  } else {
+    console.warn('[BOOT] server.ai export type not supported:', typeof ai);
+  }
+} catch (e) {
+  console.error('[BOOT] ai mount failed', e?.message || e);
+}
 
 /* ---------------- Mount modular routers (after global middleware) ---------------- */
 try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}

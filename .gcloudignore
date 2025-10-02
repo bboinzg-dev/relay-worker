@@ -1,0 +1,5 @@
+!**                 # 기본: 전부 포함
+node_modules
+.git
+.git/**
+npm-debug.log

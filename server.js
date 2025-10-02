@@ -198,6 +198,14 @@ try {
   }
 } catch (e) {
   console.error('[BOOT] ai mount failed', e?.message || e);
+  // 🔰 Fallback: server.ai.js 로딩 실패/누락 시에도 즉시 동작하도록 최소 라우트 제공
+  const express = require('express');
+  const fb = express.Router();
+  fb.get('/ai/ping', (_req, res) => res.json({ ok: true, fallback: true }));
+  fb.get('/ai/resolve', (req, res) => res.json({ ok: true, echo: String(req.query?.q || '') }));
+  fb.post('/ai/resolve', (req, res) => res.json({ ok: true, echo: String((req.body && req.body.q) || '') }));
+  app.use('/api', fb);
+  console.warn('[BOOT] fallback AI routes mounted at /api/*');
 }
 
 /* ---------------- Mount modular routers (after global middleware) ---------------- */
@@ -212,22 +220,6 @@ try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounte
 
 /* NOTE: The parts router already exists in your repo; keep it mounted. */
 try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
-
-// --- AI routes mount: export 타입(함수/Router)에 관계없이 안전하게 ---
-try {
-  const ai = require('./server.ai');
-  if (typeof ai === 'function') {
-    ai(app);
-    console.log('[BOOT] mounted AI routes via function(export)');
-  } else if (ai && typeof ai === 'object') {
-    app.use('/api', ai);
-    console.log('[BOOT] mounted AI routes at /api/* (router export)');
-  } else {
-    console.warn('[BOOT] server.ai export type not supported:', typeof ai);
-  }
-} catch (e) {
-  console.error('[BOOT] ai mount failed', e?.message || e);
-}
 
 if (process.env.ROUTE_DEBUG === '1') {
   app.get('/_routes', (req, res) => {
@@ -251,6 +243,18 @@ if (process.env.ROUTE_DEBUG === '1') {
     }
   });
   console.log('[BOOT] route debug at /_routes');
+
+  // 🔍 컨테이너 내 파일 확인용: server.ai.js 포함 여부 즉시 점검
+  const fs = require('fs');
+  const path = require('path');
+  app.get('/_ls', (_req, res) => {
+    try {
+      const here = fs.readdirSync(__dirname).sort();
+      res.json({ dir: __dirname, files: here.filter(f => f.startsWith('server')) });
+    } catch (e) {
+      res.status(500).json({ ok:false, error: String(e?.message || e) });
+    }
+  });
 }
 
 

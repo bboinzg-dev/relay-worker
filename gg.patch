@@ -1,81 +1,79 @@
-diff --git a/lib/llm.js b/lib/llm.js
-index a346b4b155e39f49db02ea6910bc8471609b1ff3..302638b39b5e2d5740383e9eb37d9a9d7b98d4ac 100644
---- a/lib/llm.js
-+++ b/lib/llm.js
-@@ -1,68 +1,66 @@
- const { VertexAI } = require('@google-cloud/vertexai');
- const { safeJsonParse } = require('../src/utils/safe-json');
- const env = require('../src/config/env');
- 
- function getModel(name) {
--  const v = new VertexAI({
--    project: env.PROJECT_ID,
--    location: env.VERTEX_LOCATION,
--  });
-+  const v = new VertexAI({ project: env.PROJECT_ID, location: env.VERTEX_LOCATION });
-   return v.getGenerativeModel({ model: name });
+*** a/server.js
+--- b/server.js
+@@
+ // (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
+ app.post('/login', loginHandler);
+ // --- AI routes mount (export 타입 자동 처리) ---
+ try {
+   const ai = require('./server.ai');
+   if (ai && typeof ai === 'object') {
+     // server.ai.js 가 express.Router()를 export 하는 형태
+     app.use('/api', ai);  // ==> 최종 경로: /api/ai/...
+     console.log('[BOOT] mounted AI routes at /api/* (router export)');
+   } else if (typeof ai === 'function') {
+     // 만약 server.ai.js 가 (app)=>{ app.post('/api/ai/resolve', ...) } 로 export 한다면
+     ai(app);
+     console.log('[BOOT] mounted AI routes via function(export)');
+   } else {
+     console.warn('[BOOT] server.ai export type not supported:', typeof ai);
+   }
+ } catch (e) {
+-  console.error('[BOOT] ai mount failed', e?.message || e);
++  console.error('[BOOT] ai mount failed', e?.message || e);
++  // 🔰 Fallback: server.ai.js 로딩 실패/누락 시에도 즉시 동작하도록 최소 라우트 제공
++  const express = require('express');
++  const fb = express.Router();
++  fb.get('/ai/ping', (_req, res) => res.json({ ok: true, fallback: true }));
++  fb.get('/ai/resolve', (req, res) => res.json({ ok: true, echo: String(req.query?.q || '') }));
++  fb.post('/ai/resolve', (req, res) => res.json({ ok: true, echo: String((req.body && req.body.q) || '') }));
++  app.use('/api', fb);
++  console.warn('[BOOT] fallback AI routes mounted at /api/*');
  }
  
+ /* ---------------- Mount modular routers (after global middleware) ---------------- */
+ try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
+ try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
+@@
+ try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
+ 
+-// --- AI routes mount: export 타입(함수/Router)에 관계없이 안전하게 ---
+-try {
+-  const ai = require('./server.ai');
+-  if (typeof ai === 'function') {
+-    ai(app);
+-    console.log('[BOOT] mounted AI routes via function(export)');
+-  } else if (ai && typeof ai === 'object') {
+-    app.use('/api', ai);
+-    console.log('[BOOT] mounted AI routes at /api/* (router export)');
+-  } else {
+-    console.warn('[BOOT] server.ai export type not supported:', typeof ai);
+-  }
+-} catch (e) {
+-  console.error('[BOOT] ai mount failed', e?.message || e);
+-}
 -
- function partsText(resp) {
-   const parts = resp?.response?.candidates?.[0]?.content?.parts || [];
-   return parts.map(p => p?.text || '').join('');
- }
- 
- async function classifyFamily({ pdfBytes, allowedFamilies }) {
--  const mdl = getModel(env.GEMINI_MODEL_CLASSIFY);  const prompt = `
-+  const mdl = getModel(env.GEMINI_MODEL_CLASSIFY);
-+  const prompt = `
- PDF 전체를 보고 아래 JSON 한 객체로만 답하세요.
- {"family_slug":"...", "brand": null|string, "code": null|string, "series": null|string}
- 
- - family_slug는 반드시 다음 중 정확히 하나: ${allowedFamilies.map(f => `"${f}"`).join(', ')}
- - 허용 목록 외 값 금지. 불확실하면 가장 근접한 하나 선택.
- `.trim();
- 
-   const resp = await mdl.generateContent({
-     contents: [{
-       role: 'user',
-       parts: [
-         { text: prompt },
-         { inlineData: { mimeType: 'application/pdf', data: pdfBytes.toString('base64') } },
-       ],
-     }],
-     generationConfig: { responseMimeType: 'application/json' },
+ if (process.env.ROUTE_DEBUG === '1') {
+   app.get('/_routes', (req, res) => {
+     try {
+       const list = [];
+       app._router.stack.forEach((m) => {
+@@
+       });
+       res.type('text/plain').send(list.join('\n'));
+     } catch (e) {
+       res.status(500).json({ ok: false, error: String(e?.message || e) });
+     }
    });
- 
-   const text = partsText(resp) || '{}';
--   const parsed = safeJsonParse(text) || {};
-+  const parsed = safeJsonParse(text) || {};
-   return parsed;
+   console.log('[BOOT] route debug at /_routes');
++  // 🔍 컨테이너 내 파일 확인용: server.ai.js 포함 여부 즉시 점검
++  const fs = require('fs');
++  const path = require('path');
++  app.get('/_ls', (_req, res) => {
++    try {
++      const here = fs.readdirSync(__dirname).sort();
++      res.json({ dir: __dirname, files: here.filter(f => f.startsWith('server')) });
++    } catch (e) {
++      res.status(500).json({ ok:false, error: String(e?.message || e) });
++    }
++  });
  }
- 
- async function extractByBlueprint({ pdfBytes, family, fields }) {
--  const mdl = getModel(env.GEMINI_MODEL_EXTRACT);  const keys = Object.keys(fields);
-+  const mdl = getModel(env.GEMINI_MODEL_EXTRACT);
-+  const keys = Object.keys(fields);
-   const prompt = `
- 다음 PDF에서 ${family} 부품의 스펙을 추출합니다.
- 아래 컬럼들만 채우세요(없으면 null). 반드시 {"values": { "<컬럼>": <값> }} JSON 한 객체만 출력.
- 허용 컬럼: ${keys.join(', ')}
- `.trim();
- 
-   const resp = await mdl.generateContent({
-     contents: [{
-       role: 'user',
-       parts: [
-         { text: prompt },
-         { inlineData: { mimeType: 'application/pdf', data: pdfBytes.toString('base64') } },
-       ],
-     }],
-     generationConfig: { responseMimeType: 'application/json' },
-   });
- 
-   const text = partsText(resp) || '{}';
-- const j = safeJsonParse(text) || {};
-+  const j = safeJsonParse(text) || {};
-   return j?.values || {};
- }
- 
--module.exports = { classifyFamily, extractByBlueprint };
-+module.exports = { classifyFamily, extractByBlueprint };

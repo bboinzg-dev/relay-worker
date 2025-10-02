@@ -35,16 +35,43 @@ const multer = require('multer');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
-const db = require('./db'); // 루트 db.js (TLS 우회 포함)
+// 1) DB 모듈: 로드 실패해도 서버는 떠야 함
+let db;
+try {
+  db = require('./db');                    // 루트 경로
+} catch (e1) {
+  try { db = require('./src/utils/db'); }  // 예전 경로 호환
+  catch (e2) {
+    console.error('[BOOT] db load failed:', e2?.message || e1?.message);
+    db = { query: async () => { throw new Error('DB_UNAVAILABLE'); } };
+  }
+}
 const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
-const { runAutoIngest, persistProcessedData } = require('./src/pipeline/ingestAuto');
+// 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
+let __INGEST_MOD__ = null;
+function getIngest() {
+  if (__INGEST_MOD__) return __INGEST_MOD__;
+  try {
+    __INGEST_MOD__ = require('./src/pipeline/ingestAuto');
+  } catch (e) {
+    console.error('[INGEST] module load failed:', e?.message || e);
+    __INGEST_MOD__ = {
+      runAutoIngest: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
+      persistProcessedData: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
+    };
+  }
+  return __INGEST_MOD__;
+}
 const { generateRunId } = require('./src/utils/run-id');
 
 
 
 // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
-const { CloudTasksClient } = require('@google-cloud/tasks');
+// 2) Cloud Tasks: 런타임에 없으면 비활성화
+let CloudTasksClient;
+try { ({ CloudTasksClient } = require('@google-cloud/tasks')); }
+catch (e) { console.warn('[BOOT] @google-cloud/tasks unavailable:', e?.message || e); }
 const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
 const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
 const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
@@ -61,6 +88,7 @@ let _tasks = null;
 let _queuePath = null;
 function getTasks() {
   if (!_tasks) {
+    if (!CloudTasksClient) throw new Error('@google-cloud/tasks unavailable');
     // 글로벌 엔드포인트 + REST fallback(HTTP/1)
     _tasks = new CloudTasksClient({ fallback: true });
     _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
@@ -346,7 +374,7 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
         brand: brand || null,
         series: series || null,
       };
-      const out = await runAutoIngest({
+      const out = await getIngest().runAutoIngest({
         gcsUri,
         family_slug,
         brand,
@@ -592,7 +620,7 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
       brand: brand || null,
       series: series || null,
     };
-    const result = await runAutoIngest({
+    const result = await getIngest().runAutoIngest({
       gcsUri: uri,
       family_slug,
       brand,
@@ -811,7 +839,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
           series: overrideSeries,
         };
 
-        const result = await runAutoIngest({
+        const result = await getIngest().runAutoIngest({
           ...payload,
           runId,
           run_id: runId,
@@ -859,7 +887,7 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
 
-        const out = await persistProcessedData(payload?.processed || {}, {
+        const out = await getIngest().persistProcessedData(payload?.processed || {}, {
           brand: overrideBrand,
           code: payload?.code ?? null,
           series: overrideSeries,

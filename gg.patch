@@ -1,59 +1,81 @@
-diff --git a/docai_smoke.js b/docai_smoke.js
-index 8a9b817a6d8f609e81ba00bf3beb5018902e387c..0dbaf5e3de812a03bb203aa7afc35c1d5d8521c6 100644
---- a/docai_smoke.js
-+++ b/docai_smoke.js
-@@ -1,20 +1,43 @@
--const { batchProcess } = require('./docai_client');
--const { extractRelayFields } = require('./docai_parse');
-+'use strict';
-+
- const { Storage } = require('@google-cloud/storage');
-+const { batchProcess, extractRelayFields } = require('./src/utils/docai');
- const { safeJsonParse } = require('./src/utils/safe-json');
-+
- const storage = new Storage();
--function parseGs(gs){ const s=gs.replace('gs://',''); const i=s.indexOf('/'); return {bucket:s.slice(0,i), name:s.slice(i+1)}; }
--(async ()=>{
--  try{
-+
-+function parseGs(gsUri) {
-+  const stripped = String(gsUri).replace('gs://', '');
-+  const idx = stripped.indexOf('/');
-+  return { bucket: stripped.slice(0, idx), name: stripped.slice(idx + 1) };
-+}
-+
-+(async () => {
+diff --git a/server.js b/server.js
+index 1424760e164f2eb0a95bc5793af720f25802fb77..c2f68ecc9024b12aac143e65a14aaf2888ca6c5d 100644
+--- a/server.js
++++ b/server.js
+@@ -140,50 +140,76 @@ const app = express();
+ 
+ // ✅ 항상 찍히는 부팅 로그 + 간단 헬스/정보
+ console.log('[BOOT] server.js starting', {
+   file: __filename,
+   node: process.version,
+   ROUTE_DEBUG: process.env.ROUTE_DEBUG || null,
+   revision: process.env.K_REVISION || null,
+ });
+ 
+ // 가장 가벼운 핑
+ app.get('/_ping', (_req, res) => res.json({ ok: true, rev: process.env.K_REVISION || null }));
+ 
+ // 현재 실행 중인 엔트리/디렉토리 확인 (정말 server.js가 실행되는지 확인)
+ app.get('/_whoami', (_req, res) => {
+   try {
+     res.json({
+       main: require.main && require.main.filename,
+       dir: __dirname,
+       ROUTE_DEBUG: process.env.ROUTE_DEBUG || null
+     });
+   } catch (e) {
+     res.status(500).json({ ok: false, error: String(e?.message || e) });
+   }
+ });
+ 
++app.post(['/api/worker/ingest', '/worker/ingest'], async (req, res) => {
 +  try {
-     const input = process.argv[2];
--    if(!input){ console.error('Usage: node docai_smoke.js gs://bucket/file.pdf'); process.exit(1); }
--    const outPrefix = `gs://${process.env.GCS_BUCKET_DOCAI || 'partsplan-473810-docai-us'}/out/${Date.now()}/`;
-+    if (!input) {
-+      console.error('Usage: node docai_smoke.js gs://bucket/file.pdf');
-+      process.exit(1);
-+    }
++    const body = req.body || {};
++    const payload = body.payload || body;
 +
-+    const bucket = process.env.GCS_BUCKET_DOCAI || 'partsplan-473810-docai-us';
-+    const outPrefix = `gs://${bucket}/out/${Date.now()}/`;
++    const gcsUri = payload.gcsUri || payload.gcs_uri;
++    if (!gcsUri) return res.status(400).json({ ok:false, error:'gcsUri required' });
 +
-     const { outputs } = await batchProcess(input, outPrefix);
-     console.log('DocAI outputs:', outputs);
--    const first = outputs.find(u => u.endsWith('.json'));
--    const {bucket,name} = parseGs(first);
--    const [buf] = await storage.bucket(bucket).file(name).download();
++    const { runAutoIngest } = getIngest();
++    const result = await runAutoIngest({
++      gcsUri,
++      family_slug: payload.family_slug || payload.family_hint || null,
++      brand: payload.brand || null,
++      code: payload.code || null,
++      series: payload.series || null,
++      display_name: payload.display_name || null,
++      overrides: { brand: payload.brand || null, series: payload.series || null }
++    });
 +
-+    const first = outputs.find((uri) => uri.endsWith('.json'));
-+    if (!first) {
-+      console.error('No JSON outputs found');
-+      process.exit(3);
-+    }
-+
-+    const { bucket: outBucket, name } = parseGs(first);
-+    const [buf] = await storage.bucket(outBucket).file(name).download();
-     const doc = safeJsonParse(buf.toString('utf8'));
-     console.log('Extracted:', extractRelayFields(doc));
--  } catch(e){ console.error(e); process.exit(2); }
-+  } catch (err) {
-+    console.error(err);
-+    process.exit(2);
++    return res.status(200).json({ ok: true, result });
++  } catch (e) {
++    console.error(e);
++    return res.status(400).json({ ok:false, error:String(e?.message || e) });
 +  }
- })();
++});
++
+ 
+ app.use(bodyParser.json({ limit: '25mb' }));
+ app.use(bodyParser.urlencoded({ extended: true }));
+ app.disable('x-powered-by');
+ 
+ /* ---------------- Env / Config ---------------- */
+ const PORT = process.env.PORT || 8080;
+ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+ 
+ function parseCorsOrigins(envStr) {
+   if (!envStr) return null;
+   const items = envStr.split(',').map(s => s.trim()).filter(Boolean);
+   return items.map(p => {
+     if (p.startsWith('/') && p.endsWith('/')) {
+       const body = p.slice(1, -1);
+       return new RegExp(body);
+     }
+     return p;
+   });
+ }
+ const CORS_ALLOW = parseCorsOrigins(process.env.CORS_ALLOW_ORIGINS);
+ 
+ /* ---------------- CORS / Security ---------------- */
+ if (CORS_ALLOW) {
+   app.use(cors({ origin: CORS_ALLOW, credentials: true }));

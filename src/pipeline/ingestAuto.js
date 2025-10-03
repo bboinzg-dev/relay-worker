@@ -18,6 +18,8 @@ const { explodeToRows } = require('../ingest/mpn-exploder');
 const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
 const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
 const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
+const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
+const { processDocument: processDocAi } = require('../services/docai');
 
 const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
 const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
@@ -537,11 +539,48 @@ async function runAutoIngest(input = {}) {
       .catch((err) => { clearTimeout(timer); reject(err); });
   });
 
+  let docAiResult = null;
+  let vertexClassification = null;
+  let vertexExtractValues = null;
+
   const runnerPromise = (async () => {
 
     // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
   let fileName = '';
   try { const { name } = parseGcsUri(gcsUri); fileName = path.basename(name); } catch {}
+
+  if (!docAiResult) {
+    try {
+      docAiResult = await processDocAi(gcsUri);
+    } catch (err) {
+      console.warn('[docai] process failed:', err?.message || err);
+    }
+  }
+
+  if (!vertexClassification) {
+    try {
+      vertexClassification = await classifyByGcs(gcsUri, fileName || 'datasheet.pdf');
+    } catch (err) {
+      console.warn('[vertex] classify failed:', err?.message || err);
+    }
+  }
+
+  if (!family_slug && vertexClassification?.family_slug) {
+    family_slug = vertexClassification.family_slug;
+  }
+  if (!overridesBrand && !brand && vertexClassification?.brand) {
+    brand = vertexClassification.brand;
+  }
+  if (!detectedBrand && vertexClassification?.brand) {
+    detectedBrand = vertexClassification.brand;
+  }
+  if (!code && vertexClassification?.code) {
+    code = vertexClassification.code;
+  }
+  if (!series && vertexClassification?.series) {
+    series = vertexClassification.series;
+  }
+
   let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
   if (!family && !FAST) {
     try {
@@ -564,6 +603,14 @@ async function runAutoIngest(input = {}) {
   const qualified = table.startsWith('public.')? table : `public.${table}`;
 
   let blueprint = await getBlueprint(family);
+
+  if (!vertexExtractValues && family) {
+    try {
+      vertexExtractValues = await extractValuesByGcs(gcsUri, family);
+    } catch (err) {
+      console.warn('[vertex] extract failed:', err?.message || err);
+    }
+  }
 
   // 블루프린트 허용 키
   let allowedKeys = Array.isArray(blueprint?.allowedKeys)
@@ -609,6 +656,11 @@ async function runAutoIngest(input = {}) {
       const r = await extractText(gcsUri);
       previewText = r?.text || previewText;
     } catch {}
+  }
+  const docAiText = typeof docAiResult?.text === 'string' ? docAiResult.text : '';
+  const docAiTables = Array.isArray(docAiResult?.tables) ? docAiResult.tables : [];
+  if (docAiText && docAiText.length > (previewText?.length || 0)) {
+    previewText = docAiText;
   }
   if (!effectiveBrand) {
     try {
@@ -657,6 +709,56 @@ async function runAutoIngest(input = {}) {
         );
       }
     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
+  }
+
+  if (docAiText) {
+    if (!extracted || typeof extracted !== 'object') extracted = {};
+    const existing = typeof extracted.text === 'string' ? extracted.text : '';
+    if (!existing || docAiText.length > existing.length) {
+      extracted.text = docAiText;
+    }
+  }
+  if (docAiTables.length) {
+    if (!extracted || typeof extracted !== 'object') extracted = {};
+    if (!Array.isArray(extracted.tables) || !extracted.tables.length) {
+      extracted.tables = docAiTables;
+    }
+  }
+  if (vertexExtractValues && typeof vertexExtractValues === 'object') {
+    const entries = Object.entries(vertexExtractValues);
+    if (entries.length) {
+      if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
+        extracted.rows = [{ ...vertexExtractValues }];
+      } else {
+        for (const row of extracted.rows) {
+          if (!row || typeof row !== 'object') continue;
+          for (const [rawKey, rawValue] of entries) {
+            const key = String(rawKey || '').trim();
+            if (!key) continue;
+            if (row[key] == null || row[key] === '') {
+              row[key] = rawValue;
+            }
+          }
+        }
+      }
+    }
+  }
+  const rawJsonPayload = {};
+  if (docAiResult && (docAiText || docAiTables.length)) rawJsonPayload.docai = docAiResult;
+  if (vertexClassification) rawJsonPayload.vertex_classify = vertexClassification;
+  if (vertexExtractValues && Object.keys(vertexExtractValues).length) {
+    rawJsonPayload.vertex_extract = vertexExtractValues;
+  }
+  if (Object.keys(rawJsonPayload).length) {
+    if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
+      extracted.rows = [{}];
+    }
+    for (const row of extracted.rows) {
+      if (!row || typeof row !== 'object') continue;
+      if (row.raw_json == null) {
+        row.raw_json = rawJsonPayload;
+      }
+    }
   }
 
   if (detectedBrand && extracted && typeof extracted === 'object') {

@@ -46,6 +46,7 @@ function resolveConnectionString() {
  *  - 위 둘 다 아니면 기본적으로 TLS 사용 + 검증 끔(운영에서 CA 준비 전 임시)
  */
 function resolveSslConfig(connStr) {
+  if (/\bhost=\/cloudsql\//.test(connStr)) return false; // Cloud SQL unix-socket이면 TLS 끔
   const insecure = process.env.DB_TLS_INSECURE === '1';
   const caPath = process.env.PGSSLROOTCERT;
 

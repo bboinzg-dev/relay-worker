@@ -163,33 +163,6 @@ app.get('/_whoami', (_req, res) => {
   }
 });
 
-app.post(['/api/worker/ingest', '/worker/ingest'], bodyParser.json({ limit: '25mb' }), async (req, res) => {
-  try {
-    const body = req.body || {};
-    const payload = body.payload || body;
-
-    const gcsUri = payload.gcsUri || payload.gcs_uri;
-    if (!gcsUri) return res.status(400).json({ ok:false, error:'gcsUri required' });
-
-    const { runAutoIngest } = getIngest();
-    const result = await runAutoIngest({
-      gcsUri,
-      family_slug: payload.family_slug || payload.family_hint || null,
-      brand: payload.brand || null,
-      code: payload.code || null,
-      series: payload.series || null,
-      display_name: payload.display_name || null,
-      overrides: { brand: payload.brand || null, series: payload.series || null }
-    });
-
-    return res.status(200).json({ ok: true, result });
-  } catch (e) {
-    console.error(e);
-    return res.status(400).json({ ok:false, error:String(e?.message || e) });
-  }
-});
-
-
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.disable('x-powered-by');

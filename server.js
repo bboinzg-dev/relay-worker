@@ -25,6 +25,7 @@ process.on('unhandledRejection', (e) => {
     TASKS_LOCATION: pick('TASKS_LOCATION'),
     GEMINI_MODEL_CLASSIFY: pick('GEMINI_MODEL_CLASSIFY'),
     GEMINI_MODEL_EXTRACT: pick('GEMINI_MODEL_EXTRACT'),
+    JWT_SECRET: !!pick('JWT_SECRET'),
   });
 })();
 
@@ -245,18 +246,47 @@ function loginHandler(req, res) {
   }
 }
 
-const authRouter = express.Router();
-// 헬스(선택)
-authRouter.get('/health', (_req, res) => res.json({ ok: true, stub: true }));
-// 로그인/로그아웃
-authRouter.post('/login', loginHandler);
-authRouter.post('/logout', (_req, res) => res.json({ ok: true }));
+function buildStubAuthRouter() {
+  const stub = express.Router();
+  stub.get('/health', (_req, res) => res.json({ ok: true, stub: true }));
+  stub.post('/login', loginHandler);
+  stub.post('/logout', (_req, res) => res.json({ ok: true }));
+  return stub;
+}
+
+let authRouter = null;
+let authRouterIsReal = false;
+try {
+  const loaded = require('./src/routes/manager');
+  const resolved = loaded && typeof loaded === 'object' && loaded.default ? loaded.default : loaded;
+  if (resolved && typeof resolved === 'function') {
+    authRouter = resolved;
+    authRouterIsReal = true;
+    console.log('[BOOT] mounted auth router from ./src/routes/manager');
+  }
+} catch (e) {
+  console.warn('[BOOT] auth router load failed:', e?.message || e);
+}
+
+if (!authRouter) {
+  authRouter = buildStubAuthRouter();
+  console.warn('[BOOT] using stub auth router');
+}
 
 // ✅ /auth/* 경로로 확정 마운트 (항상 가장 먼저 잡히게)
 app.use('/auth', authRouter);
 
-// (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
-app.post('/login', loginHandler);
+if (authRouterIsReal) {
+  const forwardToAuth = (path) => (req, res, next) => {
+    req.url = path;
+    authRouter.handle(req, res, next);
+  };
+  app.post('/login', forwardToAuth('/login'));
+  app.post('/logout', (_req, res) => res.json({ ok: true }));
+} else {
+  // (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
+  app.post('/login', loginHandler);
+}
 // --- AI routes mount (export 타입 자동 처리) ---
 try {
   const ai = require('./server.ai');

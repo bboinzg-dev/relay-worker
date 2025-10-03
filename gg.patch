@@ -1,329 +1,160 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 31ce20c4bb5564f332c1b6addbdc475cdf3e968c..e45afcc31b960578b642aba6232ec454cfafb5be 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -1,45 +1,47 @@
- 'use strict';
+diff --git a/server.js b/server.js
+index c2f68ecc9024b12aac143e65a14aaf2888ca6c5d..117cf1ab974c8171831713a5ab5ff0b682ca80f8 100644
+--- a/server.js
++++ b/server.js
+@@ -3,50 +3,51 @@
  
- const path = require('node:path');
- const fs = require('node:fs/promises');
- const os = require('node:os');
- const { execFile } = require('node:child_process');
- const { promisify } = require('node:util');
- const execFileP = promisify(execFile);
+ // ───────── 외부콜 차단 플래그 (배포 시 EXT_CALLS_OFF=1 이면 부팅 중 외부 HTTPS 호출 스킵)
+ const EXT_CALLS_OFF = process.env.EXT_CALLS_OFF === '1';
  
- const db = require('../../db');
- const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
- const { extractText } = require('../utils/extract');
- const { getBlueprint } = require('../utils/blueprint');
- const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
- const { extractFields } = require('./extractByBlueprint');
- const { saveExtractedSpecs } = require('./persist');
- const { explodeToRows } = require('../ingest/mpn-exploder');
- const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
- const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
- const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
-+const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
-+const { processDocument: processDocAi } = require('../services/docai');
+ process.on('uncaughtException', (e) => {
+   console.error('[FATAL][uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));
+   process.exit(1);
+ });
+ process.on('unhandledRejection', (e) => {
+   console.error('[FATAL][unhandledRejection]', e);
+   process.exit(1);
+ });
  
- const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
- const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
- 
- const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
- const BASE_KEYS = new Set([
-   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
-   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
-   'cover','verified_in_doc','updated_at'
- ]);
- 
- const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
- const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
- 
- function escapeRegex(str) {
-   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
- }
- 
- function textContainsExact(text, pn) {
-   if (!text || !pn) return false;
-   const pattern = escapeRegex(String(pn).trim());
-   if (!pattern) return false;
-   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
-   return re.test(String(text));
- }
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 31ce20c4bb5564f332c1b6addbdc475cdf3e968c..e45afcc31b960578b642aba6232ec454cfafb5be 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -515,172 +517,272 @@ async function runAutoIngest(input = {}) {
-     try {
-       await db.query('SELECT pg_advisory_lock(hashtext($1))', [runId]);
-       lockAcquired = true;
-     } catch (err) {
-       console.warn('[ingest] advisory lock failed:', err?.message || err);
-     }
-   }
- 
-   const releaseLock = async () => {
-     if (!lockAcquired || !runId) return;
-     lockAcquired = false;
-     try {
-       await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]);
-     } catch (err) {
-       console.warn('[ingest] advisory unlock failed:', err?.message || err);
-     }
-   };
- 
-   const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
-     const timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
-     Promise.resolve(p)
-       .then((val) => { clearTimeout(timer); resolve(val); })
-       .catch((err) => { clearTimeout(timer); reject(err); });
+ // 필수 env 스모크 로그(민감값 제외)
+ (() => {
+   const pick = (k) => (process.env[k] || '').toString();
+   console.log('[BOOT env check]', {
+     GCP_PROJECT_ID: !!pick('GCP_PROJECT_ID'),
+     VERTEX_LOCATION: pick('VERTEX_LOCATION'),
+     DOCAI_PROCESSOR_ID: !!pick('DOCAI_PROCESSOR_ID'),
+     GCS_BUCKET: pick('GCS_BUCKET'),
+     QUEUE_NAME: pick('QUEUE_NAME'),
+     TASKS_LOCATION: pick('TASKS_LOCATION'),
+     GEMINI_MODEL_CLASSIFY: pick('GEMINI_MODEL_CLASSIFY'),
+     GEMINI_MODEL_EXTRACT: pick('GEMINI_MODEL_EXTRACT'),
++    JWT_SECRET: !!pick('JWT_SECRET'),
    });
+ })();
  
-+  let docAiResult = null;
-+  let vertexClassification = null;
-+  let vertexExtractValues = null;
-+
-   const runnerPromise = (async () => {
+ const express = require('express');
+ const cors = require('cors');
+ const bodyParser = require('body-parser');
+ const multer = require('multer');
+ const crypto = require('crypto');
+ const jwt = require('jsonwebtoken');
  
-     // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
-   let fileName = '';
-   try { const { name } = parseGcsUri(gcsUri); fileName = path.basename(name); } catch {}
-+
-+  if (!docAiResult) {
-+    try {
-+      docAiResult = await processDocAi(gcsUri);
-+    } catch (err) {
-+      console.warn('[docai] process failed:', err?.message || err);
-+    }
-+  }
-+
-+  if (!vertexClassification) {
-+    try {
-+      vertexClassification = await classifyByGcs(gcsUri, fileName || 'datasheet.pdf');
-+    } catch (err) {
-+      console.warn('[vertex] classify failed:', err?.message || err);
-+    }
-+  }
-+
-+  if (!family_slug && vertexClassification?.family_slug) {
-+    family_slug = vertexClassification.family_slug;
-+  }
-+  if (!overridesBrand && !brand && vertexClassification?.brand) {
-+    brand = vertexClassification.brand;
-+  }
-+  if (!detectedBrand && vertexClassification?.brand) {
-+    detectedBrand = vertexClassification.brand;
-+  }
-+  if (!code && vertexClassification?.code) {
-+    code = vertexClassification.code;
-+  }
-+  if (!series && vertexClassification?.series) {
-+    series = vertexClassification.series;
-+  }
-+
-   let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
-   if (!family && !FAST) {
-     try {
-      const text = await readText(gcsUri, 256*1024);
-      family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
-      // ★ 강제 보정: 제목/본문에 Signal Relay가 있으면 무조건 signal로
-      if (/subminiature\s+signal\s+relay|signal\s+relay/i.test(text)) family = 'relay_signal';
-    } catch { family = 'relay_power'; }
-   }
- 
-   const overrideBrandLog = overridesBrand ?? brand ?? '';
-   console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''} brand_effective=${effectiveBrand || ''}`);
- 
- // 목적 테이블
-   const reg = await db.query(
-     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
-     [family]
-   );
-   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
-   const qualified = table.startsWith('public.')? table : `public.${table}`;
- 
-   let blueprint = await getBlueprint(family);
- 
-+  if (!vertexExtractValues && family) {
-+    try {
-+      vertexExtractValues = await extractValuesByGcs(gcsUri, family);
-+    } catch (err) {
-+      console.warn('[vertex] extract failed:', err?.message || err);
-+    }
-+  }
-+
-   // 블루프린트 허용 키
-   let allowedKeys = Array.isArray(blueprint?.allowedKeys)
-     ? [...blueprint.allowedKeys]
-     : [];
-   let variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-     ? blueprint.ingestOptions.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-     : (Array.isArray(blueprint?.variant_keys)
-       ? blueprint.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-       : []);
-   const pnTemplate = blueprint?.ingestOptions?.pn_template || blueprint?.ingestOptions?.pnTemplate || null;
-   const requiredFields = [];
-   if (blueprint?.fields && typeof blueprint.fields === 'object') {
-     for (const [fieldKey, meta] of Object.entries(blueprint.fields)) {
-       const isRequired = meta && typeof meta === 'object' && Boolean(meta.required);
-       if (!isRequired) continue;
-       const normalized = String(fieldKey || '')
-         .trim()
-         .toLowerCase()
-         .replace(/[^a-z0-9_]/g, '');
-       if (normalized && !requiredFields.includes(normalized)) {
-         requiredFields.push(normalized);
-       }
-     }
-   }
- 
-   let colTypes;
-   const disableEnsure = /^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0');
- 
-   // -------- 공용 강제정규화 유틸 --------
- 
-   if (code && !/\d/.test(String(code))) {
-     // "AGN","TQ" 처럼 숫자 없는 시리즈는 series로 넘기고 code는 비움
-     series = code; code = null;
-   }
- 
- 
-   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
-   let previewText = '';
-   try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
-   if (!previewText || previewText.length < 1000) {
-     try {
-       const r = await extractText(gcsUri);
-       previewText = r?.text || previewText;
-     } catch {}
-   }
-+  const docAiText = typeof docAiResult?.text === 'string' ? docAiResult.text : '';
-+  const docAiTables = Array.isArray(docAiResult?.tables) ? docAiResult.tables : [];
-+  if (docAiText && docAiText.length > (previewText?.length || 0)) {
-+    previewText = docAiText;
-+  }
-   if (!effectiveBrand) {
-     try {
-       detectedBrand = await detectBrandFromText(previewText, fileName);
-     } catch (err) {
-       console.warn('[brand detect] preview failed:', err?.message || err);
-     }
-   }
-   let candidates = [];
+ // 1) DB 모듈: 로드 실패해도 서버는 떠야 함
+ let db;
+ try {
+   db = require('./db');
+ } catch (err) {
+   console.error('[BOOT] db load failed:', err?.message || err);
+   db = { query: async () => { throw new Error('DB_UNAVAILABLE'); } };
+ }
+ const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
+ const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
+ // 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
+ let __INGEST_MOD__ = null;
+ function getIngest() {
+   if (__INGEST_MOD__) return __INGEST_MOD__;
    try {
-     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
-   } catch { candidates = []; }
+diff --git a/server.js b/server.js
+index c2f68ecc9024b12aac143e65a14aaf2888ca6c5d..117cf1ab974c8171831713a5ab5ff0b682ca80f8 100644
+--- a/server.js
++++ b/server.js
+@@ -223,62 +224,91 @@ app.use((req, res, next) => {
+   res.setHeader('referrer-policy', 'strict-origin-when-cross-origin');
+   next();
+ });
+ // ---------------- Always-on Auth Router (최상단 고정) ----------------
+ // 프리뷰/개발용 간단 로그인: 어떤 값이든 username/email/id 중 하나만 있으면 JWT 발급
+ // 프런트는 이 응답의 token을 쿠키(pp_session)로 저장해서 사용합니다.
+ function issueToken(payload) {
+   const id = String(
+     payload.username || payload.email || payload.id || payload.idOrEmail || 'user'
+   );
+   return {
+     id,
+     token: jwt.sign({ uid: id, username: id }, JWT_SECRET, { expiresIn: '7d' }),
+   };
+ }
  
-   // PDF → 품번/스펙 추출
-   const brandHint = effectiveBrand || detectedBrand || null;
-   let extracted = { brand: brandHint || 'unknown', rows: [] };
-   if (!effectiveBrand || !code) {
-     try {
-       if (FAST) {
-         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
-         let raw = previewText;
-         if (!raw) {
-           try { raw = await readText(gcsUri, PREVIEW_BYTES); } catch { raw = ''; }
-         }
-         if (raw && raw.length > 1000) {
-           const fieldsJson = blueprint?.fields || {};
-           const vals = await extractFields(raw, code || '', fieldsJson);
-           const fallbackBrand = brandHint || 'unknown';
-           extracted = {
-             brand: fallbackBrand,
-             rows: [{ brand: fallbackBrand, code: code || (path.parse(fileName).name), ...(vals||{}) }],
-           };
-         } else {
-           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
-           extracted = await withTimeout(
-             extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
-             EXTRACT_HARD_CAP_MS,
-             'extract',
-           );
-         }
-       } else {
-         extracted = await withTimeout(
-           extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
-           EXTRACT_HARD_CAP_MS,
-           'extract',
-         );
-       }
-     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
+ function loginHandler(req, res) {
+   try {
+     const { id, token } = issueToken(req.body || {});
+     return res.json({ ok: true, token, user: { username: id } });
+   } catch (e) {
+     return res.status(400).json({ ok: false, error: String(e?.message || e) });
    }
+ }
  
-+  if (docAiText) {
-+    if (!extracted || typeof extracted !== 'object') extracted = {};
-+    const existing = typeof extracted.text === 'string' ? extracted.text : '';
-+    if (!existing || docAiText.length > existing.length) {
-+      extracted.text = docAiText;
-+    }
-+  }
-+  if (docAiTables.length) {
-+    if (!extracted || typeof extracted !== 'object') extracted = {};
-+    if (!Array.isArray(extracted.tables) || !extracted.tables.length) {
-+      extracted.tables = docAiTables;
-+    }
-+  }
-+  if (vertexExtractValues && typeof vertexExtractValues === 'object') {
-+    const entries = Object.entries(vertexExtractValues);
-+    if (entries.length) {
-+      if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
-+        extracted.rows = [{ ...vertexExtractValues }];
-+      } else {
-+        for (const row of extracted.rows) {
-+          if (!row || typeof row !== 'object') continue;
-+          for (const [rawKey, rawValue] of entries) {
-+            const key = String(rawKey || '').trim();
-+            if (!key) continue;
-+            if (row[key] == null || row[key] === '') {
-+              row[key] = rawValue;
-+            }
-+          }
-+        }
-+      }
-+    }
-+  }
-+  const rawJsonPayload = {};
-+  if (docAiResult && (docAiText || docAiTables.length)) rawJsonPayload.docai = docAiResult;
-+  if (vertexClassification) rawJsonPayload.vertex_classify = vertexClassification;
-+  if (vertexExtractValues && Object.keys(vertexExtractValues).length) {
-+    rawJsonPayload.vertex_extract = vertexExtractValues;
-+  }
-+  if (Object.keys(rawJsonPayload).length) {
-+    if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
-+      extracted.rows = [{}];
-+    }
-+    for (const row of extracted.rows) {
-+      if (!row || typeof row !== 'object') continue;
-+      if (row.raw_json == null) {
-+        row.raw_json = rawJsonPayload;
-+      }
-+    }
-+  }
+-const authRouter = express.Router();
+-// 헬스(선택)
+-authRouter.get('/health', (_req, res) => res.json({ ok: true, stub: true }));
+-// 로그인/로그아웃
+-authRouter.post('/login', loginHandler);
+-authRouter.post('/logout', (_req, res) => res.json({ ok: true }));
++function buildStubAuthRouter() {
++  const stub = express.Router();
++  stub.get('/health', (_req, res) => res.json({ ok: true, stub: true }));
++  stub.post('/login', loginHandler);
++  stub.post('/logout', (_req, res) => res.json({ ok: true }));
++  return stub;
++}
 +
-   if (detectedBrand && extracted && typeof extracted === 'object') {
-     const brandValue = String(extracted.brand || '').trim().toLowerCase();
-     if (!brandValue || brandValue === 'unknown') {
-       extracted.brand = detectedBrand;
-     }
-     if (Array.isArray(extracted.rows)) {
-       for (const row of extracted.rows) {
-         if (!row || typeof row !== 'object') continue;
-         const rowBrand = String(row.brand || '').trim().toLowerCase();
-         if (!rowBrand || rowBrand === 'unknown') {
-           row.brand = detectedBrand;
-         }
-       }
-     }
-   }
++let authRouter = null;
++let authRouterIsReal = false;
++try {
++  const loaded = require('./src/routes/manager');
++  const resolved = loaded && typeof loaded === 'object' && loaded.default ? loaded.default : loaded;
++  if (resolved && typeof resolved === 'function') {
++    authRouter = resolved;
++    authRouterIsReal = true;
++    console.log('[BOOT] mounted auth router from ./src/routes/manager');
++  }
++} catch (e) {
++  console.warn('[BOOT] auth router load failed:', e?.message || e);
++}
++
++if (!authRouter) {
++  authRouter = buildStubAuthRouter();
++  console.warn('[BOOT] using stub auth router');
++}
  
-   // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
-   let codes = [];
-   if (!code) {
-     const skuFromTable = pickSkuListFromTables(extracted);
-     const docText = extracted?.text || previewText || '';
-     codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint, docText);
-     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
-     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
-     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
+ // ✅ /auth/* 경로로 확정 마운트 (항상 가장 먼저 잡히게)
+ app.use('/auth', authRouter);
+ 
+-// (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
+-app.post('/login', loginHandler);
++if (authRouterIsReal) {
++  const forwardToAuth = (path) => (req, res, next) => {
++    req.url = path;
++    authRouter.handle(req, res, next);
++  };
++  app.post('/login', forwardToAuth('/login'));
++  app.post('/logout', (_req, res) => res.json({ ok: true }));
++} else {
++  // (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
++  app.post('/login', loginHandler);
++}
+ // --- AI routes mount (export 타입 자동 처리) ---
+ try {
+   const ai = require('./server.ai');
+   if (ai && typeof ai === 'object') {
+     // server.ai.js 가 express.Router()를 export 하는 형태
+     app.use('/api', ai);  // ==> 최종 경로: /api/ai/...
+     console.log('[BOOT] mounted AI routes at /api/* (router export)');
+   } else if (typeof ai === 'function') {
+     // 만약 server.ai.js 가 (app)=>{ app.post('/api/ai/resolve', ...) } 로 export 한다면
+     ai(app);
+     console.log('[BOOT] mounted AI routes via function(export)');
+   } else {
+     console.warn('[BOOT] server.ai export type not supported:', typeof ai);
+   }
+ } catch (e) {
+   console.error('[BOOT] ai mount failed', e?.message || e);
+   // 🔰 Fallback: server.ai.js 로딩 실패/누락 시에도 즉시 동작하도록 최소 라우트 제공
+   const express = require('express');
+   const fb = express.Router();
+   fb.get('/ai/ping', (_req, res) => res.json({ ok: true, fallback: true }));
+   fb.get('/ai/resolve', (req, res) => res.json({ ok: true, echo: String(req.query?.q || '') }));
+   fb.post('/ai/resolve', (req, res) => res.json({ ok: true, echo: String((req.body && req.body.q) || '') }));
+   app.use('/api', fb);
+   console.warn('[BOOT] fallback AI routes mounted at /api/*');
+ }

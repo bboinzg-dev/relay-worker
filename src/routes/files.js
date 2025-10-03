@@ -88,7 +88,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
         gcs_uri: payload.gcsUri,
       };
       const body = Buffer.from(JSON.stringify(queuePayload)).toString('base64');
-      const audience = process.env.WORKER_AUDIENCE || workerUrl;
+      const audience = process.env.WORKER_AUDIENCE || new URL(workerUrl).origin;
       const httpRequest = {
         url: workerUrl,
         httpMethod: 'POST',

@@ -20,7 +20,9 @@ const Signup = z.object({
   email: z.string().email(),
   phone: z.string().optional(),
   password: z.string().min(6),
+  // 프론트에서 오는 키가 혼재할 수 있으니 다 받되 boolean으로 정규화
   is_seller_requested: z.boolean().optional(),
+  seller_requested: z.boolean().optional(),
 });
 
 router.get('/health', (_req, res) => {
@@ -31,6 +33,7 @@ router.post('/signup', express.json({ limit: '2mb' }), async (req, res) => {
   let client;
   try {
     const body = Signup.parse(req.body || {});
+    const wantSeller = !!(body.is_seller_requested ?? body.seller_requested);
 
     client = await pool.connect();
     await client.query('BEGIN');
@@ -47,10 +50,11 @@ router.post('/signup', express.json({ limit: '2mb' }), async (req, res) => {
 
     const hash = await argon2.hash(body.password, { type: argon2.argon2id });
     const userInsert = await client.query(
-      `INSERT INTO public.users (username, email, phone, password_hash, password_algo, is_seller, is_seller_requested, seller_status, status)
-       VALUES ($1, $2, $3, $4, 'argon2id', false, $5, 'none', 'active')
-       RETURNING id, username, email, is_seller`,
-      [body.username, body.email, body.phone || null, hash, !!body.is_seller_requested]
+      `INSERT INTO public.users
+         (username, email, phone, password_hash, password_algo, is_seller, seller_status, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, 'argon2id', false, $5, 'active', now(), now())
+       RETURNING id, username, email, is_seller, seller_status`,
+      [body.username, body.email.toLowerCase(), body.phone || null, hash, wantSeller ? 'pending' : 'none']
     );
 
     const user = userInsert.rows[0];
@@ -58,8 +62,8 @@ router.post('/signup', express.json({ limit: '2mb' }), async (req, res) => {
     await client.query(
       `INSERT INTO public.user_profiles (user_id, role)
        VALUES ($1, $2)
-       ON CONFLICT (user_id) DO NOTHING`,
-      [user.id, body.is_seller_requested ? 'seller_candidate' : null]
+       ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [user.id, wantSeller ? 'seller_candidate' : null]
     );
 
     await client.query('COMMIT');

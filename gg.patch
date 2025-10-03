@@ -1,122 +1,102 @@
-diff --git a/server.js b/server.js
-index b620778fbddac570590bf8779481031a99fe40db..0eb27e19c130c0639c0426adcf034269aed4aaa0 100644
---- a/server.js
-+++ b/server.js
-@@ -758,51 +758,51 @@ async function markSucceeded({ runId, taskName, retryCount, result, gcsUri, dura
-       `UPDATE public.ingest_run_logs
-           SET finished_at = now(),
-               duration_ms = $2,
-               status = 'SUCCEEDED',
-               task_name = $3,
-               retry_count = $4,
-               final_table = $5,
-               final_family = $6,
-               final_brand = $7,
-               final_code  = $8,
-               final_datasheet = $9,
-               error_message = NULL
-         WHERE id = $1`,
-       [ runId, ms, taskName || null, safeRetryCount,
-         result?.specs_table || null,
-         family,
-         brand,
-         code,
-         datasheet ]
+diff --git a/src/routes/manager.js b/src/routes/manager.js
+index 31ce6255a6fe73145b19c9f11d2ec53c1df5ff94..46b83ae83be3933a6ae922cd189d10a69ac48e2d 100644
+--- a/src/routes/manager.js
++++ b/src/routes/manager.js
+@@ -1,87 +1,91 @@
+ 'use strict';
+ 
+ const express = require('express');
+ const { z } = require('zod');
+ const argon2 = require('argon2');
+ const jwt = require('jsonwebtoken');
+ const { Pool } = require('pg');
+ 
+ const router = express.Router();
+ 
+ const pool = new Pool({
+   connectionString: process.env.DATABASE_URL,
+   ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : undefined,
+ });
+ 
+ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+ 
+ const Signup = z.object({
+   username: z.string().min(3).max(32),
+   email: z.string().email(),
+   phone: z.string().optional(),
+   password: z.string().min(6),
++  // 프론트에서 오는 키가 혼재할 수 있으니 다 받되 boolean으로 정규화
+   is_seller_requested: z.boolean().optional(),
++  seller_requested: z.boolean().optional(),
+ });
+ 
+ router.get('/health', (_req, res) => {
+   res.json({ ok: true, ready: true });
+ });
+ 
+ router.post('/signup', express.json({ limit: '2mb' }), async (req, res) => {
+   let client;
+   try {
+     const body = Signup.parse(req.body || {});
++    const wantSeller = !!(body.is_seller_requested ?? body.seller_requested);
+ 
+     client = await pool.connect();
+     await client.query('BEGIN');
+ 
+     const duplicate = await client.query(
+       `SELECT 1 FROM public.users WHERE username = $1 OR LOWER(email) = LOWER($2)`,
+       [body.username, body.email.toLowerCase()]
      );
+ 
+     if (duplicate.rowCount) {
+       await client.query('ROLLBACK');
+       return res.status(409).json({ ok: false, error: 'DUPLICATE_USERNAME_OR_EMAIL' });
+     }
+ 
+     const hash = await argon2.hash(body.password, { type: argon2.argon2id });
+     const userInsert = await client.query(
+-      `INSERT INTO public.users (username, email, phone, password_hash, password_algo, is_seller, is_seller_requested, seller_status, status)
+-       VALUES ($1, $2, $3, $4, 'argon2id', false, $5, 'none', 'active')
+-       RETURNING id, username, email, is_seller`,
+-      [body.username, body.email, body.phone || null, hash, !!body.is_seller_requested]
++      `INSERT INTO public.users
++         (username, email, phone, password_hash, password_algo, is_seller, seller_status, status, created_at, updated_at)
++       VALUES ($1, $2, $3, $4, 'argon2id', false, $5, 'active', now(), now())
++       RETURNING id, username, email, is_seller, seller_status`,
++      [body.username, body.email.toLowerCase(), body.phone || null, hash, wantSeller ? 'pending' : 'none']
+     );
+ 
+     const user = userInsert.rows[0];
+ 
+     await client.query(
+       `INSERT INTO public.user_profiles (user_id, role)
+        VALUES ($1, $2)
+-       ON CONFLICT (user_id) DO NOTHING`,
+-      [user.id, body.is_seller_requested ? 'seller_candidate' : null]
++       ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role`,
++      [user.id, wantSeller ? 'seller_candidate' : null]
+     );
+ 
+     await client.query('COMMIT');
+ 
+     const payload = { uid: String(user.id), username: user.username, isSeller: !!user.is_seller };
+     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+ 
+     return res.json({ ok: true, user, token });
    } catch (err) {
-     console.error('[ingest markSucceeded]', err?.message || err);
-   }
- }
- 
--app.post('/api/worker/ingest', requireSession, async (req, res) => {
-+async function handleWorkerIngest(req, res) {
-   const rawBody = (req.body && typeof req.body === 'object') ? req.body : {};
-   const payload = rawBody.fromTasks && rawBody.payload && typeof rawBody.payload === 'object'
-     ? rawBody.payload
-     : rawBody;
- 
-   const phaseInput = String(payload.phase || rawBody.phase || 'start').toLowerCase();
-   const knownPhases = new Set(['start', 'process', 'persist']);
-   const phase = knownPhases.has(phaseInput) ? phaseInput : 'start';
-   const runId = pickFirstString(payload.runId, payload.run_id, rawBody.runId, rawBody.run_id) || generateRunId();
-   const gcsUri = pickFirstString(
-     payload.gcsUri,
-     payload.gcs_uri,
-     payload.gsUri,
-     payload.gcsPdfUri,
-     payload.gcs_pdf_uri,
-     payload.uri,
-     payload.url,
-     rawBody.gcsUri,
-     rawBody.gcs_uri,
-     rawBody.gsUri,
-     rawBody.gcsPdfUri,
-     rawBody.uri,
-     rawBody.url
-   );
- 
-diff --git a/server.js b/server.js
-index b620778fbddac570590bf8779481031a99fe40db..0eb27e19c130c0639c0426adcf034269aed4aaa0 100644
---- a/server.js
-+++ b/server.js
-@@ -948,51 +948,59 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
-         await markSucceeded({
-           ...baseContext,
-           result: out,
-           gcsUri,
-           durationMs: out?.ms ?? (Date.now() - startedAt),
-           meta: payload,
-         });
-         return;
-       }
- 
-       console.warn('[ingest] unknown phase', { phase, runId, taskName });
-       await markFailed({ ...baseContext, error: 'unknown_phase', durationMs: Date.now() - startedAt });
-     } catch (err) {
-       console.error('[ingest async error]', err?.message || err);
+     if (client) {
        try {
-         await markFailed({
-           ...baseContext,
-           error: err?.message || err,
-           durationMs: Date.now() - startedAt,
-         });
-       } catch (innerErr) {
-         console.error('[ingest async error][markFailed]', innerErr?.message || innerErr);
+         await client.query('ROLLBACK');
+       } catch (rollbackErr) {
+         console.error('[auth/signup] rollback failed', rollbackErr);
        }
      }
-   });
--});
-+}
-+
-+app.post([
-+  '/api/worker/ingest',
-+  '/worker/ingest',
-+],
-+bodyParser.json({ limit: '25mb' }),
-+requireSession,
-+handleWorkerIngest);
- 
- async function seedManufacturerAliases() {
-   try {
-     const { rows } = await db.query(
-       `SELECT lower(column_name) AS column
-          FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = 'manufacturer_alias'`
-     );
-     const available = new Set(rows.map((r) => r.column));
-     if (!available.has('brand') || !available.has('alias')) return;
- 
-     const seeds = [
-       { brand: 'Panasonic', alias: 'Matsushita' },
-       { brand: 'OMRON', alias: 'Omron Corporation' },
-       { brand: 'TE Connectivity', alias: 'Tyco Electronics' },
-       { brand: 'Finder', alias: 'Finder Relays' },
-       { brand: 'Schneider Electric', alias: 'Square D' },
-     ];
- 
-     for (const { brand, alias } of seeds) {
-       const brandNorm = brand.toLowerCase();
-       await db.query(
-         `INSERT INTO public.manufacturer_alias (brand, alias, brand_norm)
-          VALUES ($1,$2,$3)
-          ON CONFLICT DO NOTHING`,
+     console.error('[auth/signup] error', err);
+     const isValidationError = err instanceof z.ZodError;
+     const message = isValidationError
+       ? err.issues?.[0]?.message || 'INVALID_REQUEST'
+       : err?.message || String(err);
+     const status = isValidationError ? 400 : 500;
+     return res.status(status).json({ ok: false, error: message });
+   } finally {
+     if (client) client.release();

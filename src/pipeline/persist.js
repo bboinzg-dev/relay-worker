@@ -1,6 +1,6 @@
 'use strict';
 
-const { pool } = require('../utils/db');
+const { pool } = require('../../db');
 const { getColumnsOf } = require('./ensure-spec-columns');
 
 const META_KEYS = new Set([

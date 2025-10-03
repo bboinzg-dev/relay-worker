@@ -1,7 +1,7 @@
 'use strict';
 const express = require('express');
 const router = express.Router();
-const db = require('../utils/db');
+const db = require('../../db');
 
 // 안전한 테이블명 정규식
 const isSafeIdent = (s) => /^[a-z0-9_]+$/i.test(s);

@@ -1,6 +1,6 @@
 'use strict';
 
-const { pool } = require('./db');
+const { pool } = require('../../db');
 
 const CACHE = new Map();
 const TTL = Number(process.env.BLUEPRINT_CACHE_TTL_MS || 60_000);

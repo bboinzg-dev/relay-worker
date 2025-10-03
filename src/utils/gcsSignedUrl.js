@@ -1,5 +1,5 @@
 const { Storage } = require('@google-cloud/storage');
-const db = require('./db');
+const db = require('../../db');
 const { TTLCache } = require('./memcache');
 
 const storage = new Storage();

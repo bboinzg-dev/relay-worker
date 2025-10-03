@@ -2,7 +2,7 @@
 console.log(`[PATH] entered:${__filename}`);
 const { toJsonSchema, callLLM } = require('../llm/structured');
 const { safeJsonParse } = require('../utils/safe-json');
-const { pool } = require('../utils/db'); // 기존 db 유틸
+const { pool } = require('../../db'); // 공유 PG 풀
 const { getBlueprint } = require('../utils/blueprint'); // DB에서 fields_json/specs_table 읽는 함수(앞서 만들어둔 버전)
 
 function norm(s){ return String(s||'').toLowerCase().replace(/\s+/g,''); } // 접미 보존!

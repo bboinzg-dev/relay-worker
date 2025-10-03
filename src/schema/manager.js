@@ -1,4 +1,4 @@
-const db = require('../utils/db');
+const db = require('../../db');
 
 function mapTypeToPg(t){
   const s = String(t||'text').toLowerCase();

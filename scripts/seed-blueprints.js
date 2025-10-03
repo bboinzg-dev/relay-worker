@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-const { getPool } = require('../lib/db');
+const { getPool } = require('../db');
 // 기존에 쓰던 seed JSON이 있다면 이 경로로 옮겨두세요.
 const seeds = require('../src/boot/blueprint.seeds.json');
 

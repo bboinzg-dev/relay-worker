@@ -1,4 +1,4 @@
-const db = require('./db');
+const db = require('../../db');
 const { enqueueNotify } = require('./tasks');
 
 async function ensureEventsTable() {

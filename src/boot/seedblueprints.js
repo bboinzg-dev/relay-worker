@@ -1,6 +1,6 @@
 // src/boot/seedBlueprints.js
 'use strict';
-const db = require('../utils/db');
+const db = require('../../db');
 const seeds = require('./blueprint.seeds.json'); // 최소 기본 몇 종만
 
 async function seedIfEmpty() {

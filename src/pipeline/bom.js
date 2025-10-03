@@ -1,4 +1,4 @@
-const db = require('../utils/db');
+const db = require('../../db');
 const { updateRowEmbedding } = (()=>{ try { return require('./embedding'); } catch { return { updateRowEmbedding: async()=>false }; } })();
 const { notify, findFamilyForBrandCode } = (()=>{ try { return require('../utils/notify'); } catch { return { notify: async()=>({}), findFamilyForBrandCode: async()=>null }; } })();
 

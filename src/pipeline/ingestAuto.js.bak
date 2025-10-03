@@ -14,7 +14,7 @@ const { promisify } = require('node:util');
 const { execFile } = require('node:child_process');
 const execFileP = promisify(execFile);
 
-const db = require('../utils/db');
+const db = require('../../db');
 const {
   storage,
   canonicalDatasheetPath,

@@ -38,13 +38,10 @@ const jwt = require('jsonwebtoken');
 // 1) DB 모듈: 로드 실패해도 서버는 떠야 함
 let db;
 try {
-  db = require('./db');                    // 루트 경로
-} catch (e1) {
-  try { db = require('./src/utils/db'); }  // 예전 경로 호환
-  catch (e2) {
-    console.error('[BOOT] db load failed:', e2?.message || e1?.message);
-    db = { query: async () => { throw new Error('DB_UNAVAILABLE'); } };
-  }
+  db = require('./db');
+} catch (err) {
+  console.error('[BOOT] db load failed:', err?.message || err);
+  db = { query: async () => { throw new Error('DB_UNAVAILABLE'); } };
 }
 const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
 const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');

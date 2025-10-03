@@ -1,4 +1,4 @@
-const db = require('./db');
+const db = require('../../db');
 
 async function tableExists(schema, name) {
   const r = await db.query(`SELECT to_regclass($1) as reg`, [`${schema}.${name}`]);

@@ -1,7 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const db = require('./src/utils/db');
+const db = require('./db');
 const { parseActor, hasRole } = require('./src/utils/auth');
 
 const app = express();

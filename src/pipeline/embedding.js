@@ -1,4 +1,4 @@
-const db = require('../utils/db');
+const db = require('../../db');
 const { embedText } = require('../utils/embed');
 const { specTextSignature } = require('../utils/textsig');
 

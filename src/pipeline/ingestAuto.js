@@ -7,7 +7,7 @@ const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const execFileP = promisify(execFile);
 
-const db = require('../utils/db');
+const db = require('../../db');
 const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
 const { extractText } = require('../utils/extract');
 const { getBlueprint } = require('../utils/blueprint');

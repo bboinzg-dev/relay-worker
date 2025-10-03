@@ -17,7 +17,7 @@ try { DocumentProcessorServiceClient = require('@google-cloud/documentai').v1.Do
 try { VertexAI = require('@google-cloud/vertexai').VertexAI; } catch {}
 try { pdfParse = require('pdf-parse'); } catch {}
 
-const db = require('../utils/db');
+const db = require('../../db');
 const { parseGcsUri } = require('../utils/gcs');
 const { safeJsonParse } = require('../utils/safe-json');
 

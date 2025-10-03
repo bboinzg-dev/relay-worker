@@ -1,7 +1,7 @@
 // relay-worker/src/utils/brandcode.js
 'use strict';
 
-const db = require('./db');
+const db = require('../../db');
 const { tokenize, keywordWindows } = require('./regex');
 const { callModelJson } = require('./vertex');
 

@@ -1,4 +1,4 @@
-const db = require('../utils/db');
+const db = require('../../db');
 
 async function markInvoicePaid(invoice_id, { payment_id=null } = {}){
   const client = await db.pool.connect();

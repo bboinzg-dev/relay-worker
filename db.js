@@ -7,6 +7,23 @@ const { URL } = require('url');
 
 let _pool;
 
+function attachVerboseQueryLogging(pool) {
+  if (process.env.VERBOSE_TRACE !== '1') return pool;
+
+  const origQuery = pool.query.bind(pool);
+  pool.query = async (text, params) => {
+    try {
+      const caller = new Error().stack.split('\n')[2]?.trim();
+      const head = String(text).split('\n')[0].slice(0, 140);
+      console.log(`[SQL] ${head} :: caller=${caller}`);
+    } catch (_) {
+      // best-effort logging only
+    }
+    return origQuery(text, params);
+  };
+  return pool;
+}
+
 /** 우선순위로 연결 문자열 선택 */
 function resolveConnectionString() {
   const c =
@@ -97,7 +114,7 @@ function buildPool() {
     console.error('[db] unexpected error on idle client', err);
   });
 
-  return pool;
+  return attachVerboseQueryLogging(pool);
 }
 
 function getPool() {
@@ -150,4 +167,27 @@ async function ping(timeoutMs = 800) {
   });
 }
 
-module.exports = { getPool, query, withClient, withTransaction, ping };
+const dbProxy = new Proxy(
+  {},
+  {
+    get(_target, prop) {
+      const pool = getPool();
+      const value = pool[prop];
+      if (typeof value === 'function') {
+        return value.bind(pool);
+      }
+      return value;
+    },
+  },
+);
+
+const exportsObject = { getPool, query, withClient, withTransaction, ping, db: dbProxy };
+
+Object.defineProperty(exportsObject, 'pool', {
+  enumerable: true,
+  get() {
+    return getPool();
+  },
+});
+
+module.exports = exportsObject;

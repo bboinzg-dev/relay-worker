@@ -1,48 +1,34 @@
-diff --git a/src/routes/vision.upload.js b/src/routes/vision.upload.js
-index e30b20b6f38b83d2160b22e3a36c7d67b7a885f7..d6a117dc9749c9ce649a4003674af58914c845c5 100644
---- a/src/routes/vision.upload.js
-+++ b/src/routes/vision.upload.js
-@@ -1,41 +1,41 @@
+diff --git a/src/utils/schema.js b/src/utils/schema.js
+index 888d6a3b21172290f72bb1d81957f0b6a0dfbfb9..b6fccd2abdac08470edbcc99c8d19926253ec97e 100644
+--- a/src/utils/schema.js
++++ b/src/utils/schema.js
+@@ -1,28 +1,28 @@
  'use strict';
  
- const express = require('express');
- const multer = require('multer');
- const crypto = require('crypto');
- const { Storage } = require('@google-cloud/storage');
- const { GoogleAuth } = require('google-auth-library');
- const { safeJsonParse } = require('../utils/safe-json');
+-const db = require('./db');
++const db = require('../../db');
  
- const router = express.Router();
- 
- // ==== ENV ====
--const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || 'partsplan';
-+const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || 'partsplan-473810';
- const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
- const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash';
--const BUCKET     = process.env.GCS_BUCKET || 'partsplan-docai-us';
-+const BUCKET     = process.env.GCS_BUCKET || 'partsplan-473810-docai-us';
- const MAX_PHOTO  = +(process.env.MAX_PHOTO_SIZE || 12 * 1024 * 1024);
- const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
- const API_KEY    = process.env.INGEST_API_KEY || '';
- 
- const storage = new Storage();
- const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_PHOTO } });
- 
- // ---------- CORS ----------
- router.use('/api/vision/guess', (req, res, next) => {
-   res.setHeader('Access-Control-Allow-Origin', ALLOW_ORIGIN);
-   res.setHeader('Vary', 'Origin');
-   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
-   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-   if (req.method === 'OPTIONS') return res.status(204).end();
-   next();
- });
- 
- function ext(name) {
-   const s = String(name || '');
-   const i = s.lastIndexOf('.');
-   if (i < 0) return '';
-   const e = s.slice(i + 1).toLowerCase();
-   return e && e.length <= 5 ? '.' + e : '';
+ function normalizeIdentifier(name) {
+   return String(name || '')
+     .trim()
+     .toLowerCase()
+     .replace(/[^a-z0-9_]/g, '');
  }
  
+ function parseTableName(tableName) {
+   const safe = String(tableName || '')
+     .trim()
+     .toLowerCase()
+     .replace(/[^a-z0-9_.]/g, '');
+   if (!safe) throw new Error('invalid table name');
+ 
+   let schema = 'public';
+   let table = safe;
+   if (safe.includes('.')) {
+     const parts = safe.split('.').filter(Boolean);
+     if (!parts.length) throw new Error('invalid table name');
+     if (parts.length === 1) {
+       table = parts[0];
+     } else {
+       schema = parts[0];
+       table = parts[parts.length - 1];

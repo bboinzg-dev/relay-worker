@@ -1,4 +1,4 @@
-const db = require('../utils/db');
+const db = require('../../db');
 
 function daysUntil(due) {
   if (!due) return null;

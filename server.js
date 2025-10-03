@@ -162,6 +162,36 @@ app.get('/_whoami', (_req, res) => {
   }
 });
 
+앱. 게시 ([ '/api/worker/ingest' , '/worker/ingest' ], async (req, res) => {
+  노력하다 {
+    const body = req.body || {};
+    const 페이로드 = 본문. 페이로드 || 본문;
+
+    const gcsUri = 페이로드 .gcsUri || 페이로드 .gcs_uri ;
+    if (!gcsUri) return res. status ( 400 ) .json ({ ok : false , error : 'gcsUri required' });
+
+    const { runAutoIngest } = getIngest ();
+    const 결과 = runAutoIngest를 기다립니다 ({
+ 
+      gcsUri,
+      family_slug : 페이로드.family_slug || 페이로드 .family_hint || null ,
+      브랜드 : 페이로드. 브랜드 || null ,
+      코드 : 페이로드. 코드 || null ,
+      시리즈 : 페이로드. 시리즈 || null ,
+      display_name : 페이로드. display_name || null ,
+      오버라이드 : { 브랜드 : 페이로드. 브랜드 || null , 시리즈 : 페이로드. 시리즈 || null }
+    });
+
+    res. status ( 200 ) .json ({ ok : true , result })
+ 를 반환합니다 .
+  } 캐치 (e) {
+    콘솔 . 오류 (e);
+    res.status ( 400 ) .json ({ ok : false , error : String (e? .message ||e)})를
+ 반환 합니다 .
+  }
+});
+
+
 app.post(['/api/worker/ingest', '/worker/ingest'], async (req, res) => {
   try {
     const body = req.body || {};

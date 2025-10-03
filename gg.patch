@@ -1,160 +1,122 @@
 diff --git a/server.js b/server.js
-index c2f68ecc9024b12aac143e65a14aaf2888ca6c5d..117cf1ab974c8171831713a5ab5ff0b682ca80f8 100644
+index b620778fbddac570590bf8779481031a99fe40db..0eb27e19c130c0639c0426adcf034269aed4aaa0 100644
 --- a/server.js
 +++ b/server.js
-@@ -3,50 +3,51 @@
- 
- // ───────── 외부콜 차단 플래그 (배포 시 EXT_CALLS_OFF=1 이면 부팅 중 외부 HTTPS 호출 스킵)
- const EXT_CALLS_OFF = process.env.EXT_CALLS_OFF === '1';
- 
- process.on('uncaughtException', (e) => {
-   console.error('[FATAL][uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));
-   process.exit(1);
- });
- process.on('unhandledRejection', (e) => {
-   console.error('[FATAL][unhandledRejection]', e);
-   process.exit(1);
- });
- 
- // 필수 env 스모크 로그(민감값 제외)
- (() => {
-   const pick = (k) => (process.env[k] || '').toString();
-   console.log('[BOOT env check]', {
-     GCP_PROJECT_ID: !!pick('GCP_PROJECT_ID'),
-     VERTEX_LOCATION: pick('VERTEX_LOCATION'),
-     DOCAI_PROCESSOR_ID: !!pick('DOCAI_PROCESSOR_ID'),
-     GCS_BUCKET: pick('GCS_BUCKET'),
-     QUEUE_NAME: pick('QUEUE_NAME'),
-     TASKS_LOCATION: pick('TASKS_LOCATION'),
-     GEMINI_MODEL_CLASSIFY: pick('GEMINI_MODEL_CLASSIFY'),
-     GEMINI_MODEL_EXTRACT: pick('GEMINI_MODEL_EXTRACT'),
-+    JWT_SECRET: !!pick('JWT_SECRET'),
-   });
- })();
- 
- const express = require('express');
- const cors = require('cors');
- const bodyParser = require('body-parser');
- const multer = require('multer');
- const crypto = require('crypto');
- const jwt = require('jsonwebtoken');
- 
- // 1) DB 모듈: 로드 실패해도 서버는 떠야 함
- let db;
- try {
-   db = require('./db');
- } catch (err) {
-   console.error('[BOOT] db load failed:', err?.message || err);
-   db = { query: async () => { throw new Error('DB_UNAVAILABLE'); } };
+@@ -758,51 +758,51 @@ async function markSucceeded({ runId, taskName, retryCount, result, gcsUri, dura
+       `UPDATE public.ingest_run_logs
+           SET finished_at = now(),
+               duration_ms = $2,
+               status = 'SUCCEEDED',
+               task_name = $3,
+               retry_count = $4,
+               final_table = $5,
+               final_family = $6,
+               final_brand = $7,
+               final_code  = $8,
+               final_datasheet = $9,
+               error_message = NULL
+         WHERE id = $1`,
+       [ runId, ms, taskName || null, safeRetryCount,
+         result?.specs_table || null,
+         family,
+         brand,
+         code,
+         datasheet ]
+     );
+   } catch (err) {
+     console.error('[ingest markSucceeded]', err?.message || err);
+   }
  }
- const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
- const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
- // 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
- let __INGEST_MOD__ = null;
- function getIngest() {
-   if (__INGEST_MOD__) return __INGEST_MOD__;
-   try {
-diff --git a/server.js b/server.js
-index c2f68ecc9024b12aac143e65a14aaf2888ca6c5d..117cf1ab974c8171831713a5ab5ff0b682ca80f8 100644
---- a/server.js
-+++ b/server.js
-@@ -223,62 +224,91 @@ app.use((req, res, next) => {
-   res.setHeader('referrer-policy', 'strict-origin-when-cross-origin');
-   next();
- });
- // ---------------- Always-on Auth Router (최상단 고정) ----------------
- // 프리뷰/개발용 간단 로그인: 어떤 값이든 username/email/id 중 하나만 있으면 JWT 발급
- // 프런트는 이 응답의 token을 쿠키(pp_session)로 저장해서 사용합니다.
- function issueToken(payload) {
-   const id = String(
-     payload.username || payload.email || payload.id || payload.idOrEmail || 'user'
+ 
+-app.post('/api/worker/ingest', requireSession, async (req, res) => {
++async function handleWorkerIngest(req, res) {
+   const rawBody = (req.body && typeof req.body === 'object') ? req.body : {};
+   const payload = rawBody.fromTasks && rawBody.payload && typeof rawBody.payload === 'object'
+     ? rawBody.payload
+     : rawBody;
+ 
+   const phaseInput = String(payload.phase || rawBody.phase || 'start').toLowerCase();
+   const knownPhases = new Set(['start', 'process', 'persist']);
+   const phase = knownPhases.has(phaseInput) ? phaseInput : 'start';
+   const runId = pickFirstString(payload.runId, payload.run_id, rawBody.runId, rawBody.run_id) || generateRunId();
+   const gcsUri = pickFirstString(
+     payload.gcsUri,
+     payload.gcs_uri,
+     payload.gsUri,
+     payload.gcsPdfUri,
+     payload.gcs_pdf_uri,
+     payload.uri,
+     payload.url,
+     rawBody.gcsUri,
+     rawBody.gcs_uri,
+     rawBody.gsUri,
+     rawBody.gcsPdfUri,
+     rawBody.uri,
+     rawBody.url
    );
-   return {
-     id,
-     token: jwt.sign({ uid: id, username: id }, JWT_SECRET, { expiresIn: '7d' }),
-   };
- }
  
- function loginHandler(req, res) {
+diff --git a/server.js b/server.js
+index b620778fbddac570590bf8779481031a99fe40db..0eb27e19c130c0639c0426adcf034269aed4aaa0 100644
+--- a/server.js
++++ b/server.js
+@@ -948,51 +948,59 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
+         await markSucceeded({
+           ...baseContext,
+           result: out,
+           gcsUri,
+           durationMs: out?.ms ?? (Date.now() - startedAt),
+           meta: payload,
+         });
+         return;
+       }
+ 
+       console.warn('[ingest] unknown phase', { phase, runId, taskName });
+       await markFailed({ ...baseContext, error: 'unknown_phase', durationMs: Date.now() - startedAt });
+     } catch (err) {
+       console.error('[ingest async error]', err?.message || err);
+       try {
+         await markFailed({
+           ...baseContext,
+           error: err?.message || err,
+           durationMs: Date.now() - startedAt,
+         });
+       } catch (innerErr) {
+         console.error('[ingest async error][markFailed]', innerErr?.message || innerErr);
+       }
+     }
+   });
+-});
++}
++
++app.post([
++  '/api/worker/ingest',
++  '/worker/ingest',
++],
++bodyParser.json({ limit: '25mb' }),
++requireSession,
++handleWorkerIngest);
+ 
+ async function seedManufacturerAliases() {
    try {
-     const { id, token } = issueToken(req.body || {});
-     return res.json({ ok: true, token, user: { username: id } });
-   } catch (e) {
-     return res.status(400).json({ ok: false, error: String(e?.message || e) });
-   }
- }
+     const { rows } = await db.query(
+       `SELECT lower(column_name) AS column
+          FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'manufacturer_alias'`
+     );
+     const available = new Set(rows.map((r) => r.column));
+     if (!available.has('brand') || !available.has('alias')) return;
  
--const authRouter = express.Router();
--// 헬스(선택)
--authRouter.get('/health', (_req, res) => res.json({ ok: true, stub: true }));
--// 로그인/로그아웃
--authRouter.post('/login', loginHandler);
--authRouter.post('/logout', (_req, res) => res.json({ ok: true }));
-+function buildStubAuthRouter() {
-+  const stub = express.Router();
-+  stub.get('/health', (_req, res) => res.json({ ok: true, stub: true }));
-+  stub.post('/login', loginHandler);
-+  stub.post('/logout', (_req, res) => res.json({ ok: true }));
-+  return stub;
-+}
-+
-+let authRouter = null;
-+let authRouterIsReal = false;
-+try {
-+  const loaded = require('./src/routes/manager');
-+  const resolved = loaded && typeof loaded === 'object' && loaded.default ? loaded.default : loaded;
-+  if (resolved && typeof resolved === 'function') {
-+    authRouter = resolved;
-+    authRouterIsReal = true;
-+    console.log('[BOOT] mounted auth router from ./src/routes/manager');
-+  }
-+} catch (e) {
-+  console.warn('[BOOT] auth router load failed:', e?.message || e);
-+}
-+
-+if (!authRouter) {
-+  authRouter = buildStubAuthRouter();
-+  console.warn('[BOOT] using stub auth router');
-+}
+     const seeds = [
+       { brand: 'Panasonic', alias: 'Matsushita' },
+       { brand: 'OMRON', alias: 'Omron Corporation' },
+       { brand: 'TE Connectivity', alias: 'Tyco Electronics' },
+       { brand: 'Finder', alias: 'Finder Relays' },
+       { brand: 'Schneider Electric', alias: 'Square D' },
+     ];
  
- // ✅ /auth/* 경로로 확정 마운트 (항상 가장 먼저 잡히게)
- app.use('/auth', authRouter);
- 
--// (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
--app.post('/login', loginHandler);
-+if (authRouterIsReal) {
-+  const forwardToAuth = (path) => (req, res, next) => {
-+    req.url = path;
-+    authRouter.handle(req, res, next);
-+  };
-+  app.post('/login', forwardToAuth('/login'));
-+  app.post('/logout', (_req, res) => res.json({ ok: true }));
-+} else {
-+  // (구버전 호환) /login 으로 들어오면 같은 핸들러 사용
-+  app.post('/login', loginHandler);
-+}
- // --- AI routes mount (export 타입 자동 처리) ---
- try {
-   const ai = require('./server.ai');
-   if (ai && typeof ai === 'object') {
-     // server.ai.js 가 express.Router()를 export 하는 형태
-     app.use('/api', ai);  // ==> 최종 경로: /api/ai/...
-     console.log('[BOOT] mounted AI routes at /api/* (router export)');
-   } else if (typeof ai === 'function') {
-     // 만약 server.ai.js 가 (app)=>{ app.post('/api/ai/resolve', ...) } 로 export 한다면
-     ai(app);
-     console.log('[BOOT] mounted AI routes via function(export)');
-   } else {
-     console.warn('[BOOT] server.ai export type not supported:', typeof ai);
-   }
- } catch (e) {
-   console.error('[BOOT] ai mount failed', e?.message || e);
-   // 🔰 Fallback: server.ai.js 로딩 실패/누락 시에도 즉시 동작하도록 최소 라우트 제공
-   const express = require('express');
-   const fb = express.Router();
-   fb.get('/ai/ping', (_req, res) => res.json({ ok: true, fallback: true }));
-   fb.get('/ai/resolve', (req, res) => res.json({ ok: true, echo: String(req.query?.q || '') }));
-   fb.post('/ai/resolve', (req, res) => res.json({ ok: true, echo: String((req.body && req.body.q) || '') }));
-   app.use('/api', fb);
-   console.warn('[BOOT] fallback AI routes mounted at /api/*');
- }
+     for (const { brand, alias } of seeds) {
+       const brandNorm = brand.toLowerCase();
+       await db.query(
+         `INSERT INTO public.manufacturer_alias (brand, alias, brand_norm)
+          VALUES ($1,$2,$3)
+          ON CONFLICT DO NOTHING`,

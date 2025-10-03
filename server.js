@@ -780,7 +780,7 @@ async function markSucceeded({ runId, taskName, retryCount, result, gcsUri, dura
   }
 }
 
-app.post('/api/worker/ingest', requireSession, async (req, res) => {
+async function handleWorkerIngest(req, res) {
   const rawBody = (req.body && typeof req.body === 'object') ? req.body : {};
   const payload = rawBody.fromTasks && rawBody.payload && typeof rawBody.payload === 'object'
     ? rawBody.payload
@@ -970,7 +970,15 @@ app.post('/api/worker/ingest', requireSession, async (req, res) => {
       }
     }
   });
-});
+}
+
+app.post([
+  '/api/worker/ingest',
+  '/worker/ingest',
+],
+bodyParser.json({ limit: '25mb' }),
+requireSession,
+handleWorkerIngest);
 
 async function seedManufacturerAliases() {
   try {

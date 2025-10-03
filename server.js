@@ -163,7 +163,7 @@ app.get('/_whoami', (_req, res) => {
   }
 });
 
-app.post(['/api/worker/ingest', '/worker/ingest'], async (req, res) => {
+app.post(['/api/worker/ingest', '/worker/ingest'], bodyParser.json({ limit: '25mb' }), async (req, res) => {
   try {
     const body = req.body || {};
     const payload = body.payload || body;

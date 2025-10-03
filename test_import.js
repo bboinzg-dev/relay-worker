@@ -1,3 +1,5 @@
-const { batchProcess } = require('./docai_client');
-const { extractRelayFields } = require('./docai_parse');
+'use strict';
+
+const { batchProcess, extractRelayFields } = require('./src/utils/docai');
+
 console.log('OK:', typeof batchProcess, typeof extractRelayFields);

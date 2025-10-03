@@ -3,6 +3,42 @@ const express = require('express');
 const router = express.Router();
 const db = require('../../db');
 
+const GCS_BUCKET = process.env.GCS_BUCKET || '';
+
+function sanitizeId(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function applyFallbackUrls(part, familySlug = null) {
+  if (!part || !GCS_BUCKET) return part;
+
+  const safeBrand = sanitizeId(part.brand || part.brand_norm);
+  const safeCode = sanitizeId(part.code || part.code_norm);
+  if (!safeBrand || !safeCode) return part;
+
+  const safeFamily = sanitizeId(familySlug || part.family_slug || '');
+  const base = `https://storage.googleapis.com/${GCS_BUCKET}`;
+
+  if (!part.cover) {
+    const coverPath = safeFamily
+      ? `images/${safeFamily}/${safeBrand}/${safeCode}/cover.png`
+      : `images/${safeBrand}/${safeCode}/cover.png`;
+    part.cover = `${base}/${coverPath}`;
+  }
+
+  if (!part.datasheet_url) {
+    const datasheetPath = safeFamily
+      ? `datasheets/${safeFamily}/${safeBrand}/${safeCode}/datasheet.pdf`
+      : `datasheets/${safeCode}.pdf`;
+    part.datasheet_url = `${base}/${datasheetPath}`;
+  }
+
+  return part;
+}
+
 // 안전한 테이블명 정규식
 const isSafeIdent = (s) => /^[a-z0-9_]+$/i.test(s);
 
@@ -39,6 +75,8 @@ router.get('/detail', async (req, res) => {
 
     if (!found) return res.status(404).json({ ok:false, error:'not found' });
 
+    const part = applyFallbackUrls({ ...found }, found._family_slug);
+
     // ③ 대표 이미지 1~4장 추출 (image_index 테이블 존재)
     const img = await db.query(
       `SELECT gcs_uri
@@ -58,7 +96,7 @@ router.get('/detail', async (req, res) => {
       ok: true,
       family_slug: found._family_slug,
       family_label: found._family_label,
-      part: found,           // 스펙 row 전체 반환
+      part,           // 스펙 row 전체 반환
       images
     });
   } catch (e) {

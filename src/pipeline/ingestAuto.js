@@ -23,6 +23,27 @@ const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
 const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
 const { processDocument: processDocAi } = require('../services/docai');
 
+const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
+
+function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
+  const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      clearTimeout(timer);
+      reject(new Error(`${label}_TIMEOUT`));
+    }, timeout);
+    Promise.resolve(promise)
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
 const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
 
@@ -548,7 +569,7 @@ async function runAutoIngest(input = {}) {
   const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
   const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
   const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || 262144);
-  const EXTRACT_HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
+  const EXTRACT_HARD_CAP_MS = HARD_CAP_MS;
   const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
 
   let lockAcquired = false;
@@ -590,7 +611,11 @@ async function runAutoIngest(input = {}) {
 
   if (!docAiResult) {
     try {
-      docAiResult = await processDocAi(gcsUri);
+      docAiResult = await withDeadline(
+        processDocAi(gcsUri, { runId }),
+        HARD_CAP_MS,
+        'DOCAI_PROCESS',
+      );
     } catch (err) {
       console.warn('[docai] process failed:', err?.message || err);
     }
@@ -1260,7 +1285,11 @@ async function runAutoIngest(input = {}) {
     jobId,
     job_id: jobId,
   };
-  return persistProcessedData(processedPayload, persistOverrides);
+  return withDeadline(
+    persistProcessedData(processedPayload, persistOverrides),
+    HARD_CAP_MS,
+    'PERSIST',
+  );
   })();
 
   try {

@@ -288,11 +288,6 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   if (!row || typeof row !== 'object') {
     return { ok: false, reason: 'empty_row' };
   }
-  const brand = String(row.brand || '').trim().toLowerCase();
-  if (!brand || brand === 'unknown') {
-    if (row && typeof row === 'object') row.last_error = 'missing_brand';
-    return { ok: false, reason: 'missing_brand' };
-  }
   const pn = String(row.pn || row.code || '').trim();
   if (!isValidPnValue(pn) || FORBIDDEN_RE.test(pn)) {
     if (row && typeof row === 'object') row.last_error = 'invalid_code';
@@ -504,16 +499,14 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         brandKey = await normalizeBrand(trimmed, docTextLower);
         if (brandKey) break;
       }
-      if (!brandKey) {
-        const skippedCode = String(rec.code || rec.pn || options?.code || '').trim() || '(no-code)';
-        if (physicalCols.has('last_error')) rec.last_error = 'missing_brand';
-        result.skipped.push({ reason: 'missing_brand', code: skippedCode, last_error: 'missing_brand' });
-        continue;
+      if (brandKey) {
+        if (!rec.brand || !String(rec.brand).trim()) {
+          rec.brand = options?.brand || brandKey;
+        }
+        rec.brand_norm = brandKey;
+      } else if (physicalCols.has('brand_norm')) {
+        rec.brand_norm = null;
       }
-      if (!rec.brand || !String(rec.brand).trim()) {
-        rec.brand = options?.brand || brandKey;
-      }
-      rec.brand_norm = brandKey;
       if (physicalCols.has('last_error')) rec.last_error = null;
 
       buildPnIfMissing(rec, pnTemplate);
@@ -555,7 +548,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
       rec.code_norm = codeNorm;
 
-      const naturalKey = `${rec.brand_norm}::${codeNorm}`;
+      const naturalKey = `${rec.brand_norm ?? ''}::${codeNorm}`;
       if (seenNatural.has(naturalKey)) {
         result.skipped.push({ reason: 'duplicate_code' });
         continue;

@@ -1,56 +1,169 @@
-diff --git a/server.js b/server.js
-index c4bb1e322258ba5dca3e7a0af4407f7ab859d5b2..7e201762e094f30be4939ba0318ec89ef52a6059 100644
---- a/server.js
-+++ b/server.js
-@@ -317,51 +317,50 @@ try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
+diff --git a/src/services/docai.js b/src/services/docai.js
+index 6eeb1e0e76ae66b2db84284f7a6e2a26b93f6f90..0d8bed5f66f88e9e556d358ef832a8568be76a01 100644
+--- a/src/services/docai.js
++++ b/src/services/docai.js
+@@ -1,40 +1,80 @@
+ 'use strict';
  
- // ✅ ALWAYS-ON 디버그 엔드포인트 (환경변수와 무관하게 항상 열림)
- app.get('/_routes', (req, res) => {
-   try {
-     const list = [];
-     app._router.stack.forEach((m) => {
-       if (m.route && m.route.path) {
-         const methods = Object.keys(m.route.methods).join(',').toUpperCase();
-         list.push(`${methods.padEnd(6)} ${m.route.path}`);
-       } else if (m.name === 'router' && m.handle?.stack) {
-         m.handle.stack.forEach((h) => {
-           const p = h.route?.path;
-           const ms = h.route ? Object.keys(h.route.methods).join(',').toUpperCase() : '';
-           if (p) list.push(`${ms.padEnd(6)} ${m.regexp?.toString() || ''}${p}`);
-         });
+ const path = require('node:path');
+ 
+ let DocumentProcessorServiceClient;
+ try {
+   ({ DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1);
+ } catch (err) {
+   DocumentProcessorServiceClient = null;
+ }
+ 
+ const { storage, parseGcsUri } = require('../utils/gcs');
+ 
+ const clientsByLocation = new Map();
+ 
++const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
++
++function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
++  const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
++  return new Promise((resolve, reject) => {
++    const timer = setTimeout(() => {
++      clearTimeout(timer);
++      reject(new Error(`${label}_TIMEOUT`));
++    }, timeout);
++    Promise.resolve(promise)
++      .then((value) => {
++        clearTimeout(timer);
++        resolve(value);
++      })
++      .catch((err) => {
++        clearTimeout(timer);
++        reject(err);
++      });
++  });
++}
++
++function sanitizeRunId(runId) {
++  if (!runId) return null;
++  const trimmed = String(runId).trim();
++  if (!trimmed) return null;
++  return trimmed.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120) || null;
++}
++
++async function waitForJsonOutputs(bucketName, prefix, ms = HARD_CAP_MS) {
++  const started = Date.now();
++  const bucket = storage.bucket(bucketName);
++  while (Date.now() - started < ms) {
++    const [files] = await bucket.getFiles({ prefix });
++    const jsonFiles = files.filter((file) => file.name && file.name.endsWith('.json'));
++    if (jsonFiles.length) return jsonFiles;
++    await new Promise((resolve) => setTimeout(resolve, 1500));
++  }
++  throw new Error('DOCAI_OUTPUT_TIMEOUT');
++}
++
+ function getClient(location = 'us') {
+   if (!DocumentProcessorServiceClient) return null;
+   const loc = location || 'us';
+   if (!clientsByLocation.has(loc)) {
+     clientsByLocation.set(
+       loc,
+       new DocumentProcessorServiceClient({
+         apiEndpoint: `${loc}-documentai.googleapis.com`,
+       })
+     );
+   }
+   return clientsByLocation.get(loc);
+ }
+ 
+ function buildProcessorConfig() {
+   const project =
+     process.env.DOCAI_PROJECT_ID ||
+     process.env.DOC_AI_PROJECT_ID ||
+     process.env.GCP_PROJECT_ID ||
+     process.env.GOOGLE_CLOUD_PROJECT;
+   const location =
+     process.env.DOCAI_LOCATION ||
+     process.env.DOC_AI_LOCATION ||
+     'us';
+   const processor = process.env.DOCAI_PROCESSOR_ID;
+diff --git a/src/services/docai.js b/src/services/docai.js
+index 6eeb1e0e76ae66b2db84284f7a6e2a26b93f6f90..0d8bed5f66f88e9e556d358ef832a8568be76a01 100644
+--- a/src/services/docai.js
++++ b/src/services/docai.js
+@@ -60,72 +100,73 @@ function collectText(document = {}) {
+     return out.trim();
+   };
+ 
+   for (const page of Array.isArray(document.pages) ? document.pages : []) {
+     for (const table of Array.isArray(page.tables) ? page.tables : []) {
+       const headers = [];
+       const headerRow = table.headerRows?.[0];
+       for (const cell of Array.isArray(headerRow?.cells) ? headerRow.cells : []) {
+         headers.push(getText(cell.layout));
        }
-     });
-     res.type('text/plain').send(list.join('\n') || 'no-routes');
-   } catch (e) {
-     res.status(500).json({ ok: false, error: String(e?.message || e) });
+       const rows = [];
+       for (const bodyRow of Array.isArray(table.bodyRows) ? table.bodyRows : []) {
+         const row = [];
+         for (const cell of Array.isArray(bodyRow.cells) ? bodyRow.cells : []) {
+           row.push(getText(cell.layout));
+         }
+         rows.push(row);
+       }
+       tables.push({ headers, rows });
+     }
    }
- });
- console.log('[BOOT] ALWAYS-ON route debug at /_routes');
  
- // 🔍 컨테이너 내 파일 확인: server*.js 포함 여부 즉시 점검
--const fs = require('fs');
- app.get('/_ls', (_req, res) => {
-   try {
-     const here = fs.readdirSync(__dirname).sort();
-     res.json({ dir: __dirname, files: here.filter(f => f.startsWith('server')) });
-   } catch (e) {
-     res.status(500).json({ ok:false, error: String(e?.message || e) });
+   return { text: fullText, tables };
+ }
+ 
+-async function processDocument(gcsUri) {
++async function processDocument(gcsUri, options = {}) {
+   const cfg = buildProcessorConfig();
+   if (!cfg) return null;
+   const client = getClient(cfg.location);
+   if (!client) return null;
+ 
+   const { bucket, name } = parseGcsUri(gcsUri);
+   const baseDir = path.posix.dirname(name);
+   const baseName = path.posix.basename(name, path.posix.extname(name));
+-  const suffix = `${baseName || 'doc'}-${Date.now()}`;
+-  const dir = baseDir && baseDir !== '.' ? `${baseDir}/docai/${suffix}` : `docai/${suffix}`;
++  const safeRunId = sanitizeRunId(options.runId ?? options.run_id);
++  const suffix = safeRunId || `${baseName || 'doc'}-${Date.now()}`;
++  const outBase = baseDir && baseDir !== '.' ? `${baseDir}/docai/out` : 'docai/out';
++  const dir = `${outBase}/${suffix}`;
+   const outputPrefix = `gs://${bucket}/${dir}/`;
+ 
+   const request = {
+     name: cfg.name,
+     inputDocuments: {
+       gcsDocuments: {
+         documents: [{ gcsUri, mimeType: 'application/pdf' }],
+       },
+     },
+     documentOutputConfig: {
+       gcsOutputConfig: { gcsUri: outputPrefix },
+     },
+   };
+ 
+   const [operation] = await client.batchProcessDocuments(request);
+-  await operation.promise();
++  await withDeadline(operation.promise(), HARD_CAP_MS, 'DOCAI_BATCH');
+ 
+   const { bucket: outBucket, name: outPrefix } = parseGcsUri(outputPrefix);
+-  const [files] = await storage.bucket(outBucket).getFiles({ prefix: outPrefix });
+-  const jsonFiles = files.filter((file) => file.name && file.name.endsWith('.json'));
++  const jsonFiles = await waitForJsonOutputs(outBucket, outPrefix, HARD_CAP_MS);
+   for (const file of jsonFiles) {
+     try {
+       const [buf] = await file.download();
+       const parsed = JSON.parse(buf.toString('utf8'));
+       const document = parsed?.document || parsed;
+       if (document?.text) {
+         return collectText(document);
+       }
+     } catch (err) {
+       console.warn('[DocAI] failed to parse output', err?.message || err);
+     }
    }
- });
- console.log('[BOOT] ALWAYS-ON file lister at /_ls');
- 
- 
- /* ---------------- Upload ---------------- */
- const upload = multer({ storage: multer.memoryStorage() });
- 
- /* Session helpers (Cloud Run Bearer 또는 pp_session 쿠키 허용) */
- function parseCookie(name, cookieHeader) {
-   if (!cookieHeader) return null;
-   const m = new RegExp('(?:^|;\\s*)' + name + '=([^;]+)').exec(cookieHeader);
-   return m ? decodeURIComponent(m[1]) : null;
+   return null;
  }
- function verifyJwtCookie(cookieHeader) {
-   const raw = parseCookie('pp_session', cookieHeader);
-   if (!raw) return null;
-   try { return jwt.verify(raw, JWT_SECRET); } catch { return null; }
- }
+ 
+ module.exports = { processDocument };

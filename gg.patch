@@ -1,8 +1,14 @@
 diff --git a/server.js b/server.js
-index 0245ec47f1297580141545262f7dfaa5dfd9e772..0b4d0e2492352fe13fae55c7246495f45fe472d6 100644
+index 0b4d0e2492352fe13fae55c7246495f45fe472d6..c4bb1e322258ba5dca3e7a0af4407f7ab859d5b2 100644
 --- a/server.js
 +++ b/server.js
-@@ -13,69 +13,78 @@ process.on('unhandledRejection', (e) => {
+@@ -7,59 +7,63 @@ const EXT_CALLS_OFF = process.env.EXT_CALLS_OFF === '1';
+ process.on('uncaughtException', (e) => {
+   console.error('[FATAL][uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));
+   process.exit(1);
+ });
+ process.on('unhandledRejection', (e) => {
+   console.error('[FATAL][unhandledRejection]', e);
    process.exit(1);
  });
  
@@ -22,15 +28,21 @@ index 0245ec47f1297580141545262f7dfaa5dfd9e772..0b4d0e2492352fe13fae55c7246495f4
    });
  })();
  
++// --- built-ins (한 번만) ---
++const path = require('node:path');
++const fs = require('node:fs');
++
++// --- 3rd-party ---
  const express = require('express');
  const cors = require('cors');
  const bodyParser = require('body-parser');
  const multer = require('multer');
  const crypto = require('crypto');
  const jwt = require('jsonwebtoken');
-+const path = require('node:path');
-+const fs = require('node:fs');
+-const path = require('node:path');
+-const fs = require('node:fs');
  
++// --- local ---
  // 1) DB 모듈: 로드 실패해도 서버는 떠야 함
  let db;
  try {
@@ -46,39 +58,13 @@ index 0245ec47f1297580141545262f7dfaa5dfd9e772..0b4d0e2492352fe13fae55c7246495f4
  function getIngest() {
    if (__INGEST_MOD__) return __INGEST_MOD__;
    try {
--    __INGEST_MOD__ = require('./src/pipeline/ingestAuto');
-+    const modPath = path.join(__dirname, 'src', 'pipeline', 'ingestAuto.js');
-+    __INGEST_MOD__ = require(modPath);
+     const modPath = path.join(__dirname, 'src', 'pipeline', 'ingestAuto.js');
+     __INGEST_MOD__ = require(modPath);
    } catch (e) {
      console.error('[INGEST] module load failed:', e?.message || e);
-+    if (e?.stack) console.error('[INGEST] stack:', e.stack);
-+    try {
-+      const dir = path.join(__dirname, 'src', 'pipeline');
-+      console.error('[INGEST] ls src/pipeline =', fs.readdirSync(dir));
-+      console.error('[INGEST] CWD =', process.cwd(), ' __dirname =', __dirname);
-+    } catch {}
-     __INGEST_MOD__ = {
-       runAutoIngest: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
-       persistProcessedData: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
-     };
-   }
-   return __INGEST_MOD__;
- }
- 
- 
- 
- // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
- // 2) Cloud Tasks: 런타임에 없으면 비활성화
- let CloudTasksClient;
- try { ({ CloudTasksClient } = require('@google-cloud/tasks')); }
- catch (e) { console.warn('[BOOT] @google-cloud/tasks unavailable:', e?.message || e); }
- const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
- const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
- const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
- // step 라우트 폐지 → ingest 하나로 통일
- const WORKER_TASK_URL = process.env.WORKER_TASK_URL || process.env.WORKER_STEP_URL || 'https://<YOUR-RUN-URL>/api/worker/ingest';
- const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
- 
- // ⚠️ 외부 API(예: Vertex/HTTP) 가능성이 있는 부팅 태스크는 가드 안에서만 실행
- //   → 아래 부팅 IIFE 내부의  if (!EXT_CALLS_OFF)  블록으로 이동
- //try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
+     if (e?.stack) console.error('[INGEST] stack:', e.stack);
+     try {
+       const dir = path.join(__dirname, 'src', 'pipeline');
+       console.error('[INGEST] ls src/pipeline =', fs.readdirSync(dir));
+       console.error('[INGEST] CWD =', process.cwd(), ' __dirname =', __dirname);
+     } catch {}

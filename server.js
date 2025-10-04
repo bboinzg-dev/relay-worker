@@ -29,15 +29,19 @@ process.on('unhandledRejection', (e) => {
   });
 })();
 
+// --- built-ins (한 번만) ---
+const path = require('node:path');
+const fs = require('node:fs');
+
+// --- 3rd-party ---
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const multer = require('multer');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const path = require('node:path');
-const fs = require('node:fs');
 
+// --- local ---
 // 1) DB 모듈: 로드 실패해도 서버는 떠야 함
 let db;
 try {

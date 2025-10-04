@@ -1,127 +1,95 @@
 'use strict';
 
 const express = require('express');
-const { Storage } = require('@google-cloud/storage');
-const db = require('./db');
-
 const router = express.Router();
+const { Pool } = require('pg');
+const { Storage } = require('@google-cloud/storage');
+const { Transform } = require('stream');
+const QueryStream = require('pg-query-stream');
+const { ProductServiceClient } = require('@google-cloud/retail').v2;
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const storage = new Storage();
+const retail = new ProductServiceClient();
 
-const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || '';
+const PROJECT_NUMBER = process.env.GCP_PROJECT_NUMBER;
 const BUCKET = process.env.GCS_BUCKET;
-const EXPORT_PATH = 'retail/catalog/products.ndjson';
+const NDJSON_PATH = process.env.RETAIL_CATALOG_OBJECT || 'retail/catalog/products.ndjson';
+const GCS_URI = `gs://${BUCKET}/${NDJSON_PATH}`;
+const BRANCH =
+  process.env.RETAIL_BRANCH ||
+  `projects/${PROJECT_NUMBER}/locations/global/catalogs/default_catalog/branches/default_branch`;
 
-function sanitizeKey(key) {
-  return String(key).replace(/[^A-Za-z0-9_]/g, '_').slice(0, 128) || 'attr';
-}
-
-function toCustomAttributes(raw) {
-  const attrs = {};
-  if (!raw || typeof raw !== 'object') return attrs;
-
-  for (const [k, v] of Object.entries(raw)) {
-    const key = sanitizeKey(k);
-    if (v === null || v === undefined || v === '') continue;
-
-    if (Array.isArray(v)) {
-      const nums = v.map(Number).filter((n) => Number.isFinite(n));
-      if (nums.length === v.length && nums.length > 0) {
-        attrs[key] = { numbers: nums.slice(0, 400) };
-      } else {
-        const texts = v.map((x) => String(x)).filter(Boolean);
-        if (texts.length) attrs[key] = { text: texts.slice(0, 400) };
-      }
-      continue;
-    }
-
-    const num = Number(v);
-    if (!Number.isNaN(num) && Number.isFinite(num)) {
-      attrs[key] = { numbers: [num] };
-      continue;
-    }
-
-    const str = String(v);
-    if (str) attrs[key] = { text: [str.slice(0, 256)] };
-  }
-
-  return attrs;
-}
-
-router.post('/api/retail/export-catalog', async (req, res, next) => {
+/** NDJSON Export to GCS */
+router.post('/api/retail/export-catalog', async (req, res) => {
+  const client = await pool.connect();
   try {
-    if (!BUCKET) {
-      res.status(500).json({ ok: false, error: 'GCS_BUCKET not configured' });
-      return;
-    }
+    const sql = `
+      SELECT (product)::text AS line
+      FROM retail.products_for_import
+      ORDER BY family_slug, brand, code, id
+    `;
+    const query = new QueryStream(sql);
+    const pgStream = client.query(query);
 
-    const baseRows = await db.query(
-      `SELECT id, family_slug, brand, code, display_name,
-              COALESCE(image_uri, cover) AS image_uri,
-              COALESCE(datasheet_url, datasheet_uri) AS datasheet_uri,
-              updated_at
-         FROM public.component_specs`
-    );
-
-    const families = await db.query(
-      'SELECT family_slug, specs_table FROM public.component_registry'
-    );
-
-    const rawMap = new Map();
-    for (const f of families.rows) {
-      if (!f?.specs_table) continue;
-      const tableName = String(f.specs_table).replace(/[^A-Za-z0-9_]/g, '');
-      if (!tableName) continue;
-
-      const sql = `SELECT id, raw_json FROM public.${tableName}`;
-      try {
-        const r = await db.query(sql);
-        for (const row of r.rows) {
-          const key = `${f.family_slug}:${row.id}`;
-          rawMap.set(key, row.raw_json || {});
-        }
-      } catch (err) {
-        console.warn('[retail][export] skip specs table', tableName, err?.message || err);
-      }
-    }
-
-    const lines = baseRows.rows.map((r) => {
-      const brand = r.brand || '';
-      const code = r.code || r.id;
-      const pid = `${r.family_slug}:${brand.toLowerCase()}:${code}`.slice(0, 128);
-      const raw = rawMap.get(`${r.family_slug}:${r.id}`) || {};
-      const titleBase = (r.display_name || `${brand} ${code}` || '').trim();
-      const title = titleBase || String(code || r.id || pid);
-
-      const product = {
-        id: pid,
-        title,
-        brands: brand ? [brand] : [],
-        categories: r.family_slug ? [r.family_slug] : [],
-        images: r.image_uri ? [{ uri: r.image_uri }] : [],
-        uri: r.datasheet_uri || undefined,
-        attributes: toCustomAttributes(raw),
-        availability: 'IN_STOCK',
-        fulfillmentTypes: ['pickup-in-store'],
-        audience: { genders: ['male', 'female'], ageGroups: ['adult'] },
-        primaryProductId: pid,
-      };
-
-      return JSON.stringify(product);
+    const gcsFile = storage.bucket(BUCKET).file(NDJSON_PATH);
+    const gcsWrite = gcsFile.createWriteStream({
+      resumable: false,
+      contentType: 'application/x-ndjson',
     });
 
-    const file = storage.bucket(BUCKET).file(EXPORT_PATH);
-    await file.save(lines.join('\n'), {
-      contentType: 'application/x-ndjson',
-      metadata: {
-        'x-goog-meta-project-id': PROJECT_ID || 'unknown',
-        'x-goog-meta-exported-at': new Date().toISOString(),
-        'x-goog-meta-count': String(lines.length),
+    let count = 0;
+    const toNdjson = new Transform({
+      objectMode: true,
+      transform(row, _enc, cb) {
+        count++;
+        cb(null, row.line + '\n');
       },
     });
 
-    res.json({ ok: true, gcs: `gs://${BUCKET}/${EXPORT_PATH}`, count: lines.length });
-  } catch (err) {
-    next(err);
+    await new Promise((resolve, reject) => {
+      pgStream
+        .pipe(toNdjson)
+        .pipe(gcsWrite)
+        .on('finish', resolve)
+        .on('error', reject);
+    });
+
+    const [meta] = await gcsFile.getMetadata();
+    res.json({ ok: true, gcsUri: GCS_URI, count, size: meta.size });
+  } catch (e) {
+    console.error('[retail/export] error', e);
+    res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+/** Start Import (returns operation name) */
+router.post('/api/retail/import-catalog', async (req, res) => {
+  try {
+    const [op] = await retail.importProducts({
+      parent: BRANCH,
+      inputConfig: { gcsSource: { inputUris: [GCS_URI] } },
+      reconciliationMode: 'INCREMENTAL',
+    });
+    res.json({ ok: true, operation: op.name, gcsUri: GCS_URI, branch: BRANCH });
+  } catch (e) {
+    console.error('[retail/import] error', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/** Check Import Status (use ?name=operations/… ) */
+router.get('/api/retail/import-catalog/status', async (req, res) => {
+  try {
+    const name = req.query.name;
+    if (!name) return res.status(400).json({ ok: false, error: 'missing ?name' });
+    const [resp] = await retail.checkImportProductsProgress(String(name));
+    res.json({ ok: true, metadata: resp.metadata, done: resp.done, result: resp.result });
+  } catch (e) {
+    console.error('[retail/status] error', e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 

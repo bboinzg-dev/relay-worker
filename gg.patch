@@ -1,102 +1,57 @@
-diff --git a/src/routes/manager.js b/src/routes/manager.js
-index 31ce6255a6fe73145b19c9f11d2ec53c1df5ff94..46b83ae83be3933a6ae922cd189d10a69ac48e2d 100644
---- a/src/routes/manager.js
-+++ b/src/routes/manager.js
-@@ -1,87 +1,91 @@
- 'use strict';
+diff --git a/server.js b/server.js
+index 0eb27e19c130c0639c0426adcf034269aed4aaa0..ed8779d790aa7e120f289a19f3dd52a0bc140c52 100644
+--- a/server.js
++++ b/server.js
+@@ -270,50 +270,52 @@ try {
+   } else if (typeof ai === 'function') {
+     // 만약 server.ai.js 가 (app)=>{ app.post('/api/ai/resolve', ...) } 로 export 한다면
+     ai(app);
+     console.log('[BOOT] mounted AI routes via function(export)');
+   } else {
+     console.warn('[BOOT] server.ai export type not supported:', typeof ai);
+   }
+ } catch (e) {
+   console.error('[BOOT] ai mount failed', e?.message || e);
+   // 🔰 Fallback: server.ai.js 로딩 실패/누락 시에도 즉시 동작하도록 최소 라우트 제공
+   const express = require('express');
+   const fb = express.Router();
+   fb.get('/ai/ping', (_req, res) => res.json({ ok: true, fallback: true }));
+   fb.get('/ai/resolve', (req, res) => res.json({ ok: true, echo: String(req.query?.q || '') }));
+   fb.post('/ai/resolve', (req, res) => res.json({ ok: true, echo: String((req.body && req.body.q) || '') }));
+   app.use('/api', fb);
+   console.warn('[BOOT] fallback AI routes mounted at /api/*');
+ }
  
- const express = require('express');
- const { z } = require('zod');
- const argon2 = require('argon2');
- const jwt = require('jsonwebtoken');
- const { Pool } = require('pg');
+ /* ---------------- Mount modular routers (after global middleware) ---------------- */
+ try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
+ try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
+ try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
+ try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
+ try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
++try { app.use(require('./server.retail'));   console.log('[BOOT] mounted /api/retail/export-catalog'); } catch {}
++try { app.use(require('./server.retail.import')); console.log('[BOOT] mounted /api/retail/import'); } catch {}
+ try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
+ try { app.use(require('./server.ingest.status')); console.log('[BOOT] mounted /api/ingest/:id'); } catch {}
  
- const router = express.Router();
+ // 인라인 AI 라우터(간소 버전)는 제거 — server.ai.js 하나만 유지
  
- const pool = new Pool({
-   connectionString: process.env.DATABASE_URL,
-   ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : undefined,
- });
+ /* NOTE: The parts router already exists in your repo; keep it mounted. */
+ try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
  
- const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
- 
- const Signup = z.object({
-   username: z.string().min(3).max(32),
-   email: z.string().email(),
-   phone: z.string().optional(),
-   password: z.string().min(6),
-+  // 프론트에서 오는 키가 혼재할 수 있으니 다 받되 boolean으로 정규화
-   is_seller_requested: z.boolean().optional(),
-+  seller_requested: z.boolean().optional(),
- });
- 
- router.get('/health', (_req, res) => {
-   res.json({ ok: true, ready: true });
- });
- 
- router.post('/signup', express.json({ limit: '2mb' }), async (req, res) => {
-   let client;
+ // ✅ ALWAYS-ON 디버그 엔드포인트 (환경변수와 무관하게 항상 열림)
+ app.get('/_routes', (req, res) => {
    try {
-     const body = Signup.parse(req.body || {});
-+    const wantSeller = !!(body.is_seller_requested ?? body.seller_requested);
- 
-     client = await pool.connect();
-     await client.query('BEGIN');
- 
-     const duplicate = await client.query(
-       `SELECT 1 FROM public.users WHERE username = $1 OR LOWER(email) = LOWER($2)`,
-       [body.username, body.email.toLowerCase()]
-     );
- 
-     if (duplicate.rowCount) {
-       await client.query('ROLLBACK');
-       return res.status(409).json({ ok: false, error: 'DUPLICATE_USERNAME_OR_EMAIL' });
-     }
- 
-     const hash = await argon2.hash(body.password, { type: argon2.argon2id });
-     const userInsert = await client.query(
--      `INSERT INTO public.users (username, email, phone, password_hash, password_algo, is_seller, is_seller_requested, seller_status, status)
--       VALUES ($1, $2, $3, $4, 'argon2id', false, $5, 'none', 'active')
--       RETURNING id, username, email, is_seller`,
--      [body.username, body.email, body.phone || null, hash, !!body.is_seller_requested]
-+      `INSERT INTO public.users
-+         (username, email, phone, password_hash, password_algo, is_seller, seller_status, status, created_at, updated_at)
-+       VALUES ($1, $2, $3, $4, 'argon2id', false, $5, 'active', now(), now())
-+       RETURNING id, username, email, is_seller, seller_status`,
-+      [body.username, body.email.toLowerCase(), body.phone || null, hash, wantSeller ? 'pending' : 'none']
-     );
- 
-     const user = userInsert.rows[0];
- 
-     await client.query(
-       `INSERT INTO public.user_profiles (user_id, role)
-        VALUES ($1, $2)
--       ON CONFLICT (user_id) DO NOTHING`,
--      [user.id, body.is_seller_requested ? 'seller_candidate' : null]
-+       ON CONFLICT (user_id) DO UPDATE SET role = EXCLUDED.role`,
-+      [user.id, wantSeller ? 'seller_candidate' : null]
-     );
- 
-     await client.query('COMMIT');
- 
-     const payload = { uid: String(user.id), username: user.username, isSeller: !!user.is_seller };
-     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
- 
-     return res.json({ ok: true, user, token });
-   } catch (err) {
-     if (client) {
-       try {
-         await client.query('ROLLBACK');
-       } catch (rollbackErr) {
-         console.error('[auth/signup] rollback failed', rollbackErr);
+     const list = [];
+     app._router.stack.forEach((m) => {
+       if (m.route && m.route.path) {
+         const methods = Object.keys(m.route.methods).join(',').toUpperCase();
+         list.push(`${methods.padEnd(6)} ${m.route.path}`);
+       } else if (m.name === 'router' && m.handle?.stack) {
+         m.handle.stack.forEach((h) => {
+           const p = h.route?.path;
+           const ms = h.route ? Object.keys(h.route.methods).join(',').toUpperCase() : '';
+           if (p) list.push(`${ms.padEnd(6)} ${m.regexp?.toString() || ''}${p}`);
+         });
        }
-     }
-     console.error('[auth/signup] error', err);
-     const isValidationError = err instanceof z.ZodError;
-     const message = isValidationError
-       ? err.issues?.[0]?.message || 'INVALID_REQUEST'
-       : err?.message || String(err);
-     const status = isValidationError ? 400 : 500;
-     return res.status(status).json({ ok: false, error: message });
-   } finally {
-     if (client) client.release();
+     });
+     res.type('text/plain').send(list.join('\n') || 'no-routes');

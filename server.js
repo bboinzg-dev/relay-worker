@@ -292,6 +292,8 @@ try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/ch
 try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
+try { app.use(require('./server.retail'));   console.log('[BOOT] mounted /api/retail/export-catalog'); } catch {}
+try { app.use(require('./server.retail.import')); console.log('[BOOT] mounted /api/retail/import'); } catch {}
 try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
 try { app.use(require('./server.ingest.status')); console.log('[BOOT] mounted /api/ingest/:id'); } catch {}
 

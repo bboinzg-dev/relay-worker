@@ -35,6 +35,8 @@ const bodyParser = require('body-parser');
 const multer = require('multer');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const path = require('node:path');
+const fs = require('node:fs');
 
 // 1) DB 모듈: 로드 실패해도 서버는 떠야 함
 let db;
@@ -51,9 +53,16 @@ let __INGEST_MOD__ = null;
 function getIngest() {
   if (__INGEST_MOD__) return __INGEST_MOD__;
   try {
-    __INGEST_MOD__ = require('./src/pipeline/ingestAuto');
+    const modPath = path.join(__dirname, 'src', 'pipeline', 'ingestAuto.js');
+    __INGEST_MOD__ = require(modPath);
   } catch (e) {
     console.error('[INGEST] module load failed:', e?.message || e);
+    if (e?.stack) console.error('[INGEST] stack:', e.stack);
+    try {
+      const dir = path.join(__dirname, 'src', 'pipeline');
+      console.error('[INGEST] ls src/pipeline =', fs.readdirSync(dir));
+      console.error('[INGEST] CWD =', process.cwd(), ' __dirname =', __dirname);
+    } catch {}
     __INGEST_MOD__ = {
       runAutoIngest: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
       persistProcessedData: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },

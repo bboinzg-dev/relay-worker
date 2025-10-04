@@ -339,7 +339,6 @@ app.get('/_routes', (req, res) => {
 console.log('[BOOT] ALWAYS-ON route debug at /_routes');
 
 // 🔍 컨테이너 내 파일 확인: server*.js 포함 여부 즉시 점검
-const fs = require('fs');
 app.get('/_ls', (_req, res) => {
   try {
     const here = fs.readdirSync(__dirname).sort();

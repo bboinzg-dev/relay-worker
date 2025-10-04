@@ -1,5 +1,7 @@
 'use strict';
 
+const path = require('node:path');
+
 let DocumentProcessorServiceClient;
 try {
   ({ DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1);
@@ -9,17 +11,23 @@ try {
 
 const { storage, parseGcsUri } = require('../utils/gcs');
 
-let cachedClient = null;
+const clientsByLocation = new Map();
 
-function getClient() {
+function getClient(location = 'us') {
   if (!DocumentProcessorServiceClient) return null;
-  if (!cachedClient) {
-    cachedClient = new DocumentProcessorServiceClient();
+  const loc = location || 'us';
+  if (!clientsByLocation.has(loc)) {
+    clientsByLocation.set(
+      loc,
+      new DocumentProcessorServiceClient({
+        apiEndpoint: `${loc}-documentai.googleapis.com`,
+      })
+    );
   }
-  return cachedClient;
+  return clientsByLocation.get(loc);
 }
 
-function buildProcessorName() {
+function buildProcessorConfig() {
   const project =
     process.env.DOCAI_PROJECT_ID ||
     process.env.DOC_AI_PROJECT_ID ||
@@ -33,7 +41,8 @@ function buildProcessorName() {
   if (!project || !processor) return null;
   return {
     name: `projects/${project}/locations/${location}/processors/${processor}`,
-  };
+    location,
+    };
 }
 
 function collectText(document = {}) {
@@ -74,24 +83,49 @@ function collectText(document = {}) {
 }
 
 async function processDocument(gcsUri) {
-  const cfg = buildProcessorName();
+  const cfg = buildProcessorConfig();
   if (!cfg) return null;
-  const client = getClient();
+  const client = getClient(cfg.location);
   if (!client) return null;
 
   const { bucket, name } = parseGcsUri(gcsUri);
-  const [buf] = await storage.bucket(bucket).file(name).download();
+  const baseDir = path.posix.dirname(name);
+  const baseName = path.posix.basename(name, path.posix.extname(name));
+  const suffix = `${baseName || 'doc'}-${Date.now()}`;
+  const dir = baseDir && baseDir !== '.' ? `${baseDir}/docai/${suffix}` : `docai/${suffix}`;
+  const outputPrefix = `gs://${bucket}/${dir}/`;
 
   const request = {
     name: cfg.name,
-    rawDocument: { content: buf, mimeType: 'application/pdf' },
-    skipHumanReview: true,
+    inputDocuments: {
+      gcsDocuments: {
+        documents: [{ gcsUri, mimeType: 'application/pdf' }],
+      },
+    },
+    documentOutputConfig: {
+      gcsOutputConfig: { gcsUri: outputPrefix },
+    },
   };
 
-  const [result] = await client.processDocument(request);
-  const document = result?.document;
-  if (!document) return null;
-  return collectText(document);
+  const [operation] = await client.batchProcessDocuments(request);
+  await operation.promise();
+
+  const { bucket: outBucket, name: outPrefix } = parseGcsUri(outputPrefix);
+  const [files] = await storage.bucket(outBucket).getFiles({ prefix: outPrefix });
+  const jsonFiles = files.filter((file) => file.name && file.name.endsWith('.json'));
+  for (const file of jsonFiles) {
+    try {
+      const [buf] = await file.download();
+      const parsed = JSON.parse(buf.toString('utf8'));
+      const document = parsed?.document || parsed;
+      if (document?.text) {
+        return collectText(document);
+      }
+    } catch (err) {
+      console.warn('[DocAI] failed to parse output', err?.message || err);
+    }
+  }
+  return null;
 }
 
 module.exports = { processDocument };

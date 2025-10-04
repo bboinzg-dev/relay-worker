@@ -1,57 +1,210 @@
-diff --git a/server.js b/server.js
-index 0eb27e19c130c0639c0426adcf034269aed4aaa0..ed8779d790aa7e120f289a19f3dd52a0bc140c52 100644
---- a/server.js
-+++ b/server.js
-@@ -270,50 +270,52 @@ try {
-   } else if (typeof ai === 'function') {
-     // 만약 server.ai.js 가 (app)=>{ app.post('/api/ai/resolve', ...) } 로 export 한다면
-     ai(app);
-     console.log('[BOOT] mounted AI routes via function(export)');
-   } else {
-     console.warn('[BOOT] server.ai export type not supported:', typeof ai);
+diff --git a/server.retail.js b/server.retail.js
+index fad45948be27b119b885a6eccb8f927bd9e57b2c..45442801d11463ea93a2f5bf99bf2f3a8afc5b96 100644
+--- a/server.retail.js
++++ b/server.retail.js
+@@ -1,128 +1,96 @@
+ 'use strict';
+ 
+ const express = require('express');
++const router = express.Router();
++const { Pool } = require('pg');
+ const { Storage } = require('@google-cloud/storage');
+-const db = require('./db');
++const { Transform } = require('stream');
++const QueryStream = require('pg-query-stream');
++const { ProductServiceClient } = require('@google-cloud/retail').v2;
+ 
+-const router = express.Router();
++const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+ const storage = new Storage();
++const retail = new ProductServiceClient();
+ 
+-const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || '';
++const PROJECT_NUMBER = process.env.GCP_PROJECT_NUMBER;
+ const BUCKET = process.env.GCS_BUCKET;
+-const EXPORT_PATH = 'retail/catalog/products.ndjson';
+-
+-function sanitizeKey(key) {
+-  return String(key).replace(/[^A-Za-z0-9_]/g, '_').slice(0, 128) || 'attr';
+-}
+-
+-function toCustomAttributes(raw) {
+-  const attrs = {};
+-  if (!raw || typeof raw !== 'object') return attrs;
+-
+-  for (const [k, v] of Object.entries(raw)) {
+-    const key = sanitizeKey(k);
+-    if (v === null || v === undefined || v === '') continue;
++const NDJSON_PATH = process.env.RETAIL_CATALOG_OBJECT || 'retail/catalog/products.ndjson';
++const GCS_URI = `gs://${BUCKET}/${NDJSON_PATH}`;
++const BRANCH =
++  process.env.RETAIL_BRANCH ||
++  `projects/${PROJECT_NUMBER}/locations/global/catalogs/default_catalog/branches/default_branch`;
++
++/** NDJSON Export to GCS */
++router.post('/api/retail/export-catalog', async (req, res) => {
++  const client = await pool.connect();
++  try {
++    const sql = `
++      SELECT (product)::text AS line
++      FROM retail.products_for_import
++      ORDER BY family_slug, brand, code, id
++    `;
++    const query = new QueryStream(sql);
++    const pgStream = client.query(query);
++
++    const gcsFile = storage.bucket(BUCKET).file(NDJSON_PATH);
++    const gcsWrite = gcsFile.createWriteStream({
++      resumable: false,
++      contentType: 'application/x-ndjson',
++    });
+ 
+-    if (Array.isArray(v)) {
+-      const nums = v.map(Number).filter((n) => Number.isFinite(n));
+-      if (nums.length === v.length && nums.length > 0) {
+-        attrs[key] = { numbers: nums.slice(0, 400) };
+-      } else {
+-        const texts = v.map((x) => String(x)).filter(Boolean);
+-        if (texts.length) attrs[key] = { text: texts.slice(0, 400) };
+-      }
+-      continue;
+-    }
++    let count = 0;
++    const toNdjson = new Transform({
++      objectMode: true,
++      transform(row, _enc, cb) {
++        count++;
++        cb(null, row.line + '\n');
++      },
++    });
+ 
+-    const num = Number(v);
+-    if (!Number.isNaN(num) && Number.isFinite(num)) {
+-      attrs[key] = { numbers: [num] };
+-      continue;
+-    }
++    await new Promise((resolve, reject) => {
++      pgStream
++        .pipe(toNdjson)
++        .pipe(gcsWrite)
++        .on('finish', resolve)
++        .on('error', reject);
++    });
+ 
+-    const str = String(v);
+-    if (str) attrs[key] = { text: [str.slice(0, 256)] };
++    const [meta] = await gcsFile.getMetadata();
++    res.json({ ok: true, gcsUri: GCS_URI, count, size: meta.size });
++  } catch (e) {
++    console.error('[retail/export] error', e);
++    res.status(500).json({ ok: false, error: e.message });
++  } finally {
++    client.release();
    }
- } catch (e) {
-   console.error('[BOOT] ai mount failed', e?.message || e);
-   // 🔰 Fallback: server.ai.js 로딩 실패/누락 시에도 즉시 동작하도록 최소 라우트 제공
-   const express = require('express');
-   const fb = express.Router();
-   fb.get('/ai/ping', (_req, res) => res.json({ ok: true, fallback: true }));
-   fb.get('/ai/resolve', (req, res) => res.json({ ok: true, echo: String(req.query?.q || '') }));
-   fb.post('/ai/resolve', (req, res) => res.json({ ok: true, echo: String((req.body && req.body.q) || '') }));
-   app.use('/api', fb);
-   console.warn('[BOOT] fallback AI routes mounted at /api/*');
- }
++});
  
- /* ---------------- Mount modular routers (after global middleware) ---------------- */
- try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
- try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
- try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
- try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
- try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
-+try { app.use(require('./server.retail'));   console.log('[BOOT] mounted /api/retail/export-catalog'); } catch {}
-+try { app.use(require('./server.retail.import')); console.log('[BOOT] mounted /api/retail/import'); } catch {}
- try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
- try { app.use(require('./server.ingest.status')); console.log('[BOOT] mounted /api/ingest/:id'); } catch {}
- 
- // 인라인 AI 라우터(간소 버전)는 제거 — server.ai.js 하나만 유지
- 
- /* NOTE: The parts router already exists in your repo; keep it mounted. */
- try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
- 
- // ✅ ALWAYS-ON 디버그 엔드포인트 (환경변수와 무관하게 항상 열림)
- app.get('/_routes', (req, res) => {
+-  return attrs;
+-}
+-
+-router.post('/api/retail/export-catalog', async (req, res, next) => {
++/** Start Import (returns operation name) */
++router.post('/api/retail/import-catalog', async (req, res) => {
    try {
-     const list = [];
-     app._router.stack.forEach((m) => {
-       if (m.route && m.route.path) {
-         const methods = Object.keys(m.route.methods).join(',').toUpperCase();
-         list.push(`${methods.padEnd(6)} ${m.route.path}`);
-       } else if (m.name === 'router' && m.handle?.stack) {
-         m.handle.stack.forEach((h) => {
-           const p = h.route?.path;
-           const ms = h.route ? Object.keys(h.route.methods).join(',').toUpperCase() : '';
-           if (p) list.push(`${ms.padEnd(6)} ${m.regexp?.toString() || ''}${p}`);
-         });
-       }
+-    if (!BUCKET) {
+-      res.status(500).json({ ok: false, error: 'GCS_BUCKET not configured' });
+-      return;
+-    }
+-
+-    const baseRows = await db.query(
+-      `SELECT id, family_slug, brand, code, display_name,
+-              COALESCE(image_uri, cover) AS image_uri,
+-              COALESCE(datasheet_url, datasheet_uri) AS datasheet_uri,
+-              updated_at
+-         FROM public.component_specs`
+-    );
+-
+-    const families = await db.query(
+-      'SELECT family_slug, specs_table FROM public.component_registry'
+-    );
+-
+-    const rawMap = new Map();
+-    for (const f of families.rows) {
+-      if (!f?.specs_table) continue;
+-      const tableName = String(f.specs_table).replace(/[^A-Za-z0-9_]/g, '');
+-      if (!tableName) continue;
+-
+-      const sql = `SELECT id, raw_json FROM public.${tableName}`;
+-      try {
+-        const r = await db.query(sql);
+-        for (const row of r.rows) {
+-          const key = `${f.family_slug}:${row.id}`;
+-          rawMap.set(key, row.raw_json || {});
+-        }
+-      } catch (err) {
+-        console.warn('[retail][export] skip specs table', tableName, err?.message || err);
+-      }
+-    }
+-
+-    const lines = baseRows.rows.map((r) => {
+-      const brand = r.brand || '';
+-      const code = r.code || r.id;
+-      const pid = `${r.family_slug}:${brand.toLowerCase()}:${code}`.slice(0, 128);
+-      const raw = rawMap.get(`${r.family_slug}:${r.id}`) || {};
+-      const titleBase = (r.display_name || `${brand} ${code}` || '').trim();
+-      const title = titleBase || String(code || r.id || pid);
+-
+-      const product = {
+-        id: pid,
+-        title,
+-        brands: brand ? [brand] : [],
+-        categories: r.family_slug ? [r.family_slug] : [],
+-        images: r.image_uri ? [{ uri: r.image_uri }] : [],
+-        uri: r.datasheet_uri || undefined,
+-        attributes: toCustomAttributes(raw),
+-        availability: 'IN_STOCK',
+-        fulfillmentTypes: ['pickup-in-store'],
+-        audience: { genders: ['male', 'female'], ageGroups: ['adult'] },
+-        primaryProductId: pid,
+-      };
+-
+-      return JSON.stringify(product);
+-    });
+-
+-    const file = storage.bucket(BUCKET).file(EXPORT_PATH);
+-    await file.save(lines.join('\n'), {
+-      contentType: 'application/x-ndjson',
+-      metadata: {
+-        'x-goog-meta-project-id': PROJECT_ID || 'unknown',
+-        'x-goog-meta-exported-at': new Date().toISOString(),
+-        'x-goog-meta-count': String(lines.length),
+-      },
++    const [op] = await retail.importProducts({
++      parent: BRANCH,
++      inputConfig: { gcsSource: { inputUris: [GCS_URI] } },
++      reconciliationMode: 'INCREMENTAL',
      });
-     res.type('text/plain').send(list.join('\n') || 'no-routes');
++    res.json({ ok: true, operation: op.name, gcsUri: GCS_URI, branch: BRANCH });
++  } catch (e) {
++    console.error('[retail/import] error', e);
++    res.status(500).json({ ok: false, error: e.message });
++  }
++});
+ 
+-    res.json({ ok: true, gcs: `gs://${BUCKET}/${EXPORT_PATH}`, count: lines.length });
+-  } catch (err) {
+-    next(err);
++/** Check Import Status (use ?name=operations/… ) */
++router.get('/api/retail/import-catalog/status', async (req, res) => {
++  try {
++    const name = req.query.name;
++    if (!name) return res.status(400).json({ ok: false, error: 'missing ?name' });
++    const [resp] = await retail.checkImportProductsProgress(String(name));
++    res.json({ ok: true, metadata: resp.metadata, done: resp.done, result: resp.result });
++  } catch (e) {
++    console.error('[retail/status] error', e);
++    res.status(500).json({ ok: false, error: e.message });
+   }
+ });
+ 
+-module.exports = router;
++module.exports = router;

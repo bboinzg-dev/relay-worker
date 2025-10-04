@@ -18,8 +18,8 @@ async function resolveHandler(req, res) {
   }
 }
 
-router.get('/ai/resolve', resolveHandler);
-router.post('/ai/resolve', resolveHandler);
-router.get('/ai/ping', (_req, res) => res.json({ ok:true }));
+router.get('/resolve', resolveHandler);
+router.post('/resolve', resolveHandler);
+router.get('/ping', (_req, res) => res.json({ ok:true }));
 
 module.exports = router;

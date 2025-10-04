@@ -262,28 +262,29 @@ if (authRouterIsReal) {
 }
 // --- AI routes mount (export 타입 자동 처리) ---
 try {
-  const ai = require('./server.ai');
-  if (ai && typeof ai === 'object') {
-    // server.ai.js 가 express.Router()를 export 하는 형태
-    app.use('/api', ai);  // ==> 최종 경로: /api/ai/...
-    console.log('[BOOT] mounted AI routes at /api/* (router export)');
-  } else if (typeof ai === 'function') {
-    // 만약 server.ai.js 가 (app)=>{ app.post('/api/ai/resolve', ...) } 로 export 한다면
-    ai(app);
+  const aiModule = require('./server.ai');
+  if (aiModule && typeof aiModule === 'function' && aiModule.stack) {
+    app.use('/api/ai', aiModule);
+    console.log('[BOOT] mounted AI routes at /api/ai/* (router export)');
+  } else if (typeof aiModule === 'function') {
+    aiModule(app);
     console.log('[BOOT] mounted AI routes via function(export)');
+  } else if (aiModule) {
+    app.use('/api/ai', aiModule);
+    console.log('[BOOT] mounted AI routes at /api/ai/* (object export)');
   } else {
-    console.warn('[BOOT] server.ai export type not supported:', typeof ai);
+    console.warn('[BOOT] server.ai export missing or unsupported');
   }
 } catch (e) {
   console.error('[BOOT] ai mount failed', e?.message || e);
   // 🔰 Fallback: server.ai.js 로딩 실패/누락 시에도 즉시 동작하도록 최소 라우트 제공
   const express = require('express');
   const fb = express.Router();
-  fb.get('/ai/ping', (_req, res) => res.json({ ok: true, fallback: true }));
-  fb.get('/ai/resolve', (req, res) => res.json({ ok: true, echo: String(req.query?.q || '') }));
-  fb.post('/ai/resolve', (req, res) => res.json({ ok: true, echo: String((req.body && req.body.q) || '') }));
-  app.use('/api', fb);
-  console.warn('[BOOT] fallback AI routes mounted at /api/*');
+  fb.get('/ping', (_req, res) => res.json({ ok: true, fallback: true }));
+  fb.get('/resolve', (req, res) => res.json({ ok: true, echo: String(req.query?.q || '') }));
+  fb.post('/resolve', (req, res) => res.json({ ok: true, echo: String((req.body && req.body.q) || '') }));
+  app.use('/api/ai', fb);
+  console.warn('[BOOT] fallback AI routes mounted at /api/ai/*');
 }
 
 /* ---------------- Mount modular routers (after global middleware) ---------------- */
@@ -681,6 +682,123 @@ function getTaskContext(req, phase) {
   };
 }
 
+const ingestJobMeta = { inspectedAt: 0, columns: null };
+
+async function getIngestJobColumns() {
+  const now = Date.now();
+  if (ingestJobMeta.inspectedAt && now - ingestJobMeta.inspectedAt < 60_000) {
+    return ingestJobMeta.columns;
+  }
+  ingestJobMeta.inspectedAt = now;
+  try {
+    const { rows } = await db.query(
+      `SELECT lower(column_name) AS column
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'ingest_jobs'`
+    );
+    if (!rows.length) {
+      ingestJobMeta.columns = null;
+      return null;
+    }
+    ingestJobMeta.columns = new Set(rows.map((r) => r.column));
+  } catch (err) {
+    ingestJobMeta.columns = null;
+    console.warn('[ingest] inspect ingest_jobs failed:', err?.message || err);
+  }
+  return ingestJobMeta.columns;
+}
+
+function detectSourceType(uri) {
+  const val = String(uri || '').toLowerCase();
+  if (!val) return null;
+  if (val.startsWith('gs://')) return 'pdf';
+  if (val.endsWith('.pdf')) return 'pdf';
+  return null;
+}
+
+async function setJobStatus(runId, status, error, sourceType, gcsUri) {
+  if (!runId) return;
+  const columns = await getIngestJobColumns();
+  if (!columns || !columns.size) return;
+
+  const updates = [];
+  const params = [];
+  let idx = 1;
+
+  if (columns.has('status') && status) {
+    updates.push(`status = $${idx++}`);
+    params.push(status);
+  }
+  if (columns.has('last_error')) {
+    updates.push(`last_error = $${idx++}`);
+    params.push(error || null);
+  }
+  if (columns.has('source_type') && sourceType) {
+    updates.push(`source_type = COALESCE($${idx++}, source_type)`);
+    params.push(sourceType);
+  }
+  if (columns.has('gcs_pdf_uri') && gcsUri) {
+    updates.push(`gcs_pdf_uri = COALESCE($${idx++}, gcs_pdf_uri)`);
+    params.push(gcsUri);
+  }
+  if (columns.has('updated_at')) {
+    updates.push('updated_at = now()');
+  }
+
+  if (!updates.length) return;
+
+  async function apply(whereColumn) {
+    const whereIdx = params.length + 1;
+    const sql = `UPDATE public.ingest_jobs SET ${updates.join(', ')} WHERE ${whereColumn} = $${whereIdx}`;
+    const res = await db.query(sql, [...params, runId]);
+    return res.rowCount || 0;
+  }
+
+  try {
+    let affected = 0;
+    if (columns.has('run_id')) {
+      affected = await apply('run_id');
+    }
+    if (!affected && columns.has('id')) {
+      affected = await apply('id');
+    }
+    if (!affected && columns.has('run_id') && columns.has('id')) {
+      const insertCols = ['id'];
+      const insertVals = [runId];
+      const placeholders = ['$1'];
+      let pos = 2;
+      insertCols.push('run_id');
+      insertVals.push(runId);
+      placeholders.push(`$${pos++}`);
+      if (columns.has('status')) {
+        insertCols.push('status');
+        insertVals.push(status || null);
+        placeholders.push(`$${pos++}`);
+      }
+      if (columns.has('last_error')) {
+        insertCols.push('last_error');
+        insertVals.push(error || null);
+        placeholders.push(`$${pos++}`);
+      }
+      if (columns.has('source_type')) {
+        insertCols.push('source_type');
+        insertVals.push(sourceType || null);
+        placeholders.push(`$${pos++}`);
+      }
+      if (columns.has('gcs_pdf_uri')) {
+        insertCols.push('gcs_pdf_uri');
+        insertVals.push(gcsUri || null);
+        placeholders.push(`$${pos++}`);
+      }
+      const insertSql = `INSERT INTO public.ingest_jobs (${insertCols.join(', ')}) VALUES (${placeholders.join(', ')}) ON CONFLICT (id) DO NOTHING`;
+      await db.query(insertSql, insertVals);
+    }
+  } catch (err) {
+    console.warn('[ingest] setJobStatus failed:', err?.message || err);
+  }
+}
+
 async function markRunningState({ runId, gcsUri, taskName, retryCount }) {
   const safeRetryCount = Number.isFinite(retryCount) ? retryCount : 0;
   const update = await db.query(
@@ -709,6 +827,8 @@ async function markRunningState({ runId, gcsUri, taskName, retryCount }) {
       [runId, runId, taskName || null, safeRetryCount, gcsUri || null]
     );
   }
+  const sourceType = detectSourceType(gcsUri);
+  await setJobStatus(runId, 'RUNNING', null, sourceType, gcsUri);
 }
 
 async function markRunningOrInsert(context) {
@@ -727,7 +847,7 @@ async function markRunning(context) {
   return markRunningState(context);
 }
 
-async function markFailed({ runId, taskName, retryCount, error, durationMs }) {
+async function markFailed({ runId, taskName, retryCount, error, durationMs, gcsUri }) {
   const errMsg = String(error || 'ingest_failed');
   const safeRetryCount = Number.isFinite(retryCount) ? retryCount : 0;
   const ms = Number.isFinite(durationMs) ? durationMs : 0;
@@ -746,6 +866,8 @@ async function markFailed({ runId, taskName, retryCount, error, durationMs }) {
   } catch (err) {
     console.error('[ingest markFailed]', err?.message || err);
   }
+  const sourceType = detectSourceType(gcsUri);
+  await setJobStatus(runId, 'FAILED', errMsg, sourceType, gcsUri);
 }
 
 async function markSucceeded({ runId, taskName, retryCount, result, gcsUri, durationMs, meta }) {
@@ -780,6 +902,9 @@ async function markSucceeded({ runId, taskName, retryCount, result, gcsUri, dura
   } catch (err) {
     console.error('[ingest markSucceeded]', err?.message || err);
   }
+  const sourceUri = gcsUri || result?.datasheet_uri || meta?.datasheet_uri || null;
+  const sourceType = detectSourceType(sourceUri);
+  await setJobStatus(runId, 'SUCCEEDED', null, sourceType, sourceUri);
 }
 
 async function handleWorkerIngest(req, res) {
@@ -993,26 +1118,31 @@ async function seedManufacturerAliases() {
     if (!available.has('brand') || !available.has('alias')) return;
 
     const seeds = [
-      { brand: 'Panasonic', alias: 'Matsushita' },
-      { brand: 'OMRON', alias: 'Omron Corporation' },
-      { brand: 'TE Connectivity', alias: 'Tyco Electronics' },
-      { brand: 'Finder', alias: 'Finder Relays' },
-      { brand: 'Schneider Electric', alias: 'Square D' },
+      { brand: 'Omron', alias: 'OMRON', aliases: ['OMRON', 'Omron', '오므론'] },
+      { brand: 'Panasonic', alias: 'Panasonic', aliases: ['Panasonic', 'Matsushita', '松下'] },
+      { brand: 'TE Connectivity', alias: 'TE', aliases: ['TE', 'Tyco', 'TE Connectivity'] },
+      { brand: 'Finder', alias: 'Finder', aliases: ['Finder', 'Finder Relays'] },
+      { brand: 'Schneider Electric', alias: 'Schneider Electric', aliases: ['Schneider Electric', 'Square D'] },
     ];
 
-    for (const { brand, alias } of seeds) {
-      const brandNorm = brand.toLowerCase();
+    const supportsAliases = available.has('aliases');
+
+    for (const { brand, alias, aliases } of seeds) {
+      if (!brand || !alias) continue;
+      const columns = ['brand', 'alias'];
+      const values = [brand, alias];
+      if (supportsAliases) {
+        columns.push('aliases');
+        values.push(Array.isArray(aliases) && aliases.length ? aliases : [alias]);
+      }
+
+      const colsSql = columns.join(', ');
+      const placeholders = columns.map((_, idx) => `$${idx + 1}`).join(', ');
       await db.query(
-        `INSERT INTO public.manufacturer_alias (brand, alias, brand_norm)
-         VALUES ($1,$2,$3)
+        `INSERT INTO public.manufacturer_alias (${colsSql})
+         VALUES (${placeholders})
          ON CONFLICT DO NOTHING`,
-        [brand, alias, brandNorm]
-      );
-      await db.query(
-        `INSERT INTO public.manufacturer_alias (brand, alias, brand_norm)
-         VALUES ($1,'',$2)
-         ON CONFLICT DO NOTHING`,
-        [brand, brandNorm]
+        values
       );
     }
   } catch (err) {
@@ -1080,6 +1210,30 @@ async function seedExtractionRecipe() {
   }
 }
 
+async function ensureRelaySignalPnTemplate() {
+  const template = '{series}{contact_form}{coil_voltage_vdc|pad=2}{suffix}';
+  try {
+    const res = await db.query(
+      `UPDATE public.component_spec_blueprint
+         SET ingest_options = jsonb_set(
+               COALESCE(ingest_options, '{}'::jsonb),
+               '{pn_template}',
+               to_jsonb($1::text),
+               true
+             ),
+             version = COALESCE(version, 0) + 1
+       WHERE family_slug = 'relay_signal'
+         AND COALESCE(ingest_options->>'pn_template', '') <> $1`,
+      [template]
+    );
+    if (res.rowCount > 0) {
+      console.log('[BOOT] updated relay_signal pn_template');
+    }
+  } catch (err) {
+    console.warn('[BOOT] relay_signal pn_template update skipped:', err?.message || err);
+  }
+}
+
 /* ---------------- Boot-time setup ---------------- */
 (async () => {
   try {
@@ -1106,6 +1260,7 @@ async function seedExtractionRecipe() {
     await db.query(`ALTER TABLE IF EXISTS public.relay_signal_specs ADD COLUMN IF NOT EXISTS contact_arrangement text`);
     await seedManufacturerAliases();
     await seedExtractionRecipe();
+    await ensureRelaySignalPnTemplate();
     console.log('[BOOT] ensured ingest_run_logs');
     
     // ───────── 부팅 시 외부 HTTPS/Vertex 호출은 여기서만 (가드 적용)

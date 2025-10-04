@@ -1,210 +1,152 @@
-diff --git a/server.retail.js b/server.retail.js
-index fad45948be27b119b885a6eccb8f927bd9e57b2c..45442801d11463ea93a2f5bf99bf2f3a8afc5b96 100644
---- a/server.retail.js
-+++ b/server.retail.js
-@@ -1,128 +1,96 @@
+diff --git a/src/services/docai.js b/src/services/docai.js
+index 6b03be532203a6e51e8641e222d7de4c2da1866a..bf7d48c28c3fc15795511b622aebe92e6ce04e94 100644
+--- a/src/services/docai.js
++++ b/src/services/docai.js
+@@ -1,97 +1,131 @@
  'use strict';
  
- const express = require('express');
-+const router = express.Router();
-+const { Pool } = require('pg');
- const { Storage } = require('@google-cloud/storage');
--const db = require('./db');
-+const { Transform } = require('stream');
-+const QueryStream = require('pg-query-stream');
-+const { ProductServiceClient } = require('@google-cloud/retail').v2;
- 
--const router = express.Router();
-+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
- const storage = new Storage();
-+const retail = new ProductServiceClient();
- 
--const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || '';
-+const PROJECT_NUMBER = process.env.GCP_PROJECT_NUMBER;
- const BUCKET = process.env.GCS_BUCKET;
--const EXPORT_PATH = 'retail/catalog/products.ndjson';
--
--function sanitizeKey(key) {
--  return String(key).replace(/[^A-Za-z0-9_]/g, '_').slice(0, 128) || 'attr';
--}
--
--function toCustomAttributes(raw) {
--  const attrs = {};
--  if (!raw || typeof raw !== 'object') return attrs;
--
--  for (const [k, v] of Object.entries(raw)) {
--    const key = sanitizeKey(k);
--    if (v === null || v === undefined || v === '') continue;
-+const NDJSON_PATH = process.env.RETAIL_CATALOG_OBJECT || 'retail/catalog/products.ndjson';
-+const GCS_URI = `gs://${BUCKET}/${NDJSON_PATH}`;
-+const BRANCH =
-+  process.env.RETAIL_BRANCH ||
-+  `projects/${PROJECT_NUMBER}/locations/global/catalogs/default_catalog/branches/default_branch`;
++const path = require('node:path');
 +
-+/** NDJSON Export to GCS */
-+router.post('/api/retail/export-catalog', async (req, res) => {
-+  const client = await pool.connect();
-+  try {
-+    const sql = `
-+      SELECT (product)::text AS line
-+      FROM retail.products_for_import
-+      ORDER BY family_slug, brand, code, id
-+    `;
-+    const query = new QueryStream(sql);
-+    const pgStream = client.query(query);
-+
-+    const gcsFile = storage.bucket(BUCKET).file(NDJSON_PATH);
-+    const gcsWrite = gcsFile.createWriteStream({
-+      resumable: false,
-+      contentType: 'application/x-ndjson',
-+    });
+ let DocumentProcessorServiceClient;
+ try {
+   ({ DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1);
+ } catch (err) {
+   DocumentProcessorServiceClient = null;
+ }
  
--    if (Array.isArray(v)) {
--      const nums = v.map(Number).filter((n) => Number.isFinite(n));
--      if (nums.length === v.length && nums.length > 0) {
--        attrs[key] = { numbers: nums.slice(0, 400) };
--      } else {
--        const texts = v.map((x) => String(x)).filter(Boolean);
--        if (texts.length) attrs[key] = { text: texts.slice(0, 400) };
--      }
--      continue;
--    }
-+    let count = 0;
-+    const toNdjson = new Transform({
-+      objectMode: true,
-+      transform(row, _enc, cb) {
-+        count++;
-+        cb(null, row.line + '\n');
+ const { storage, parseGcsUri } = require('../utils/gcs');
+ 
+-let cachedClient = null;
++const clientsByLocation = new Map();
+ 
+-function getClient() {
++function getClient(location = 'us') {
+   if (!DocumentProcessorServiceClient) return null;
+-  if (!cachedClient) {
+-    cachedClient = new DocumentProcessorServiceClient();
++  const loc = location || 'us';
++  if (!clientsByLocation.has(loc)) {
++    clientsByLocation.set(
++      loc,
++      new DocumentProcessorServiceClient({
++        apiEndpoint: `${loc}-documentai.googleapis.com`,
++      })
++    );
+   }
+-  return cachedClient;
++  return clientsByLocation.get(loc);
+ }
+ 
+-function buildProcessorName() {
++function buildProcessorConfig() {
+   const project =
+     process.env.DOCAI_PROJECT_ID ||
+     process.env.DOC_AI_PROJECT_ID ||
+     process.env.GCP_PROJECT_ID ||
+     process.env.GOOGLE_CLOUD_PROJECT;
+   const location =
+     process.env.DOCAI_LOCATION ||
+     process.env.DOC_AI_LOCATION ||
+     'us';
+   const processor = process.env.DOCAI_PROCESSOR_ID;
+   if (!project || !processor) return null;
+   return {
+     name: `projects/${project}/locations/${location}/processors/${processor}`,
++    location,
+   };
+ }
+ 
+ function collectText(document = {}) {
+   const fullText = document.text || '';
+   const tables = [];
+ 
+   const getText = (layout) => {
+     const segments = layout?.textAnchor?.textSegments || [];
+     let out = '';
+     for (const seg of segments) {
+       const start = Number(seg.startIndex || 0);
+       const end = Number(seg.endIndex || 0);
+       out += fullText.slice(start, end);
+     }
+     return out.trim();
+   };
+ 
+   for (const page of Array.isArray(document.pages) ? document.pages : []) {
+     for (const table of Array.isArray(page.tables) ? page.tables : []) {
+       const headers = [];
+       const headerRow = table.headerRows?.[0];
+       for (const cell of Array.isArray(headerRow?.cells) ? headerRow.cells : []) {
+         headers.push(getText(cell.layout));
+       }
+       const rows = [];
+       for (const bodyRow of Array.isArray(table.bodyRows) ? table.bodyRows : []) {
+         const row = [];
+         for (const cell of Array.isArray(bodyRow.cells) ? bodyRow.cells : []) {
+           row.push(getText(cell.layout));
+         }
+         rows.push(row);
+       }
+       tables.push({ headers, rows });
+     }
+   }
+ 
+   return { text: fullText, tables };
+ }
+ 
+ async function processDocument(gcsUri) {
+-  const cfg = buildProcessorName();
++  const cfg = buildProcessorConfig();
+   if (!cfg) return null;
+-  const client = getClient();
++  const client = getClient(cfg.location);
+   if (!client) return null;
+ 
+   const { bucket, name } = parseGcsUri(gcsUri);
+-  const [buf] = await storage.bucket(bucket).file(name).download();
++  const baseDir = path.posix.dirname(name);
++  const baseName = path.posix.basename(name, path.posix.extname(name));
++  const suffix = `${baseName || 'doc'}-${Date.now()}`;
++  const dir = baseDir && baseDir !== '.' ? `${baseDir}/docai/${suffix}` : `docai/${suffix}`;
++  const outputPrefix = `gs://${bucket}/${dir}/`;
+ 
+   const request = {
+     name: cfg.name,
+-    rawDocument: { content: buf, mimeType: 'application/pdf' },
+-    skipHumanReview: true,
++    inputDocuments: {
++      gcsDocuments: {
++        documents: [{ gcsUri, mimeType: 'application/pdf' }],
 +      },
-+    });
++    },
++    documentOutputConfig: {
++      gcsOutputConfig: { gcsUri: outputPrefix },
++    },
+   };
  
--    const num = Number(v);
--    if (!Number.isNaN(num) && Number.isFinite(num)) {
--      attrs[key] = { numbers: [num] };
--      continue;
--    }
-+    await new Promise((resolve, reject) => {
-+      pgStream
-+        .pipe(toNdjson)
-+        .pipe(gcsWrite)
-+        .on('finish', resolve)
-+        .on('error', reject);
-+    });
- 
--    const str = String(v);
--    if (str) attrs[key] = { text: [str.slice(0, 256)] };
-+    const [meta] = await gcsFile.getMetadata();
-+    res.json({ ok: true, gcsUri: GCS_URI, count, size: meta.size });
-+  } catch (e) {
-+    console.error('[retail/export] error', e);
-+    res.status(500).json({ ok: false, error: e.message });
-+  } finally {
-+    client.release();
-   }
-+});
- 
--  return attrs;
--}
--
--router.post('/api/retail/export-catalog', async (req, res, next) => {
-+/** Start Import (returns operation name) */
-+router.post('/api/retail/import-catalog', async (req, res) => {
-   try {
--    if (!BUCKET) {
--      res.status(500).json({ ok: false, error: 'GCS_BUCKET not configured' });
--      return;
--    }
--
--    const baseRows = await db.query(
--      `SELECT id, family_slug, brand, code, display_name,
--              COALESCE(image_uri, cover) AS image_uri,
--              COALESCE(datasheet_url, datasheet_uri) AS datasheet_uri,
--              updated_at
--         FROM public.component_specs`
--    );
--
--    const families = await db.query(
--      'SELECT family_slug, specs_table FROM public.component_registry'
--    );
--
--    const rawMap = new Map();
--    for (const f of families.rows) {
--      if (!f?.specs_table) continue;
--      const tableName = String(f.specs_table).replace(/[^A-Za-z0-9_]/g, '');
--      if (!tableName) continue;
--
--      const sql = `SELECT id, raw_json FROM public.${tableName}`;
--      try {
--        const r = await db.query(sql);
--        for (const row of r.rows) {
--          const key = `${f.family_slug}:${row.id}`;
--          rawMap.set(key, row.raw_json || {});
--        }
--      } catch (err) {
--        console.warn('[retail][export] skip specs table', tableName, err?.message || err);
--      }
--    }
--
--    const lines = baseRows.rows.map((r) => {
--      const brand = r.brand || '';
--      const code = r.code || r.id;
--      const pid = `${r.family_slug}:${brand.toLowerCase()}:${code}`.slice(0, 128);
--      const raw = rawMap.get(`${r.family_slug}:${r.id}`) || {};
--      const titleBase = (r.display_name || `${brand} ${code}` || '').trim();
--      const title = titleBase || String(code || r.id || pid);
--
--      const product = {
--        id: pid,
--        title,
--        brands: brand ? [brand] : [],
--        categories: r.family_slug ? [r.family_slug] : [],
--        images: r.image_uri ? [{ uri: r.image_uri }] : [],
--        uri: r.datasheet_uri || undefined,
--        attributes: toCustomAttributes(raw),
--        availability: 'IN_STOCK',
--        fulfillmentTypes: ['pickup-in-store'],
--        audience: { genders: ['male', 'female'], ageGroups: ['adult'] },
--        primaryProductId: pid,
--      };
--
--      return JSON.stringify(product);
--    });
--
--    const file = storage.bucket(BUCKET).file(EXPORT_PATH);
--    await file.save(lines.join('\n'), {
--      contentType: 'application/x-ndjson',
--      metadata: {
--        'x-goog-meta-project-id': PROJECT_ID || 'unknown',
--        'x-goog-meta-exported-at': new Date().toISOString(),
--        'x-goog-meta-count': String(lines.length),
--      },
-+    const [op] = await retail.importProducts({
-+      parent: BRANCH,
-+      inputConfig: { gcsSource: { inputUris: [GCS_URI] } },
-+      reconciliationMode: 'INCREMENTAL',
-     });
-+    res.json({ ok: true, operation: op.name, gcsUri: GCS_URI, branch: BRANCH });
-+  } catch (e) {
-+    console.error('[retail/import] error', e);
-+    res.status(500).json({ ok: false, error: e.message });
+-  const [result] = await client.processDocument(request);
+-  const document = result?.document;
+-  if (!document) return null;
+-  return collectText(document);
++  const [operation] = await client.batchProcessDocuments(request);
++  await operation.promise();
++
++  const { bucket: outBucket, name: outPrefix } = parseGcsUri(outputPrefix);
++  const [files] = await storage.bucket(outBucket).getFiles({ prefix: outPrefix });
++  const jsonFiles = files.filter((file) => file.name && file.name.endsWith('.json'));
++  for (const file of jsonFiles) {
++    try {
++      const [buf] = await file.download();
++      const parsed = JSON.parse(buf.toString('utf8'));
++      const document = parsed?.document || parsed;
++      if (document?.text) {
++        return collectText(document);
++      }
++    } catch (err) {
++      console.warn('[DocAI] failed to parse output', err?.message || err);
++    }
 +  }
-+});
++  return null;
+ }
  
--    res.json({ ok: true, gcs: `gs://${BUCKET}/${EXPORT_PATH}`, count: lines.length });
--  } catch (err) {
--    next(err);
-+/** Check Import Status (use ?name=operations/… ) */
-+router.get('/api/retail/import-catalog/status', async (req, res) => {
-+  try {
-+    const name = req.query.name;
-+    if (!name) return res.status(400).json({ ok: false, error: 'missing ?name' });
-+    const [resp] = await retail.checkImportProductsProgress(String(name));
-+    res.json({ ok: true, metadata: resp.metadata, done: resp.done, result: resp.result });
-+  } catch (e) {
-+    console.error('[retail/status] error', e);
-+    res.status(500).json({ ok: false, error: e.message });
-   }
- });
- 
--module.exports = router;
-+module.exports = router;
+-module.exports = { processDocument };
++module.exports = { processDocument };

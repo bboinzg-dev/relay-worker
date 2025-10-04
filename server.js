@@ -61,7 +61,6 @@ function getIngest() {
   }
   return __INGEST_MOD__;
 }
-const { enqueueIngest } = require('./src/utils/enqueue');
 
 
 
@@ -975,7 +974,7 @@ async function handleWorkerIngest(req, res) {
         };
 
         try {
-          await enqueueIngest(nextPayload);
+          await enqueueIngestTask(nextPayload);
         } catch (err) {
           console.error(
             '[enqueue error]',
@@ -1033,7 +1032,7 @@ async function handleWorkerIngest(req, res) {
         };
 
         try {
-          await enqueueIngest(nextPayload);
+          await enqueueIngestTask(nextPayload);
         } catch (err) {
           console.error(
             '[enqueue error]',

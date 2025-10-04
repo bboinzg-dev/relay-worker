@@ -1,152 +1,170 @@
-diff --git a/src/services/docai.js b/src/services/docai.js
-index 6b03be532203a6e51e8641e222d7de4c2da1866a..bf7d48c28c3fc15795511b622aebe92e6ce04e94 100644
---- a/src/services/docai.js
-+++ b/src/services/docai.js
-@@ -1,97 +1,131 @@
- 'use strict';
- 
-+const path = require('node:path');
-+
- let DocumentProcessorServiceClient;
+diff --git a/server.js b/server.js
+index c4f1c9719770da0d6de043624745a0cfe4c1ac10..129a462e83fa583ba51128729cb16b39c963c02b 100644
+--- a/server.js
++++ b/server.js
+@@ -39,51 +39,50 @@ const jwt = require('jsonwebtoken');
+ // 1) DB 모듈: 로드 실패해도 서버는 떠야 함
+ let db;
  try {
-   ({ DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1);
+   db = require('./db');
  } catch (err) {
-   DocumentProcessorServiceClient = null;
+   console.error('[BOOT] db load failed:', err?.message || err);
+   db = { query: async () => { throw new Error('DB_UNAVAILABLE'); } };
  }
- 
- const { storage, parseGcsUri } = require('../utils/gcs');
- 
--let cachedClient = null;
-+const clientsByLocation = new Map();
- 
--function getClient() {
-+function getClient(location = 'us') {
-   if (!DocumentProcessorServiceClient) return null;
--  if (!cachedClient) {
--    cachedClient = new DocumentProcessorServiceClient();
-+  const loc = location || 'us';
-+  if (!clientsByLocation.has(loc)) {
-+    clientsByLocation.set(
-+      loc,
-+      new DocumentProcessorServiceClient({
-+        apiEndpoint: `${loc}-documentai.googleapis.com`,
-+      })
-+    );
+ const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
+ const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
+ // 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
+ let __INGEST_MOD__ = null;
+ function getIngest() {
+   if (__INGEST_MOD__) return __INGEST_MOD__;
+   try {
+     __INGEST_MOD__ = require('./src/pipeline/ingestAuto');
+   } catch (e) {
+     console.error('[INGEST] module load failed:', e?.message || e);
+     __INGEST_MOD__ = {
+       runAutoIngest: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
+       persistProcessedData: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
+     };
    }
--  return cachedClient;
-+  return clientsByLocation.get(loc);
+   return __INGEST_MOD__;
  }
+-const { enqueueIngest } = require('./src/utils/enqueue');
  
--function buildProcessorName() {
-+function buildProcessorConfig() {
-   const project =
-     process.env.DOCAI_PROJECT_ID ||
-     process.env.DOC_AI_PROJECT_ID ||
-     process.env.GCP_PROJECT_ID ||
-     process.env.GOOGLE_CLOUD_PROJECT;
-   const location =
-     process.env.DOCAI_LOCATION ||
-     process.env.DOC_AI_LOCATION ||
-     'us';
-   const processor = process.env.DOCAI_PROCESSOR_ID;
-   if (!project || !processor) return null;
-   return {
-     name: `projects/${project}/locations/${location}/processors/${processor}`,
-+    location,
-   };
- }
  
- function collectText(document = {}) {
-   const fullText = document.text || '';
-   const tables = [];
  
-   const getText = (layout) => {
-     const segments = layout?.textAnchor?.textSegments || [];
-     let out = '';
-     for (const seg of segments) {
-       const start = Number(seg.startIndex || 0);
-       const end = Number(seg.endIndex || 0);
-       out += fullText.slice(start, end);
-     }
-     return out.trim();
-   };
+ // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
+ // 2) Cloud Tasks: 런타임에 없으면 비활성화
+ let CloudTasksClient;
+ try { ({ CloudTasksClient } = require('@google-cloud/tasks')); }
+ catch (e) { console.warn('[BOOT] @google-cloud/tasks unavailable:', e?.message || e); }
+ const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+ const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
+ const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
+ // step 라우트 폐지 → ingest 하나로 통일
+ const WORKER_TASK_URL = process.env.WORKER_TASK_URL || process.env.WORKER_STEP_URL || 'https://<YOUR-RUN-URL>/api/worker/ingest';
+ const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
  
-   for (const page of Array.isArray(document.pages) ? document.pages : []) {
-     for (const table of Array.isArray(page.tables) ? page.tables : []) {
-       const headers = [];
-       const headerRow = table.headerRows?.[0];
-       for (const cell of Array.isArray(headerRow?.cells) ? headerRow.cells : []) {
-         headers.push(getText(cell.layout));
-       }
-       const rows = [];
-       for (const bodyRow of Array.isArray(table.bodyRows) ? table.bodyRows : []) {
-         const row = [];
-         for (const cell of Array.isArray(bodyRow.cells) ? bodyRow.cells : []) {
-           row.push(getText(cell.layout));
+ // ⚠️ 외부 API(예: Vertex/HTTP) 가능성이 있는 부팅 태스크는 가드 안에서만 실행
+ //   → 아래 부팅 IIFE 내부의  if (!EXT_CALLS_OFF)  블록으로 이동
+ //try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
+ 
+ // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
+ let _tasks = null;
+ let _queuePath = null;
+ function getTasks() {
+   if (!_tasks) {
+     if (!CloudTasksClient) throw new Error('@google-cloud/tasks unavailable');
+diff --git a/server.js b/server.js
+index c4f1c9719770da0d6de043624745a0cfe4c1ac10..129a462e83fa583ba51128729cb16b39c963c02b 100644
+--- a/server.js
++++ b/server.js
+@@ -953,51 +952,51 @@ async function handleWorkerIngest(req, res) {
+ 
+         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+         const nextOverrides = {
+           ...(payload?.overrides || {}),
+           brand: overrideBrand,
+           series: overrideSeries,
+         };
+ 
+         const nextPayload = {
+           runId,
+           run_id: runId,
+           gcsUri,
+           gcs_uri: gcsUri,
+           family_slug: payload?.family_slug ?? null,
+           brand: payload?.brand ?? null,
+           code: payload?.code ?? null,
+           series: payload?.series ?? null,
+           display_name: payload?.display_name ?? null,
+           uploader_id: payload?.uploader_id ?? null,
+           overrides: nextOverrides,
+           phase: 'process',
+         };
+ 
+         try {
+-          await enqueueIngest(nextPayload);
++          await enqueueIngestTask(nextPayload);
+         } catch (err) {
+           console.error(
+             '[enqueue error]',
+             err?.code || err?.response?.status || err?.message,
+             err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
+           );
+           throw new Error(`enqueue failed: ${String(err?.message || err)}`);
          }
-         rows.push(row);
+ 
+         return;
        }
-       tables.push({ headers, rows });
-     }
-   }
  
-   return { text: fullText, tables };
- }
+       if (phase === 'process') {
+         await markProcessing(baseContext);
  
- async function processDocument(gcsUri) {
--  const cfg = buildProcessorName();
-+  const cfg = buildProcessorConfig();
-   if (!cfg) return null;
--  const client = getClient();
-+  const client = getClient(cfg.location);
-   if (!client) return null;
+         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+         const nextOverrides = {
+           ...(payload?.overrides || {}),
+           brand: overrideBrand,
+           series: overrideSeries,
+         };
  
-   const { bucket, name } = parseGcsUri(gcsUri);
--  const [buf] = await storage.bucket(bucket).file(name).download();
-+  const baseDir = path.posix.dirname(name);
-+  const baseName = path.posix.basename(name, path.posix.extname(name));
-+  const suffix = `${baseName || 'doc'}-${Date.now()}`;
-+  const dir = baseDir && baseDir !== '.' ? `${baseDir}/docai/${suffix}` : `docai/${suffix}`;
-+  const outputPrefix = `gs://${bucket}/${dir}/`;
+         const result = await getIngest().runAutoIngest({
+           ...payload,
+diff --git a/server.js b/server.js
+index c4f1c9719770da0d6de043624745a0cfe4c1ac10..129a462e83fa583ba51128729cb16b39c963c02b 100644
+--- a/server.js
++++ b/server.js
+@@ -1011,51 +1010,51 @@ async function handleWorkerIngest(req, res) {
  
-   const request = {
-     name: cfg.name,
--    rawDocument: { content: buf, mimeType: 'application/pdf' },
--    skipHumanReview: true,
-+    inputDocuments: {
-+      gcsDocuments: {
-+        documents: [{ gcsUri, mimeType: 'application/pdf' }],
-+      },
-+    },
-+    documentOutputConfig: {
-+      gcsOutputConfig: { gcsUri: outputPrefix },
-+    },
-   };
+         const processed = result?.processed;
+         if (!processed || !Array.isArray(processed.records)) {
+           throw new Error('process_no_records');
+         }
  
--  const [result] = await client.processDocument(request);
--  const document = result?.document;
--  if (!document) return null;
--  return collectText(document);
-+  const [operation] = await client.batchProcessDocuments(request);
-+  await operation.promise();
-+
-+  const { bucket: outBucket, name: outPrefix } = parseGcsUri(outputPrefix);
-+  const [files] = await storage.bucket(outBucket).getFiles({ prefix: outPrefix });
-+  const jsonFiles = files.filter((file) => file.name && file.name.endsWith('.json'));
-+  for (const file of jsonFiles) {
-+    try {
-+      const [buf] = await file.download();
-+      const parsed = JSON.parse(buf.toString('utf8'));
-+      const document = parsed?.document || parsed;
-+      if (document?.text) {
-+        return collectText(document);
-+      }
-+    } catch (err) {
-+      console.warn('[DocAI] failed to parse output', err?.message || err);
-+    }
-+  }
-+  return null;
- }
+         await markRunning(baseContext);
  
--module.exports = { processDocument };
-+module.exports = { processDocument };
+         const nextPayload = {
+           runId,
+           run_id: runId,
+           gcsUri,
+           gcs_uri: gcsUri,
+           family_slug: payload?.family_slug ?? null,
+           brand: payload?.brand ?? null,
+           code: payload?.code ?? null,
+           series: payload?.series ?? null,
+           display_name: payload?.display_name ?? null,
+           uploader_id: payload?.uploader_id ?? null,
+           phase: 'persist',
+           processed,
+           overrides: nextOverrides,
+         };
+ 
+         try {
+-          await enqueueIngest(nextPayload);
++          await enqueueIngestTask(nextPayload);
+         } catch (err) {
+           console.error(
+             '[enqueue error]',
+             err?.code || err?.response?.status || err?.message,
+             err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
+           );
+           throw new Error(`persist enqueue failed: ${String(err?.message || err)}`);
+         }
+         return;
+       }
+ 
+       if (phase === 'persist') {
+         await markPersisting(baseContext);
+ 
+         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+ 
+         const out = await getIngest().persistProcessedData(payload?.processed || {}, {
+           brand: overrideBrand,
+           code: payload?.code ?? null,
+           series: overrideSeries,
+           display_name: payload?.display_name ?? null,
+         });
+ 
+         const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);

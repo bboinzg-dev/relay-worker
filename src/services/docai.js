@@ -13,6 +13,46 @@ const { storage, parseGcsUri } = require('../utils/gcs');
 
 const clientsByLocation = new Map();
 
+const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
+
+function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
+  const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      clearTimeout(timer);
+      reject(new Error(`${label}_TIMEOUT`));
+    }, timeout);
+    Promise.resolve(promise)
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
+function sanitizeRunId(runId) {
+  if (!runId) return null;
+  const trimmed = String(runId).trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120) || null;
+}
+
+async function waitForJsonOutputs(bucketName, prefix, ms = HARD_CAP_MS) {
+  const started = Date.now();
+  const bucket = storage.bucket(bucketName);
+  while (Date.now() - started < ms) {
+    const [files] = await bucket.getFiles({ prefix });
+    const jsonFiles = files.filter((file) => file.name && file.name.endsWith('.json'));
+    if (jsonFiles.length) return jsonFiles;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  throw new Error('DOCAI_OUTPUT_TIMEOUT');
+}
+
 function getClient(location = 'us') {
   if (!DocumentProcessorServiceClient) return null;
   const loc = location || 'us';
@@ -82,7 +122,7 @@ function collectText(document = {}) {
   return { text: fullText, tables };
 }
 
-async function processDocument(gcsUri) {
+async function processDocument(gcsUri, options = {}) {
   const cfg = buildProcessorConfig();
   if (!cfg) return null;
   const client = getClient(cfg.location);
@@ -91,8 +131,10 @@ async function processDocument(gcsUri) {
   const { bucket, name } = parseGcsUri(gcsUri);
   const baseDir = path.posix.dirname(name);
   const baseName = path.posix.basename(name, path.posix.extname(name));
-  const suffix = `${baseName || 'doc'}-${Date.now()}`;
-  const dir = baseDir && baseDir !== '.' ? `${baseDir}/docai/${suffix}` : `docai/${suffix}`;
+  const safeRunId = sanitizeRunId(options.runId ?? options.run_id);
+  const suffix = safeRunId || `${baseName || 'doc'}-${Date.now()}`;
+  const outBase = baseDir && baseDir !== '.' ? `${baseDir}/docai/out` : 'docai/out';
+  const dir = `${outBase}/${suffix}`;
   const outputPrefix = `gs://${bucket}/${dir}/`;
 
   const request = {
@@ -108,11 +150,10 @@ async function processDocument(gcsUri) {
   };
 
   const [operation] = await client.batchProcessDocuments(request);
-  await operation.promise();
+  await withDeadline(operation.promise(), HARD_CAP_MS, 'DOCAI_BATCH');
 
   const { bucket: outBucket, name: outPrefix } = parseGcsUri(outputPrefix);
-  const [files] = await storage.bucket(outBucket).getFiles({ prefix: outPrefix });
-  const jsonFiles = files.filter((file) => file.name && file.name.endsWith('.json'));
+  const jsonFiles = await waitForJsonOutputs(outBucket, outPrefix, HARD_CAP_MS);
   for (const file of jsonFiles) {
     try {
       const [buf] = await file.download();

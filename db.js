@@ -83,14 +83,21 @@ function buildPool() {
   const max = parseInt(process.env.PGPOOL_MAX || '10', 10);
   const idle = parseInt(process.env.PG_IDLE_TIMEOUT_MS || '30000', 10);
   const connTimeout = parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '5000', 10);
+  const statementTimeout = parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || '30000', 10);
+  const queryTimeout = parseInt(process.env.PG_QUERY_TIMEOUT_MS || '30000', 10);
 
-  const pool = new Pool({
+  const config = {
     connectionString,
     ssl,                                 // 위에서 결정
     max,
     idleTimeoutMillis: idle,
     connectionTimeoutMillis: connTimeout,
-  });
+  };
+
+  if (Number.isFinite(statementTimeout)) config.statement_timeout = statementTimeout;
+  if (Number.isFinite(queryTimeout)) config.query_timeout = queryTimeout;
+
+  const pool = new Pool(config);
 
   // 로그(민감정보 제외)
   try {

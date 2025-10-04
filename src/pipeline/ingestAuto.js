@@ -11,6 +11,8 @@ const db = require('../../db');
 const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
 const { extractText } = require('../utils/extract');
 const { getBlueprint } = require('../utils/blueprint');
+const { resolveBrand } = require('../utils/brand');
+const { detectVariantKeys } = require('../utils/ordering');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
 const { saveExtractedSpecs } = require('./persist');
@@ -47,6 +49,43 @@ function textContainsExact(text, pn) {
 }
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
+
+function pickBrandHint(...values) {
+  for (const value of values) {
+    if (value == null) continue;
+    const trimmed = String(value).trim();
+    if (!trimmed) continue;
+    if (trimmed.toLowerCase() === 'unknown') continue;
+    return trimmed;
+  }
+  return null;
+}
+
+function mergeRuntimeMetadata(rawJson, meta = {}) {
+  const hasBrandSource = Object.prototype.hasOwnProperty.call(meta, 'brand_source');
+  const hasVariantKeys = Object.prototype.hasOwnProperty.call(meta, 'variant_keys_runtime');
+  if (!hasBrandSource && !hasVariantKeys) return rawJson;
+
+  let base = {};
+  if (rawJson && typeof rawJson === 'object' && !Array.isArray(rawJson)) {
+    base = { ...rawJson };
+  } else if (typeof rawJson === 'string') {
+    try {
+      const parsed = JSON.parse(rawJson);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        base = parsed;
+      }
+    } catch (_) {
+      base = {};
+    }
+  } else if (rawJson != null) {
+    base = { value: rawJson };
+  }
+
+  if (hasBrandSource) base.brand_source = meta.brand_source ?? null;
+  if (hasVariantKeys) base.variant_keys_runtime = meta.variant_keys_runtime ?? [];
+  return base;
+}
 
 // --- 브랜드 자동 감지 (manufacturer_alias 기반) ---
 async function detectBrandFromText(text = '', fileName = '') {
@@ -592,7 +631,7 @@ async function runAutoIngest(input = {}) {
   }
 
   const overrideBrandLog = overridesBrand ?? brand ?? '';
-  console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''} brand_effective=${effectiveBrand || ''}`);
+  console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''}`);
 
 // 목적 테이블
   const reg = await db.query(
@@ -848,12 +887,70 @@ async function runAutoIngest(input = {}) {
     // extracted.rows는 건드리지 않음.
   }
 
+  const extractedText = extracted?.text || previewText || '';
+  const brandHintSeed = pickBrandHint(
+    overridesBrand,
+    effectiveBrand,
+    brand,
+    extracted?.brand,
+    detectedBrand,
+    vertexClassification?.brand,
+  );
+
+  let brandResolution = null;
+  try {
+    brandResolution = await resolveBrand({ rawText: extractedText, hint: brandHintSeed });
+  } catch (err) {
+    console.warn('[brand resolve] failed:', err?.message || err);
+  }
+
+  const brandEffectiveResolved = pickBrandHint(
+    brandResolution?.brand_effective,
+    brandHintSeed,
+    effectiveBrand,
+    extracted?.brand,
+    detectedBrand,
+  ) || 'unknown';
+
+  let brandSource = brandResolution?.source || null;
+  if (!brandSource || brandSource === 'none') {
+    brandSource = brandHintSeed ? 'hint' : 'none';
+  }
+  if (!brandEffectiveResolved || brandEffectiveResolved.toLowerCase() === 'unknown') {
+    brandSource = 'none';
+  }
+
+  if (extracted && typeof extracted === 'object') {
+    extracted.brand = brandEffectiveResolved;
+  }
+
+  let runtimeVariantKeys = [];
+  try {
+    runtimeVariantKeys = await detectVariantKeys({
+      rawText: extractedText,
+      family,
+      blueprintVariantKeys: variantKeys,
+    });
+  } catch (err) {
+    console.warn('[variant] runtime detect failed:', err?.message || err);
+    runtimeVariantKeys = Array.isArray(variantKeys) ? [...variantKeys] : [];
+  }
+
+  console.log('[PATH] brand resolved', {
+    runId,
+    family,
+    hint: brandHintSeed || null,
+    effective: brandEffectiveResolved,
+    source: brandSource,
+    vkeys_runtime: runtimeVariantKeys,
+  });
+
 
   // 커버 추출 비활성(요청에 따라 완전 OFF)
   let coverUri = null;
   if (/^(1|true|on)$/i.test(process.env.COVER_CAPTURE || '0')) {
     try {
-      const bForCover = effectiveBrand || extracted.brand || 'unknown';
+      const bForCover = brandEffectiveResolved || 'unknown';
       const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
       coverUri = await withTimeout(
         extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
@@ -875,10 +972,16 @@ async function runAutoIngest(input = {}) {
 
   // 레코드 구성
   const records = [];
-  const extractedText = extracted?.text || previewText || '';
   const now = new Date();
-  const brandName = effectiveBrand || extracted.brand || 'unknown';
+  const brandName = brandEffectiveResolved || 'unknown';
   const baseSeries = series || code || null;
+  const runtimeMeta = {
+    brand_source: brandSource ?? null,
+    variant_keys_runtime: Array.isArray(runtimeVariantKeys) ? runtimeVariantKeys : [],
+  };
+  const hasRuntimeMeta =
+    runtimeMeta.brand_source != null ||
+    (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
 
   let variantColumnsEnsured = false;
   try {
@@ -1049,7 +1152,11 @@ async function runAutoIngest(input = {}) {
     rec.updated_at = now;
     // persist에서 브랜드 정규화할 때 쓰도록 원문 텍스트 전달
     rec._doc_text = extractedText;
-    if (row.raw_json != null) rec.raw_json = row.raw_json;
+    if (hasRuntimeMeta) {
+      rec.raw_json = mergeRuntimeMetadata(row.raw_json, runtimeMeta);
+    } else if (row.raw_json != null) {
+      rec.raw_json = row.raw_json;
+    }
 
     for (const [rawKey, rawValue] of Object.entries(row)) {
       const key = String(rawKey || '').trim();
@@ -1086,6 +1193,9 @@ async function runAutoIngest(input = {}) {
         updated_at: now,
       };
       if (coverUri) rec.cover = coverUri;
+      if (hasRuntimeMeta) {
+        rec.raw_json = mergeRuntimeMetadata(rec.raw_json, runtimeMeta);
+      }
       if (physicalCols.has('series') && fallbackSeries != null) rec.series = fallbackSeries;
       if (rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
       if (rec.display_name != null && rec.displayname == null) rec.displayname = rec.display_name;
@@ -1096,6 +1206,8 @@ async function runAutoIngest(input = {}) {
   console.log('[MPNDBG]', {
     picks: candidateMap.length,
     vkeys: Array.isArray(blueprint?.ingestOptions?.variant_keys) ? blueprint.ingestOptions.variant_keys : [],
+    vkeys_runtime: runtimeVariantKeys,
+    brand_source: brandSource,
     expanded: explodedRows.length,
     recs: records.length,
     colsSanitized: colTypes?.size || 0,
@@ -1121,8 +1233,11 @@ async function runAutoIngest(input = {}) {
     jobId,
     job_id: jobId,
     text: extractedText,
-    brand: extracted?.brand ?? null,
+    brand: brandEffectiveResolved || extracted?.brand || null,
     brand_detected: detectedBrand || null,
+    brand_effective: brandEffectiveResolved || null,
+    brand_source: brandSource || null,
+    variant_keys_runtime: runtimeVariantKeys,
   };
 
   if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
@@ -1134,8 +1249,9 @@ async function runAutoIngest(input = {}) {
     return { ok: true, phase: 'process', processed: processedPayload };
   }
 
+  const persistBrand = pickBrandHint(brandEffectiveResolved, overridesBrand, effectiveBrand, detectedBrand, brand);
   const persistOverrides = {
-    brand: effectiveBrand || detectedBrand || null,
+    brand: persistBrand || null,
     code,
     series: overridesSeries ?? series,
     display_name,
@@ -1173,12 +1289,22 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     text: processedText = null,
     brand: processedBrand = null,
     brand_detected: processedDetected = null,
+    brand_effective: processedEffective = null,
+    brand_source: processedBrandSource = null,
+    variant_keys_runtime: processedVariantKeys = [],
   } = processed || {};
 
   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
     ? initialRecords
     : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
   const records = Array.isArray(recordsSource) ? recordsSource : [];
+  const runtimeMeta = {
+    brand_source: processedBrandSource ?? null,
+    variant_keys_runtime: Array.isArray(processedVariantKeys) ? processedVariantKeys : [],
+  };
+  const hasRuntimeMeta =
+    runtimeMeta.brand_source != null ||
+    (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
   const docText = typeof processedText === 'string'
     ? processedText
     : (processedText != null ? String(processedText) : '');
@@ -1189,7 +1315,16 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     if (trimmed.toLowerCase() === 'unknown') return null;
     return trimmed;
   };
-  const brandSeed = normalizeSeedBrand(processedBrand) || normalizeSeedBrand(processedDetected) || null;
+  const brandSeed =
+    normalizeSeedBrand(processedEffective) ||
+    normalizeSeedBrand(processedBrand) ||
+    normalizeSeedBrand(processedDetected) ||
+    null;
+  const attachRuntimeMeta = (row) => {
+    if (!hasRuntimeMeta) return;
+    if (!row || typeof row !== 'object') return;
+    row.raw_json = mergeRuntimeMetadata(row.raw_json, runtimeMeta);
+  };
   if ((docText && docText.length) || brandSeed) {
     const applyRowHints = (row) => {
       if (!row || typeof row !== 'object') return;
@@ -1199,10 +1334,16 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       if (brandSeed && (!row.brand || !String(row.brand).trim())) {
         row.brand = brandSeed;
       }
+      attachRuntimeMeta(row);
     };
     for (const row of records) applyRowHints(row);
     if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
       for (const row of processedRowsInput) applyRowHints(row);
+    }
+  } else if (hasRuntimeMeta) {
+    for (const row of records) attachRuntimeMeta(row);
+    if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+      for (const row of processedRowsInput) attachRuntimeMeta(row);
     }
   }
 
@@ -1225,6 +1366,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     };
 
     let brandOverride = safeBrand(overrides?.brand)
+      || safeBrand(processedEffective)
       || safeBrand(processedBrand)
       || safeBrand(brandName)
       || safeBrand(extractedBrand)
@@ -1309,7 +1451,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   const affected = typeof persistResult.affected === 'number' ? persistResult.affected : upsertsCount;
   const ok = affected > 0;
 
-  const fallbackBrand = overrides.brand || brandName || extractedBrand || null;
+  const fallbackBrand = overrides.brand || brandName || processedEffective || extractedBrand || null;
   const primaryRecord = records[0] || null;
   const finalBrand = primaryRecord?.brand || fallbackBrand;
   const finalCode =
@@ -1326,12 +1468,15 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     final_table: table,
     specs_table: table,
     brand: finalBrand,
+    brand_effective: finalBrand,
+    brand_source: processedBrandSource || null,
     code: finalCode,
     datasheet_uri: gcsUri,
     cover: coverUri || primaryRecord?.image_uri || null,
     rows: affected,        // 실제 반영된 개수만 기록
     codes: Array.from(persistedCodes),  // 표시는 그대로
     mpn_list: mergedMpns,
+    variant_keys_runtime: runtimeMeta.variant_keys_runtime,
     reject_reasons: Array.from(rejectReasons),
     warnings: Array.from(warningReasons),
   };

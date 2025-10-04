@@ -847,7 +847,9 @@ async function markRunning(context) {
 }
 
 async function markFailed({ runId, taskName, retryCount, error, durationMs, gcsUri }) {
-  const errMsg = String(error || 'ingest_failed');
+  const errMsg = (error && typeof error === 'object' && error.message)
+    ? String(error.message)
+    : String(error || 'ingest_failed');
   const safeRetryCount = Number.isFinite(retryCount) ? retryCount : 0;
   const ms = Number.isFinite(durationMs) ? durationMs : 0;
   try {

@@ -1,170 +1,677 @@
-diff --git a/server.js b/server.js
-index c4f1c9719770da0d6de043624745a0cfe4c1ac10..129a462e83fa583ba51128729cb16b39c963c02b 100644
---- a/server.js
-+++ b/server.js
-@@ -39,51 +39,50 @@ const jwt = require('jsonwebtoken');
- // 1) DB 모듈: 로드 실패해도 서버는 떠야 함
- let db;
- try {
-   db = require('./db');
- } catch (err) {
-   console.error('[BOOT] db load failed:', err?.message || err);
-   db = { query: async () => { throw new Error('DB_UNAVAILABLE'); } };
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index e45afcc31b960578b642aba6232ec454cfafb5be..46e6aa4a536f21453680d5410e9620c3b8a2407d 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1,75 +1,114 @@
+ 'use strict';
+ 
+ const path = require('node:path');
+ const fs = require('node:fs/promises');
+ const os = require('node:os');
+ const { execFile } = require('node:child_process');
+ const { promisify } = require('node:util');
+ const execFileP = promisify(execFile);
+ 
+ const db = require('../../db');
+ const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
+ const { extractText } = require('../utils/extract');
+ const { getBlueprint } = require('../utils/blueprint');
++const { resolveBrand } = require('../utils/brand');
++const { detectVariantKeys } = require('../utils/ordering');
+ const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
+ const { extractFields } = require('./extractByBlueprint');
+ const { saveExtractedSpecs } = require('./persist');
+ const { explodeToRows } = require('../ingest/mpn-exploder');
+ const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
+ const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
+ const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
+ const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
+ const { processDocument: processDocAi } = require('../services/docai');
+ 
+ const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
+ const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
+ 
+ const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
+ const BASE_KEYS = new Set([
+   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
+   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
+   'cover','verified_in_doc','updated_at'
+ ]);
+ 
+ const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
+ const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
+ 
+ function escapeRegex(str) {
+   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
  }
- const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
- const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
- // 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
- let __INGEST_MOD__ = null;
- function getIngest() {
-   if (__INGEST_MOD__) return __INGEST_MOD__;
+ 
+ function textContainsExact(text, pn) {
+   if (!text || !pn) return false;
+   const pattern = escapeRegex(String(pn).trim());
+   if (!pattern) return false;
+   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
+   return re.test(String(text));
+ }
+ 
+ function normLower(s){ return String(s||'').trim().toLowerCase(); }
+ 
++function pickBrandHint(...values) {
++  for (const value of values) {
++    if (value == null) continue;
++    const trimmed = String(value).trim();
++    if (!trimmed) continue;
++    if (trimmed.toLowerCase() === 'unknown') continue;
++    return trimmed;
++  }
++  return null;
++}
++
++function mergeRuntimeMetadata(rawJson, meta = {}) {
++  const hasBrandSource = Object.prototype.hasOwnProperty.call(meta, 'brand_source');
++  const hasVariantKeys = Object.prototype.hasOwnProperty.call(meta, 'variant_keys_runtime');
++  if (!hasBrandSource && !hasVariantKeys) return rawJson;
++
++  let base = {};
++  if (rawJson && typeof rawJson === 'object' && !Array.isArray(rawJson)) {
++    base = { ...rawJson };
++  } else if (typeof rawJson === 'string') {
++    try {
++      const parsed = JSON.parse(rawJson);
++      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
++        base = parsed;
++      }
++    } catch (_) {
++      base = {};
++    }
++  } else if (rawJson != null) {
++    base = { value: rawJson };
++  }
++
++  if (hasBrandSource) base.brand_source = meta.brand_source ?? null;
++  if (hasVariantKeys) base.variant_keys_runtime = meta.variant_keys_runtime ?? [];
++  return base;
++}
++
+ // --- 브랜드 자동 감지 (manufacturer_alias 기반) ---
+ async function detectBrandFromText(text = '', fileName = '') {
+   const hay = `${String(fileName || '')} ${String(text || '')}`.toLowerCase();
+   if (!hay.trim()) return null;
    try {
-     __INGEST_MOD__ = require('./src/pipeline/ingestAuto');
-   } catch (e) {
-     console.error('[INGEST] module load failed:', e?.message || e);
-     __INGEST_MOD__ = {
-       runAutoIngest: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
-       persistProcessedData: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
-     };
+     const { rows } = await db.query(
+       `SELECT brand, brand_norm, alias, aliases FROM public.manufacturer_alias`
+     );
+     for (const row of rows) {
+       if (!row) continue;
+       const tokens = new Set();
+       if (row.brand) tokens.add(String(row.brand));
+       if (row.brand_norm) tokens.add(String(row.brand_norm));
+       if (row.alias) tokens.add(String(row.alias));
+       if (Array.isArray(row.aliases)) {
+         for (const a of row.aliases) tokens.add(String(a));
+       } else if (typeof row.aliases === 'string') {
+         tokens.add(row.aliases);
+       }
+       for (const token of tokens) {
+         const trimmed = String(token || '').trim();
+         if (!trimmed) continue;
+         if (trimmed.toLowerCase() === 'unknown') continue;
+         if (trimmed.length < 2) continue;
+         const pattern = escapeRegex(trimmed.toLowerCase());
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index e45afcc31b960578b642aba6232ec454cfafb5be..46e6aa4a536f21453680d5410e9620c3b8a2407d 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -570,51 +609,51 @@ async function runAutoIngest(input = {}) {
    }
-   return __INGEST_MOD__;
+   if (!overridesBrand && !brand && vertexClassification?.brand) {
+     brand = vertexClassification.brand;
+   }
+   if (!detectedBrand && vertexClassification?.brand) {
+     detectedBrand = vertexClassification.brand;
+   }
+   if (!code && vertexClassification?.code) {
+     code = vertexClassification.code;
+   }
+   if (!series && vertexClassification?.series) {
+     series = vertexClassification.series;
+   }
+ 
+   let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
+   if (!family && !FAST) {
+     try {
+      const text = await readText(gcsUri, 256*1024);
+      family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
+      // ★ 강제 보정: 제목/본문에 Signal Relay가 있으면 무조건 signal로
+      if (/subminiature\s+signal\s+relay|signal\s+relay/i.test(text)) family = 'relay_signal';
+    } catch { family = 'relay_power'; }
+   }
+ 
+   const overrideBrandLog = overridesBrand ?? brand ?? '';
+-  console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''} brand_effective=${effectiveBrand || ''}`);
++  console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''}`);
+ 
+ // 목적 테이블
+   const reg = await db.query(
+     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+     [family]
+   );
+   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
+   const qualified = table.startsWith('public.')? table : `public.${table}`;
+ 
+   let blueprint = await getBlueprint(family);
+ 
+   if (!vertexExtractValues && family) {
+     try {
+       vertexExtractValues = await extractValuesByGcs(gcsUri, family);
+     } catch (err) {
+       console.warn('[vertex] extract failed:', err?.message || err);
+     }
+   }
+ 
+   // 블루프린트 허용 키
+   let allowedKeys = Array.isArray(blueprint?.allowedKeys)
+     ? [...blueprint.allowedKeys]
+     : [];
+   let variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+     ? blueprint.ingestOptions.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index e45afcc31b960578b642aba6232ec454cfafb5be..46e6aa4a536f21453680d5410e9620c3b8a2407d 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -826,81 +865,145 @@ async function runAutoIngest(input = {}) {
+       const seen = new Set();
+       for (const p of picks) {
+         const raw = typeof p === 'string' ? p : p?.code;
+         const trimmed = typeof raw === 'string' ? raw.trim() : '';
+         if (!trimmed) continue;
+         const norm = normalizeCode(trimmed);
+         if (seen.has(norm)) continue;
+         seen.add(norm);
+         merged.push(trimmed);
+       }
+       if (merged.length) {
+         candidates = merged;
+         // 🔹 types/order/series 휴리스틱으로도 찾은 경우, 이것도 추출 결과에 반영
+         if (extracted && typeof extracted === 'object') {
+           const uniq = Array.from(new Set([...(extracted.codes || []), ...merged]));
+           extracted.codes = uniq;
+           extracted.mpn_list = uniq;
+         }
+       }
+     }
+ 
+     // 분할 여부는 별도 판단. 여기서는 후보만 모아둠.
+     // extracted.rows는 건드리지 않음.
+   }
+ 
++  const extractedText = extracted?.text || previewText || '';
++  const brandHintSeed = pickBrandHint(
++    overridesBrand,
++    effectiveBrand,
++    brand,
++    extracted?.brand,
++    detectedBrand,
++    vertexClassification?.brand,
++  );
++
++  let brandResolution = null;
++  try {
++    brandResolution = await resolveBrand({ rawText: extractedText, hint: brandHintSeed });
++  } catch (err) {
++    console.warn('[brand resolve] failed:', err?.message || err);
++  }
++
++  const brandEffectiveResolved = pickBrandHint(
++    brandResolution?.brand_effective,
++    brandHintSeed,
++    effectiveBrand,
++    extracted?.brand,
++    detectedBrand,
++  ) || 'unknown';
++
++  let brandSource = brandResolution?.source || null;
++  if (!brandSource || brandSource === 'none') {
++    brandSource = brandHintSeed ? 'hint' : 'none';
++  }
++  if (!brandEffectiveResolved || brandEffectiveResolved.toLowerCase() === 'unknown') {
++    brandSource = 'none';
++  }
++
++  if (extracted && typeof extracted === 'object') {
++    extracted.brand = brandEffectiveResolved;
++  }
++
++  let runtimeVariantKeys = [];
++  try {
++    runtimeVariantKeys = await detectVariantKeys({
++      rawText: extractedText,
++      family,
++      blueprintVariantKeys: variantKeys,
++    });
++  } catch (err) {
++    console.warn('[variant] runtime detect failed:', err?.message || err);
++    runtimeVariantKeys = Array.isArray(variantKeys) ? [...variantKeys] : [];
++  }
++
++  console.log('[PATH] brand resolved', {
++    runId,
++    family,
++    hint: brandHintSeed || null,
++    effective: brandEffectiveResolved,
++    source: brandSource,
++    vkeys_runtime: runtimeVariantKeys,
++  });
++
+ 
+   // 커버 추출 비활성(요청에 따라 완전 OFF)
+   let coverUri = null;
+   if (/^(1|true|on)$/i.test(process.env.COVER_CAPTURE || '0')) {
+     try {
+-      const bForCover = effectiveBrand || extracted.brand || 'unknown';
++      const bForCover = brandEffectiveResolved || 'unknown';
+       const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
+       coverUri = await withTimeout(
+         extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
+         Math.min(30000, Math.round(BUDGET * 0.15)),
+         'cover',
+       );
+     } catch (e) { console.warn('[cover fail]', e?.message || e); }
+   }
+ 
+   if (code) {
+     const trimmedCode = String(code || '').trim();
+     if (trimmedCode) {
+       const norm = normalizeCode(trimmedCode);
+       if (!candidates.some((c) => normalizeCode(c) === norm)) {
+         candidates = [trimmedCode, ...candidates];
+       }
+     }
+   }
+ 
+   // 레코드 구성
+   const records = [];
+-  const extractedText = extracted?.text || previewText || '';
+   const now = new Date();
+-  const brandName = effectiveBrand || extracted.brand || 'unknown';
++  const brandName = brandEffectiveResolved || 'unknown';
+   const baseSeries = series || code || null;
++  const runtimeMeta = {
++    brand_source: brandSource ?? null,
++    variant_keys_runtime: Array.isArray(runtimeVariantKeys) ? runtimeVariantKeys : [],
++  };
++  const hasRuntimeMeta =
++    runtimeMeta.brand_source != null ||
++    (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
+ 
+   let variantColumnsEnsured = false;
+   try {
+     const { detected: inferredKeys = [], newKeys: freshKeys = [] } = await inferVariantKeys({
+       family,
+       brand: brandName,
+       series: baseSeries,
+       blueprint,
+       extracted,
+     });
+ 
+     if (Array.isArray(inferredKeys) && inferredKeys.length) {
+       const brandSlug = normalizeSlug(brandName);
+       const seriesSlug = normalizeSlug(baseSeries);
+       try {
+         await db.query(
+           `SELECT public.upsert_variant_keys($1,$2,$3,$4::jsonb)`,
+           [family, brandSlug, seriesSlug, JSON.stringify(inferredKeys)],
+         );
+       } catch (err) {
+         console.warn('[variant] upsert_variant_keys failed:', err?.message || err);
+       }
+ 
+       const mergedVariant = new Set(variantKeys);
+       for (const key of inferredKeys) mergedVariant.add(key);
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index e45afcc31b960578b642aba6232ec454cfafb5be..46e6aa4a536f21453680d5410e9620c3b8a2407d 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1027,226 +1130,265 @@ async function runAutoIngest(input = {}) {
+     rec.series_code = row.series_code ?? row.series ?? baseSeries ?? null;
+     if (row.series != null && physicalCols.has('series')) rec.series = row.series;
+     rec.datasheet_uri = row.datasheet_uri || gcsUri;
+     if (row.datasheet_url) rec.datasheet_url = row.datasheet_url;
+     else if (rec.datasheet_uri && rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
+     if (row.mfr_full != null) rec.mfr_full = row.mfr_full;
+     let verified;
+     if (row.verified_in_doc != null) {
+       if (typeof row.verified_in_doc === 'string') {
+         verified = row.verified_in_doc.trim().toLowerCase() === 'true';
+       } else {
+         verified = Boolean(row.verified_in_doc);
+       }
+     } else {
+       verified = candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm);
+     }
+     rec.verified_in_doc = Boolean(verified);
+     rec.image_uri = row.image_uri || coverUri || null;
+     if (coverUri && rec.cover == null) rec.cover = coverUri;
+     const displayName = row.display_name || row.displayname || `${rec.brand} ${mpn}`;
+     rec.display_name = displayName;
+     if (rec.displayname == null && displayName != null) rec.displayname = displayName;
+     rec.updated_at = now;
+     // persist에서 브랜드 정규화할 때 쓰도록 원문 텍스트 전달
+     rec._doc_text = extractedText;
+-    if (row.raw_json != null) rec.raw_json = row.raw_json;
++    if (hasRuntimeMeta) {
++      rec.raw_json = mergeRuntimeMetadata(row.raw_json, runtimeMeta);
++    } else if (row.raw_json != null) {
++      rec.raw_json = row.raw_json;
++    }
+ 
+     for (const [rawKey, rawValue] of Object.entries(row)) {
+       const key = String(rawKey || '').trim();
+       if (!key) continue;
+       const lower = key.toLowerCase();
+       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
+       if (physicalCols.has(lower) || allowedSet.has(lower) || variantSet.has(lower)) {
+         rec[lower] = rawValue;
+       }
+     }
+ 
+     if (blueprint?.code_rules) applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
+     records.push(rec);
+   }
+ 
+   if (candidateMap.length) {
+     const fallbackSeries = baseSeries || null;
+     for (const cand of candidateMap) {
+       const norm = cand.norm;
+       const naturalKey = `${normLower(brandName)}::${norm}`;
+       if (seenCodes.has(naturalKey)) continue;
+       seenCodes.add(naturalKey);
+       const verified = mpnNormFromDoc.has(norm);
+       const rec = {
+         family_slug: family,
+         brand: brandName,
+         pn: cand.raw,
+         code: cand.raw,
+         series_code: fallbackSeries,
+         datasheet_uri: gcsUri,
+         image_uri: coverUri || null,
+         display_name: `${brandName} ${cand.raw}`,
+         verified_in_doc: verified,
+         updated_at: now,
+       };
+       if (coverUri) rec.cover = coverUri;
++      if (hasRuntimeMeta) {
++        rec.raw_json = mergeRuntimeMetadata(rec.raw_json, runtimeMeta);
++      }
+       if (physicalCols.has('series') && fallbackSeries != null) rec.series = fallbackSeries;
+       if (rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
+       if (rec.display_name != null && rec.displayname == null) rec.displayname = rec.display_name;
+       records.push(rec);
+     }
+   }
+ 
+   console.log('[MPNDBG]', {
+     picks: candidateMap.length,
+     vkeys: Array.isArray(blueprint?.ingestOptions?.variant_keys) ? blueprint.ingestOptions.variant_keys : [],
++    vkeys_runtime: runtimeVariantKeys,
++    brand_source: brandSource,
+     expanded: explodedRows.length,
+     recs: records.length,
+     colsSanitized: colTypes?.size || 0,
+   });
+ 
+   const processedPayload = {
+     started,
+     gcsUri,
+     family,
+     table,
+     qualified,
+     pnTemplate,
+     requiredFields,
+     coverUri,
+     records,
+     rows: records,
+     mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
+     extractedBrand: extracted?.brand || null,
+     brandName,
+     baseSeries,
+     runId,
+     run_id: runId,
+     jobId,
+     job_id: jobId,
+     text: extractedText,
+-    brand: extracted?.brand ?? null,
++    brand: brandEffectiveResolved || extracted?.brand || null,
+     brand_detected: detectedBrand || null,
++    brand_effective: brandEffectiveResolved || null,
++    brand_source: brandSource || null,
++    variant_keys_runtime: runtimeVariantKeys,
+   };
+ 
+   if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
+   if (display_name != null) processedPayload.display_name = display_name;
+   if (code != null) processedPayload.code = code;
+   if (series != null) processedPayload.series = series;
+ 
+   if (input && typeof input === 'object' && input.skipPersist) {
+     return { ok: true, phase: 'process', processed: processedPayload };
+   }
+ 
++  const persistBrand = pickBrandHint(brandEffectiveResolved, overridesBrand, effectiveBrand, detectedBrand, brand);
+   const persistOverrides = {
+-    brand: effectiveBrand || detectedBrand || null,
++    brand: persistBrand || null,
+     code,
+     series: overridesSeries ?? series,
+     display_name,
+     runId,
+     run_id: runId,
+     jobId,
+     job_id: jobId,
+   };
+   return persistProcessedData(processedPayload, persistOverrides);
+   })();
+ 
+   try {
+     return await runnerPromise;
+   } finally {
+     await releaseLock();
+   }
  }
--const { enqueueIngest } = require('./src/utils/enqueue');
  
+ async function persistProcessedData(processed = {}, overrides = {}) {
+   const {
+     started = Date.now(),
+     gcsUri = null,
+     family = null,
+     table = null,
+     qualified: qualifiedInput = null,
+     pnTemplate = null,
+     requiredFields = [],
+     coverUri = null,
+     records: initialRecords = [],
+     rows: processedRowsInput = [],
+     mpnList = [],
+     extractedBrand = null,
+     brandName = null,
+     baseSeries = null,
+     text: processedText = null,
+     brand: processedBrand = null,
+     brand_detected: processedDetected = null,
++    brand_effective: processedEffective = null,
++    brand_source: processedBrandSource = null,
++    variant_keys_runtime: processedVariantKeys = [],
+   } = processed || {};
  
- 
- // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
- // 2) Cloud Tasks: 런타임에 없으면 비활성화
- let CloudTasksClient;
- try { ({ CloudTasksClient } = require('@google-cloud/tasks')); }
- catch (e) { console.warn('[BOOT] @google-cloud/tasks unavailable:', e?.message || e); }
- const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
- const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
- const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
- // step 라우트 폐지 → ingest 하나로 통일
- const WORKER_TASK_URL = process.env.WORKER_TASK_URL || process.env.WORKER_STEP_URL || 'https://<YOUR-RUN-URL>/api/worker/ingest';
- const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
- 
- // ⚠️ 외부 API(예: Vertex/HTTP) 가능성이 있는 부팅 태스크는 가드 안에서만 실행
- //   → 아래 부팅 IIFE 내부의  if (!EXT_CALLS_OFF)  블록으로 이동
- //try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
- 
- // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
- let _tasks = null;
- let _queuePath = null;
- function getTasks() {
-   if (!_tasks) {
-     if (!CloudTasksClient) throw new Error('@google-cloud/tasks unavailable');
-diff --git a/server.js b/server.js
-index c4f1c9719770da0d6de043624745a0cfe4c1ac10..129a462e83fa583ba51128729cb16b39c963c02b 100644
---- a/server.js
-+++ b/server.js
-@@ -953,51 +952,51 @@ async function handleWorkerIngest(req, res) {
- 
-         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
-         const nextOverrides = {
-           ...(payload?.overrides || {}),
-           brand: overrideBrand,
-           series: overrideSeries,
-         };
- 
-         const nextPayload = {
-           runId,
-           run_id: runId,
-           gcsUri,
-           gcs_uri: gcsUri,
-           family_slug: payload?.family_slug ?? null,
-           brand: payload?.brand ?? null,
-           code: payload?.code ?? null,
-           series: payload?.series ?? null,
-           display_name: payload?.display_name ?? null,
-           uploader_id: payload?.uploader_id ?? null,
-           overrides: nextOverrides,
-           phase: 'process',
-         };
- 
-         try {
--          await enqueueIngest(nextPayload);
-+          await enqueueIngestTask(nextPayload);
-         } catch (err) {
-           console.error(
-             '[enqueue error]',
-             err?.code || err?.response?.status || err?.message,
-             err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
-           );
-           throw new Error(`enqueue failed: ${String(err?.message || err)}`);
-         }
- 
-         return;
+   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
+     ? initialRecords
+     : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
+   const records = Array.isArray(recordsSource) ? recordsSource : [];
++  const runtimeMeta = {
++    brand_source: processedBrandSource ?? null,
++    variant_keys_runtime: Array.isArray(processedVariantKeys) ? processedVariantKeys : [],
++  };
++  const hasRuntimeMeta =
++    runtimeMeta.brand_source != null ||
++    (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
+   const docText = typeof processedText === 'string'
+     ? processedText
+     : (processedText != null ? String(processedText) : '');
+   const normalizeSeedBrand = (value) => {
+     if (value == null) return null;
+     const trimmed = String(value).trim();
+     if (!trimmed) return null;
+     if (trimmed.toLowerCase() === 'unknown') return null;
+     return trimmed;
+   };
+-  const brandSeed = normalizeSeedBrand(processedBrand) || normalizeSeedBrand(processedDetected) || null;
++  const brandSeed =
++    normalizeSeedBrand(processedEffective) ||
++    normalizeSeedBrand(processedBrand) ||
++    normalizeSeedBrand(processedDetected) ||
++    null;
++  const attachRuntimeMeta = (row) => {
++    if (!hasRuntimeMeta) return;
++    if (!row || typeof row !== 'object') return;
++    row.raw_json = mergeRuntimeMetadata(row.raw_json, runtimeMeta);
++  };
+   if ((docText && docText.length) || brandSeed) {
+     const applyRowHints = (row) => {
+       if (!row || typeof row !== 'object') return;
+       if (docText && (row._doc_text == null || row._doc_text === '')) {
+         row._doc_text = docText;
        }
- 
-       if (phase === 'process') {
-         await markProcessing(baseContext);
- 
-         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
-         const nextOverrides = {
-           ...(payload?.overrides || {}),
-           brand: overrideBrand,
-           series: overrideSeries,
-         };
- 
-         const result = await getIngest().runAutoIngest({
-           ...payload,
-diff --git a/server.js b/server.js
-index c4f1c9719770da0d6de043624745a0cfe4c1ac10..129a462e83fa583ba51128729cb16b39c963c02b 100644
---- a/server.js
-+++ b/server.js
-@@ -1011,51 +1010,51 @@ async function handleWorkerIngest(req, res) {
- 
-         const processed = result?.processed;
-         if (!processed || !Array.isArray(processed.records)) {
-           throw new Error('process_no_records');
-         }
- 
-         await markRunning(baseContext);
- 
-         const nextPayload = {
-           runId,
-           run_id: runId,
-           gcsUri,
-           gcs_uri: gcsUri,
-           family_slug: payload?.family_slug ?? null,
-           brand: payload?.brand ?? null,
-           code: payload?.code ?? null,
-           series: payload?.series ?? null,
-           display_name: payload?.display_name ?? null,
-           uploader_id: payload?.uploader_id ?? null,
-           phase: 'persist',
-           processed,
-           overrides: nextOverrides,
-         };
- 
-         try {
--          await enqueueIngest(nextPayload);
-+          await enqueueIngestTask(nextPayload);
-         } catch (err) {
-           console.error(
-             '[enqueue error]',
-             err?.code || err?.response?.status || err?.message,
-             err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
-           );
-           throw new Error(`persist enqueue failed: ${String(err?.message || err)}`);
-         }
-         return;
+       if (brandSeed && (!row.brand || !String(row.brand).trim())) {
+         row.brand = brandSeed;
        }
++      attachRuntimeMeta(row);
+     };
+     for (const row of records) applyRowHints(row);
+     if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+       for (const row of processedRowsInput) applyRowHints(row);
+     }
++  } else if (hasRuntimeMeta) {
++    for (const row of records) attachRuntimeMeta(row);
++    if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
++      for (const row of processedRowsInput) attachRuntimeMeta(row);
++    }
+   }
  
-       if (phase === 'persist') {
-         await markPersisting(baseContext);
+   const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
+   const runId = processed?.runId ?? processed?.run_id ?? overrides?.runId ?? overrides?.run_id ?? null;
+   const jobId = processed?.jobId ?? processed?.job_id ?? overrides?.jobId ?? overrides?.job_id ?? null;
  
-         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
+   if (qualified && family && records.length) {
+     const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
+     const requiredList = Array.isArray(requiredFields) ? requiredFields : [];
+     const effectiveRequired = allowMinimal ? [] : requiredList;
  
-         const out = await getIngest().persistProcessedData(payload?.processed || {}, {
-           brand: overrideBrand,
-           code: payload?.code ?? null,
-           series: overrideSeries,
-           display_name: payload?.display_name ?? null,
-         });
+     const safeBrand = (value) => {
+       if (value == null) return null;
+       const trimmed = String(value).trim();
+       if (!trimmed) return null;
+       if (trimmed.toLowerCase() === 'unknown') return null;
+       return trimmed;
+     };
  
-         const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
+     let brandOverride = safeBrand(overrides?.brand)
++      || safeBrand(processedEffective)
+       || safeBrand(processedBrand)
+       || safeBrand(brandName)
+       || safeBrand(extractedBrand)
+       || safeBrand(processedDetected)
+       || null;
+ 
+     if (!brandOverride) {
+       let baseName = '';
+       try {
+         const { name } = parseGcsUri(gcsUri || '');
+         baseName = path.basename(name || '');
+       } catch {}
+       try {
+         const guessed = await detectBrandFromText(docText || '', baseName);
+         if (safeBrand(guessed)) brandOverride = guessed;
+       } catch (err) {
+         console.warn('[brand detect] persist retry failed:', err?.message || err);
+       }
+     }
+ 
+     if (brandOverride) {
+       for (const row of records) {
+         if (!row || typeof row !== 'object') continue;
+         const current = String(row.brand || '').trim();
+         if (!current || current.toLowerCase() === 'unknown') {
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index e45afcc31b960578b642aba6232ec454cfafb5be..46e6aa4a536f21453680d5410e9620c3b8a2407d 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1287,65 +1429,68 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+   if (!persistedCodes.size && records.length) {
+     for (const rec of records) {
+       const pn = String(rec.pn || rec.code || '').trim();
+       if (pn) persistedCodes.add(pn);
+     }
+   }
+ 
+   const persistedList = Array.from(persistedCodes);
+   const mpnListSafe = Array.isArray(mpnList) ? mpnList : [];
+   const mergedMpns = Array.from(new Set([...persistedList, ...mpnListSafe]));
+ 
+   const rejectReasons = new Set(
+     (persistResult.skipped || [])
+       .map((it) => (it && typeof it === 'object' ? it.reason : it))
+       .filter(Boolean)
+   );
+   const warningReasons = new Set(
+     (persistResult.warnings || []).filter(Boolean)
+   );
+ 
+   const ms = Number.isFinite(processed?.ms) ? processed.ms : (typeof started === 'number' ? Date.now() - started : null);
+   const upsertsCount = typeof persistResult.upserts === 'number' ? persistResult.upserts : 0;
+   const affected = typeof persistResult.affected === 'number' ? persistResult.affected : upsertsCount;
+   const ok = affected > 0;
+ 
+-  const fallbackBrand = overrides.brand || brandName || extractedBrand || null;
++  const fallbackBrand = overrides.brand || brandName || processedEffective || extractedBrand || null;
+   const primaryRecord = records[0] || null;
+   const finalBrand = primaryRecord?.brand || fallbackBrand;
+   const finalCode =
+     persistedList[0] ||
+     primaryRecord?.pn ||
+     primaryRecord?.code ||
+     overrides.code ||
+     null;
+ 
+   const response = {
+     ok,
+     ms,
+     family,
+     final_table: table,
+     specs_table: table,
+     brand: finalBrand,
++    brand_effective: finalBrand,
++    brand_source: processedBrandSource || null,
+     code: finalCode,
+     datasheet_uri: gcsUri,
+     cover: coverUri || primaryRecord?.image_uri || null,
+     rows: affected,        // 실제 반영된 개수만 기록
+     codes: Array.from(persistedCodes),  // 표시는 그대로
+     mpn_list: mergedMpns,
++    variant_keys_runtime: runtimeMeta.variant_keys_runtime,
+     reject_reasons: Array.from(rejectReasons),
+     warnings: Array.from(warningReasons),
+   };
+ 
+   if (response.code == null && Array.isArray(processed?.candidateCodes) && processed.candidateCodes.length) {
+     response.code = processed.candidateCodes[0];
+   }
+ 
+   if (response.code == null && baseSeries != null) {
+     response.code = baseSeries;
+   }
+ 
+   response.affected = affected;
+   return response;
+ }
+ 
+ module.exports = { runAutoIngest, persistProcessedData };

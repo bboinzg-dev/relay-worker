@@ -151,7 +151,12 @@ async function enqueueIngestTask(payload = {}) {
     await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
   } catch (err) {
     const detail = err?.response?.data || err?.message || String(err);
-    console.warn('[tasks.createTask] failed', { code: err?.code, detail, queuePath });
+    console.warn('[tasks.createTask] failed', {
+      code: err?.code,
+      detail,
+      queuePath,
+      invoker: process.env.TASKS_INVOKER_SA,
+    });
     throw err;
   }
 }

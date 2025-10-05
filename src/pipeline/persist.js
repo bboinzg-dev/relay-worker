@@ -55,6 +55,16 @@ function isValidPnValue(value) {
   return PN_RE.test(trimmed);
 }
 
+function repairPn(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
+  s = s.replace(/[–—―]/g, '-');
+  s = s.replace(/\s+/g, '');
+  s = s.replace(/[^0-9A-Za-z\-_/().]/g, '');
+  if (s.length < 3) return null;
+  return s;
+}
+
 function isNumericType(type = '') {
   const t = String(type || '').toLowerCase();
   return (
@@ -288,14 +298,30 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   if (!row || typeof row !== 'object') {
     return { ok: false, reason: 'empty_row' };
   }
-  const pn = String(row.pn || row.code || '').trim();
+  let pn = String(row.pn || row.code || '').trim();
+  const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
   if (!isValidPnValue(pn) || FORBIDDEN_RE.test(pn)) {
-    if (row && typeof row === 'object') row.last_error = 'invalid_code';
-    return { ok: false, reason: 'invalid_code' };
+    const fixed = repairPn(pn);
+    if (fixed && isValidPnValue(fixed)) {
+      row.last_error = row.last_error || 'invalid_code_fixed';
+      pn = fixed;
+    } else if (allowMinimal) {
+      const fallback = String(row.series || row.code || '').trim();
+      const fallbackPn = repairPn(fallback);
+      if (fallbackPn && fallbackPn.length >= 3) {
+        pn = fallbackPn;
+        row.last_error = row.last_error || 'invalid_code_fallback';
+      } else {
+        row.last_error = 'invalid_code';
+        return { ok: false, reason: 'invalid_code' };
+      }
+    } else {
+      row.last_error = 'invalid_code';
+      return { ok: false, reason: 'invalid_code' };
+    }
   }
   row.pn = pn;
   if (row.code == null || String(row.code).trim() === '') row.code = pn;
-  const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
   if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !allowMinimal) {
     return { ok: false, reason: 'missing_core_spec' };
   }

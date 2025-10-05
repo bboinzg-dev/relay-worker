@@ -1,310 +1,148 @@
-diff --git a/server.js b/server.js
-index 7e201762e094f30be4939ba0318ec89ef52a6059..26087f339bced2f7188009ec560f09f911cbc72e 100644
---- a/server.js
-+++ b/server.js
-@@ -123,51 +123,57 @@ async function enqueueIngestTask(payload = {}) {
-   const maxAttempts = Number(process.env.TASKS_MAX_ATTEMPTS || 12);
-   const minBackoffSeconds = Number(process.env.TASKS_MIN_BACKOFF_SEC || 1);
-   const maxBackoffSeconds = Number(process.env.TASKS_MAX_BACKOFF_SEC || 60);
-   const maxDoublings = Number(process.env.TASKS_MAX_DOUBLINGS || 4);
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 35287afe73a643f80e93fc68f018f90fdbd180a2..f07b74464aee9f0599ac52af13a9848f859388da 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -33,50 +33,60 @@ const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
  
-   const task = {
-     httpRequest: {
-       httpMethod: 'POST',
-       url: WORKER_TASK_URL,            // ★ ingest 하나로 통일
-       headers: { 'Content-Type': 'application/json' },
-       body,
-       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } } : {}),
-     },
-     // gRPC Duration 객체 (REST가 아님)
-     dispatchDeadline: { seconds: deadlineSeconds, nanos: 0 },
-     // 콜드스타트/일시 에러 완충
-     scheduleTime: { seconds: nowSeconds + delaySeconds },
-     retryConfig: {
-       maxAttempts,
-       minBackoff: { seconds: minBackoffSeconds },
-       maxBackoff: { seconds: maxBackoffSeconds },
-       maxDoublings,
-     },
-   };
+ const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const SCALE_MAP = {
+   k: 1e3,
+   m: 1e-3,
+   g: 1e9,
+   'µ': 1e-6,
+   u: 1e-6,
+   n: 1e-9,
+   p: 1e-12,
+ };
  
--  await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
-+  try {
-+    await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
-+  } catch (err) {
-+    const detail = err?.response?.data || err?.message || String(err);
-+    console.warn('[tasks.createTask] failed', { code: err?.code, detail, queuePath });
-+    throw err;
-+  }
+ function normKey(key) {
+   return String(key || '')
+     .trim()
+     .toLowerCase();
  }
  
- 
- const app = express();
- 
- // ✅ 항상 찍히는 부팅 로그 + 간단 헬스/정보
- console.log('[BOOT] server.js starting', {
-   file: __filename,
-   node: process.version,
-   ROUTE_DEBUG: process.env.ROUTE_DEBUG || null,
-   revision: process.env.K_REVISION || null,
- });
- 
- // 가장 가벼운 핑
- app.get('/_ping', (_req, res) => res.json({ ok: true, rev: process.env.K_REVISION || null }));
- 
- // 현재 실행 중인 엔트리/디렉토리 확인 (정말 server.js가 실행되는지 확인)
- app.get('/_whoami', (_req, res) => {
-   try {
-     res.json({
-       main: require.main && require.main.filename,
-       dir: __dirname,
-       ROUTE_DEBUG: process.env.ROUTE_DEBUG || null
-     });
-   } catch (e) {
-diff --git a/server.js b/server.js
-index 7e201762e094f30be4939ba0318ec89ef52a6059..26087f339bced2f7188009ec560f09f911cbc72e 100644
---- a/server.js
-+++ b/server.js
-@@ -1031,51 +1037,86 @@ async function handleWorkerIngest(req, res) {
- 
-         const nextPayload = {
-           runId,
-           run_id: runId,
-           gcsUri,
-           gcs_uri: gcsUri,
-           family_slug: payload?.family_slug ?? null,
-           brand: payload?.brand ?? null,
-           code: payload?.code ?? null,
-           series: payload?.series ?? null,
-           display_name: payload?.display_name ?? null,
-           uploader_id: payload?.uploader_id ?? null,
-           phase: 'persist',
-           processed,
-           overrides: nextOverrides,
-         };
- 
-         try {
-           await enqueueIngestTask(nextPayload);
-         } catch (err) {
-           console.error(
-             '[enqueue error]',
-             err?.code || err?.response?.status || err?.message,
-             err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
-           );
--          throw new Error(`persist enqueue failed: ${String(err?.message || err)}`);
-+          console.warn('[ingest][persist fallback] attempting inline persist', { runId });
-+          try {
-+            await markPersisting(baseContext);
-+            const inlineResult = await getIngest().persistProcessedData(processed || {}, {
-+              brand: overrideBrand,
-+              code: payload?.code ?? null,
-+              series: overrideSeries,
-+              display_name: payload?.display_name ?? null,
-+            });
-+
-+            const failureReasons = new Set(Array.isArray(inlineResult?.reject_reasons) ? inlineResult.reject_reasons : []);
-+            const warningReasons = new Set(Array.isArray(inlineResult?.warnings) ? inlineResult.warnings : []);
-+
-+            if (!inlineResult?.ok) {
-+              const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
-+              const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
-+              await markFailed({
-+                ...baseContext,
-+                error: message,
-+                durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
-+              });
-+              return;
-+            }
-+
-+            await markSucceeded({
-+              ...baseContext,
-+              result: inlineResult,
-+              gcsUri,
-+              durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
-+              meta: payload,
-+            });
-+            return;
-+          } catch (fallbackErr) {
-+            console.error('[ingest][persist fallback] failed', fallbackErr?.message || fallbackErr);
-+            throw new Error(`persist enqueue failed: ${String(err?.message || err)}; fallback failed: ${String(fallbackErr?.message || fallbackErr)}`);
-+          }
-         }
-         return;
-       }
- 
-       if (phase === 'persist') {
-         await markPersisting(baseContext);
- 
-         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
- 
-         const out = await getIngest().persistProcessedData(payload?.processed || {}, {
-           brand: overrideBrand,
-           code: payload?.code ?? null,
-           series: overrideSeries,
-           display_name: payload?.display_name ?? null,
-         });
- 
-         const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
-         const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
- 
-         if (!out?.ok) {
-           const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
-           const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
-           await markFailed({
-             ...baseContext,
-diff --git a/server.js b/server.js
-index 7e201762e094f30be4939ba0318ec89ef52a6059..26087f339bced2f7188009ec560f09f911cbc72e 100644
---- a/server.js
-+++ b/server.js
-@@ -123,51 +123,57 @@ async function enqueueIngestTask(payload = {}) {
-   const maxAttempts = Number(process.env.TASKS_MAX_ATTEMPTS || 12);
-   const minBackoffSeconds = Number(process.env.TASKS_MIN_BACKOFF_SEC || 1);
-   const maxBackoffSeconds = Number(process.env.TASKS_MAX_BACKOFF_SEC || 60);
-   const maxDoublings = Number(process.env.TASKS_MAX_DOUBLINGS || 4);
- 
-   const task = {
-     httpRequest: {
-       httpMethod: 'POST',
-       url: WORKER_TASK_URL,            // ★ ingest 하나로 통일
-       headers: { 'Content-Type': 'application/json' },
-       body,
-       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } } : {}),
-     },
-     // gRPC Duration 객체 (REST가 아님)
-     dispatchDeadline: { seconds: deadlineSeconds, nanos: 0 },
-     // 콜드스타트/일시 에러 완충
-     scheduleTime: { seconds: nowSeconds + delaySeconds },
-     retryConfig: {
-       maxAttempts,
-       minBackoff: { seconds: minBackoffSeconds },
-       maxBackoff: { seconds: maxBackoffSeconds },
-       maxDoublings,
-     },
-   };
- 
--  await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
-+  try {
-+    await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
-+  } catch (err) {
-+    const detail = err?.response?.data || err?.message || String(err);
-+    console.warn('[tasks.createTask] failed', { code: err?.code, detail, queuePath });
-+    throw err;
-+  }
+ function isValidPnValue(value) {
+   const trimmed = String(value || '').trim();
+   if (!trimmed) return false;
+   return PN_RE.test(trimmed);
  }
  
- 
- const app = express();
- 
- // ✅ 항상 찍히는 부팅 로그 + 간단 헬스/정보
- console.log('[BOOT] server.js starting', {
-   file: __filename,
-   node: process.version,
-   ROUTE_DEBUG: process.env.ROUTE_DEBUG || null,
-   revision: process.env.K_REVISION || null,
- });
- 
- // 가장 가벼운 핑
- app.get('/_ping', (_req, res) => res.json({ ok: true, rev: process.env.K_REVISION || null }));
- 
- // 현재 실행 중인 엔트리/디렉토리 확인 (정말 server.js가 실행되는지 확인)
- app.get('/_whoami', (_req, res) => {
-   try {
-     res.json({
-       main: require.main && require.main.filename,
-       dir: __dirname,
-       ROUTE_DEBUG: process.env.ROUTE_DEBUG || null
-     });
-   } catch (e) {
-diff --git a/server.js b/server.js
-index 7e201762e094f30be4939ba0318ec89ef52a6059..26087f339bced2f7188009ec560f09f911cbc72e 100644
---- a/server.js
-+++ b/server.js
-@@ -1031,51 +1037,86 @@ async function handleWorkerIngest(req, res) {
- 
-         const nextPayload = {
-           runId,
-           run_id: runId,
-           gcsUri,
-           gcs_uri: gcsUri,
-           family_slug: payload?.family_slug ?? null,
-           brand: payload?.brand ?? null,
-           code: payload?.code ?? null,
-           series: payload?.series ?? null,
-           display_name: payload?.display_name ?? null,
-           uploader_id: payload?.uploader_id ?? null,
-           phase: 'persist',
-           processed,
-           overrides: nextOverrides,
-         };
- 
-         try {
-           await enqueueIngestTask(nextPayload);
-         } catch (err) {
-           console.error(
-             '[enqueue error]',
-             err?.code || err?.response?.status || err?.message,
-             err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
-           );
--          throw new Error(`persist enqueue failed: ${String(err?.message || err)}`);
-+          console.warn('[ingest][persist fallback] attempting inline persist', { runId });
-+          try {
-+            await markPersisting(baseContext);
-+            const inlineResult = await getIngest().persistProcessedData(processed || {}, {
-+              brand: overrideBrand,
-+              code: payload?.code ?? null,
-+              series: overrideSeries,
-+              display_name: payload?.display_name ?? null,
-+            });
++function repairPn(raw) {
++  if (!raw) return null;
++  let s = String(raw).trim();
++  s = s.replace(/[–—―]/g, '-');
++  s = s.replace(/\s+/g, '');
++  s = s.replace(/[^0-9A-Za-z\-_/().]/g, '');
++  if (s.length < 3) return null;
++  return s;
++}
 +
-+            const failureReasons = new Set(Array.isArray(inlineResult?.reject_reasons) ? inlineResult.reject_reasons : []);
-+            const warningReasons = new Set(Array.isArray(inlineResult?.warnings) ? inlineResult.warnings : []);
-+
-+            if (!inlineResult?.ok) {
-+              const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
-+              const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
-+              await markFailed({
-+                ...baseContext,
-+                error: message,
-+                durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
-+              });
-+              return;
-+            }
-+
-+            await markSucceeded({
-+              ...baseContext,
-+              result: inlineResult,
-+              gcsUri,
-+              durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
-+              meta: payload,
-+            });
-+            return;
-+          } catch (fallbackErr) {
-+            console.error('[ingest][persist fallback] failed', fallbackErr?.message || fallbackErr);
-+            throw new Error(`persist enqueue failed: ${String(err?.message || err)}; fallback failed: ${String(fallbackErr?.message || fallbackErr)}`);
-+          }
-         }
-         return;
-       }
+ function isNumericType(type = '') {
+   const t = String(type || '').toLowerCase();
+   return (
+     t.includes('int') ||
+     t.includes('numeric') ||
+     t.includes('decimal') ||
+     t.includes('real') ||
+     t.includes('double')
+   );
+ }
  
-       if (phase === 'persist') {
-         await markPersisting(baseContext);
+ function parseNumberToken(token, suffix) {
+   if (!token) return null;
+   const cleaned = token.replace(/,/g, '');
+   const base = Number(cleaned);
+   if (!Number.isFinite(base)) return null;
+   if (!suffix) return base;
+   const scale = SCALE_MAP[suffix.toLowerCase()];
+   return scale != null ? base * scale : base;
+ }
  
-         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+ function parseNumericOrRange(value) {
+   if (value == null || value === '') return { value: null };
+   if (typeof value === 'number') {
+     return Number.isFinite(value) ? { value } : { value: null };
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 35287afe73a643f80e93fc68f018f90fdbd180a2..f07b74464aee9f0599ac52af13a9848f859388da 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -266,58 +276,74 @@ function hasCoreSpecValue(value) {
  
-         const out = await getIngest().persistProcessedData(payload?.processed || {}, {
-           brand: overrideBrand,
-           code: payload?.code ?? null,
-           series: overrideSeries,
-           display_name: payload?.display_name ?? null,
-         });
+ function hasCoreSpec(row, keys = [], candidateKeys = []) {
+   const primary = Array.isArray(keys) ? keys.filter(Boolean) : [];
+   const fallback = Array.isArray(candidateKeys) ? candidateKeys.filter(Boolean) : [];
+   const list = primary.length ? primary : fallback;
+   if (!list.length) {
+     for (const key of Object.keys(row || {})) {
+       const norm = normKey(key);
+       if (!norm || META_KEYS.has(norm)) continue;
+       if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
+     }
+     return false;
+   }
+   for (const key of list) {
+     const norm = normKey(key);
+     if (!norm) continue;
+     if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
+   }
+   return false;
+ }
  
-         const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
-         const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
+ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
+   if (!row || typeof row !== 'object') {
+     return { ok: false, reason: 'empty_row' };
+   }
+-  const pn = String(row.pn || row.code || '').trim();
++  let pn = String(row.pn || row.code || '').trim();
++  const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
+   if (!isValidPnValue(pn) || FORBIDDEN_RE.test(pn)) {
+-    if (row && typeof row === 'object') row.last_error = 'invalid_code';
+-    return { ok: false, reason: 'invalid_code' };
++    const fixed = repairPn(pn);
++    if (fixed && isValidPnValue(fixed)) {
++      row.last_error = row.last_error || 'invalid_code_fixed';
++      pn = fixed;
++    } else if (allowMinimal) {
++      const fallback = String(row.series || row.code || '').trim();
++      const fallbackPn = repairPn(fallback);
++      if (fallbackPn && fallbackPn.length >= 3) {
++        pn = fallbackPn;
++        row.last_error = row.last_error || 'invalid_code_fallback';
++      } else {
++        row.last_error = 'invalid_code';
++        return { ok: false, reason: 'invalid_code' };
++      }
++    } else {
++      row.last_error = 'invalid_code';
++      return { ok: false, reason: 'invalid_code' };
++    }
+   }
+   row.pn = pn;
+   if (row.code == null || String(row.code).trim() === '') row.code = pn;
+-  const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
+   if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !allowMinimal) {
+     return { ok: false, reason: 'missing_core_spec' };
+   }
+   return { ok: true };
+ }
  
-         if (!out?.ok) {
-           const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
-           const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
-           await markFailed({
-             ...baseContext,
+ async function getColumnTypes(targetTable) {
+   const [schema, table] = targetTable.includes('.')
+     ? targetTable.split('.', 2)
+     : ['public', targetTable];
+ 
+   const { rows } = await pool.query(
+     `SELECT lower(column_name) AS column, data_type
+        FROM information_schema.columns
+       WHERE table_schema = $1
+         AND table_name   = $2`,
+     [schema, table],
+   );
+ 
+   const map = new Map();
+   for (const row of rows) {
+     map.set(row.column, String(row.data_type || '').toLowerCase());
+   }
+   return map;
+ }

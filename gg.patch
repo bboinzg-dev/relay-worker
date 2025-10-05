@@ -1,81 +1,310 @@
-diff --git a/db.js b/db.js
-index 18495a38ca93abae4548383ce1280424bfbc4a81..0d4bbff34fa61cfff8011c4e5d91d54efe506ca7 100644
---- a/db.js
-+++ b/db.js
-@@ -54,59 +54,71 @@ function resolveSslConfig(connStr) {
-   let sslmode = '';
-   try {
-     const u = new URL(connStr);
-     sslmode = (u.searchParams.get('sslmode') || '').toLowerCase();
-   } catch {}
+diff --git a/server.js b/server.js
+index 7e201762e094f30be4939ba0318ec89ef52a6059..26087f339bced2f7188009ec560f09f911cbc72e 100644
+--- a/server.js
++++ b/server.js
+@@ -123,51 +123,57 @@ async function enqueueIngestTask(payload = {}) {
+   const maxAttempts = Number(process.env.TASKS_MAX_ATTEMPTS || 12);
+   const minBackoffSeconds = Number(process.env.TASKS_MIN_BACKOFF_SEC || 1);
+   const maxBackoffSeconds = Number(process.env.TASKS_MAX_BACKOFF_SEC || 60);
+   const maxDoublings = Number(process.env.TASKS_MAX_DOUBLINGS || 4);
  
-   if (insecure) {
-     return { rejectUnauthorized: false };
-   }
- 
-   if (caPath && fs.existsSync(caPath)) {
-     return { ca: fs.readFileSync(caPath), rejectUnauthorized: true };
-   }
- 
-   // AlloyDB는 TLS 필수(ENCRYPTED_ONLY). CA 없으면 기본적으로 검증만 끔.
-   if (sslmode === 'disable') {
-     // 비권장: AlloyDB에서는 실패할 수 있음
-     return false;
-   }
-   return { rejectUnauthorized: false };
- }
- 
- console.log('[db] file =', __filename);
- console.log('[db] env  =', { DB_TLS_INSECURE: process.env.DB_TLS_INSECURE, PGSSLMODE: process.env.PGSSLMODE });
- 
-+function parseEnvInt(name, defaultValue) {
-+  const raw = process.env[name];
-+  if (!raw) return defaultValue;
-+
-+  const parsed = parseInt(raw, 10);
-+  if (!Number.isFinite(parsed)) {
-+    console.warn(`[db] invalid numeric value for ${name}:`, raw, `→ fallback ${defaultValue}`);
-+    return defaultValue;
-+  }
-+  return parsed;
-+}
-+
- function buildPool() {
-   const connectionString = resolveConnectionString();
-   const ssl = resolveSslConfig(connectionString);
- 
--  const max = parseInt(process.env.PGPOOL_MAX || '10', 10);
--  const idle = parseInt(process.env.PG_IDLE_TIMEOUT_MS || '600000', 10);
--  const connTimeout = parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '30000', 10);
--  const statementTimeout = parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || '30000', 10);
--  const queryTimeout = parseInt(process.env.PG_QUERY_TIMEOUT_MS || '30000', 10);
-+  const max = parseEnvInt('PGPOOL_MAX', 10);
-+  const idle = parseEnvInt('PG_IDLE_TIMEOUT_MS', 600000);
-+  const connTimeout = parseEnvInt('PG_CONNECT_TIMEOUT_MS', 30000);
-+  const statementTimeout = parseEnvInt('PG_STATEMENT_TIMEOUT_MS', 30000);
-+  const queryTimeout = parseEnvInt('PG_QUERY_TIMEOUT_MS', 30000);
- 
-   const config = {
-     connectionString,
-     ssl,                                 // 위에서 결정
-     max,
-     // 긴 OCR/추출 대기 후에도 커넥션 유지/재연결 여유
-     idleTimeoutMillis: idle,
-     connectionTimeoutMillis: connTimeout,
+   const task = {
+     httpRequest: {
+       httpMethod: 'POST',
+       url: WORKER_TASK_URL,            // ★ ingest 하나로 통일
+       headers: { 'Content-Type': 'application/json' },
+       body,
+       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } } : {}),
+     },
+     // gRPC Duration 객체 (REST가 아님)
+     dispatchDeadline: { seconds: deadlineSeconds, nanos: 0 },
+     // 콜드스타트/일시 에러 완충
+     scheduleTime: { seconds: nowSeconds + delaySeconds },
+     retryConfig: {
+       maxAttempts,
+       minBackoff: { seconds: minBackoffSeconds },
+       maxBackoff: { seconds: maxBackoffSeconds },
+       maxDoublings,
+     },
    };
  
-   if (Number.isFinite(statementTimeout)) config.statement_timeout = statementTimeout;
-   if (Number.isFinite(queryTimeout)) config.query_timeout = queryTimeout;
+-  await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
++  try {
++    await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
++  } catch (err) {
++    const detail = err?.response?.data || err?.message || String(err);
++    console.warn('[tasks.createTask] failed', { code: err?.code, detail, queuePath });
++    throw err;
++  }
+ }
  
-   const pool = new Pool(config);
  
-   // 로그(민감정보 제외)
+ const app = express();
+ 
+ // ✅ 항상 찍히는 부팅 로그 + 간단 헬스/정보
+ console.log('[BOOT] server.js starting', {
+   file: __filename,
+   node: process.version,
+   ROUTE_DEBUG: process.env.ROUTE_DEBUG || null,
+   revision: process.env.K_REVISION || null,
+ });
+ 
+ // 가장 가벼운 핑
+ app.get('/_ping', (_req, res) => res.json({ ok: true, rev: process.env.K_REVISION || null }));
+ 
+ // 현재 실행 중인 엔트리/디렉토리 확인 (정말 server.js가 실행되는지 확인)
+ app.get('/_whoami', (_req, res) => {
    try {
-     const u = new URL(connectionString.replace(/:[^@]+@/, ':***@'));
-     console.log('[db] pool created', {
-       host: u.hostname,
-       port: u.port || 5432,
-       db: u.pathname.replace(/^\//, ''),
-       ssl:
-         ssl === false
-           ? 'off'
+     res.json({
+       main: require.main && require.main.filename,
+       dir: __dirname,
+       ROUTE_DEBUG: process.env.ROUTE_DEBUG || null
+     });
+   } catch (e) {
+diff --git a/server.js b/server.js
+index 7e201762e094f30be4939ba0318ec89ef52a6059..26087f339bced2f7188009ec560f09f911cbc72e 100644
+--- a/server.js
++++ b/server.js
+@@ -1031,51 +1037,86 @@ async function handleWorkerIngest(req, res) {
+ 
+         const nextPayload = {
+           runId,
+           run_id: runId,
+           gcsUri,
+           gcs_uri: gcsUri,
+           family_slug: payload?.family_slug ?? null,
+           brand: payload?.brand ?? null,
+           code: payload?.code ?? null,
+           series: payload?.series ?? null,
+           display_name: payload?.display_name ?? null,
+           uploader_id: payload?.uploader_id ?? null,
+           phase: 'persist',
+           processed,
+           overrides: nextOverrides,
+         };
+ 
+         try {
+           await enqueueIngestTask(nextPayload);
+         } catch (err) {
+           console.error(
+             '[enqueue error]',
+             err?.code || err?.response?.status || err?.message,
+             err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
+           );
+-          throw new Error(`persist enqueue failed: ${String(err?.message || err)}`);
++          console.warn('[ingest][persist fallback] attempting inline persist', { runId });
++          try {
++            await markPersisting(baseContext);
++            const inlineResult = await getIngest().persistProcessedData(processed || {}, {
++              brand: overrideBrand,
++              code: payload?.code ?? null,
++              series: overrideSeries,
++              display_name: payload?.display_name ?? null,
++            });
++
++            const failureReasons = new Set(Array.isArray(inlineResult?.reject_reasons) ? inlineResult.reject_reasons : []);
++            const warningReasons = new Set(Array.isArray(inlineResult?.warnings) ? inlineResult.warnings : []);
++
++            if (!inlineResult?.ok) {
++              const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
++              const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
++              await markFailed({
++                ...baseContext,
++                error: message,
++                durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
++              });
++              return;
++            }
++
++            await markSucceeded({
++              ...baseContext,
++              result: inlineResult,
++              gcsUri,
++              durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
++              meta: payload,
++            });
++            return;
++          } catch (fallbackErr) {
++            console.error('[ingest][persist fallback] failed', fallbackErr?.message || fallbackErr);
++            throw new Error(`persist enqueue failed: ${String(err?.message || err)}; fallback failed: ${String(fallbackErr?.message || fallbackErr)}`);
++          }
+         }
+         return;
+       }
+ 
+       if (phase === 'persist') {
+         await markPersisting(baseContext);
+ 
+         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+ 
+         const out = await getIngest().persistProcessedData(payload?.processed || {}, {
+           brand: overrideBrand,
+           code: payload?.code ?? null,
+           series: overrideSeries,
+           display_name: payload?.display_name ?? null,
+         });
+ 
+         const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
+         const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
+ 
+         if (!out?.ok) {
+           const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
+           const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
+           await markFailed({
+             ...baseContext,
+diff --git a/server.js b/server.js
+index 7e201762e094f30be4939ba0318ec89ef52a6059..26087f339bced2f7188009ec560f09f911cbc72e 100644
+--- a/server.js
++++ b/server.js
+@@ -123,51 +123,57 @@ async function enqueueIngestTask(payload = {}) {
+   const maxAttempts = Number(process.env.TASKS_MAX_ATTEMPTS || 12);
+   const minBackoffSeconds = Number(process.env.TASKS_MIN_BACKOFF_SEC || 1);
+   const maxBackoffSeconds = Number(process.env.TASKS_MAX_BACKOFF_SEC || 60);
+   const maxDoublings = Number(process.env.TASKS_MAX_DOUBLINGS || 4);
+ 
+   const task = {
+     httpRequest: {
+       httpMethod: 'POST',
+       url: WORKER_TASK_URL,            // ★ ingest 하나로 통일
+       headers: { 'Content-Type': 'application/json' },
+       body,
+       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } } : {}),
+     },
+     // gRPC Duration 객체 (REST가 아님)
+     dispatchDeadline: { seconds: deadlineSeconds, nanos: 0 },
+     // 콜드스타트/일시 에러 완충
+     scheduleTime: { seconds: nowSeconds + delaySeconds },
+     retryConfig: {
+       maxAttempts,
+       minBackoff: { seconds: minBackoffSeconds },
+       maxBackoff: { seconds: maxBackoffSeconds },
+       maxDoublings,
+     },
+   };
+ 
+-  await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
++  try {
++    await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
++  } catch (err) {
++    const detail = err?.response?.data || err?.message || String(err);
++    console.warn('[tasks.createTask] failed', { code: err?.code, detail, queuePath });
++    throw err;
++  }
+ }
+ 
+ 
+ const app = express();
+ 
+ // ✅ 항상 찍히는 부팅 로그 + 간단 헬스/정보
+ console.log('[BOOT] server.js starting', {
+   file: __filename,
+   node: process.version,
+   ROUTE_DEBUG: process.env.ROUTE_DEBUG || null,
+   revision: process.env.K_REVISION || null,
+ });
+ 
+ // 가장 가벼운 핑
+ app.get('/_ping', (_req, res) => res.json({ ok: true, rev: process.env.K_REVISION || null }));
+ 
+ // 현재 실행 중인 엔트리/디렉토리 확인 (정말 server.js가 실행되는지 확인)
+ app.get('/_whoami', (_req, res) => {
+   try {
+     res.json({
+       main: require.main && require.main.filename,
+       dir: __dirname,
+       ROUTE_DEBUG: process.env.ROUTE_DEBUG || null
+     });
+   } catch (e) {
+diff --git a/server.js b/server.js
+index 7e201762e094f30be4939ba0318ec89ef52a6059..26087f339bced2f7188009ec560f09f911cbc72e 100644
+--- a/server.js
++++ b/server.js
+@@ -1031,51 +1037,86 @@ async function handleWorkerIngest(req, res) {
+ 
+         const nextPayload = {
+           runId,
+           run_id: runId,
+           gcsUri,
+           gcs_uri: gcsUri,
+           family_slug: payload?.family_slug ?? null,
+           brand: payload?.brand ?? null,
+           code: payload?.code ?? null,
+           series: payload?.series ?? null,
+           display_name: payload?.display_name ?? null,
+           uploader_id: payload?.uploader_id ?? null,
+           phase: 'persist',
+           processed,
+           overrides: nextOverrides,
+         };
+ 
+         try {
+           await enqueueIngestTask(nextPayload);
+         } catch (err) {
+           console.error(
+             '[enqueue error]',
+             err?.code || err?.response?.status || err?.message,
+             err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
+           );
+-          throw new Error(`persist enqueue failed: ${String(err?.message || err)}`);
++          console.warn('[ingest][persist fallback] attempting inline persist', { runId });
++          try {
++            await markPersisting(baseContext);
++            const inlineResult = await getIngest().persistProcessedData(processed || {}, {
++              brand: overrideBrand,
++              code: payload?.code ?? null,
++              series: overrideSeries,
++              display_name: payload?.display_name ?? null,
++            });
++
++            const failureReasons = new Set(Array.isArray(inlineResult?.reject_reasons) ? inlineResult.reject_reasons : []);
++            const warningReasons = new Set(Array.isArray(inlineResult?.warnings) ? inlineResult.warnings : []);
++
++            if (!inlineResult?.ok) {
++              const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
++              const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
++              await markFailed({
++                ...baseContext,
++                error: message,
++                durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
++              });
++              return;
++            }
++
++            await markSucceeded({
++              ...baseContext,
++              result: inlineResult,
++              gcsUri,
++              durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
++              meta: payload,
++            });
++            return;
++          } catch (fallbackErr) {
++            console.error('[ingest][persist fallback] failed', fallbackErr?.message || fallbackErr);
++            throw new Error(`persist enqueue failed: ${String(err?.message || err)}; fallback failed: ${String(fallbackErr?.message || fallbackErr)}`);
++          }
+         }
+         return;
+       }
+ 
+       if (phase === 'persist') {
+         await markPersisting(baseContext);
+ 
+         const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+         const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+ 
+         const out = await getIngest().persistProcessedData(payload?.processed || {}, {
+           brand: overrideBrand,
+           code: payload?.code ?? null,
+           series: overrideSeries,
+           display_name: payload?.display_name ?? null,
+         });
+ 
+         const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
+         const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
+ 
+         if (!out?.ok) {
+           const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
+           const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
+           await markFailed({
+             ...baseContext,

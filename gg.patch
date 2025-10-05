@@ -1,73 +1,8 @@
 diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 35287afe73a643f80e93fc68f018f90fdbd180a2..f07b74464aee9f0599ac52af13a9848f859388da 100644
+index f07b74464aee9f0599ac52af13a9848f859388da..407f40ccba9b12afc1426dd476e5c5485d649e8c 100644
 --- a/src/pipeline/persist.js
 +++ b/src/pipeline/persist.js
-@@ -33,50 +33,60 @@ const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
- 
- const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
- const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
- const SCALE_MAP = {
-   k: 1e3,
-   m: 1e-3,
-   g: 1e9,
-   'µ': 1e-6,
-   u: 1e-6,
-   n: 1e-9,
-   p: 1e-12,
- };
- 
- function normKey(key) {
-   return String(key || '')
-     .trim()
-     .toLowerCase();
- }
- 
- function isValidPnValue(value) {
-   const trimmed = String(value || '').trim();
-   if (!trimmed) return false;
-   return PN_RE.test(trimmed);
- }
- 
-+function repairPn(raw) {
-+  if (!raw) return null;
-+  let s = String(raw).trim();
-+  s = s.replace(/[–—―]/g, '-');
-+  s = s.replace(/\s+/g, '');
-+  s = s.replace(/[^0-9A-Za-z\-_/().]/g, '');
-+  if (s.length < 3) return null;
-+  return s;
-+}
-+
- function isNumericType(type = '') {
-   const t = String(type || '').toLowerCase();
-   return (
-     t.includes('int') ||
-     t.includes('numeric') ||
-     t.includes('decimal') ||
-     t.includes('real') ||
-     t.includes('double')
-   );
- }
- 
- function parseNumberToken(token, suffix) {
-   if (!token) return null;
-   const cleaned = token.replace(/,/g, '');
-   const base = Number(cleaned);
-   if (!Number.isFinite(base)) return null;
-   if (!suffix) return base;
-   const scale = SCALE_MAP[suffix.toLowerCase()];
-   return scale != null ? base * scale : base;
- }
- 
- function parseNumericOrRange(value) {
-   if (value == null || value === '') return { value: null };
-   if (typeof value === 'number') {
-     return Number.isFinite(value) ? { value } : { value: null };
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 35287afe73a643f80e93fc68f018f90fdbd180a2..f07b74464aee9f0599ac52af13a9848f859388da 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -266,58 +276,74 @@ function hasCoreSpecValue(value) {
+@@ -276,61 +276,69 @@ function hasCoreSpecValue(value) {
  
  function hasCoreSpec(row, keys = [], candidateKeys = []) {
    const primary = Array.isArray(keys) ? keys.filter(Boolean) : [];
@@ -93,34 +28,40 @@ index 35287afe73a643f80e93fc68f018f90fdbd180a2..f07b74464aee9f0599ac52af13a9848f
    if (!row || typeof row !== 'object') {
      return { ok: false, reason: 'empty_row' };
    }
--  const pn = String(row.pn || row.code || '').trim();
-+  let pn = String(row.pn || row.code || '').trim();
-+  const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
++
++  const brand = String(row.brand || '').trim().toLowerCase();
++  if (!brand || brand === 'unknown') {
++    row.last_error = 'missing_brand';
++    return { ok: false, reason: 'missing_brand' };
++  }
++
+   let pn = String(row.pn || row.code || '').trim();
+   const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
    if (!isValidPnValue(pn) || FORBIDDEN_RE.test(pn)) {
--    if (row && typeof row === 'object') row.last_error = 'invalid_code';
--    return { ok: false, reason: 'invalid_code' };
-+    const fixed = repairPn(pn);
-+    if (fixed && isValidPnValue(fixed)) {
-+      row.last_error = row.last_error || 'invalid_code_fixed';
-+      pn = fixed;
-+    } else if (allowMinimal) {
-+      const fallback = String(row.series || row.code || '').trim();
-+      const fallbackPn = repairPn(fallback);
-+      if (fallbackPn && fallbackPn.length >= 3) {
-+        pn = fallbackPn;
-+        row.last_error = row.last_error || 'invalid_code_fallback';
-+      } else {
-+        row.last_error = 'invalid_code';
-+        return { ok: false, reason: 'invalid_code' };
-+      }
-+    } else {
-+      row.last_error = 'invalid_code';
-+      return { ok: false, reason: 'invalid_code' };
-+    }
+     const fixed = repairPn(pn);
+     if (fixed && isValidPnValue(fixed)) {
++      console.warn('[persist] pn repaired', { original: pn, fixed });
+       row.last_error = row.last_error || 'invalid_code_fixed';
+       pn = fixed;
+     } else if (allowMinimal) {
+-      const fallback = String(row.series || row.code || '').trim();
+-      const fallbackPn = repairPn(fallback);
++      const fallbackPn = repairPn(String(row.series || row.code || ''));
+       if (fallbackPn && fallbackPn.length >= 3) {
++        console.warn('[persist] pn fallback applied', { original: pn, fallback: fallbackPn });
+         pn = fallbackPn;
+         row.last_error = row.last_error || 'invalid_code_fallback';
+       } else {
+         row.last_error = 'invalid_code';
+         return { ok: false, reason: 'invalid_code' };
+       }
+     } else {
+       row.last_error = 'invalid_code';
+       return { ok: false, reason: 'invalid_code' };
+     }
    }
    row.pn = pn;
    if (row.code == null || String(row.code).trim() === '') row.code = pn;
--  const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
    if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !allowMinimal) {
      return { ok: false, reason: 'missing_core_spec' };
    }
@@ -133,16 +74,3 @@ index 35287afe73a643f80e93fc68f018f90fdbd180a2..f07b74464aee9f0599ac52af13a9848f
      : ['public', targetTable];
  
    const { rows } = await pool.query(
-     `SELECT lower(column_name) AS column, data_type
-        FROM information_schema.columns
-       WHERE table_schema = $1
-         AND table_name   = $2`,
-     [schema, table],
-   );
- 
-   const map = new Map();
-   for (const row of rows) {
-     map.set(row.column, String(row.data_type || '').toLowerCase());
-   }
-   return map;
- }

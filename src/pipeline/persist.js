@@ -298,17 +298,25 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   if (!row || typeof row !== 'object') {
     return { ok: false, reason: 'empty_row' };
   }
+
+  const brand = String(row.brand || '').trim().toLowerCase();
+  if (!brand || brand === 'unknown') {
+    row.last_error = 'missing_brand';
+    return { ok: false, reason: 'missing_brand' };
+  }
+
   let pn = String(row.pn || row.code || '').trim();
   const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
   if (!isValidPnValue(pn) || FORBIDDEN_RE.test(pn)) {
     const fixed = repairPn(pn);
     if (fixed && isValidPnValue(fixed)) {
+      console.warn('[persist] pn repaired', { original: pn, fixed });
       row.last_error = row.last_error || 'invalid_code_fixed';
       pn = fixed;
     } else if (allowMinimal) {
-      const fallback = String(row.series || row.code || '').trim();
-      const fallbackPn = repairPn(fallback);
+      const fallbackPn = repairPn(String(row.series || row.code || ''));
       if (fallbackPn && fallbackPn.length >= 3) {
+        console.warn('[persist] pn fallback applied', { original: pn, fallback: fallbackPn });
         pn = fallbackPn;
         row.last_error = row.last_error || 'invalid_code_fallback';
       } else {

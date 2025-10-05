@@ -71,6 +71,22 @@ const SKIP_SPEC_KEYS = new Set([
   'raw_tables',
 ]);
 
+function gatherRuntimeSpecKeys(rows) {
+  const set = new Set();
+  const list = Array.isArray(rows) ? rows : [];
+  for (const row of list) {
+    if (!row || typeof row !== 'object') continue;
+    for (const rawKey of Object.keys(row)) {
+      const trimmed = String(rawKey || '').trim();
+      if (!trimmed) continue;
+      const lower = trimmed.toLowerCase();
+      if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
+      set.add(trimmed);
+    }
+  }
+  return set;
+}
+
 const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
 const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
 
@@ -887,7 +903,7 @@ async function runAutoIngest(input = {}) {
     }
   }
 
-  const runtimeSpecKeys = new Set();
+  const canonicalRuntimeSpecKeys = new Set();
   const sanitizeSpecRows = (rows) => {
     if (!Array.isArray(rows)) return [];
     return rows.map((row) => {
@@ -914,7 +930,7 @@ async function runAutoIngest(input = {}) {
         }
         const canon = canonicalize(key);
         if (!canon) continue;
-        runtimeSpecKeys.add(canon);
+        canonicalRuntimeSpecKeys.add(canon);
         const existing = Object.prototype.hasOwnProperty.call(out, canon) ? out[canon] : undefined;
         if (!Object.prototype.hasOwnProperty.call(out, canon) || existing == null || existing === '') {
           out[canon] = rawValue;
@@ -928,7 +944,7 @@ async function runAutoIngest(input = {}) {
     extracted.rows = sanitizeSpecRows(extracted.rows);
   }
 
-  const autoAddKeys = Array.from(runtimeSpecKeys);
+  const autoAddKeys = Array.from(canonicalRuntimeSpecKeys);
   if (process.env.AUTO_ADD_FIELDS === '1' && family && autoAddKeys.length) {
     try {
       const { rows } = await db.query(
@@ -1183,17 +1199,7 @@ async function runAutoIngest(input = {}) {
   colTypes = await getColumnTypes(qualified);
 
   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
-  const runtimeSpecKeys = new Set();
-  for (const row of rawRows) {
-    if (!row || typeof row !== 'object') continue;
-    for (const rawKey of Object.keys(row)) {
-      const trimmed = String(rawKey || '').trim();
-      if (!trimmed) continue;
-      const lower = trimmed.toLowerCase();
-      if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
-      runtimeSpecKeys.add(trimmed);
-    }
-  }
+  const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
 
   const aiCanonicalMap = new Map();
   const aiCanonicalMapLower = new Map();

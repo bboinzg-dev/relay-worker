@@ -152,6 +152,7 @@ async function enqueueIngestTask(payload = {}) {
     console.warn('[tasks.createTask] failed', { code: err?.code, detail, queuePath });
     throw err;
   }
+}
 
 const app = express();
 

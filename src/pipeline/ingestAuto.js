@@ -15,6 +15,7 @@ const { resolveBrand } = require('../utils/brand');
 const { detectVariantKeys } = require('../utils/ordering');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
+const { aiCanonicalizeKeys } = require('./ai/canonKeys');
 const { canonicalize } = require('./specKeyMap');
 const { saveExtractedSpecs } = require('./persist');
 const { explodeToRows } = require('../ingest/mpn-exploder');
@@ -72,6 +73,35 @@ const SKIP_SPEC_KEYS = new Set([
 
 const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
 const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
+
+const RESERVED_SPEC_KEYS = new Set([
+  'id',
+  'created_at',
+  'updated_at',
+  'brand',
+  'brand_norm',
+  'pn',
+  'pn_norm',
+  'code',
+  'series',
+  'image_uri',
+  'datasheet_uri',
+]);
+
+function normalizeSpecKeyName(value) {
+  if (value == null) return null;
+  let s = String(value).trim().toLowerCase();
+  if (!s) return null;
+  s = s.replace(/[–—―]/g, '-');
+  s = s.replace(/\s+/g, '_');
+  s = s.replace(/[^0-9a-z_]+/g, '_');
+  s = s.replace(/_+/g, '_');
+  s = s.replace(/^_|_$/g, '');
+  if (!s) return null;
+  if (s.length > 63) s = s.slice(0, 63);
+  if (RESERVED_SPEC_KEYS.has(s)) return null;
+  return s;
+}
 
 function escapeRegex(str) {
   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -1152,6 +1182,124 @@ async function runAutoIngest(input = {}) {
   await ensureSpecColumnsForBlueprint(qualified, blueprint);
   colTypes = await getColumnTypes(qualified);
 
+  const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
+  const runtimeSpecKeys = new Set();
+  for (const row of rawRows) {
+    if (!row || typeof row !== 'object') continue;
+    for (const rawKey of Object.keys(row)) {
+      const trimmed = String(rawKey || '').trim();
+      if (!trimmed) continue;
+      const lower = trimmed.toLowerCase();
+      if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
+      runtimeSpecKeys.add(trimmed);
+    }
+  }
+
+  const aiCanonicalMap = new Map();
+  const aiCanonicalMapLower = new Map();
+  if (process.env.AUTO_CANON_KEYS === '1' && runtimeSpecKeys.size) {
+    const specCols = colTypes ? Array.from(colTypes.keys()) : [];
+    const blueprintFieldKeys = blueprint?.fields && typeof blueprint.fields === 'object'
+      ? Object.keys(blueprint.fields).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+      : [];
+    const knownKeys = Array.from(new Set([
+      ...specCols,
+      ...blueprintFieldKeys,
+      ...(Array.isArray(variantKeys) ? variantKeys : []),
+    ]));
+
+    try {
+      const { map, newKeys } = await aiCanonicalizeKeys(
+        family,
+        Array.from(runtimeSpecKeys),
+        knownKeys
+      );
+
+      const knownLower = new Set(knownKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
+      const newKeySet = new Set((Array.isArray(newKeys) ? newKeys : []).map((k) => String(k || '').trim()).filter(Boolean));
+      const newCanonKeys = [];
+      for (const [orig, info] of Object.entries(map || {})) {
+        const trimmedOrig = String(orig || '').trim();
+        if (!trimmedOrig) continue;
+        const baseLower = trimmedOrig.toLowerCase();
+        let canonical = String(info?.canonical || '').trim();
+        let action = info?.action === 'map' ? 'map' : 'new';
+        let conf = Number(info?.conf || 0);
+        if (!Number.isFinite(conf)) conf = 0;
+
+        let finalKey = null;
+        if (action === 'map' && canonical) {
+          const lowerCanon = canonical.toLowerCase();
+          if (knownLower.has(lowerCanon)) {
+            finalKey = lowerCanon;
+          } else {
+            finalKey = normalizeSpecKeyName(canonical) || lowerCanon || null;
+          }
+          if (!finalKey) {
+            finalKey = baseLower;
+            action = 'new';
+          }
+        } else {
+          const normalized = normalizeSpecKeyName(canonical || trimmedOrig);
+          finalKey = normalized || baseLower;
+          action = 'new';
+        }
+
+        if (!finalKey || META_KEYS.has(finalKey) || BASE_KEYS.has(finalKey)) continue;
+        const payload = { canonical: finalKey, action, conf };
+        aiCanonicalMap.set(trimmedOrig, payload);
+        aiCanonicalMapLower.set(baseLower, payload);
+        if (action === 'new' || newKeySet.has(trimmedOrig)) newCanonKeys.push(finalKey);
+      }
+
+      if (process.env.AUTO_ADD_FIELDS === '1' && newCanonKeys.length) {
+        const uniqueNew = Array.from(new Set(newCanonKeys.filter(Boolean)));
+        const limitRaw = Number(process.env.AUTO_ADD_FIELDS_LIMIT || '20');
+        const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : uniqueNew.length;
+        const target = uniqueNew.slice(0, limit);
+        if (target.length) {
+          try {
+            const { rows } = await db.query(
+              'SELECT public.ensure_dynamic_spec_columns($1,$2::jsonb) AS created',
+              [family, JSON.stringify(target)]
+            );
+            console.log('[schema] added columns', rows?.[0]?.created);
+          } catch (err) {
+            console.warn('[schema] ensure_dynamic_spec_columns failed:', err?.message || err);
+          }
+
+          for (const key of target) {
+            if (!key) continue;
+            if (colTypes && !colTypes.has(key)) colTypes.set(key, 'text');
+            if (!allowedKeys.includes(key)) allowedKeys.push(key);
+          }
+
+          allowedKeys = Array.from(new Set(allowedKeys));
+
+          if (Array.isArray(blueprint?.allowedKeys)) {
+            blueprint.allowedKeys = Array.from(new Set([...blueprint.allowedKeys, ...target]));
+          } else {
+            blueprint.allowedKeys = [...target];
+          }
+        }
+      }
+
+      const minCanonConf = Number(process.env.AUTO_CANON_MIN_CONF || '0.66');
+      for (const [orig, info] of aiCanonicalMap.entries()) {
+        if (info.action !== 'map' || !info.canonical || info.conf < minCanonConf) continue;
+        try {
+          await db.query('SELECT public.upsert_spec_alias($1,$2,$3)', [family, orig, info.canonical]);
+        } catch (_) {
+          /* ignore alias cache errors */
+        }
+      }
+    } catch (err) {
+      console.warn('[canon] aiCanonicalizeKeys failed:', err?.message || err);
+      aiCanonicalMap.clear();
+      aiCanonicalMapLower.clear();
+    }
+  }
+
   const mpnsFromDoc = harvestMpnCandidates(
     extracted?.text ?? '',
     (baseSeries || series || code || '')
@@ -1169,7 +1317,6 @@ async function runAutoIngest(input = {}) {
     candidateMap.push({ raw: trimmed, norm });
   }
 
-  const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
   const baseRows = (rawRows.length ? rawRows : [{}]).map((row) => {
     const obj = row && typeof row === 'object' ? { ...row } : {};
     if (obj.brand == null) obj.brand = brandName;
@@ -1261,8 +1408,11 @@ async function runAutoIngest(input = {}) {
       if (!key) continue;
       const lower = key.toLowerCase();
       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
-      if (physicalCols.has(lower) || allowedSet.has(lower) || variantSet.has(lower)) {
-        rec[lower] = rawValue;
+      const mapped = aiCanonicalMap.get(key) || aiCanonicalMapLower.get(lower);
+      const target = mapped?.canonical || lower;
+      if (!target || META_KEYS.has(target) || BASE_KEYS.has(target)) continue;
+      if (physicalCols.has(target) || allowedSet.has(target) || variantSet.has(target)) {
+        rec[target] = rawValue;
       }
     }
 

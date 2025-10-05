@@ -1,13 +1,14 @@
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 6aee5cff60ca6bee2832ba97740bebce7c8302b6..6c9eae37a23b4d2d9f2d32cadd33f06bbec48e03 100644
+index 6c9eae37a23b4d2d9f2d32cadd33f06bbec48e03..6b644cf78f7f21cabaa06f3c1899f95ebed02eef 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -1,44 +1,43 @@
+@@ -1,30 +1,31 @@
  'use strict';
  
  const path = require('node:path');
  const fs = require('node:fs/promises');
  const os = require('node:os');
++const crypto = require('node:crypto');
  const { execFile } = require('node:child_process');
  const { promisify } = require('node:util');
  const execFileP = promisify(execFile);
@@ -21,7 +22,6 @@ index 6aee5cff60ca6bee2832ba97740bebce7c8302b6..6c9eae37a23b4d2d9f2d32cadd33f06b
  const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
  const { extractFields } = require('./extractByBlueprint');
  const { aiCanonicalizeKeys } = require('./ai/canonKeys');
--const { canonicalize } = require('./specKeyMap');
  const { saveExtractedSpecs } = require('./persist');
  const { explodeToRows } = require('../ingest/mpn-exploder');
  const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
@@ -34,73 +34,205 @@ index 6aee5cff60ca6bee2832ba97740bebce7c8302b6..6c9eae37a23b4d2d9f2d32cadd33f06b
  
  function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
    const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
-   return new Promise((resolve, reject) => {
-     const timer = setTimeout(() => {
-       clearTimeout(timer);
-       reject(new Error(`${label}_TIMEOUT`));
-     }, timeout);
-     Promise.resolve(promise)
-       .then((value) => {
-         clearTimeout(timer);
-         resolve(value);
-       })
-       .catch((err) => {
-         clearTimeout(timer);
-         reject(err);
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 6aee5cff60ca6bee2832ba97740bebce7c8302b6..6c9eae37a23b4d2d9f2d32cadd33f06bbec48e03 100644
+index 6c9eae37a23b4d2d9f2d32cadd33f06bbec48e03..6b644cf78f7f21cabaa06f3c1899f95ebed02eef 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -906,51 +905,51 @@ async function runAutoIngest(input = {}) {
-   const canonicalRuntimeSpecKeys = new Set();
-   const sanitizeSpecRows = (rows) => {
-     if (!Array.isArray(rows)) return [];
-     return rows.map((row) => {
-       if (!row || typeof row !== 'object') return {};
-       const out = {};
-       for (const [rawKey, rawValue] of Object.entries(row)) {
-         const key = String(rawKey || '').trim();
-         if (!key) continue;
-         const lower = key.toLowerCase();
-         if (META_KEYS.has(lower) || BASE_KEYS.has(lower) || SKIP_SPEC_KEYS.has(lower)) {
-           const existing = Object.prototype.hasOwnProperty.call(out, lower) ? out[lower] : undefined;
-           if (!Object.prototype.hasOwnProperty.call(out, lower) || existing == null || existing === '') {
-             out[lower] = rawValue;
-           }
-           continue;
-         }
-         if (lower.startsWith('_')) {
-           const metaKey = lower;
-           const existing = Object.prototype.hasOwnProperty.call(out, metaKey) ? out[metaKey] : undefined;
-           if (!Object.prototype.hasOwnProperty.call(out, metaKey) || existing == null || existing === '') {
-             out[metaKey] = rawValue;
-           }
-           continue;
-         }
--        const canon = canonicalize(key);
-+        const canon = normalizeSpecKeyName(key);
-         if (!canon) continue;
-         canonicalRuntimeSpecKeys.add(canon);
-         const existing = Object.prototype.hasOwnProperty.call(out, canon) ? out[canon] : undefined;
-         if (!Object.prototype.hasOwnProperty.call(out, canon) || existing == null || existing === '') {
-           out[canon] = rawValue;
-         }
-       }
-       return out;
-     });
+@@ -581,69 +582,69 @@ async function extractPartNumbersFromText(text, { series } = {}) {
+ 
+   const prefix = series ? normalizeCode(series) : null;
+   const seen = new Set();
+   const out = [];
+ 
+   const push = (raw) => {
+     if (!raw) return;
+     const norm = normalizeCode(raw);
+     if (!norm) return;
+     if (prefix && !norm.startsWith(prefix)) return;
+     if (seen.has(norm)) return;
+     seen.add(norm);
+     const cleaned = typeof raw === 'string' ? raw.trim() : String(raw || '');
+     out.push(cleaned || norm);
    };
  
-   if (Array.isArray(extracted?.rows) && extracted.rows.length) {
-     extracted.rows = sanitizeSpecRows(extracted.rows);
+   for (const { code } of extractPartNumbersFromTypesTables(src, 200)) push(code);
+   for (const { code } of rankPartNumbersFromOrderingSections(src, 200)) push(code);
+   for (const { code } of extractPartNumbersBySeriesHeuristic(src, 200)) push(code);
+ 
+   return out;
+ }
+ 
+ 
+ 
+-async function runAutoIngest(input = {}) {
++async function doIngestPipeline(input = {}, runIdParam = null) {
+   let {
+     gcsUri: rawGcsUri = null,
+     gsUri: rawGsUri = null,
+     family_slug = null,
+     brand = null,
+     code = null,
+     series = null,
+     display_name = null,
+   } = input;
+ 
+   const overridesBrand = input?.overrides?.brand ?? null;
+   const overridesSeries = input?.overrides?.series ?? null;
+   const effectiveBrand = overridesBrand || brand || null;
+   let detectedBrand = null;
+   if (overridesSeries != null && (series == null || series === '')) series = overridesSeries;
+ 
+   const gcsUri = (rawGcsUri || rawGsUri || '').trim();
+-  const runId = input?.runId ?? input?.run_id ?? null;
++  const runId = runIdParam ?? input?.runId ?? input?.run_id ?? null;
+   const jobId = input?.jobId ?? input?.job_id ?? null;
+ 
+   const started = Date.now();
+   if (!gcsUri) throw new Error('gcsUri/gsUri required');
+   // 기본 2분 하드캡 (ENV로 조정 가능)
+   const BUDGET = Number(process.env.INGEST_BUDGET_MS || 120000);
+   const FAST = /^(1|true|on)$/i.test(process.env.FAST_INGEST || '1');
+   const PREVIEW_BYTES = Number(process.env.PREVIEW_BYTES || 262144);
+   const EXTRACT_HARD_CAP_MS = HARD_CAP_MS;
+   const FIRST_PASS_CODES = parseInt(process.env.FIRST_PASS_CODES || '20', 10);
+ 
+   let lockAcquired = false;
+   if (runId) {
+     try {
+       await db.query('SELECT pg_advisory_lock(hashtext($1))', [runId]);
+       lockAcquired = true;
+     } catch (err) {
+       console.warn('[ingest] advisory lock failed:', err?.message || err);
+     }
    }
  
-   const autoAddKeys = Array.from(canonicalRuntimeSpecKeys);
-   if (process.env.AUTO_ADD_FIELDS === '1' && family && autoAddKeys.length) {
+   const releaseLock = async () => {
+     if (!lockAcquired || !runId) return;
+     lockAcquired = false;
      try {
-       const { rows } = await db.query(
-         'SELECT public.ensure_dynamic_spec_columns($1, $2::jsonb) AS created',
-         [family, JSON.stringify(autoAddKeys)]
-       );
-       const created = rows?.[0]?.created;
-       if (Array.isArray(created) && created.length) {
-         console.log('[schema] added columns', created);
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 6c9eae37a23b4d2d9f2d32cadd33f06bbec48e03..6b644cf78f7f21cabaa06f3c1899f95ebed02eef 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1505,50 +1506,121 @@ async function runAutoIngest(input = {}) {
+   const persistBrand = pickBrandHint(brandEffectiveResolved, overridesBrand, effectiveBrand, detectedBrand, brand);
+   const persistOverrides = {
+     brand: persistBrand || null,
+     code,
+     series: overridesSeries ?? series,
+     display_name,
+     runId,
+     run_id: runId,
+     jobId,
+     job_id: jobId,
+   };
+   return withDeadline(
+     persistProcessedData(processedPayload, persistOverrides),
+     HARD_CAP_MS,
+     'PERSIST',
+   );
+   })();
+ 
+   try {
+     return await runnerPromise;
+   } finally {
+     await releaseLock();
+   }
+ }
+ 
++async function runAutoIngest(payload = {}) {
++  const normalizedPayload = payload && typeof payload === 'object' ? { ...payload } : {};
++  const runId = normalizedPayload.runId ?? normalizedPayload.run_id ?? crypto.randomUUID();
++  normalizedPayload.runId = runId;
++  normalizedPayload.run_id = runId;
++
++  await db.query(
++    `
++      INSERT INTO public.ingest_run_logs (id, gcs_uri, status, started_at, ts)
++      VALUES ($1, $2, 'RUNNING', now(), now())
++      ON CONFLICT (id) DO NOTHING
++    `,
++    [runId, normalizedPayload.gcsUri || normalizedPayload.gsUri || null],
++  );
++
++  const watchdogMs = Number(process.env.INGEST_WATCHDOG_MS || 870000);
++  const watchdog = setTimeout(async () => {
++    try {
++      await db.query(
++        `
++          UPDATE public.ingest_run_logs
++             SET status='FAILED', event='WATCHDOG_TIMEOUT', error_message='watchdog timeout', finished_at=now(), ts=now()
++           WHERE id = $1 AND status='RUNNING'
++        `,
++        [runId],
++      );
++    } catch (err) {
++      console.warn('[ingest] watchdog update failed:', err?.message || err);
++    }
++  }, watchdogMs);
++  if (typeof watchdog?.unref === 'function') watchdog.unref();
++
++  try {
++    const result = await doIngestPipeline(normalizedPayload, runId);
++    await db.query(
++      `
++        UPDATE public.ingest_run_logs
++           SET status='SUCCEEDED',
++               event='PERSIST_DONE',
++               error_message=NULL,
++               finished_at=now(), ts=now()
++         WHERE id=$1
++      `,
++      [runId],
++    );
++    return result;
++  } catch (e) {
++    const msg = (e && e.message ? String(e.message) : 'error').slice(0, 500);
++    try {
++      await db.query(
++        `
++          UPDATE public.ingest_run_logs
++             SET status='FAILED',
++                 event='EXCEPTION',
++                 error_message=$2,
++                 finished_at=now(), ts=now()
++           WHERE id=$1
++        `,
++        [runId, msg],
++      );
++    } catch (err) {
++      console.warn('[ingest] failure update failed:', err?.message || err);
++    }
++    throw e;
++  } finally {
++    clearTimeout(watchdog);
++    try { await db.query('SELECT pg_advisory_unlock(hashtextextended($1))', [runId]); } catch {}
++    try { await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]); } catch {}
++  }
++}
++
+ async function persistProcessedData(processed = {}, overrides = {}) {
+   const {
+     started = Date.now(),
+     gcsUri = null,
+     family = null,
+     table = null,
+     qualified: qualifiedInput = null,
+     pnTemplate = null,
+     requiredFields = [],
+     coverUri = null,
+     records: initialRecords = [],
+     rows: processedRowsInput = [],
+     mpnList = [],
+     extractedBrand = null,
+     brandName = null,
+     baseSeries = null,
+     text: processedText = null,
+     brand: processedBrand = null,
+     brand_detected: processedDetected = null,
+     brand_effective: processedEffective = null,
+     brand_source: processedBrandSource = null,
+     variant_keys_runtime: processedVariantKeys = [],
+   } = processed || {};
+ 
+   const recordsSource = Array.isArray(initialRecords) && initialRecords.length

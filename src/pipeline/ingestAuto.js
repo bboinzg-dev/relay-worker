@@ -3,6 +3,7 @@
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const execFileP = promisify(execFile);
@@ -603,7 +604,7 @@ async function extractPartNumbersFromText(text, { series } = {}) {
 
 
 
-async function runAutoIngest(input = {}) {
+async function doIngestPipeline(input = {}, runIdParam = null) {
   let {
     gcsUri: rawGcsUri = null,
     gsUri: rawGsUri = null,
@@ -621,7 +622,7 @@ async function runAutoIngest(input = {}) {
   if (overridesSeries != null && (series == null || series === '')) series = overridesSeries;
 
   const gcsUri = (rawGcsUri || rawGsUri || '').trim();
-  const runId = input?.runId ?? input?.run_id ?? null;
+  const runId = runIdParam ?? input?.runId ?? input?.run_id ?? null;
   const jobId = input?.jobId ?? input?.job_id ?? null;
 
   const started = Date.now();
@@ -1524,6 +1525,77 @@ async function runAutoIngest(input = {}) {
     return await runnerPromise;
   } finally {
     await releaseLock();
+  }
+}
+
+async function runAutoIngest(payload = {}) {
+  const normalizedPayload = payload && typeof payload === 'object' ? { ...payload } : {};
+  const runId = normalizedPayload.runId ?? normalizedPayload.run_id ?? crypto.randomUUID();
+  normalizedPayload.runId = runId;
+  normalizedPayload.run_id = runId;
+
+  await db.query(
+    `
+      INSERT INTO public.ingest_run_logs (id, gcs_uri, status, started_at, ts)
+      VALUES ($1, $2, 'RUNNING', now(), now())
+      ON CONFLICT (id) DO NOTHING
+    `,
+    [runId, normalizedPayload.gcsUri || normalizedPayload.gsUri || null],
+  );
+
+  const watchdogMs = Number(process.env.INGEST_WATCHDOG_MS || 870000);
+  const watchdog = setTimeout(async () => {
+    try {
+      await db.query(
+        `
+          UPDATE public.ingest_run_logs
+             SET status='FAILED', event='WATCHDOG_TIMEOUT', error_message='watchdog timeout', finished_at=now(), ts=now()
+           WHERE id = $1 AND status='RUNNING'
+        `,
+        [runId],
+      );
+    } catch (err) {
+      console.warn('[ingest] watchdog update failed:', err?.message || err);
+    }
+  }, watchdogMs);
+  if (typeof watchdog?.unref === 'function') watchdog.unref();
+
+  try {
+    const result = await doIngestPipeline(normalizedPayload, runId);
+    await db.query(
+      `
+        UPDATE public.ingest_run_logs
+           SET status='SUCCEEDED',
+               event='PERSIST_DONE',
+               error_message=NULL,
+               finished_at=now(), ts=now()
+         WHERE id=$1
+      `,
+      [runId],
+    );
+    return result;
+  } catch (e) {
+    const msg = (e && e.message ? String(e.message) : 'error').slice(0, 500);
+    try {
+      await db.query(
+        `
+          UPDATE public.ingest_run_logs
+             SET status='FAILED',
+                 event='EXCEPTION',
+                 error_message=$2,
+                 finished_at=now(), ts=now()
+           WHERE id=$1
+        `,
+        [runId, msg],
+      );
+    } catch (err) {
+      console.warn('[ingest] failure update failed:', err?.message || err);
+    }
+    throw e;
+  } finally {
+    clearTimeout(watchdog);
+    try { await db.query('SELECT pg_advisory_unlock(hashtextextended($1))', [runId]); } catch {}
+    try { await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]); } catch {}
   }
 }
 

@@ -76,15 +76,27 @@ function resolveSslConfig(connStr) {
 console.log('[db] file =', __filename);
 console.log('[db] env  =', { DB_TLS_INSECURE: process.env.DB_TLS_INSECURE, PGSSLMODE: process.env.PGSSLMODE });
 
+function parseEnvInt(name, defaultValue) {
+  const raw = process.env[name];
+  if (!raw) return defaultValue;
+
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) {
+    console.warn(`[db] invalid numeric value for ${name}:`, raw, `→ fallback ${defaultValue}`);
+    return defaultValue;
+  }
+  return parsed;
+}
+
 function buildPool() {
   const connectionString = resolveConnectionString();
   const ssl = resolveSslConfig(connectionString);
 
-  const max = parseInt(process.env.PGPOOL_MAX || '10', 10);
-  const idle = parseInt(process.env.PG_IDLE_TIMEOUT_MS || '600000', 10);
-  const connTimeout = parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '30000', 10);
-  const statementTimeout = parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || '30000', 10);
-  const queryTimeout = parseInt(process.env.PG_QUERY_TIMEOUT_MS || '30000', 10);
+  const max = parseEnvInt('PGPOOL_MAX', 10);
+  const idle = parseEnvInt('PG_IDLE_TIMEOUT_MS', 600000);
+  const connTimeout = parseEnvInt('PG_CONNECT_TIMEOUT_MS', 30000);
+  const statementTimeout = parseEnvInt('PG_STATEMENT_TIMEOUT_MS', 30000);
+  const queryTimeout = parseEnvInt('PG_QUERY_TIMEOUT_MS', 30000);
 
   const config = {
     connectionString,

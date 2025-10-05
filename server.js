@@ -1294,6 +1294,15 @@ async function ensureRelaySignalPnTemplate() {
   }
 }
 
+async function ensureMarketTables() {
+  try {
+    await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
+    // 위 DDL 중 핵심만 축약 호출 — 상세판은 SQL 파일로 유지해도 OK
+    await db.query(`CREATE TABLE IF NOT EXISTS public.listings (id uuid PRIMARY KEY DEFAULT uuid_generate_v4(), brand text NOT NULL, code text NOT NULL, brand_norm text GENERATED ALWAYS AS (lower(brand)) STORED, code_norm text GENERATED ALWAYS AS (lower(code)) STORED, qty_available integer NOT NULL DEFAULT 0, unit_price_cents integer NOT NULL DEFAULT 0, currency text DEFAULT 'USD', status text NOT NULL DEFAULT 'pending', created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now())`);
+    await db.query(`CREATE TABLE IF NOT EXISTS public.purchase_requests (id uuid PRIMARY KEY DEFAULT uuid_generate_v4(), brand text NOT NULL, code text NOT NULL, brand_norm text GENERATED ALWAYS AS (lower(brand)) STORED, code_norm text GENERATED ALWAYS AS (lower(code)) STORED, qty_required integer NOT NULL DEFAULT 0, qty_confirmed integer NOT NULL DEFAULT 0, status text NOT NULL DEFAULT 'open', created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now())`);
+  } catch (e) { console.warn('[BOOT] ensure market tables skipped:', e?.message || e); }
+}
+
 /* ---------------- Boot-time setup ---------------- */
 (async () => {
   try {
@@ -1321,6 +1330,7 @@ async function ensureRelaySignalPnTemplate() {
     await seedManufacturerAliases();
     await seedExtractionRecipe();
     await ensureRelaySignalPnTemplate();
+    await ensureMarketTables();
     console.log('[BOOT] ensured ingest_run_logs');
     
     // ───────── 부팅 시 외부 HTTPS/Vertex 호출은 여기서만 (가드 적용)

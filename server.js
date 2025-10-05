@@ -145,9 +145,13 @@ async function enqueueIngestTask(payload = {}) {
     },
   };
 
-  await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
-}
-
+  try {
+    await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
+  } catch (err) {
+    const detail = err?.response?.data || err?.message || String(err);
+    console.warn('[tasks.createTask] failed', { code: err?.code, detail, queuePath });
+    throw err;
+  }
 
 const app = express();
 
@@ -1053,7 +1057,42 @@ async function handleWorkerIngest(req, res) {
             err?.code || err?.response?.status || err?.message,
             err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
           );
-          throw new Error(`persist enqueue failed: ${String(err?.message || err)}`);
+          console.warn('[ingest][persist fallback] attempting inline persist', { runId });
+          try {
+            await markPersisting(baseContext);
+            const inlineResult = await getIngest().persistProcessedData(processed || {}, {
+              brand: overrideBrand,
+              code: payload?.code ?? null,
+              series: overrideSeries,
+              display_name: payload?.display_name ?? null,
+            });
+
+            const failureReasons = new Set(Array.isArray(inlineResult?.reject_reasons) ? inlineResult.reject_reasons : []);
+            const warningReasons = new Set(Array.isArray(inlineResult?.warnings) ? inlineResult.warnings : []);
+
+            if (!inlineResult?.ok) {
+              const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
+              const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
+              await markFailed({
+                ...baseContext,
+                error: message,
+                durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
+              });
+              return;
+            }
+
+            await markSucceeded({
+              ...baseContext,
+              result: inlineResult,
+              gcsUri,
+              durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
+              meta: payload,
+            });
+            return;
+          } catch (fallbackErr) {
+            console.error('[ingest][persist fallback] failed', fallbackErr?.message || fallbackErr);
+            throw new Error(`persist enqueue failed: ${String(err?.message || err)}; fallback failed: ${String(fallbackErr?.message || fallbackErr)}`);
+          }
         }
         return;
       }

@@ -15,6 +15,7 @@ const { resolveBrand } = require('../utils/brand');
 const { detectVariantKeys } = require('../utils/ordering');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
+const { canonicalize } = require('./specKeyMap');
 const { saveExtractedSpecs } = require('./persist');
 const { explodeToRows } = require('../ingest/mpn-exploder');
 const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
@@ -52,6 +53,21 @@ const BASE_KEYS = new Set([
   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
   'cover','verified_in_doc','updated_at'
+]);
+const SKIP_SPEC_KEYS = new Set([
+  'raw_json',
+  'text',
+  'tables',
+  'mpn_list',
+  'mpn',
+  'codes',
+  'series',
+  'series_code',
+  'raw_text',
+  'raw_specs',
+  'rawspecs',
+  'raw_table',
+  'raw_tables',
 ]);
 
 const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
@@ -838,6 +854,63 @@ async function runAutoIngest(input = {}) {
           row.brand = detectedBrand;
         }
       }
+    }
+  }
+
+  const runtimeSpecKeys = new Set();
+  const sanitizeSpecRows = (rows) => {
+    if (!Array.isArray(rows)) return [];
+    return rows.map((row) => {
+      if (!row || typeof row !== 'object') return {};
+      const out = {};
+      for (const [rawKey, rawValue] of Object.entries(row)) {
+        const key = String(rawKey || '').trim();
+        if (!key) continue;
+        const lower = key.toLowerCase();
+        if (META_KEYS.has(lower) || BASE_KEYS.has(lower) || SKIP_SPEC_KEYS.has(lower)) {
+          const existing = Object.prototype.hasOwnProperty.call(out, lower) ? out[lower] : undefined;
+          if (!Object.prototype.hasOwnProperty.call(out, lower) || existing == null || existing === '') {
+            out[lower] = rawValue;
+          }
+          continue;
+        }
+        if (lower.startsWith('_')) {
+          const metaKey = lower;
+          const existing = Object.prototype.hasOwnProperty.call(out, metaKey) ? out[metaKey] : undefined;
+          if (!Object.prototype.hasOwnProperty.call(out, metaKey) || existing == null || existing === '') {
+            out[metaKey] = rawValue;
+          }
+          continue;
+        }
+        const canon = canonicalize(key);
+        if (!canon) continue;
+        runtimeSpecKeys.add(canon);
+        const existing = Object.prototype.hasOwnProperty.call(out, canon) ? out[canon] : undefined;
+        if (!Object.prototype.hasOwnProperty.call(out, canon) || existing == null || existing === '') {
+          out[canon] = rawValue;
+        }
+      }
+      return out;
+    });
+  };
+
+  if (Array.isArray(extracted?.rows) && extracted.rows.length) {
+    extracted.rows = sanitizeSpecRows(extracted.rows);
+  }
+
+  const autoAddKeys = Array.from(runtimeSpecKeys);
+  if (process.env.AUTO_ADD_FIELDS === '1' && family && autoAddKeys.length) {
+    try {
+      const { rows } = await db.query(
+        'SELECT public.ensure_dynamic_spec_columns($1, $2::jsonb) AS created',
+        [family, JSON.stringify(autoAddKeys)]
+      );
+      const created = rows?.[0]?.created;
+      if (Array.isArray(created) && created.length) {
+        console.log('[schema] added columns', created);
+      }
+    } catch (err) {
+      console.warn('[schema] ensure_dynamic_spec_columns failed:', err?.message || err);
     }
   }
 

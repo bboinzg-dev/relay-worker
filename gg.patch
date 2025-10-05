@@ -1,156 +1,213 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 407f40ccba9b12afc1426dd476e5c5485d649e8c..2a5ecd91ebf1d55c763baa133193e9c6e92935b6 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -8,83 +8,87 @@ const META_KEYS = new Set([
-   'brand',
-   'brand_norm',
-   'pn',
-   'pn_norm',
-   'code',
-   'code_norm',
-   'mfr_full',
-   'datasheet_uri',
-   'verified_in_doc',
-   'display_name',
-   'displayname',
-   'image_uri',
-   'cover',
-   'series',
-   'series_code',
-   'raw_json',
-   'last_error',
-   'created_at',
-   'updated_at',
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index ca5f92b8de8d8b3a579378a2a2ea7d12732cff61..8d6a6e42ac6967eca888e68b6af26bdea1ac71a7 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1,80 +1,96 @@
+ 'use strict';
+ 
+ const path = require('node:path');
+ const fs = require('node:fs/promises');
+ const os = require('node:os');
+ const { execFile } = require('node:child_process');
+ const { promisify } = require('node:util');
+ const execFileP = promisify(execFile);
+ 
+ const db = require('../../db');
+ const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
+ const { extractText } = require('../utils/extract');
+ const { getBlueprint } = require('../utils/blueprint');
+ const { resolveBrand } = require('../utils/brand');
+ const { detectVariantKeys } = require('../utils/ordering');
+ const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
+ const { extractFields } = require('./extractByBlueprint');
++const { canonicalize } = require('./specKeyMap');
+ const { saveExtractedSpecs } = require('./persist');
+ const { explodeToRows } = require('../ingest/mpn-exploder');
+ const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
+ const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
+ const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
+ const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
+ const { processDocument: processDocAi } = require('../services/docai');
+ 
+ const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
+ 
+ function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
+   const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
+   return new Promise((resolve, reject) => {
+     const timer = setTimeout(() => {
+       clearTimeout(timer);
+       reject(new Error(`${label}_TIMEOUT`));
+     }, timeout);
+     Promise.resolve(promise)
+       .then((value) => {
+         clearTimeout(timer);
+         resolve(value);
+       })
+       .catch((err) => {
+         clearTimeout(timer);
+         reject(err);
+       });
+   });
+ }
+ 
+ const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
+ const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
+ 
+ const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
+ const BASE_KEYS = new Set([
+   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
+   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
+   'cover','verified_in_doc','updated_at'
  ]);
++const SKIP_SPEC_KEYS = new Set([
++  'raw_json',
++  'text',
++  'tables',
++  'mpn_list',
++  'mpn',
++  'codes',
++  'series',
++  'series_code',
++  'raw_text',
++  'raw_specs',
++  'rawspecs',
++  'raw_table',
++  'raw_tables',
++]);
  
- const CONFLICT_KEYS = ['brand_norm', 'code_norm'];
+ const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
+ const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
  
- const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
- const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
-+const BANNED_PREFIX = /^(pdf|page|figure|table|sheet|rev|ver|draft)\b/i;
-+const BANNED_EXACT = /^pdf-?1(\.\d+)?$/i;
- 
- const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
- const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
- const SCALE_MAP = {
-   k: 1e3,
-   m: 1e-3,
-   g: 1e9,
-   'µ': 1e-6,
-   u: 1e-6,
-   n: 1e-9,
-   p: 1e-12,
- };
- 
- function normKey(key) {
-   return String(key || '')
-     .trim()
-     .toLowerCase();
+ function escapeRegex(str) {
+   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
  }
  
- function isValidPnValue(value) {
-   const trimmed = String(value || '').trim();
-   if (!trimmed) return false;
-   return PN_RE.test(trimmed);
+ function textContainsExact(text, pn) {
+   if (!text || !pn) return false;
+   const pattern = escapeRegex(String(pn).trim());
+   if (!pattern) return false;
+   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
+   return re.test(String(text));
  }
  
- function repairPn(raw) {
-   if (!raw) return null;
-   let s = String(raw).trim();
-+  if (!s) return null;
-+  if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
-   s = s.replace(/[–—―]/g, '-');
-   s = s.replace(/\s+/g, '');
-   s = s.replace(/[^0-9A-Za-z\-_/().]/g, '');
--  if (s.length < 3) return null;
--  return s;
-+  if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
-+  return s.length >= 3 ? s : null;
- }
+ function normLower(s){ return String(s||'').trim().toLowerCase(); }
  
- function isNumericType(type = '') {
-   const t = String(type || '').toLowerCase();
-   return (
-     t.includes('int') ||
-     t.includes('numeric') ||
-     t.includes('decimal') ||
-     t.includes('real') ||
-     t.includes('double')
-   );
- }
- 
- function parseNumberToken(token, suffix) {
-   if (!token) return null;
-   const cleaned = token.replace(/,/g, '');
-   const base = Number(cleaned);
-   if (!Number.isFinite(base)) return null;
-   if (!suffix) return base;
-   const scale = SCALE_MAP[suffix.toLowerCase()];
-   return scale != null ? base * scale : base;
- }
- 
- function parseNumericOrRange(value) {
-   if (value == null || value === '') return { value: null };
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 407f40ccba9b12afc1426dd476e5c5485d649e8c..2a5ecd91ebf1d55c763baa133193e9c6e92935b6 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -285,51 +289,56 @@ function hasCoreSpec(row, keys = [], candidateKeys = []) {
-       if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
+ function pickBrandHint(...values) {
+   for (const value of values) {
+     if (value == null) continue;
+     const trimmed = String(value).trim();
+     if (!trimmed) continue;
+     if (trimmed.toLowerCase() === 'unknown') continue;
+     return trimmed;
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index ca5f92b8de8d8b3a579378a2a2ea7d12732cff61..8d6a6e42ac6967eca888e68b6af26bdea1ac71a7 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -819,50 +835,107 @@ async function runAutoIngest(input = {}) {
      }
-     return false;
-   }
-   for (const key of list) {
-     const norm = normKey(key);
-     if (!norm) continue;
-     if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
-   }
-   return false;
- }
- 
- function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
-   if (!row || typeof row !== 'object') {
-     return { ok: false, reason: 'empty_row' };
-   }
- 
-   const brand = String(row.brand || '').trim().toLowerCase();
-   if (!brand || brand === 'unknown') {
-     row.last_error = 'missing_brand';
-     return { ok: false, reason: 'missing_brand' };
-   }
- 
-   let pn = String(row.pn || row.code || '').trim();
-   const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
--  if (!isValidPnValue(pn) || FORBIDDEN_RE.test(pn)) {
-+  if (
-+    !isValidPnValue(pn) ||
-+    FORBIDDEN_RE.test(pn) ||
-+    BANNED_PREFIX.test(pn) ||
-+    BANNED_EXACT.test(pn)
-+  ) {
-     const fixed = repairPn(pn);
-     if (fixed && isValidPnValue(fixed)) {
-       console.warn('[persist] pn repaired', { original: pn, fixed });
-       row.last_error = row.last_error || 'invalid_code_fixed';
-       pn = fixed;
-     } else if (allowMinimal) {
-       const fallbackPn = repairPn(String(row.series || row.code || ''));
-       if (fallbackPn && fallbackPn.length >= 3) {
-         console.warn('[persist] pn fallback applied', { original: pn, fallback: fallbackPn });
-         pn = fallbackPn;
-         row.last_error = row.last_error || 'invalid_code_fallback';
-       } else {
-         row.last_error = 'invalid_code';
-         return { ok: false, reason: 'invalid_code' };
+     for (const row of extracted.rows) {
+       if (!row || typeof row !== 'object') continue;
+       if (row.raw_json == null) {
+         row.raw_json = rawJsonPayload;
        }
-     } else {
-       row.last_error = 'invalid_code';
-       return { ok: false, reason: 'invalid_code' };
      }
    }
-   row.pn = pn;
-   if (row.code == null || String(row.code).trim() === '') row.code = pn;
-   if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !allowMinimal) {
-     return { ok: false, reason: 'missing_core_spec' };
+ 
+   if (detectedBrand && extracted && typeof extracted === 'object') {
+     const brandValue = String(extracted.brand || '').trim().toLowerCase();
+     if (!brandValue || brandValue === 'unknown') {
+       extracted.brand = detectedBrand;
+     }
+     if (Array.isArray(extracted.rows)) {
+       for (const row of extracted.rows) {
+         if (!row || typeof row !== 'object') continue;
+         const rowBrand = String(row.brand || '').trim().toLowerCase();
+         if (!rowBrand || rowBrand === 'unknown') {
+           row.brand = detectedBrand;
+         }
+       }
+     }
+   }
+ 
++  const runtimeSpecKeys = new Set();
++  const sanitizeSpecRows = (rows) => {
++    if (!Array.isArray(rows)) return [];
++    return rows.map((row) => {
++      if (!row || typeof row !== 'object') return {};
++      const out = {};
++      for (const [rawKey, rawValue] of Object.entries(row)) {
++        const key = String(rawKey || '').trim();
++        if (!key) continue;
++        const lower = key.toLowerCase();
++        if (META_KEYS.has(lower) || BASE_KEYS.has(lower) || SKIP_SPEC_KEYS.has(lower)) {
++          const existing = Object.prototype.hasOwnProperty.call(out, lower) ? out[lower] : undefined;
++          if (!Object.prototype.hasOwnProperty.call(out, lower) || existing == null || existing === '') {
++            out[lower] = rawValue;
++          }
++          continue;
++        }
++        if (lower.startsWith('_')) {
++          const metaKey = lower;
++          const existing = Object.prototype.hasOwnProperty.call(out, metaKey) ? out[metaKey] : undefined;
++          if (!Object.prototype.hasOwnProperty.call(out, metaKey) || existing == null || existing === '') {
++            out[metaKey] = rawValue;
++          }
++          continue;
++        }
++        const canon = canonicalize(key);
++        if (!canon) continue;
++        runtimeSpecKeys.add(canon);
++        const existing = Object.prototype.hasOwnProperty.call(out, canon) ? out[canon] : undefined;
++        if (!Object.prototype.hasOwnProperty.call(out, canon) || existing == null || existing === '') {
++          out[canon] = rawValue;
++        }
++      }
++      return out;
++    });
++  };
++
++  if (Array.isArray(extracted?.rows) && extracted.rows.length) {
++    extracted.rows = sanitizeSpecRows(extracted.rows);
++  }
++
++  const autoAddKeys = Array.from(runtimeSpecKeys);
++  if (process.env.AUTO_ADD_FIELDS === '1' && family && autoAddKeys.length) {
++    try {
++      const { rows } = await db.query(
++        'SELECT public.ensure_dynamic_spec_columns($1, $2::jsonb) AS created',
++        [family, JSON.stringify(autoAddKeys)]
++      );
++      const created = rows?.[0]?.created;
++      if (Array.isArray(created) && created.length) {
++        console.log('[schema] added columns', created);
++      }
++    } catch (err) {
++      console.warn('[schema] ensure_dynamic_spec_columns failed:', err?.message || err);
++    }
++  }
++
+   // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
+   let codes = [];
+   if (!code) {
+     const skuFromTable = pickSkuListFromTables(extracted);
+     const docText = extracted?.text || previewText || '';
+     codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint, docText);
+     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
+     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
+     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
+   }
+ 
+   // 🔹 후보(candidates)가 아직 비었고, 방금 수집한 codes가 있으면 candidates로 승격
+   if (!candidates.length && codes.length) {
+     const merged = [];
+     const seen = new Set();
+     for (const raw of codes) {
+       const trimmed = typeof raw === 'string' ? raw.trim() : String(raw || '');
+       if (!trimmed) continue;
+       const norm = normalizeCode(trimmed);
+       if (seen.has(norm)) continue;
+       seen.add(norm);
+       merged.push(trimmed);
+     }
+     if (merged.length) candidates = merged;
    }

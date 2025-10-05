@@ -16,7 +16,6 @@ const { detectVariantKeys } = require('../utils/ordering');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
 const { aiCanonicalizeKeys } = require('./ai/canonKeys');
-const { canonicalize } = require('./specKeyMap');
 const { saveExtractedSpecs } = require('./persist');
 const { explodeToRows } = require('../ingest/mpn-exploder');
 const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
@@ -928,7 +927,7 @@ async function runAutoIngest(input = {}) {
           }
           continue;
         }
-        const canon = canonicalize(key);
+        const canon = normalizeSpecKeyName(key);
         if (!canon) continue;
         canonicalRuntimeSpecKeys.add(canon);
         const existing = Object.prototype.hasOwnProperty.call(out, canon) ? out[canon] : undefined;

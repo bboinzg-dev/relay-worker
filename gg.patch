@@ -1,106 +1,58 @@
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 28066c641c48f817b4ec653e86304c260c202abd..6aee5cff60ca6bee2832ba97740bebce7c8302b6 100644
+index 6aee5cff60ca6bee2832ba97740bebce7c8302b6..6c9eae37a23b4d2d9f2d32cadd33f06bbec48e03 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -49,50 +49,66 @@ function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
- const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
- const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
+@@ -1,44 +1,43 @@
+ 'use strict';
  
- const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
- const BASE_KEYS = new Set([
-   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
-   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
-   'cover','verified_in_doc','updated_at'
- ]);
- const SKIP_SPEC_KEYS = new Set([
-   'raw_json',
-   'text',
-   'tables',
-   'mpn_list',
-   'mpn',
-   'codes',
-   'series',
-   'series_code',
-   'raw_text',
-   'raw_specs',
-   'rawspecs',
-   'raw_table',
-   'raw_tables',
- ]);
+ const path = require('node:path');
+ const fs = require('node:fs/promises');
+ const os = require('node:os');
+ const { execFile } = require('node:child_process');
+ const { promisify } = require('node:util');
+ const execFileP = promisify(execFile);
  
-+function gatherRuntimeSpecKeys(rows) {
-+  const set = new Set();
-+  const list = Array.isArray(rows) ? rows : [];
-+  for (const row of list) {
-+    if (!row || typeof row !== 'object') continue;
-+    for (const rawKey of Object.keys(row)) {
-+      const trimmed = String(rawKey || '').trim();
-+      if (!trimmed) continue;
-+      const lower = trimmed.toLowerCase();
-+      if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
-+      set.add(trimmed);
-+    }
-+  }
-+  return set;
-+}
-+
- const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
- const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
+ const db = require('../../db');
+ const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
+ const { extractText } = require('../utils/extract');
+ const { getBlueprint } = require('../utils/blueprint');
+ const { resolveBrand } = require('../utils/brand');
+ const { detectVariantKeys } = require('../utils/ordering');
+ const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
+ const { extractFields } = require('./extractByBlueprint');
+ const { aiCanonicalizeKeys } = require('./ai/canonKeys');
+-const { canonicalize } = require('./specKeyMap');
+ const { saveExtractedSpecs } = require('./persist');
+ const { explodeToRows } = require('../ingest/mpn-exploder');
+ const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
+ const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
+ const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
+ const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
+ const { processDocument: processDocAi } = require('../services/docai');
  
- const RESERVED_SPEC_KEYS = new Set([
-   'id',
-   'created_at',
-   'updated_at',
-   'brand',
-   'brand_norm',
-   'pn',
-   'pn_norm',
-   'code',
-   'series',
-   'image_uri',
-   'datasheet_uri',
- ]);
+ const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
  
- function normalizeSpecKeyName(value) {
-   if (value == null) return null;
-   let s = String(value).trim().toLowerCase();
-   if (!s) return null;
-   s = s.replace(/[–—―]/g, '-');
-   s = s.replace(/\s+/g, '_');
-   s = s.replace(/[^0-9a-z_]+/g, '_');
-   s = s.replace(/_+/g, '_');
+ function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
+   const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
+   return new Promise((resolve, reject) => {
+     const timer = setTimeout(() => {
+       clearTimeout(timer);
+       reject(new Error(`${label}_TIMEOUT`));
+     }, timeout);
+     Promise.resolve(promise)
+       .then((value) => {
+         clearTimeout(timer);
+         resolve(value);
+       })
+       .catch((err) => {
+         clearTimeout(timer);
+         reject(err);
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 28066c641c48f817b4ec653e86304c260c202abd..6aee5cff60ca6bee2832ba97740bebce7c8302b6 100644
+index 6aee5cff60ca6bee2832ba97740bebce7c8302b6..6c9eae37a23b4d2d9f2d32cadd33f06bbec48e03 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -865,92 +881,92 @@ async function runAutoIngest(input = {}) {
-     }
-     for (const row of extracted.rows) {
-       if (!row || typeof row !== 'object') continue;
-       if (row.raw_json == null) {
-         row.raw_json = rawJsonPayload;
-       }
-     }
-   }
- 
-   if (detectedBrand && extracted && typeof extracted === 'object') {
-     const brandValue = String(extracted.brand || '').trim().toLowerCase();
-     if (!brandValue || brandValue === 'unknown') {
-       extracted.brand = detectedBrand;
-     }
-     if (Array.isArray(extracted.rows)) {
-       for (const row of extracted.rows) {
-         if (!row || typeof row !== 'object') continue;
-         const rowBrand = String(row.brand || '').trim().toLowerCase();
-         if (!rowBrand || rowBrand === 'unknown') {
-           row.brand = detectedBrand;
-         }
-       }
-     }
-   }
- 
--  const runtimeSpecKeys = new Set();
-+  const canonicalRuntimeSpecKeys = new Set();
+@@ -906,51 +905,51 @@ async function runAutoIngest(input = {}) {
+   const canonicalRuntimeSpecKeys = new Set();
    const sanitizeSpecRows = (rows) => {
      if (!Array.isArray(rows)) return [];
      return rows.map((row) => {
@@ -125,10 +77,10 @@ index 28066c641c48f817b4ec653e86304c260c202abd..6aee5cff60ca6bee2832ba97740bebce
            }
            continue;
          }
-         const canon = canonicalize(key);
+-        const canon = canonicalize(key);
++        const canon = normalizeSpecKeyName(key);
          if (!canon) continue;
--        runtimeSpecKeys.add(canon);
-+        canonicalRuntimeSpecKeys.add(canon);
+         canonicalRuntimeSpecKeys.add(canon);
          const existing = Object.prototype.hasOwnProperty.call(out, canon) ? out[canon] : undefined;
          if (!Object.prototype.hasOwnProperty.call(out, canon) || existing == null || existing === '') {
            out[canon] = rawValue;
@@ -142,8 +94,7 @@ index 28066c641c48f817b4ec653e86304c260c202abd..6aee5cff60ca6bee2832ba97740bebce
      extracted.rows = sanitizeSpecRows(extracted.rows);
    }
  
--  const autoAddKeys = Array.from(runtimeSpecKeys);
-+  const autoAddKeys = Array.from(canonicalRuntimeSpecKeys);
+   const autoAddKeys = Array.from(canonicalRuntimeSpecKeys);
    if (process.env.AUTO_ADD_FIELDS === '1' && family && autoAddKeys.length) {
      try {
        const { rows } = await db.query(
@@ -153,86 +104,3 @@ index 28066c641c48f817b4ec653e86304c260c202abd..6aee5cff60ca6bee2832ba97740bebce
        const created = rows?.[0]?.created;
        if (Array.isArray(created) && created.length) {
          console.log('[schema] added columns', created);
-       }
-     } catch (err) {
-       console.warn('[schema] ensure_dynamic_spec_columns failed:', err?.message || err);
-     }
-   }
- 
-   // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
-   let codes = [];
-   if (!code) {
-     const skuFromTable = pickSkuListFromTables(extracted);
-     const docText = extracted?.text || previewText || '';
-     codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint, docText);
-     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
-     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
-     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
-   }
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 28066c641c48f817b4ec653e86304c260c202abd..6aee5cff60ca6bee2832ba97740bebce7c8302b6 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -1161,61 +1177,51 @@ async function runAutoIngest(input = {}) {
-     }
- 
-     if (Array.isArray(freshKeys) && freshKeys.length) {
-       console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
-     }
-   } catch (err) {
-     console.warn('[variant] inferVariantKeys failed:', err?.message || err);
-   }
- 
-   if (!disableEnsure) {
-     await ensureSpecsTableByFamily(family);
-     if (!variantColumnsEnsured) {
-       try {
-         await ensureBlueprintVariantColumns(family);
-         variantColumnsEnsured = true;
-       } catch (err) {
-         console.warn('[variant] ensure_blueprint_variant_columns fallback failed:', err?.message || err);
-       }
-     }
-   }
- 
-   await ensureSpecColumnsForBlueprint(qualified, blueprint);
-   colTypes = await getColumnTypes(qualified);
- 
-   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
--  const runtimeSpecKeys = new Set();
--  for (const row of rawRows) {
--    if (!row || typeof row !== 'object') continue;
--    for (const rawKey of Object.keys(row)) {
--      const trimmed = String(rawKey || '').trim();
--      if (!trimmed) continue;
--      const lower = trimmed.toLowerCase();
--      if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
--      runtimeSpecKeys.add(trimmed);
--    }
--  }
-+  const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
- 
-   const aiCanonicalMap = new Map();
-   const aiCanonicalMapLower = new Map();
-   if (process.env.AUTO_CANON_KEYS === '1' && runtimeSpecKeys.size) {
-     const specCols = colTypes ? Array.from(colTypes.keys()) : [];
-     const blueprintFieldKeys = blueprint?.fields && typeof blueprint.fields === 'object'
-       ? Object.keys(blueprint.fields).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-       : [];
-     const knownKeys = Array.from(new Set([
-       ...specCols,
-       ...blueprintFieldKeys,
-       ...(Array.isArray(variantKeys) ? variantKeys : []),
-     ]));
- 
-     try {
-       const { map, newKeys } = await aiCanonicalizeKeys(
-         family,
-         Array.from(runtimeSpecKeys),
-         knownKeys
-       );
- 
-       const knownLower = new Set(knownKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
-       const newKeySet = new Set((Array.isArray(newKeys) ? newKeys : []).map((k) => String(k || '').trim()).filter(Boolean));
-       const newCanonKeys = [];
-       for (const [orig, info] of Object.entries(map || {})) {

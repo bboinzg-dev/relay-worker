@@ -30,6 +30,8 @@ const CONFLICT_KEYS = ['brand_norm', 'code_norm'];
 
 const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
 const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
+const BANNED_PREFIX = /^(pdf|page|figure|table|sheet|rev|ver|draft)\b/i;
+const BANNED_EXACT = /^pdf-?1(\.\d+)?$/i;
 
 const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
 const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
@@ -58,11 +60,13 @@ function isValidPnValue(value) {
 function repairPn(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
+  if (!s) return null;
+  if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
   s = s.replace(/[–—―]/g, '-');
   s = s.replace(/\s+/g, '');
   s = s.replace(/[^0-9A-Za-z\-_/().]/g, '');
-  if (s.length < 3) return null;
-  return s;
+  if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
+  return s.length >= 3 ? s : null;
 }
 
 function isNumericType(type = '') {
@@ -307,7 +311,12 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
 
   let pn = String(row.pn || row.code || '').trim();
   const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
-  if (!isValidPnValue(pn) || FORBIDDEN_RE.test(pn)) {
+  if (
+    !isValidPnValue(pn) ||
+    FORBIDDEN_RE.test(pn) ||
+    BANNED_PREFIX.test(pn) ||
+    BANNED_EXACT.test(pn)
+  ) {
     const fixed = repairPn(pn);
     if (fixed && isValidPnValue(fixed)) {
       console.warn('[persist] pn repaired', { original: pn, fixed });

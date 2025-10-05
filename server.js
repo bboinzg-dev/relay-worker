@@ -101,7 +101,6 @@ function getTasks() {
     if (!CloudTasksClient) throw new Error('@google-cloud/tasks unavailable');
     // 지역 엔드포인트 + REST fallback(HTTP/1)
     _tasks = new CloudTasksClient({
-      apiEndpoint: `${TASKS_LOCATION}-tasks.googleapis.com`,
       fallback: true,
     });
     _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);

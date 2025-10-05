@@ -1,17 +1,102 @@
 diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index f07b74464aee9f0599ac52af13a9848f859388da..407f40ccba9b12afc1426dd476e5c5485d649e8c 100644
+index 407f40ccba9b12afc1426dd476e5c5485d649e8c..2a5ecd91ebf1d55c763baa133193e9c6e92935b6 100644
 --- a/src/pipeline/persist.js
 +++ b/src/pipeline/persist.js
-@@ -276,61 +276,69 @@ function hasCoreSpecValue(value) {
+@@ -8,83 +8,87 @@ const META_KEYS = new Set([
+   'brand',
+   'brand_norm',
+   'pn',
+   'pn_norm',
+   'code',
+   'code_norm',
+   'mfr_full',
+   'datasheet_uri',
+   'verified_in_doc',
+   'display_name',
+   'displayname',
+   'image_uri',
+   'cover',
+   'series',
+   'series_code',
+   'raw_json',
+   'last_error',
+   'created_at',
+   'updated_at',
+ ]);
  
- function hasCoreSpec(row, keys = [], candidateKeys = []) {
-   const primary = Array.isArray(keys) ? keys.filter(Boolean) : [];
-   const fallback = Array.isArray(candidateKeys) ? candidateKeys.filter(Boolean) : [];
-   const list = primary.length ? primary : fallback;
-   if (!list.length) {
-     for (const key of Object.keys(row || {})) {
-       const norm = normKey(key);
-       if (!norm || META_KEYS.has(norm)) continue;
+ const CONFLICT_KEYS = ['brand_norm', 'code_norm'];
+ 
+ const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
+ const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
++const BANNED_PREFIX = /^(pdf|page|figure|table|sheet|rev|ver|draft)\b/i;
++const BANNED_EXACT = /^pdf-?1(\.\d+)?$/i;
+ 
+ const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const SCALE_MAP = {
+   k: 1e3,
+   m: 1e-3,
+   g: 1e9,
+   'µ': 1e-6,
+   u: 1e-6,
+   n: 1e-9,
+   p: 1e-12,
+ };
+ 
+ function normKey(key) {
+   return String(key || '')
+     .trim()
+     .toLowerCase();
+ }
+ 
+ function isValidPnValue(value) {
+   const trimmed = String(value || '').trim();
+   if (!trimmed) return false;
+   return PN_RE.test(trimmed);
+ }
+ 
+ function repairPn(raw) {
+   if (!raw) return null;
+   let s = String(raw).trim();
++  if (!s) return null;
++  if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
+   s = s.replace(/[–—―]/g, '-');
+   s = s.replace(/\s+/g, '');
+   s = s.replace(/[^0-9A-Za-z\-_/().]/g, '');
+-  if (s.length < 3) return null;
+-  return s;
++  if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
++  return s.length >= 3 ? s : null;
+ }
+ 
+ function isNumericType(type = '') {
+   const t = String(type || '').toLowerCase();
+   return (
+     t.includes('int') ||
+     t.includes('numeric') ||
+     t.includes('decimal') ||
+     t.includes('real') ||
+     t.includes('double')
+   );
+ }
+ 
+ function parseNumberToken(token, suffix) {
+   if (!token) return null;
+   const cleaned = token.replace(/,/g, '');
+   const base = Number(cleaned);
+   if (!Number.isFinite(base)) return null;
+   if (!suffix) return base;
+   const scale = SCALE_MAP[suffix.toLowerCase()];
+   return scale != null ? base * scale : base;
+ }
+ 
+ function parseNumericOrRange(value) {
+   if (value == null || value === '') return { value: null };
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 407f40ccba9b12afc1426dd476e5c5485d649e8c..2a5ecd91ebf1d55c763baa133193e9c6e92935b6 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -285,51 +289,56 @@ function hasCoreSpec(row, keys = [], candidateKeys = []) {
        if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
      }
      return false;
@@ -28,27 +113,31 @@ index f07b74464aee9f0599ac52af13a9848f859388da..407f40ccba9b12afc1426dd476e5c548
    if (!row || typeof row !== 'object') {
      return { ok: false, reason: 'empty_row' };
    }
-+
-+  const brand = String(row.brand || '').trim().toLowerCase();
-+  if (!brand || brand === 'unknown') {
-+    row.last_error = 'missing_brand';
-+    return { ok: false, reason: 'missing_brand' };
-+  }
-+
+ 
+   const brand = String(row.brand || '').trim().toLowerCase();
+   if (!brand || brand === 'unknown') {
+     row.last_error = 'missing_brand';
+     return { ok: false, reason: 'missing_brand' };
+   }
+ 
    let pn = String(row.pn || row.code || '').trim();
    const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
-   if (!isValidPnValue(pn) || FORBIDDEN_RE.test(pn)) {
+-  if (!isValidPnValue(pn) || FORBIDDEN_RE.test(pn)) {
++  if (
++    !isValidPnValue(pn) ||
++    FORBIDDEN_RE.test(pn) ||
++    BANNED_PREFIX.test(pn) ||
++    BANNED_EXACT.test(pn)
++  ) {
      const fixed = repairPn(pn);
      if (fixed && isValidPnValue(fixed)) {
-+      console.warn('[persist] pn repaired', { original: pn, fixed });
+       console.warn('[persist] pn repaired', { original: pn, fixed });
        row.last_error = row.last_error || 'invalid_code_fixed';
        pn = fixed;
      } else if (allowMinimal) {
--      const fallback = String(row.series || row.code || '').trim();
--      const fallbackPn = repairPn(fallback);
-+      const fallbackPn = repairPn(String(row.series || row.code || ''));
+       const fallbackPn = repairPn(String(row.series || row.code || ''));
        if (fallbackPn && fallbackPn.length >= 3) {
-+        console.warn('[persist] pn fallback applied', { original: pn, fallback: fallbackPn });
+         console.warn('[persist] pn fallback applied', { original: pn, fallback: fallbackPn });
          pn = fallbackPn;
          row.last_error = row.last_error || 'invalid_code_fallback';
        } else {
@@ -65,12 +154,3 @@ index f07b74464aee9f0599ac52af13a9848f859388da..407f40ccba9b12afc1426dd476e5c548
    if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !allowMinimal) {
      return { ok: false, reason: 'missing_core_spec' };
    }
-   return { ok: true };
- }
- 
- async function getColumnTypes(targetTable) {
-   const [schema, table] = targetTable.includes('.')
-     ? targetTable.split('.', 2)
-     : ['public', targetTable];
- 
-   const { rows } = await pool.query(

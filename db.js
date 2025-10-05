@@ -81,8 +81,8 @@ function buildPool() {
   const ssl = resolveSslConfig(connectionString);
 
   const max = parseInt(process.env.PGPOOL_MAX || '10', 10);
-  const idle = parseInt(process.env.PG_IDLE_TIMEOUT_MS || '30000', 10);
-  const connTimeout = parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '5000', 10);
+  const idle = parseInt(process.env.PG_IDLE_TIMEOUT_MS || '600000', 10);
+  const connTimeout = parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '30000', 10);
   const statementTimeout = parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || '30000', 10);
   const queryTimeout = parseInt(process.env.PG_QUERY_TIMEOUT_MS || '30000', 10);
 
@@ -90,6 +90,7 @@ function buildPool() {
     connectionString,
     ssl,                                 // 위에서 결정
     max,
+    // 긴 OCR/추출 대기 후에도 커넥션 유지/재연결 여유
     idleTimeoutMillis: idle,
     connectionTimeoutMillis: connTimeout,
   };

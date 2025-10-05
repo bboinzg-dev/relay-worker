@@ -1,169 +1,67 @@
-diff --git a/src/services/docai.js b/src/services/docai.js
-index 6eeb1e0e76ae66b2db84284f7a6e2a26b93f6f90..0d8bed5f66f88e9e556d358ef832a8568be76a01 100644
---- a/src/services/docai.js
-+++ b/src/services/docai.js
-@@ -1,40 +1,80 @@
- 'use strict';
+diff --git a/db.js b/db.js
+index 85953c9c926f0b7dca6230cac621f2e02c6aae10..18495a38ca93abae4548383ce1280424bfbc4a81 100644
+--- a/db.js
++++ b/db.js
+@@ -59,59 +59,60 @@ function resolveSslConfig(connStr) {
  
- const path = require('node:path');
- 
- let DocumentProcessorServiceClient;
- try {
-   ({ DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1);
- } catch (err) {
-   DocumentProcessorServiceClient = null;
- }
- 
- const { storage, parseGcsUri } = require('../utils/gcs');
- 
- const clientsByLocation = new Map();
- 
-+const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
-+
-+function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
-+  const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
-+  return new Promise((resolve, reject) => {
-+    const timer = setTimeout(() => {
-+      clearTimeout(timer);
-+      reject(new Error(`${label}_TIMEOUT`));
-+    }, timeout);
-+    Promise.resolve(promise)
-+      .then((value) => {
-+        clearTimeout(timer);
-+        resolve(value);
-+      })
-+      .catch((err) => {
-+        clearTimeout(timer);
-+        reject(err);
-+      });
-+  });
-+}
-+
-+function sanitizeRunId(runId) {
-+  if (!runId) return null;
-+  const trimmed = String(runId).trim();
-+  if (!trimmed) return null;
-+  return trimmed.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120) || null;
-+}
-+
-+async function waitForJsonOutputs(bucketName, prefix, ms = HARD_CAP_MS) {
-+  const started = Date.now();
-+  const bucket = storage.bucket(bucketName);
-+  while (Date.now() - started < ms) {
-+    const [files] = await bucket.getFiles({ prefix });
-+    const jsonFiles = files.filter((file) => file.name && file.name.endsWith('.json'));
-+    if (jsonFiles.length) return jsonFiles;
-+    await new Promise((resolve) => setTimeout(resolve, 1500));
-+  }
-+  throw new Error('DOCAI_OUTPUT_TIMEOUT');
-+}
-+
- function getClient(location = 'us') {
-   if (!DocumentProcessorServiceClient) return null;
-   const loc = location || 'us';
-   if (!clientsByLocation.has(loc)) {
-     clientsByLocation.set(
-       loc,
-       new DocumentProcessorServiceClient({
-         apiEndpoint: `${loc}-documentai.googleapis.com`,
-       })
-     );
+   if (insecure) {
+     return { rejectUnauthorized: false };
    }
-   return clientsByLocation.get(loc);
+ 
+   if (caPath && fs.existsSync(caPath)) {
+     return { ca: fs.readFileSync(caPath), rejectUnauthorized: true };
+   }
+ 
+   // AlloyDB는 TLS 필수(ENCRYPTED_ONLY). CA 없으면 기본적으로 검증만 끔.
+   if (sslmode === 'disable') {
+     // 비권장: AlloyDB에서는 실패할 수 있음
+     return false;
+   }
+   return { rejectUnauthorized: false };
  }
  
- function buildProcessorConfig() {
-   const project =
-     process.env.DOCAI_PROJECT_ID ||
-     process.env.DOC_AI_PROJECT_ID ||
-     process.env.GCP_PROJECT_ID ||
-     process.env.GOOGLE_CLOUD_PROJECT;
-   const location =
-     process.env.DOCAI_LOCATION ||
-     process.env.DOC_AI_LOCATION ||
-     'us';
-   const processor = process.env.DOCAI_PROCESSOR_ID;
-diff --git a/src/services/docai.js b/src/services/docai.js
-index 6eeb1e0e76ae66b2db84284f7a6e2a26b93f6f90..0d8bed5f66f88e9e556d358ef832a8568be76a01 100644
---- a/src/services/docai.js
-+++ b/src/services/docai.js
-@@ -60,72 +100,73 @@ function collectText(document = {}) {
-     return out.trim();
+ console.log('[db] file =', __filename);
+ console.log('[db] env  =', { DB_TLS_INSECURE: process.env.DB_TLS_INSECURE, PGSSLMODE: process.env.PGSSLMODE });
+ 
+ function buildPool() {
+   const connectionString = resolveConnectionString();
+   const ssl = resolveSslConfig(connectionString);
+ 
+   const max = parseInt(process.env.PGPOOL_MAX || '10', 10);
+-  const idle = parseInt(process.env.PG_IDLE_TIMEOUT_MS || '30000', 10);
+-  const connTimeout = parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '5000', 10);
++  const idle = parseInt(process.env.PG_IDLE_TIMEOUT_MS || '600000', 10);
++  const connTimeout = parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '30000', 10);
+   const statementTimeout = parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || '30000', 10);
+   const queryTimeout = parseInt(process.env.PG_QUERY_TIMEOUT_MS || '30000', 10);
+ 
+   const config = {
+     connectionString,
+     ssl,                                 // 위에서 결정
+     max,
++    // 긴 OCR/추출 대기 후에도 커넥션 유지/재연결 여유
+     idleTimeoutMillis: idle,
+     connectionTimeoutMillis: connTimeout,
    };
  
-   for (const page of Array.isArray(document.pages) ? document.pages : []) {
-     for (const table of Array.isArray(page.tables) ? page.tables : []) {
-       const headers = [];
-       const headerRow = table.headerRows?.[0];
-       for (const cell of Array.isArray(headerRow?.cells) ? headerRow.cells : []) {
-         headers.push(getText(cell.layout));
-       }
-       const rows = [];
-       for (const bodyRow of Array.isArray(table.bodyRows) ? table.bodyRows : []) {
-         const row = [];
-         for (const cell of Array.isArray(bodyRow.cells) ? bodyRow.cells : []) {
-           row.push(getText(cell.layout));
-         }
-         rows.push(row);
-       }
-       tables.push({ headers, rows });
-     }
-   }
+   if (Number.isFinite(statementTimeout)) config.statement_timeout = statementTimeout;
+   if (Number.isFinite(queryTimeout)) config.query_timeout = queryTimeout;
  
-   return { text: fullText, tables };
- }
+   const pool = new Pool(config);
  
--async function processDocument(gcsUri) {
-+async function processDocument(gcsUri, options = {}) {
-   const cfg = buildProcessorConfig();
-   if (!cfg) return null;
-   const client = getClient(cfg.location);
-   if (!client) return null;
- 
-   const { bucket, name } = parseGcsUri(gcsUri);
-   const baseDir = path.posix.dirname(name);
-   const baseName = path.posix.basename(name, path.posix.extname(name));
--  const suffix = `${baseName || 'doc'}-${Date.now()}`;
--  const dir = baseDir && baseDir !== '.' ? `${baseDir}/docai/${suffix}` : `docai/${suffix}`;
-+  const safeRunId = sanitizeRunId(options.runId ?? options.run_id);
-+  const suffix = safeRunId || `${baseName || 'doc'}-${Date.now()}`;
-+  const outBase = baseDir && baseDir !== '.' ? `${baseDir}/docai/out` : 'docai/out';
-+  const dir = `${outBase}/${suffix}`;
-   const outputPrefix = `gs://${bucket}/${dir}/`;
- 
-   const request = {
-     name: cfg.name,
-     inputDocuments: {
-       gcsDocuments: {
-         documents: [{ gcsUri, mimeType: 'application/pdf' }],
-       },
-     },
-     documentOutputConfig: {
-       gcsOutputConfig: { gcsUri: outputPrefix },
-     },
-   };
- 
-   const [operation] = await client.batchProcessDocuments(request);
--  await operation.promise();
-+  await withDeadline(operation.promise(), HARD_CAP_MS, 'DOCAI_BATCH');
- 
-   const { bucket: outBucket, name: outPrefix } = parseGcsUri(outputPrefix);
--  const [files] = await storage.bucket(outBucket).getFiles({ prefix: outPrefix });
--  const jsonFiles = files.filter((file) => file.name && file.name.endsWith('.json'));
-+  const jsonFiles = await waitForJsonOutputs(outBucket, outPrefix, HARD_CAP_MS);
-   for (const file of jsonFiles) {
-     try {
-       const [buf] = await file.download();
-       const parsed = JSON.parse(buf.toString('utf8'));
-       const document = parsed?.document || parsed;
-       if (document?.text) {
-         return collectText(document);
-       }
-     } catch (err) {
-       console.warn('[DocAI] failed to parse output', err?.message || err);
-     }
-   }
-   return null;
- }
- 
- module.exports = { processDocument };
+   // 로그(민감정보 제외)
+   try {
+     const u = new URL(connectionString.replace(/:[^@]+@/, ':***@'));
+     console.log('[db] pool created', {
+       host: u.hostname,
+       port: u.port || 5432,
+       db: u.pathname.replace(/^\//, ''),
+       ssl:
+         ssl === false
+           ? 'off'
+           : ssl?.rejectUnauthorized === false
+           ? 'tls-insecure'
+           : 'tls-verify',
+       max,
+     });
+   } catch {

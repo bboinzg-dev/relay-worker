@@ -3,7 +3,18 @@
 
 // ───────── 외부콜 차단 플래그 (배포 시 EXT_CALLS_OFF=1 이면 부팅 중 외부 HTTPS 호출 스킵)
 const EXT_CALLS_OFF = process.env.EXT_CALLS_OFF === '1';
-const { generateRunId } = require('./src/utils/run-id');
+// ---- run-id safe import (fallback to UUID) ----
+let generateRunId;
+try {
+  ({ generateRunId } = require('./src/utils/run-id'));
+} catch (e) {
+  console.warn('[BOOT] run-id util missing:', e?.message || e);
+}
+if (typeof generateRunId !== 'function') {
+  const { randomUUID } = require('node:crypto');
+  generateRunId = () => randomUUID(); // uuid v4 → DB ingest_jobs.id(uuid)와도 호환
+}
+// ----------------------------------------------
 
 process.on('uncaughtException', (e) => {
   console.error('[FATAL][uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));

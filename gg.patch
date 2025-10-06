@@ -1,92 +1,20 @@
-diff --git a/server.js b/server.js
-index a51ffa6e91f9b6e184b8d52141d22e2aa1333270..1ca99f88ce9cf041e7951306d6f09bd43011d17b 100644
---- a/server.js
-+++ b/server.js
-@@ -1272,77 +1272,87 @@ async function seedExtractionRecipe() {
+diff --git a/src/utils/run-id.js b/src/utils/run-id.js
+index 329e7393aa96477d32e198de2edc68a78bac913a..6b683a79b54a1890bbf7859e762e4811700e671f 100644
+--- a/src/utils/run-id.js
++++ b/src/utils/run-id.js
+@@ -1,10 +1,11 @@
+ 'use strict';
  
- async function ensureRelaySignalPnTemplate() {
-   const template = '{series}{contact_form}{coil_voltage_vdc|pad=2}{suffix}';
-   try {
-     const res = await db.query(
-       `UPDATE public.component_spec_blueprint
-          SET ingest_options = jsonb_set(
-                COALESCE(ingest_options, '{}'::jsonb),
-                '{pn_template}',
-                to_jsonb($1::text),
-                true
-              ),
-              version = COALESCE(version, 0) + 1
-        WHERE family_slug = 'relay_signal'
-          AND COALESCE(ingest_options->>'pn_template', '') <> $1`,
-       [template]
-     );
-     if (res.rowCount > 0) {
-       console.log('[BOOT] updated relay_signal pn_template');
-     }
-   } catch (err) {
-     console.warn('[BOOT] relay_signal pn_template update skipped:', err?.message || err);
-   }
+-const crypto = require('crypto');
++const { randomUUID } = require('node:crypto');
+ 
+-function generateRunId() {
+-  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+-  return crypto.randomBytes(16).toString('hex');
++function generateRunId(prefix = '') {
++  // 기본은 uuid v4. 필요하면 prefix 붙여서 사용 가능.
++  const id = randomUUID();
++  return prefix ? `${prefix}_${id}` : id;
  }
  
-+async function ensureMarketTables() {
-+  try {
-+    await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
-+    // 위 DDL 중 핵심만 축약 호출 — 상세판은 SQL 파일로 유지해도 OK
-+    await db.query(`CREATE TABLE IF NOT EXISTS public.listings (id uuid PRIMARY KEY DEFAULT uuid_generate_v4(), brand text NOT NULL, code text NOT NULL, brand_norm text GENERATED ALWAYS AS (lower(brand)) STORED, code_norm text GENERATED ALWAYS AS (lower(code)) STORED, qty_available integer NOT NULL DEFAULT 0, unit_price_cents integer NOT NULL DEFAULT 0, currency text DEFAULT 'USD', status text NOT NULL DEFAULT 'pending', created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now())`);
-+    await db.query(`CREATE TABLE IF NOT EXISTS public.purchase_requests (id uuid PRIMARY KEY DEFAULT uuid_generate_v4(), brand text NOT NULL, code text NOT NULL, brand_norm text GENERATED ALWAYS AS (lower(brand)) STORED, code_norm text GENERATED ALWAYS AS (lower(code)) STORED, qty_required integer NOT NULL DEFAULT 0, qty_confirmed integer NOT NULL DEFAULT 0, status text NOT NULL DEFAULT 'open', created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now())`);
-+  } catch (e) { console.warn('[BOOT] ensure market tables skipped:', e?.message || e); }
-+}
-+
- /* ---------------- Boot-time setup ---------------- */
- (async () => {
-   try {
-     await db.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
-     await db.query(`
-       CREATE TABLE IF NOT EXISTS public.ingest_run_logs (
-         id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
-         task_name text, retry_count integer, gcs_uri text not null,
-         status text CHECK (status in ('RUNNING','SUCCEEDED','FAILED')),
-         final_table text, final_family text, final_brand text, final_code text,
-         final_datasheet text, duration_ms integer, error_message text,
-         started_at timestamptz DEFAULT now(), finished_at timestamptz
-       )
-     `);
-     await db.query(`UPDATE public.ingest_run_logs SET status='RUNNING' WHERE lower(status)='processing'`);
-     await db.query(`ALTER TABLE public.ingest_run_logs DROP CONSTRAINT IF EXISTS ingest_run_logs_status_check`);
-     await db.query(`ALTER TABLE public.ingest_run_logs ADD CONSTRAINT ingest_run_logs_status_check CHECK (status IN ('RUNNING','SUCCEEDED','FAILED'))`);
-     await db.query(`ALTER TABLE public.ingest_run_logs ALTER COLUMN status SET DEFAULT 'RUNNING'`);
- 
-     await db.query(`ALTER TABLE IF EXISTS public.relay_power_specs ADD COLUMN IF NOT EXISTS coil_voltage_vdc text`);
-     await db.query(`ALTER TABLE IF EXISTS public.relay_power_specs ADD COLUMN IF NOT EXISTS contact_form text`);
-     await db.query(`ALTER TABLE IF EXISTS public.relay_power_specs ADD COLUMN IF NOT EXISTS suffix text`);
-     await db.query(`ALTER TABLE IF EXISTS public.relay_signal_specs ADD COLUMN IF NOT EXISTS coil_voltage_vdc text`);
-     await db.query(`ALTER TABLE IF EXISTS public.relay_signal_specs ADD COLUMN IF NOT EXISTS contact_arrangement text`);
-     await seedManufacturerAliases();
-     await seedExtractionRecipe();
-     await ensureRelaySignalPnTemplate();
-+    await ensureMarketTables();
-     console.log('[BOOT] ensured ingest_run_logs');
-     
-     // ───────── 부팅 시 외부 HTTPS/Vertex 호출은 여기서만 (가드 적용)
-     if (!EXT_CALLS_OFF) {
-       try {
-         // 예) 임베딩 워밍업, 외부 웹훅 통지, 지표 전송 등
-         // 실제 존재하는 태스크만 남기고, 없으면 주석 그대로 두세요.
-         const runEmbedWarmup = require('./src/tasks/embedFamilies')?.run;
-         if (typeof runEmbedWarmup === 'function') {
-           console.log('[BOOT] embed warmup start');
-           await runEmbedWarmup().catch((e) => console.warn('[BOOT] embed warmup skipped:', e?.message || e));
-         }
-         // TODO: notifyWarmup / ensureIngestRunLogs 등 외부콜 루틴이 있다면 여기에서만 실행
-       } catch (e) {
-         console.warn('[BOOT] external init skipped:', e?.message || e);
-       }
-     } else {
-       console.log('[BOOT] EXT_CALLS_OFF=1 → external warmups skipped');
-     }
-   } catch (e) {
-     console.warn('[BOOT] ensure ingest_run_logs failed:', e?.message || e);
-   }
- })();
- 
- // ✅ 헬스 라우터는 404보다 "위"에, 맨 마지막에 1번만 마운트
+ module.exports = { generateRunId };

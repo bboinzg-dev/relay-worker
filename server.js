@@ -137,7 +137,7 @@ async function enqueueIngestTask(payload = {}) {
     fromTasks: true,
     payload,
   };
-  const body = Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
+  const body = Buffer.from(JSON.stringify(bodyPayload), 'utf8').toString('base64');
 
   const nowSeconds = Math.floor(Date.now() / 1000);
   const deadlineSeconds = Number(process.env.TASKS_DEADLINE_SEC || 150);
@@ -978,194 +978,193 @@ async function handleWorkerIngest(req, res) {
     rawBody.url
   );
 
-  if (!res.headersSent) {
-    res.status(202).json({ ok: true, run_id: runId, runId, phase });
-  }
-
   const { taskName, retryCount } = getTaskContext(req, phase);
+  const startedAt = Date.now();
+  const baseContext = { runId, gcsUri, taskName, retryCount };
+  let failureMarked = false;
 
-  setImmediate(async () => {
-    const startedAt = Date.now();
-    const baseContext = { runId, gcsUri, taskName, retryCount };
+  try {
+    if (phase === 'start') {
+      await markRunningOrInsert(baseContext);
 
-    try {
-      if (phase === 'start') {
-        await markRunningOrInsert(baseContext);
-
-        if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
-          throw new Error('gcsUri required');
-        }
-
-        const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-        const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
-        const nextOverrides = {
-          ...(payload?.overrides || {}),
-          brand: overrideBrand,
-          series: overrideSeries,
-        };
-
-        const nextPayload = {
-          runId,
-          run_id: runId,
-          gcsUri,
-          gcs_uri: gcsUri,
-          family_slug: payload?.family_slug ?? null,
-          brand: payload?.brand ?? null,
-          code: payload?.code ?? null,
-          series: payload?.series ?? null,
-          display_name: payload?.display_name ?? null,
-          uploader_id: payload?.uploader_id ?? null,
-          overrides: nextOverrides,
-          phase: 'process',
-        };
-
-        try {
-          await enqueueIngestTask(nextPayload);
-        } catch (err) {
-          console.error(
-            '[enqueue error]',
-            err?.code || err?.response?.status || err?.message,
-            err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
-          );
-          throw new Error(`enqueue failed: ${String(err?.message || err)}`);
-        }
-
-        return;
+      if (!gcsUri || !/^gs:\/\//i.test(gcsUri)) {
+        throw new Error('gcsUri required');
       }
 
-      if (phase === 'process') {
-        await markProcessing(baseContext);
+      const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+      const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+      const nextOverrides = {
+        ...(payload?.overrides || {}),
+        brand: overrideBrand,
+        series: overrideSeries,
+      };
 
-        const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-        const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
-        const nextOverrides = {
-          ...(payload?.overrides || {}),
-          brand: overrideBrand,
-          series: overrideSeries,
-        };
+      const nextPayload = {
+        runId,
+        run_id: runId,
+        gcsUri,
+        gcs_uri: gcsUri,
+        family_slug: payload?.family_slug ?? null,
+        brand: payload?.brand ?? null,
+        code: payload?.code ?? null,
+        series: payload?.series ?? null,
+        display_name: payload?.display_name ?? null,
+        uploader_id: payload?.uploader_id ?? null,
+        overrides: nextOverrides,
+        phase: 'process',
+      };
 
-        const result = await getIngest().runAutoIngest({
-          ...payload,
-          runId,
-          run_id: runId,
-          gcsUri,
-          gcs_uri: gcsUri,
-          skipPersist: true,
-          overrides: nextOverrides,
-        });
+      await enqueueIngestTask(nextPayload);
 
-        const processed = result?.processed;
-        if (!processed || !Array.isArray(processed.records)) {
-          throw new Error('process_no_records');
-        }
+      return res.status(200).json({ ok: true, runId, phase, queued: 'process' });
+    }
 
-        await markRunning(baseContext);
+    if (phase === 'process') {
+      await markProcessing(baseContext);
 
-        const nextPayload = {
-          runId,
-          run_id: runId,
-          gcsUri,
-          gcs_uri: gcsUri,
-          family_slug: payload?.family_slug ?? null,
-          brand: payload?.brand ?? null,
-          code: payload?.code ?? null,
-          series: payload?.series ?? null,
-          display_name: payload?.display_name ?? null,
-          uploader_id: payload?.uploader_id ?? null,
-          phase: 'persist',
-          processed,
-          overrides: nextOverrides,
-        };
+      const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+      const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+      const nextOverrides = {
+        ...(payload?.overrides || {}),
+        brand: overrideBrand,
+        series: overrideSeries,
+      };
 
-        try {
-          await enqueueIngestTask(nextPayload);
-        } catch (err) {
-          console.error(
-            '[enqueue error]',
-            err?.code || err?.response?.status || err?.message,
-            err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
-          );
-          console.warn('[ingest][persist fallback] attempting inline persist', { runId });
-          try {
-            await markPersisting(baseContext);
-            const inlineResult = await getIngest().persistProcessedData(processed || {}, {
-              brand: overrideBrand,
-              code: payload?.code ?? null,
-              series: overrideSeries,
-              display_name: payload?.display_name ?? null,
-            });
+      const result = await getIngest().runAutoIngest({
+        ...payload,
+        runId,
+        run_id: runId,
+        gcsUri,
+        gcs_uri: gcsUri,
+        skipPersist: true,
+        overrides: nextOverrides,
+      });
 
-            const failureReasons = new Set(Array.isArray(inlineResult?.reject_reasons) ? inlineResult.reject_reasons : []);
-            const warningReasons = new Set(Array.isArray(inlineResult?.warnings) ? inlineResult.warnings : []);
-
-            if (!inlineResult?.ok) {
-              const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
-              const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
-              await markFailed({
-                ...baseContext,
-                error: message,
-                durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
-              });
-              return;
-            }
-
-            await markSucceeded({
-              ...baseContext,
-              result: inlineResult,
-              gcsUri,
-              durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
-              meta: payload,
-            });
-            return;
-          } catch (fallbackErr) {
-            console.error('[ingest][persist fallback] failed', fallbackErr?.message || fallbackErr);
-            throw new Error(`persist enqueue failed: ${String(err?.message || err)}; fallback failed: ${String(fallbackErr?.message || fallbackErr)}`);
-          }
-        }
-        return;
+      const processed = result?.processed;
+      if (!processed || !Array.isArray(processed.records)) {
+        throw new Error('process_no_records');
       }
 
-      if (phase === 'persist') {
+      await markRunning(baseContext);
+
+      const nextPayload = {
+        runId,
+        run_id: runId,
+        gcsUri,
+        gcs_uri: gcsUri,
+        family_slug: payload?.family_slug ?? null,
+        brand: payload?.brand ?? null,
+        code: payload?.code ?? null,
+        series: payload?.series ?? null,
+        display_name: payload?.display_name ?? null,
+        uploader_id: payload?.uploader_id ?? null,
+        phase: 'persist',
+        processed,
+        overrides: nextOverrides,
+      };
+
+      try {
+        await enqueueIngestTask(nextPayload);
+        return res.status(200).json({ ok: true, runId, phase, queued: 'persist' });
+      } catch (err) {
+        console.error(
+          '[enqueue error]',
+          err?.code || err?.response?.status || err?.message,
+          err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
+        );
+        console.warn('[ingest][persist fallback] attempting inline persist', { runId });
+
         await markPersisting(baseContext);
-
-        const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-        const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
-
-        const out = await getIngest().persistProcessedData(payload?.processed || {}, {
+        const inlineResult = await getIngest().persistProcessedData(processed || {}, {
           brand: overrideBrand,
           code: payload?.code ?? null,
           series: overrideSeries,
           display_name: payload?.display_name ?? null,
         });
 
-        const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
-        const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
+        const failureReasons = new Set(Array.isArray(inlineResult?.reject_reasons) ? inlineResult.reject_reasons : []);
+        const warningReasons = new Set(Array.isArray(inlineResult?.warnings) ? inlineResult.warnings : []);
 
-        if (!out?.ok) {
+        if (!inlineResult?.ok) {
           const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
           const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
           await markFailed({
             ...baseContext,
             error: message,
-            durationMs: out?.ms ?? (Date.now() - startedAt),
+            durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
           });
-          return;
+          failureMarked = true;
+          return res.status(500).json({ ok: false, error: message, runId, phase });
         }
 
         await markSucceeded({
           ...baseContext,
-          result: out,
+          result: inlineResult,
           gcsUri,
-          durationMs: out?.ms ?? (Date.now() - startedAt),
+          durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
           meta: payload,
         });
-        return;
+
+        return res.status(200).json({
+          ok: true,
+          runId,
+          phase,
+          persisted_inline: true,
+          specs_table: inlineResult?.specs_table || null,
+        });
+      }
+    }
+
+    if (phase === 'persist') {
+      await markPersisting(baseContext);
+
+      const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+      const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+
+      const out = await getIngest().persistProcessedData(payload?.processed || {}, {
+        brand: overrideBrand,
+        code: payload?.code ?? null,
+        series: overrideSeries,
+        display_name: payload?.display_name ?? null,
+      });
+
+      const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
+      const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
+
+      if (!out?.ok) {
+        const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
+        const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
+        await markFailed({
+          ...baseContext,
+          error: message,
+          durationMs: out?.ms ?? (Date.now() - startedAt),
+        });
+        failureMarked = true;
+        return res.status(500).json({ ok: false, error: message, runId, phase });
       }
 
-      console.warn('[ingest] unknown phase', { phase, runId, taskName });
-      await markFailed({ ...baseContext, error: 'unknown_phase', durationMs: Date.now() - startedAt });
-    } catch (err) {
-      console.error('[ingest async error]', err?.message || err);
+      await markSucceeded({
+        ...baseContext,
+        result: out,
+        gcsUri,
+        durationMs: out?.ms ?? (Date.now() - startedAt),
+        meta: payload,
+      });
+
+      return res.status(200).json({
+        ok: true,
+        runId,
+        phase,
+        specs_table: out?.specs_table || null,
+        id: out?.row?.id || null,
+      });
+    }
+
+    console.warn('[ingest] unknown phase', { phase, runId, taskName });
+    throw Object.assign(new Error('unknown_phase'), { statusCode: 400 });
+  } catch (err) {
+    console.error('[worker/ingest]', err?.message || err);
+    if (!failureMarked) {
       try {
         await markFailed({
           ...baseContext,
@@ -1173,10 +1172,18 @@ async function handleWorkerIngest(req, res) {
           durationMs: Date.now() - startedAt,
         });
       } catch (innerErr) {
-        console.error('[ingest async error][markFailed]', innerErr?.message || innerErr);
+        console.error('[worker/ingest][markFailed]', innerErr?.message || innerErr);
       }
     }
-  });
+
+    const statusCode = Number.isInteger(err?.statusCode) ? err.statusCode : 500;
+    return res.status(statusCode >= 400 ? statusCode : 500).json({
+      ok: false,
+      error: String(err?.message || err),
+      runId,
+      phase,
+    });
+  }
 }
 
 app.post([

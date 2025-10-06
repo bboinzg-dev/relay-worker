@@ -3,6 +3,7 @@
 
 // ───────── 외부콜 차단 플래그 (배포 시 EXT_CALLS_OFF=1 이면 부팅 중 외부 HTTPS 호출 스킵)
 const EXT_CALLS_OFF = process.env.EXT_CALLS_OFF === '1';
+const { generateRunId } = require('./src/utils/run-id');
 
 process.on('uncaughtException', (e) => {
   console.error('[FATAL][uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));
@@ -32,6 +33,7 @@ process.on('unhandledRejection', (e) => {
 // --- built-ins (한 번만) ---
 const path = require('node:path');
 const fs = require('node:fs');
+
 
 // --- 3rd-party ---
 const express = require('express');

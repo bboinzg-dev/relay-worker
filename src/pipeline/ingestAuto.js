@@ -133,6 +133,49 @@ function textContainsExact(text, pn) {
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
 
+function isValidCode(s) {
+  const v = String(s || '').trim();
+  if (!v) return false;
+  if (v.length < 2 || v.length > 64) return false;
+  if (!/[0-9A-Za-z]/.test(v)) return false;
+  if (/\s{2,}/.test(v)) return false;
+  return true;
+}
+
+function renderFromTemplate(rec, pnTemplate, variantKeys = []) {
+  if (!pnTemplate) return null;
+  let out = pnTemplate;
+  const dict = new Map(Object.entries(rec || {}));
+  for (const k of variantKeys) if (!dict.has(k)) dict.set(k, rec?.[k]);
+  dict.set('series', rec?.series ?? rec?.series_code ?? '');
+  dict.set('series_code', rec?.series_code ?? rec?.series ?? '');
+  out = out.replace(/\{([a-z0-9_]+)\}/ig, (_, k) => String(dict.get(k) ?? ''));
+  out = out.replace(/\s+/g,'').trim();
+  return out || null;
+}
+
+function recoverCode(rec, { pnTemplate, variantKeys }) {
+  let c = rec.code || rec.pn || null;
+  if (isValidCode(c)) return c;
+
+  const fromTpl = renderFromTemplate(rec, pnTemplate, variantKeys);
+  if (isValidCode(fromTpl)) return fromTpl;
+
+  const parts = [];
+  if (rec.series_code || rec.series) parts.push(rec.series_code || rec.series);
+  for (const k of (Array.isArray(variantKeys) ? variantKeys : [])) {
+    if (rec[k] != null) parts.push(String(rec[k]));
+  }
+  const guess = parts.join('');
+  if (isValidCode(guess)) return guess;
+
+  if (Array.isArray(rec.candidates) && rec.candidates.length) {
+    const first = String(rec.candidates[0] || '').trim();
+    if (isValidCode(first)) return first;
+  }
+  return null;
+}
+
 function pickBrandHint(...values) {
   for (const value of values) {
     if (value == null) continue;
@@ -1626,7 +1669,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
     ? initialRecords
     : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
-  const records = Array.isArray(recordsSource) ? recordsSource : [];
+  let records = Array.isArray(recordsSource) ? recordsSource : [];
   const runtimeMeta = {
     brand_source: processedBrandSource ?? null,
     variant_keys_runtime: Array.isArray(processedVariantKeys) ? processedVariantKeys : [],
@@ -1735,16 +1778,54 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       }
     }
 
-    persistResult = await saveExtractedSpecs(qualified, family, records, {
-      brand: brandOverride,
-      pnTemplate,
-      requiredKeys: effectiveRequired,
-      coreSpecKeys: effectiveRequired,
-      runId,
-      run_id: runId,
-      jobId,
-      job_id: jobId,
-    }) || persistResult;
+    let blueprint;
+    let variantKeysSource = Array.isArray(processedVariantKeys) ? processedVariantKeys : null;
+    if ((!Array.isArray(variantKeysSource) || !variantKeysSource.length) && family) {
+      try {
+        blueprint = await getBlueprint(family);
+        if (!Array.isArray(variantKeysSource) || !variantKeysSource.length) {
+          variantKeysSource = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+            ? blueprint.ingestOptions.variant_keys
+            : null;
+        }
+      } catch (err) {
+        console.warn('[persist] blueprint fetch failed for variant recovery:', err?.message || err);
+      }
+    }
+
+    const variantKeys = Array.isArray(variantKeysSource)
+      ? variantKeysSource.map((k) => String(k || '').trim()).filter(Boolean)
+      : [];
+
+    for (const r of records) {
+      if (!r || typeof r !== 'object') continue;
+      if (!Array.isArray(r.candidates) && Array.isArray(processed?.candidateCodes)) {
+        r.candidates = processed.candidateCodes;
+      }
+      const fixed = recoverCode(r, { pnTemplate, variantKeys });
+      if (fixed) {
+        if (!r.code) r.code = fixed;
+        if (!r.pn) r.pn = fixed;
+      }
+    }
+
+    records = records.filter((r) => isValidCode(r?.pn || r?.code));
+    if (!records.length) {
+      persistResult.skipped = [{ reason: 'missing_pn' }];
+    }
+
+    if (records.length) {
+      persistResult = await saveExtractedSpecs(qualified, family, records, {
+        brand: brandOverride,
+        pnTemplate,
+        requiredKeys: effectiveRequired,
+        coreSpecKeys: effectiveRequired,
+        runId,
+        run_id: runId,
+        jobId,
+        job_id: jobId,
+      }) || persistResult;
+    }
   } else if (!records.length) {
     persistResult.skipped = [{ reason: 'missing_pn' }];
   }

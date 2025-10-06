@@ -1,20 +1,268 @@
-diff --git a/src/utils/run-id.js b/src/utils/run-id.js
-index 329e7393aa96477d32e198de2edc68a78bac913a..6b683a79b54a1890bbf7859e762e4811700e671f 100644
---- a/src/utils/run-id.js
-+++ b/src/utils/run-id.js
-@@ -1,10 +1,11 @@
- 'use strict';
- 
--const crypto = require('crypto');
-+const { randomUUID } = require('node:crypto');
- 
--function generateRunId() {
--  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
--  return crypto.randomBytes(16).toString('hex');
-+function generateRunId(prefix = '') {
-+  // 기본은 uuid v4. 필요하면 prefix 붙여서 사용 가능.
-+  const id = randomUUID();
-+  return prefix ? `${prefix}_${id}` : id;
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 6b644cf78f7f21cabaa06f3c1899f95ebed02eef..bf6089af82dc18792a46e410ad368e7354130a91 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -111,50 +111,93 @@ function normalizeSpecKeyName(value) {
+   s = s.replace(/[–—―]/g, '-');
+   s = s.replace(/\s+/g, '_');
+   s = s.replace(/[^0-9a-z_]+/g, '_');
+   s = s.replace(/_+/g, '_');
+   s = s.replace(/^_|_$/g, '');
+   if (!s) return null;
+   if (s.length > 63) s = s.slice(0, 63);
+   if (RESERVED_SPEC_KEYS.has(s)) return null;
+   return s;
  }
  
- module.exports = { generateRunId };
+ function escapeRegex(str) {
+   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+ }
+ 
+ function textContainsExact(text, pn) {
+   if (!text || !pn) return false;
+   const pattern = escapeRegex(String(pn).trim());
+   if (!pattern) return false;
+   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
+   return re.test(String(text));
+ }
+ 
+ function normLower(s){ return String(s||'').trim().toLowerCase(); }
+ 
++function isValidCode(s) {
++  const v = String(s || '').trim();
++  if (!v) return false;
++  if (v.length < 2 || v.length > 64) return false;
++  if (!/[0-9A-Za-z]/.test(v)) return false;
++  if (/\s{2,}/.test(v)) return false;
++  return true;
++}
++
++function renderFromTemplate(rec, pnTemplate, variantKeys = []) {
++  if (!pnTemplate) return null;
++  let out = pnTemplate;
++  const dict = new Map(Object.entries(rec || {}));
++  for (const k of variantKeys) if (!dict.has(k)) dict.set(k, rec?.[k]);
++  dict.set('series', rec?.series ?? rec?.series_code ?? '');
++  dict.set('series_code', rec?.series_code ?? rec?.series ?? '');
++  out = out.replace(/\{([a-z0-9_]+)\}/ig, (_, k) => String(dict.get(k) ?? ''));
++  out = out.replace(/\s+/g,'').trim();
++  return out || null;
++}
++
++function recoverCode(rec, { pnTemplate, variantKeys }) {
++  let c = rec.code || rec.pn || null;
++  if (isValidCode(c)) return c;
++
++  const fromTpl = renderFromTemplate(rec, pnTemplate, variantKeys);
++  if (isValidCode(fromTpl)) return fromTpl;
++
++  const parts = [];
++  if (rec.series_code || rec.series) parts.push(rec.series_code || rec.series);
++  for (const k of (Array.isArray(variantKeys) ? variantKeys : [])) {
++    if (rec[k] != null) parts.push(String(rec[k]));
++  }
++  const guess = parts.join('');
++  if (isValidCode(guess)) return guess;
++
++  if (Array.isArray(rec.candidates) && rec.candidates.length) {
++    const first = String(rec.candidates[0] || '').trim();
++    if (isValidCode(first)) return first;
++  }
++  return null;
++}
++
+ function pickBrandHint(...values) {
+   for (const value of values) {
+     if (value == null) continue;
+     const trimmed = String(value).trim();
+     if (!trimmed) continue;
+     if (trimmed.toLowerCase() === 'unknown') continue;
+     return trimmed;
+   }
+   return null;
+ }
+ 
+ function mergeRuntimeMetadata(rawJson, meta = {}) {
+   const hasBrandSource = Object.prototype.hasOwnProperty.call(meta, 'brand_source');
+   const hasVariantKeys = Object.prototype.hasOwnProperty.call(meta, 'variant_keys_runtime');
+   if (!hasBrandSource && !hasVariantKeys) return rawJson;
+ 
+   let base = {};
+   if (rawJson && typeof rawJson === 'object' && !Array.isArray(rawJson)) {
+     base = { ...rawJson };
+   } else if (typeof rawJson === 'string') {
+     try {
+       const parsed = JSON.parse(rawJson);
+       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+         base = parsed;
+       }
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 6b644cf78f7f21cabaa06f3c1899f95ebed02eef..bf6089af82dc18792a46e410ad368e7354130a91 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1604,51 +1647,51 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+     started = Date.now(),
+     gcsUri = null,
+     family = null,
+     table = null,
+     qualified: qualifiedInput = null,
+     pnTemplate = null,
+     requiredFields = [],
+     coverUri = null,
+     records: initialRecords = [],
+     rows: processedRowsInput = [],
+     mpnList = [],
+     extractedBrand = null,
+     brandName = null,
+     baseSeries = null,
+     text: processedText = null,
+     brand: processedBrand = null,
+     brand_detected: processedDetected = null,
+     brand_effective: processedEffective = null,
+     brand_source: processedBrandSource = null,
+     variant_keys_runtime: processedVariantKeys = [],
+   } = processed || {};
+ 
+   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
+     ? initialRecords
+     : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
+-  const records = Array.isArray(recordsSource) ? recordsSource : [];
++  let records = Array.isArray(recordsSource) ? recordsSource : [];
+   const runtimeMeta = {
+     brand_source: processedBrandSource ?? null,
+     variant_keys_runtime: Array.isArray(processedVariantKeys) ? processedVariantKeys : [],
+   };
+   const hasRuntimeMeta =
+     runtimeMeta.brand_source != null ||
+     (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
+   const docText = typeof processedText === 'string'
+     ? processedText
+     : (processedText != null ? String(processedText) : '');
+   const normalizeSeedBrand = (value) => {
+     if (value == null) return null;
+     const trimmed = String(value).trim();
+     if (!trimmed) return null;
+     if (trimmed.toLowerCase() === 'unknown') return null;
+     return trimmed;
+   };
+   const brandSeed =
+     normalizeSeedBrand(processedEffective) ||
+     normalizeSeedBrand(processedBrand) ||
+     normalizeSeedBrand(processedDetected) ||
+     null;
+   const attachRuntimeMeta = (row) => {
+     if (!hasRuntimeMeta) return;
+     if (!row || typeof row !== 'object') return;
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 6b644cf78f7f21cabaa06f3c1899f95ebed02eef..bf6089af82dc18792a46e410ad368e7354130a91 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1713,60 +1756,98 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+         if (safeBrand(guessed)) brandOverride = guessed;
+       } catch (err) {
+         console.warn('[brand detect] persist retry failed:', err?.message || err);
+       }
+     }
+ 
+     if (brandOverride) {
+       for (const row of records) {
+         if (!row || typeof row !== 'object') continue;
+         const current = String(row.brand || '').trim();
+         if (!current || current.toLowerCase() === 'unknown') {
+           row.brand = brandOverride;
+         }
+       }
+       if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+         for (const row of processedRowsInput) {
+           if (!row || typeof row !== 'object') continue;
+           const current = String(row.brand || '').trim();
+           if (!current || current.toLowerCase() === 'unknown') {
+             row.brand = brandOverride;
+           }
+         }
+       }
+     }
+ 
+-    persistResult = await saveExtractedSpecs(qualified, family, records, {
+-      brand: brandOverride,
+-      pnTemplate,
+-      requiredKeys: effectiveRequired,
+-      coreSpecKeys: effectiveRequired,
+-      runId,
+-      run_id: runId,
+-      jobId,
+-      job_id: jobId,
+-    }) || persistResult;
++    let blueprint;
++    let variantKeysSource = Array.isArray(processedVariantKeys) ? processedVariantKeys : null;
++    if ((!Array.isArray(variantKeysSource) || !variantKeysSource.length) && family) {
++      try {
++        blueprint = await getBlueprint(family);
++        if (!Array.isArray(variantKeysSource) || !variantKeysSource.length) {
++          variantKeysSource = Array.isArray(blueprint?.ingestOptions?.variant_keys)
++            ? blueprint.ingestOptions.variant_keys
++            : null;
++        }
++      } catch (err) {
++        console.warn('[persist] blueprint fetch failed for variant recovery:', err?.message || err);
++      }
++    }
++
++    const variantKeys = Array.isArray(variantKeysSource)
++      ? variantKeysSource.map((k) => String(k || '').trim()).filter(Boolean)
++      : [];
++
++    for (const r of records) {
++      if (!r || typeof r !== 'object') continue;
++      if (!Array.isArray(r.candidates) && Array.isArray(processed?.candidateCodes)) {
++        r.candidates = processed.candidateCodes;
++      }
++      const fixed = recoverCode(r, { pnTemplate, variantKeys });
++      if (fixed) {
++        if (!r.code) r.code = fixed;
++        if (!r.pn) r.pn = fixed;
++      }
++    }
++
++    records = records.filter((r) => isValidCode(r?.pn || r?.code));
++    if (!records.length) {
++      persistResult.skipped = [{ reason: 'missing_pn' }];
++    }
++
++    if (records.length) {
++      persistResult = await saveExtractedSpecs(qualified, family, records, {
++        brand: brandOverride,
++        pnTemplate,
++        requiredKeys: effectiveRequired,
++        coreSpecKeys: effectiveRequired,
++        runId,
++        run_id: runId,
++        jobId,
++        job_id: jobId,
++      }) || persistResult;
++    }
+   } else if (!records.length) {
+     persistResult.skipped = [{ reason: 'missing_pn' }];
+   }
+ 
+   const persistedCodes = new Set(
+     (persistResult.written || [])
+       .map((pn) => String(pn || '').trim())
+       .filter(Boolean)
+   );
+ 
+   if (!persistedCodes.size && records.length) {
+     for (const rec of records) {
+       const pn = String(rec.pn || rec.code || '').trim();
+       if (pn) persistedCodes.add(pn);
+     }
+   }
+ 
+   const persistedList = Array.from(persistedCodes);
+   const mpnListSafe = Array.isArray(mpnList) ? mpnList : [];
+   const mergedMpns = Array.from(new Set([...persistedList, ...mpnListSafe]));
+ 
+   const rejectReasons = new Set(
+     (persistResult.skipped || [])
+       .map((it) => (it && typeof it === 'object' ? it.reason : it))
+       .filter(Boolean)

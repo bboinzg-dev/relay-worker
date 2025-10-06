@@ -3,6 +3,7 @@
 
 // ───────── 외부콜 차단 플래그 (배포 시 EXT_CALLS_OFF=1 이면 부팅 중 외부 HTTPS 호출 스킵)
 const EXT_CALLS_OFF = process.env.EXT_CALLS_OFF === '1';
+const { randomUUID } = require('node:crypto');
 // ---- run-id safe import (fallback to UUID) ----
 let generateRunId;
 try {
@@ -10,9 +11,15 @@ try {
 } catch (e) {
   console.warn('[BOOT] run-id util missing:', e?.message || e);
 }
-if (typeof generateRunId !== 'function') {
-  const { randomUUID } = require('node:crypto');
-  generateRunId = () => randomUUID(); // uuid v4 → DB ingest_jobs.id(uuid)와도 호환
+// ✅ 어떤 상황에서도 안전하게 runId를 생성하는 래퍼 (정의 유무와 무관)
+function newRunId() {
+  try {
+    // typeof는 미정의 변수에도 안전
+    // eslint-disable-next-line no-undef
+    return (typeof generateRunId === 'function') ? generateRunId() : randomUUID();
+  } catch {
+    return randomUUID();
+  }
 }
 // ----------------------------------------------
 
@@ -954,7 +961,7 @@ async function handleWorkerIngest(req, res) {
   const phaseInput = String(payload.phase || rawBody.phase || 'start').toLowerCase();
   const knownPhases = new Set(['start', 'process', 'persist']);
   const phase = knownPhases.has(phaseInput) ? phaseInput : 'start';
-  const runId = pickFirstString(payload.runId, payload.run_id, rawBody.runId, rawBody.run_id) || generateRunId();
+  const runId = pickFirstString(payload.runId, payload.run_id, rawBody.runId, rawBody.run_id) || newRunId();
   const gcsUri = pickFirstString(
     payload.gcsUri,
     payload.gcs_uri,

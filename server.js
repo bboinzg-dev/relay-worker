@@ -140,7 +140,8 @@ async function enqueueIngestTask(payload = {}) {
   const body = Buffer.from(JSON.stringify(bodyPayload), 'utf8').toString('base64');
 
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const deadlineSeconds = Number(process.env.TASKS_DEADLINE_SEC || 150);
+  const rawDeadline = Number(process.env.TASKS_DEADLINE_SEC || 900);
+  const deadlineSeconds = Math.min(Math.max(Number.isFinite(rawDeadline) ? rawDeadline : 900, 30), 1800);
   const delaySeconds = Number(process.env.TASKS_DELAY_SEC || 5);
   const maxAttempts = Number(process.env.TASKS_MAX_ATTEMPTS || 12);
   const minBackoffSeconds = Number(process.env.TASKS_MIN_BACKOFF_SEC || 1);
@@ -156,6 +157,7 @@ async function enqueueIngestTask(payload = {}) {
       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } } : {}),
     },
     // gRPC Duration 객체 (REST가 아님)
+    // Cloud Tasks HTTP deadline: default 15m, clamped to [30s, 30m]
     dispatchDeadline: { seconds: deadlineSeconds, nanos: 0 },
     // 콜드스타트/일시 에러 완충
     scheduleTime: { seconds: nowSeconds + delaySeconds },

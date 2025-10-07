@@ -5,8 +5,6 @@ const { safeJsonParse } = require('../utils/safe-json');
 const { pool } = require('../../db'); // 공유 PG 풀
 const { getBlueprint } = require('../utils/blueprint'); // DB에서 fields_json/specs_table 읽는 함수(앞서 만들어둔 버전)
 
-function norm(s){ return String(s||'').toLowerCase().replace(/\s+/g,''); } // 접미 보존!
-
 exports.extractAndUpsertOne = async function extractAndUpsertOne({ pdfBase64, family, brand, code }) {
   const bp = await getBlueprint(pool, family); // { fields, specsTable }
   // 스키마 보장(ADD COLUMN만)
@@ -25,23 +23,45 @@ family=${family}, code="${code}"의 스펙만 추출하세요.
   const j = safeJsonParse(raw) || {};
   const values = j.values || {};
 
-  // UPSERT (brand_norm, code_norm)
-  const brand_norm = norm(brand);
-  const code_norm  = norm(code);
+  // UPSERT (brand_norm, pn)
+  const resolvedValues = values && typeof values === 'object' ? { ...values } : {};
+  const pnCandidate = resolvedValues.pn != null ? resolvedValues.pn : code;
+  const pnValue = String(pnCandidate || code || '').trim();
+  if (!pnValue) throw new Error('pn_missing');
 
-  const cols = Object.keys(values);
-  const colList = cols.map(c=>`"${c}"`).join(', ');
-  const params = cols.map((_,i)=>`$${i+8}`).join(', ');
+  const skipKeys = new Set(['pn', 'brand', 'code', 'family_slug', 'verified_in_doc']);
+  const neverInsert = new Set(['id', 'brand_norm', 'code_norm', 'pn_norm', 'created_at', 'updated_at']);
+  const dynamicEntries = Object.entries(resolvedValues).filter(([key]) => {
+    if (!key) return false;
+    const lower = String(key).toLowerCase();
+    if (skipKeys.has(lower)) return false;
+    if (neverInsert.has(lower)) return false;
+    return true;
+  });
+
+  const baseCols = ['family_slug', 'brand', 'code', 'pn', 'verified_in_doc'];
+  const insertCols = baseCols.concat(dynamicEntries.map(([key]) => key));
+  const placeholders = insertCols.map((_, idx) => `$${idx + 1}`);
+
+  const updateCols = insertCols.filter((col) => !['pn', 'family_slug'].includes(String(col).toLowerCase()));
+  const updateAssignments = updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`);
+  updateAssignments.push('"updated_at" = now()');
 
   const sql = `
     INSERT INTO public.${bp.specsTable}
-    (family_slug, brand, brand_norm, code, code_norm, verified_in_doc${cols.length ? ','+colList : ''})
-    VALUES ($1,$2,$3,$4,$5,true${cols.length ? ','+params : ''})
-    ON CONFLICT (brand_norm, code_norm)
-    DO UPDATE SET
-      verified_in_doc = true
-      ${cols.length ? ','+cols.map(c=>`"${c}"=EXCLUDED."${c}"`).join(',') : ''}
+    (${insertCols.map((c) => `"${c}"`).join(', ')})
+    VALUES (${placeholders.join(', ')})
+    ON CONFLICT (brand_norm, pn)
+    DO UPDATE SET ${updateAssignments.join(', ')}
   `;
-  const args = [family, brand, brand_norm, code, code_norm].concat(cols.map(c=>values[c]));
+
+  const args = [
+    family,
+    brand,
+    code,
+    pnValue,
+    true,
+    ...dynamicEntries.map(([, value]) => value),
+  ];
   await pool.query(sql, args);
 };

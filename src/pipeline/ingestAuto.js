@@ -2203,6 +2203,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         run_id: runId,
         jobId,
         job_id: jobId,
+        gcsUri,
       }) || persistResult;
     }
   } else if (!records.length) {

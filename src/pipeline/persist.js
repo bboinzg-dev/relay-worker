@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+
 const { pool } = require('../../db');
 const { getColumnsOf } = require('./ensure-spec-columns');
 
@@ -52,9 +54,18 @@ function normKey(key) {
     .toLowerCase();
 }
 
-function isValidPnValue(value) {
+function sha1(input) {
+  return crypto.createHash('sha1').update(String(input || '')).digest('hex');
+}
+
+function isMinimalFallbackPn(value) {
+  return typeof value === 'string' && value.startsWith('pdf:');
+}
+
+function isValidCode(value) {
   const trimmed = String(value || '').trim();
   if (!trimmed) return false;
+  if (isMinimalFallbackPn(trimmed)) return true;
   return PN_RE.test(trimmed);
 }
 
@@ -361,9 +372,22 @@ function renderTemplateWithPattern(template, record, pattern) {
   return { rendered, used };
 }
 
-function renderAnyTemplate(template, record = {}, { collapseWhitespace = true } = {}) {
+function renderAnyTemplate(template, record = {}, ctxOrOptions = {}, maybeOptions = {}) {
   if (!template) return null;
-  const context = record && typeof record === 'object' ? record : {};
+  let ctxText = '';
+  let options = { collapseWhitespace: true };
+  if (typeof ctxOrOptions === 'string') {
+    ctxText = ctxOrOptions;
+    options = { ...options, ...(maybeOptions && typeof maybeOptions === 'object' ? maybeOptions : {}) };
+  } else if (ctxOrOptions && typeof ctxOrOptions === 'object' && !Array.isArray(ctxOrOptions)) {
+    options = { ...options, ...ctxOrOptions };
+  }
+  const context = record && typeof record === 'object' ? { ...record } : {};
+  if (ctxText) {
+    if (context._doc_text == null) context._doc_text = ctxText;
+    if (context.doc_text == null) context.doc_text = ctxText;
+    if (context.__text == null) context.__text = ctxText;
+  }
   let working = String(template);
   let used = false;
 
@@ -376,6 +400,7 @@ function renderAnyTemplate(template, record = {}, { collapseWhitespace = true } 
   if (single.used) used = true;
 
   if (!used) return null;
+  const collapseWhitespace = options?.collapseWhitespace !== false;
   let cleaned = collapseWhitespace ? working.replace(/\s+/g, '') : working;
   cleaned = cleaned.trim();
   return cleaned || null;
@@ -427,6 +452,14 @@ function hasCoreSpec(row, keys = [], candidateKeys = []) {
   return false;
 }
 
+function isMinimalInsertEnabled() {
+  return /^(1|true|on)$/i.test(String(process.env.ALLOW_MINIMAL_INSERT || '').trim());
+}
+
+function isMinimalInsertStrict() {
+  return String(process.env.ALLOW_MINIMAL_INSERT || '').trim() === '1';
+}
+
 function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   if (!row || typeof row !== 'object') {
     return { ok: false, reason: 'empty_row' };
@@ -439,15 +472,16 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   }
 
   let pn = String(row.pn || row.code || '').trim();
-  const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
-  if (
-    !isValidPnValue(pn) ||
-    FORBIDDEN_RE.test(pn) ||
-    BANNED_PREFIX.test(pn) ||
-    BANNED_EXACT.test(pn)
-  ) {
+  const allowMinimal = isMinimalInsertEnabled();
+  const minimalFallback = allowMinimal && isMinimalFallbackPn(pn);
+  if (!isValidCode(pn)) {
+    if (minimalFallback) {
+      row.last_error = row.last_error || 'invalid_code_fallback';
+      row.pn = pn;
+      return { ok: true };
+    }
     const fixed = repairPn(pn);
-    if (fixed && isValidPnValue(fixed)) {
+    if (fixed && isValidCode(fixed)) {
       console.warn('[persist] pn repaired', { original: pn, fixed });
       row.last_error = row.last_error || 'invalid_code_fixed';
       pn = fixed;
@@ -464,6 +498,18 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
     } else {
       row.last_error = 'invalid_code';
       return { ok: false, reason: 'invalid_code' };
+    }
+  } else if (!minimalFallback) {
+    if (FORBIDDEN_RE.test(pn) || BANNED_PREFIX.test(pn) || BANNED_EXACT.test(pn)) {
+      const fixed = repairPn(pn);
+      if (fixed && isValidCode(fixed) && !FORBIDDEN_RE.test(fixed) && !BANNED_PREFIX.test(fixed) && !BANNED_EXACT.test(fixed)) {
+        console.warn('[persist] pn repaired', { original: pn, fixed });
+        row.last_error = row.last_error || 'invalid_code_fixed';
+        pn = fixed;
+      } else {
+        row.last_error = 'invalid_code';
+        return { ok: false, reason: 'invalid_code' };
+      }
     }
   }
   row.pn = pn;
@@ -571,6 +617,10 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
 
   console.log(`[PATH] persist family=${familySlug} rows=${rows.length} brand_override=${options?.brand || ''}`);
 
+  const allowMinimalStrict = isMinimalInsertStrict();
+  const gcsUri = options?.gcsUri || options?.gcs_uri || null;
+  const fallbackHash = gcsUri ? sha1(gcsUri) : null;
+
   const runId = options?.runId ?? options?.run_id ?? null;
   const jobId = options?.jobId ?? options?.job_id ?? null;
   const suffixParts = [];
@@ -652,7 +702,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   const seenNatural = new Set();
 
   try {
-    for (const row of rows) {
+    for (const [rowIndex, row] of rows.entries()) {
       result.processed += 1;
       const rec = {};
       for (const [key, value] of Object.entries(row || {})) {
@@ -663,7 +713,15 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         rec.brand = options.brand;
       }
 
-      const docTextLower = String(rec._doc_text || '').toLowerCase();
+      const docTextRaw = String(
+        rec._doc_text ??
+          rec.doc_text ??
+          row?._doc_text ??
+          row?.doc_text ??
+          (options?.docText || options?.doc_text) ??
+          '',
+      );
+      const docTextLower = docTextRaw.toLowerCase();
       const brandCandidates = [options?.brand, rec.brand, rec.brand_norm];
       let brandKey = null;
       for (const candidate of brandCandidates) {
@@ -684,18 +742,40 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       if (physicalCols.has('last_error')) rec.last_error = null;
 
       const templateContext = { ...rec };
+      const ctxText = docTextRaw;
       const pnWasTemplate = looksLikeTemplate(templateContext.pn);
       const codeWasTemplate = looksLikeTemplate(templateContext.code);
 
       if (pnWasTemplate) {
-        const renderedPn = renderAnyTemplate(templateContext.pn, templateContext);
+        const renderedPn = renderAnyTemplate(templateContext.pn, templateContext, ctxText);
         rec.pn = renderedPn ?? null;
       }
 
       if (codeWasTemplate) {
         const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
-        const renderedCode = renderAnyTemplate(templateContext.code, contextForCode);
+        const renderedCode = renderAnyTemplate(templateContext.code, contextForCode, ctxText);
         rec.code = renderedCode ?? null;
+      }
+
+      if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
+        rec.pn = rec.code;
+      }
+
+      if (!isValidCode(rec.pn) && allowMinimalStrict) {
+        const base = fallbackHash || sha1(`${targetTable || ''}:${familySlug || ''}`);
+        const fallbackPn = `pdf:${base}#${rowIndex + 1}`;
+        rec.pn = fallbackPn;
+        if (!rec.code || !isValidCode(rec.code)) {
+          rec.code = fallbackPn;
+        }
+        if (physicalCols.has('last_error')) {
+          rec.last_error = rec.last_error || 'invalid_code_fallback';
+        }
+        warnings.add('minimal_pn_fallback');
+      }
+
+      if (!isValidCode(rec.pn)) {
+        rec.pn = null;
       }
 
       if (!rec.pn && rec.code) {
@@ -704,11 +784,19 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
 
       buildPnIfMissing(rec, pnTemplate);
 
-      const pnMissing = !rec.pn || String(rec.pn).trim() === '';
+      if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
+        rec.pn = rec.code;
+      }
+
+      const pnMissing = !isValidCode(rec.pn);
       if (pnMissing && (pnWasTemplate || codeWasTemplate)) {
         if (physicalCols.has('last_error')) rec.last_error = 'template_render_failed';
         result.skipped.push({ reason: 'invalid_code', detail: 'template_render_failed' });
         continue;
+      }
+
+      if (!isValidCode(rec.code) && isValidCode(rec.pn)) {
+        rec.code = rec.pn;
       }
 
       const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });
@@ -720,7 +808,8 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       const pnValue = String(rec.pn || rec.code || '').trim();
-      if (!pnValue || !isValidPnValue(pnValue) || FORBIDDEN_RE.test(pnValue)) {
+      const pnIsFallback = isMinimalFallbackPn(pnValue);
+      if (!pnValue || !isValidCode(pnValue) || (!pnIsFallback && FORBIDDEN_RE.test(pnValue))) {
         const skippedCode = pnValue || String(rec.code || rec.pn || '').trim() || '(no-code)';
         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
         result.skipped.push({ reason: 'invalid_code', code: skippedCode, last_error: 'invalid_code' });

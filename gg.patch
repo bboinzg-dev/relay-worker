@@ -1,189 +1,140 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index c49e32fc83fcc3d82170577b83aa1f4701226225..8eec92ff25ba3caf7bb8e6d5ec7a86709647bd74 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -1691,115 +1691,153 @@ async function persistProcessedData(processed = {}, overrides = {}) {
-     started = Date.now(),
-     gcsUri = null,
-     family: processedFamily = null,
-     family_slug: processedFamilySlug = null,
-     table: processedTable = null,
-     specs_table: processedSpecsTable = null,
-     qualified: qualifiedInput = null,
-     pnTemplate = null,
-     requiredFields = [],
-     coverUri = null,
-     records: initialRecords = [],
-     rows: processedRowsInput = [],
-     mpnList = [],
-     extractedBrand = null,
-     brandName = null,
-     baseSeries = null,
-     text: processedText = null,
-     brand: processedBrand = null,
-     brand_detected: processedDetected = null,
-     brand_effective: processedEffective = null,
-     brand_source: processedBrandSource = null,
-     variant_keys_runtime: processedVariantKeys = [],
-     meta: processedMeta = null,
-   } = processed || {};
+diff --git a/server.js b/server.js
+index b3e9c0ae19c00acdb67d8b0d611217c09551ba53..54f9dfda3488a1da6da2efe133de7d57ec677172 100644
+--- a/server.js
++++ b/server.js
+@@ -1051,63 +1051,71 @@ async function handleWorkerIngest(req, res) {
+       const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+       const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+       const nextOverrides = {
+         ...(payload?.overrides || {}),
+         brand: overrideBrand,
+         series: overrideSeries,
+       };
  
-+  // persist: Cloud Tasks가 별도 요청으로 호출 → 매번 family/table/colTypes 재확정 필수
-   const normalizeFamily = (value) => {
-     if (!value) return null;
-     const trimmed = String(value).trim();
-     return trimmed || null;
-   };
+       const result = await getIngest().runAutoIngest({
+         ...payload,
+         runId,
+         run_id: runId,
+         gcsUri,
+         gcs_uri: gcsUri,
+         skipPersist: true,
+         overrides: nextOverrides,
+       });
  
--  const metaFamily =
--    normalizeFamily(processedMeta?.family) ||
--    normalizeFamily(processedMeta?.family_slug);
--  const overridesFamily =
--    normalizeFamily(overrides?.family) ||
--    normalizeFamily(overrides?.family_slug);
--  const family =
--    normalizeFamily(processedFamily) ||
--    normalizeFamily(processedFamilySlug) ||
--    metaFamily ||
--    overridesFamily ||
--    null;
-+  const pickFamily = (...values) => {
-+    for (const value of values) {
-+      const normalized = normalizeFamily(value);
-+      if (normalized) return normalized;
-+    }
-+    return null;
-+  };
+       const processed = result?.processed;
+       if (!processed || !Array.isArray(processed.records)) {
+         throw new Error('process_no_records');
+       }
+ 
+       await markRunning(baseContext);
+ 
++      await db.query(
++        `UPDATE public.ingest_run_logs
++            SET detail = jsonb_set(coalesce(detail,'{}'::jsonb), '{processed}', $2::jsonb, true),
++                updated_at = now()
++          WHERE id = $1`,
++        [runId, JSON.stringify(processed)]
++      );
 +
-+  const family = pickFamily(
-+    processedFamily,
-+    processedFamilySlug,
-+    processedMeta?.family,
-+    processedMeta?.family_slug,
-+    overrides?.family,
-+    overrides?.family_slug,
-+  );
+       const nextPayload = {
+         runId,
+         run_id: runId,
+         gcsUri,
+         gcs_uri: gcsUri,
+         family_slug: payload?.family_slug ?? null,
+         brand: payload?.brand ?? null,
+         code: payload?.code ?? null,
+         series: payload?.series ?? null,
+         display_name: payload?.display_name ?? null,
+         uploader_id: payload?.uploader_id ?? null,
+         phase: 'persist',
+-        processed,
++        // processed는 싣지 않음. DB에서 가져와 사용.
+         overrides: nextOverrides,
+       };
  
-+  const sanitizePart = (value) => String(value || '').replace(/[^a-zA-Z0-9_]/g, '');
-   const sanitizeIdentifier = (value) => {
-     const trimmed = String(value || '').trim();
-     if (!trimmed) return '';
-     if (trimmed.includes('.')) {
-       const [schemaRaw, tableRaw] = trimmed.split('.', 2);
--      const schemaSafe = String(schemaRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
--      const tableSafe = String(tableRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
-+      const schemaSafe = sanitizePart(schemaRaw);
-+      const tableSafe = sanitizePart(tableRaw);
-       if (!schemaSafe || !tableSafe) return '';
-       return `${schemaSafe}.${tableSafe}`;
+       try {
+         await enqueueIngestTask(nextPayload);
+         return res.status(200).json({ ok: true, runId, phase, queued: 'persist' });
+       } catch (err) {
+         console.error(
+           '[enqueue error]',
+           err?.code || err?.response?.status || err?.message,
+           err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
+         );
+         console.warn('[ingest][persist fallback] attempting inline persist', { runId });
+ 
+         await markPersisting(baseContext);
+         const inlineResult = await getIngest().persistProcessedData(processed || {}, {
+           brand: overrideBrand,
+           code: payload?.code ?? null,
+           series: overrideSeries,
+           display_name: payload?.display_name ?? null,
+         });
+ 
+         const failureReasons = new Set(Array.isArray(inlineResult?.reject_reasons) ? inlineResult.reject_reasons : []);
+         const warningReasons = new Set(Array.isArray(inlineResult?.warnings) ? inlineResult.warnings : []);
+ 
+diff --git a/server.js b/server.js
+index b3e9c0ae19c00acdb67d8b0d611217c09551ba53..54f9dfda3488a1da6da2efe133de7d57ec677172 100644
+--- a/server.js
++++ b/server.js
+@@ -1125,51 +1133,57 @@ async function handleWorkerIngest(req, res) {
+ 
+         await markSucceeded({
+           ...baseContext,
+           result: inlineResult,
+           gcsUri,
+           durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
+           meta: payload,
+         });
+ 
+         return res.status(200).json({
+           ok: true,
+           runId,
+           phase,
+           persisted_inline: true,
+           specs_table: inlineResult?.specs_table || null,
+         });
+       }
      }
--    return trimmed.replace(/[^a-zA-Z0-9_]/g, '');
-+    return sanitizePart(trimmed);
-   };
  
--  const pickTableCandidate = (...values) => {
--    for (const value of values) {
--      const normalized = sanitizeIdentifier(value);
--      if (normalized) return normalized;
-+  const extractQualified = (value) => {
-+    const normalized = sanitizeIdentifier(value);
-+    if (!normalized) return { table: '', qualified: '' };
-+    if (normalized.includes('.')) {
-+      const [schema, tbl] = normalized.split('.', 2);
-+      return { table: tbl, qualified: `${schema}.${tbl}` };
-     }
--    return '';
-+    return { table: normalized, qualified: '' };
-   };
+     if (phase === 'persist') {
+       await markPersisting(baseContext);
  
--  let table = pickTableCandidate(processedSpecsTable, processedTable, qualifiedInput);
-+  const tableCandidates = [
-+    processedSpecsTable,
-+    processedTable,
-+    qualifiedInput,
-+    overrides?.specs_table,
-+    overrides?.table,
-+    overrides?.qualified,
-+  ];
-+
-+  let table = '';
-+  let qualified = '';
-+  for (const candidate of tableCandidates) {
-+    const { table: tbl, qualified: qual } = extractQualified(candidate);
-+    if (tbl) {
-+      table = tbl;
-+      if (qual) qualified = qual;
-+      break;
-+    }
-+  }
-+
-   if (!table && family) {
-     try {
-       const r = await db.query(
-         `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
-         [family],
-       );
--      table = pickTableCandidate(r.rows?.[0]?.specs_table);
-+      const { table: tbl, qualified: qual } = extractQualified(r.rows?.[0]?.specs_table);
-+      if (tbl) {
-+        table = tbl;
-+        if (qual) qualified = qual;
+       const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
+       const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
+ 
+-      const out = await getIngest().persistProcessedData(payload?.processed || {}, {
++      let proc = payload?.processed || null;
++      if (!proc) {
++        const r = await db.query(`SELECT detail->'processed' AS p FROM public.ingest_run_logs WHERE id=$1`, [runId]);
++        proc = r.rows?.[0]?.p || null;
 +      }
-     } catch (err) {
-       console.warn('[persist] specs_table lookup failed:', err?.message || err);
-     }
-   }
 +
-   if (!table && family) {
--    table = sanitizeIdentifier(`${family}_specs`);
-+    const fallback = sanitizePart(`${family}_specs`);
-+    if (fallback) table = fallback;
-+  }
-+
-+  if (!table) {
-+    throw new Error('persist_no_table');
-+  }
-+
-+  if (!qualified) {
-+    qualified = table.includes('.') ? table : `public.${table}`;
-   }
--  const qualified = qualifiedInput || (table ? (table.includes('.') ? table : `public.${table}`) : null);
++      const out = await getIngest().persistProcessedData(proc || {}, {
+         brand: overrideBrand,
+         code: payload?.code ?? null,
+         series: overrideSeries,
+         display_name: payload?.display_name ?? null,
+       });
  
-   let colTypes = new Map();
--  if (qualified) {
--    try {
--      colTypes = await getColumnTypes(qualified);
--    } catch (err) {
--      console.warn('[persist] column type fetch failed:', err?.message || err);
--      colTypes = new Map();
--    }
-+  try {
-+    colTypes = await getColumnTypes(qualified);
-+  } catch (err) {
-+    console.warn('[persist] column type fetch failed:', err?.message || err);
-+    colTypes = new Map();
-   }
+       const reasons = new Set([...(out?.reject_reasons || []), ...(out?.warnings || [])]);
+       if (!out?.ok) {
+         const list = [...reasons];
+         const hard = list.some((r) => /missing_|invalid_|no_records|reject/i.test(r));
+         await markFailed({
+           ...baseContext,
+           error: list.join(',') || 'ingest_rejected',
+           durationMs: out?.ms ?? (Date.now() - startedAt),
+         });
+         failureMarked = true;
+         if (hard) {
+           return res.status(200).json({ ok: false, runId, phase, reasons: list });
+         }
+         return res.status(500).json({ ok: false, runId, phase, reasons: list });
+       }
  
-   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
-     ? initialRecords
-     : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
-   let records = Array.isArray(recordsSource) ? recordsSource : [];
-   const runtimeMeta = {
-     brand_source: processedBrandSource ?? null,
-     variant_keys_runtime: Array.isArray(processedVariantKeys) ? processedVariantKeys : [],
-   };
-   const hasRuntimeMeta =
-     runtimeMeta.brand_source != null ||
-     (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
-   const docText = typeof processedText === 'string'
-     ? processedText
-     : (processedText != null ? String(processedText) : '');
-   const normalizeSeedBrand = (value) => {
-     if (value == null) return null;
-     const trimmed = String(value).trim();
-     if (!trimmed) return null;
-     if (trimmed.toLowerCase() === 'unknown') return null;
-     return trimmed;
-   };
-   const brandSeed =
-     normalizeSeedBrand(processedEffective) ||
+       await markSucceeded({
+         ...baseContext,
+         result: out,

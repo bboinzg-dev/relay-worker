@@ -1073,6 +1073,14 @@ async function handleWorkerIngest(req, res) {
 
       await markRunning(baseContext);
 
+      await db.query(
+        `UPDATE public.ingest_run_logs
+            SET detail = jsonb_set(coalesce(detail,'{}'::jsonb), '{processed}', $2::jsonb, true),
+                updated_at = now()
+          WHERE id = $1`,
+        [runId, JSON.stringify(processed)]
+      );
+
       const nextPayload = {
         runId,
         run_id: runId,
@@ -1085,7 +1093,7 @@ async function handleWorkerIngest(req, res) {
         display_name: payload?.display_name ?? null,
         uploader_id: payload?.uploader_id ?? null,
         phase: 'persist',
-        processed,
+        // processed는 싣지 않음. DB에서 가져와 사용.
         overrides: nextOverrides,
       };
 
@@ -1147,7 +1155,13 @@ async function handleWorkerIngest(req, res) {
       const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
       const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
 
-      const out = await getIngest().persistProcessedData(payload?.processed || {}, {
+      let proc = payload?.processed || null;
+      if (!proc) {
+        const r = await db.query(`SELECT detail->'processed' AS p FROM public.ingest_run_logs WHERE id=$1`, [runId]);
+        proc = r.rows?.[0]?.p || null;
+      }
+
+      const out = await getIngest().persistProcessedData(proc || {}, {
         brand: overrideBrand,
         code: payload?.code ?? null,
         series: overrideSeries,

@@ -745,7 +745,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
       rec.code_norm = codeNorm;
 
-      const naturalKey = `${rec.brand_norm ?? ''}::${pnNorm}`;
+      const naturalKey = `${rec.brand_norm ?? ''}::${rec.pn_norm ?? pnNorm ?? normKey(rec.pn)}`;
       if (seenNatural.has(naturalKey)) {
         result.skipped.push({ reason: 'duplicate_code' });
         continue;

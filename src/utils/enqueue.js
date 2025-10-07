@@ -52,10 +52,12 @@ async function enqueueIngest(payload = {}) {
   };
 
   const raw = process.env.TASKS_DISPATCH_DEADLINE || process.env.TASKS_DEADLINE_SEC;
-  if (raw) {
-    const secs = Number(String(raw).replace(/s$/i,''));
-    if (Number.isFinite(secs)) task.dispatchDeadline = { seconds: Math.max(0, Math.ceil(secs)) };
-  }
+  const parsed = Number.parseFloat(typeof raw === 'string' ? raw.replace(/s$/i, '') : raw);
+  const deadlineSeconds = Math.min(
+    Math.max(Number.isFinite(parsed) ? parsed : 900, 30),
+    1800
+  );
+  task.dispatchDeadline = { seconds: Math.ceil(deadlineSeconds), nanos: 0 };
 
   const [resp] = await client.createTask({ parent, task });
   return resp.name;

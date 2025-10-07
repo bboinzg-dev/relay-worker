@@ -98,17 +98,18 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       if (invokerSA) {
         httpRequest.oidcToken = { serviceAccountEmail: invokerSA, audience };
       }
-      const rawDispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE;
+      const rawDispatchDeadline = process.env.TASKS_DISPATCH_DEADLINE || process.env.TASKS_DEADLINE_SEC;
       const parsedDispatchDeadline = Number.parseFloat(
         typeof rawDispatchDeadline === 'string'
           ? rawDispatchDeadline.replace(/s$/i, '')
           : rawDispatchDeadline
       );
-      const dispatchDeadlineSeconds = Number.isFinite(parsedDispatchDeadline)
-        ? parsedDispatchDeadline
-        : 150;
+      const dispatchDeadlineSeconds = Math.min(
+        Math.max(Number.isFinite(parsedDispatchDeadline) ? parsedDispatchDeadline : 900, 30),
+        1800
+      );
       const dispatchDeadline = {
-        seconds: Math.min(Math.max(0, Math.ceil(dispatchDeadlineSeconds)), 1800),
+        seconds: Math.ceil(dispatchDeadlineSeconds),
         nanos: 0,
       };
       const task = {

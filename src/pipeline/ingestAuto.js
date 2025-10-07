@@ -17,7 +17,7 @@ const { detectVariantKeys } = require('../utils/ordering');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
 const { aiCanonicalizeKeys } = require('./ai/canonKeys');
-const { saveExtractedSpecs } = require('./persist');
+const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
 const { explodeToRows } = require('../ingest/mpn-exploder');
 const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
 const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
@@ -332,6 +332,38 @@ function recoverCode(rec, { pnTemplate, variantKeys }) {
     if (isValidCode(first)) return first;
   }
   return null;
+}
+
+function renderInlineTemplate(value, context) {
+  if (!looksLikeTemplate(value)) return value;
+  const rendered = renderAnyTemplate(value, context);
+  return rendered != null && rendered !== '' ? rendered : null;
+}
+
+function sanitizeRecordTemplates(records) {
+  if (!Array.isArray(records)) return;
+  for (const rec of records) {
+    if (!rec || typeof rec !== 'object') continue;
+    const context = { ...rec };
+    const renderedPn = renderInlineTemplate(context.pn, context);
+    if (looksLikeTemplate(context.pn)) {
+      rec.pn = renderedPn ?? null;
+    } else if (renderedPn != null) {
+      rec.pn = renderedPn;
+    }
+
+    const contextForCode = { ...context, pn: rec.pn ?? context.pn };
+    const renderedCode = renderInlineTemplate(context.code, contextForCode);
+    if (looksLikeTemplate(context.code)) {
+      rec.code = renderedCode ?? null;
+    } else if (renderedCode != null) {
+      rec.code = renderedCode;
+    }
+
+    if (!rec.pn && rec.code) {
+      rec.pn = rec.code;
+    }
+  }
 }
 
 function pickBrandHint(...values) {
@@ -1980,6 +2012,10 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     ? initialRecords
     : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
   let records = Array.isArray(recordsSource) ? recordsSource : [];
+  sanitizeRecordTemplates(records);
+  if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+    sanitizeRecordTemplates(processedRowsInput);
+  }
   const runtimeMeta = {
     brand_source: processedBrandSource ?? null,
     variant_keys_runtime: Array.isArray(processedVariantKeys) ? processedVariantKeys : [],

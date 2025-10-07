@@ -26,7 +26,7 @@ const META_KEYS = new Set([
   'updated_at',
 ]);
 
-const CONFLICT_KEYS = ['brand_norm', 'code_norm'];
+const CONFLICT_KEYS = ['brand_norm', 'pn'];
 
 const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
 const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
@@ -224,36 +224,164 @@ async function normalizeBrand(raw, docTextLower = '') {
   return resolved;
 }
 
-function applyPnTemplateOptions(value, optionStr) {
+function escapeRegExp(str) {
+  return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function applyTemplateOptions(value, options = []) {
   if (value == null) return value;
-  if (!optionStr) return value;
   let out = String(value);
-  for (const token of String(optionStr).split(',').map((t) => t.trim()).filter(Boolean)) {
-    const [key, rawVal] = token.split('=').map((t) => t.trim());
-    if (!key) continue;
-    if (key === 'pad') {
-      const width = Number(rawVal);
+  for (const rawToken of options) {
+    const token = String(rawToken || '').trim();
+    if (!token) continue;
+    const [opRaw, argRaw = ''] = token.split('=').map((t) => t.trim());
+    const op = opRaw.toLowerCase();
+    if (!op) continue;
+    if (op === 'pad') {
+      const width = Number(argRaw);
       if (Number.isFinite(width) && width > 0) out = out.padStart(width, '0');
+      continue;
+    }
+    if (op === 'upcase' || op === 'upper' || op === 'uppercase') {
+      out = out.toUpperCase();
+      continue;
+    }
+    if (op === 'downcase' || op === 'lower' || op === 'lowercase') {
+      out = out.toLowerCase();
+      continue;
+    }
+    if (op === 'trim') {
+      out = out.trim();
+      continue;
+    }
+    if (op === 'prefix') {
+      out = `${argRaw}${out}`;
+      continue;
+    }
+    if (op === 'suffix') {
+      out = `${out}${argRaw}`;
+      continue;
+    }
+    if (op === 'replace' && argRaw) {
+      const [search, replacement = ''] = argRaw.split(':');
+      if (search != null) {
+        const matcher = new RegExp(escapeRegExp(search), 'g');
+        out = out.replace(matcher, replacement);
+      }
+      continue;
     }
   }
   return out;
 }
 
-function renderPnTemplate(template, record = {}) {
-  if (!template) return null;
+function looksLikeTemplate(value) {
+  return typeof value === 'string' && value.includes('{') && value.includes('}');
+}
+
+function resolveTemplateValue(record, field) {
+  const rawKey = String(field || '').trim();
+  if (!rawKey) return null;
+  const norm = normKey(rawKey);
+  const candidates = [];
+  const push = (key) => {
+    if (!key) return;
+    if (!candidates.includes(key)) candidates.push(key);
+  };
+  push(rawKey);
+  if (norm && norm !== rawKey) push(norm);
+  if (norm) {
+    push(`${norm}_code`);
+    push(`${norm}_text`);
+    push(`${norm}_value`);
+    push(`${norm}_raw`);
+  }
+  if (rawKey && rawKey !== norm) {
+    push(`${rawKey}_code`);
+    push(`${rawKey}_text`);
+    push(`${rawKey}_value`);
+    push(`${rawKey}_raw`);
+  }
+
+  const extract = (value) => {
+    if (value == null) return null;
+    if (Array.isArray(value)) {
+      const first = value.find((v) => v != null && String(v).trim() !== '');
+      return first != null ? first : null;
+    }
+    if (typeof value === 'object') {
+      if ('value' in value && value.value != null && String(value.value).trim() !== '') {
+        return value.value;
+      }
+      if ('text' in value && value.text != null && String(value.text).trim() !== '') {
+        return value.text;
+      }
+      return null;
+    }
+    const str = String(value).trim();
+    if (str === '') return null;
+    return value;
+  };
+
+  for (const key of candidates) {
+    if (!key) continue;
+    const resolved = extract(record[key]);
+    if (resolved != null) return resolved;
+  }
+
+  if (norm) {
+    const normalizedOrder = [norm, `${norm}_code`, `${norm}_text`, `${norm}_value`, `${norm}_raw`];
+    for (const target of normalizedOrder) {
+      for (const [key, value] of Object.entries(record || {})) {
+        if (normKey(key) !== target) continue;
+        const resolved = extract(value);
+        if (resolved != null) return resolved;
+      }
+    }
+  }
+
+  return null;
+}
+
+function renderTemplateWithPattern(template, record, pattern) {
   let used = false;
-  const rendered = String(template).replace(/\{\{\s*([^}|]+?)(?:\|([^}]+))?\s*\}\}/g, (_, key, options) => {
-    const field = String(key || '').trim();
-    if (!field) return '';
-    const value = record[field];
+  const rendered = String(template).replace(pattern, (_, body) => {
+    const parts = String(body || '')
+      .split('|')
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (!parts.length) return '';
+    const base = parts.shift();
+    const value = resolveTemplateValue(record, base);
     if (value == null || value === '') return '';
     used = true;
-    const applied = applyPnTemplateOptions(String(value), options);
+    const applied = applyTemplateOptions(String(value), parts);
     return applied == null ? '' : String(applied);
   });
-  const cleaned = rendered.replace(/\s+/g, '');
-  if (!used || !cleaned.trim()) return null;
-  return cleaned.trim();
+  return { rendered, used };
+}
+
+function renderAnyTemplate(template, record = {}, { collapseWhitespace = true } = {}) {
+  if (!template) return null;
+  const context = record && typeof record === 'object' ? record : {};
+  let working = String(template);
+  let used = false;
+
+  const double = renderTemplateWithPattern(working, context, /\{\{\s*([^{}]+?)\s*\}\}/g);
+  working = double.rendered;
+  if (double.used) used = true;
+
+  const single = renderTemplateWithPattern(working, context, /\{\s*([^{}]+?)\s*\}/g);
+  working = single.rendered;
+  if (single.used) used = true;
+
+  if (!used) return null;
+  let cleaned = collapseWhitespace ? working.replace(/\s+/g, '') : working;
+  cleaned = cleaned.trim();
+  return cleaned || null;
+}
+
+function renderPnTemplate(template, record = {}) {
+  return renderAnyTemplate(template, record);
 }
 
 function buildPnIfMissing(record = {}, pnTemplate) {
@@ -511,7 +639,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   const sql = [
     `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
     `VALUES (${placeholders})`,
-    'ON CONFLICT (brand_norm, code_norm)',
+    'ON CONFLICT (brand_norm, pn)',
     updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
     'RETURNING pn',
   ].join('\n');
@@ -552,7 +680,33 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
       if (physicalCols.has('last_error')) rec.last_error = null;
 
+      const templateContext = { ...rec };
+      const pnWasTemplate = looksLikeTemplate(templateContext.pn);
+      const codeWasTemplate = looksLikeTemplate(templateContext.code);
+
+      if (pnWasTemplate) {
+        const renderedPn = renderAnyTemplate(templateContext.pn, templateContext);
+        rec.pn = renderedPn ?? null;
+      }
+
+      if (codeWasTemplate) {
+        const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
+        const renderedCode = renderAnyTemplate(templateContext.code, contextForCode);
+        rec.code = renderedCode ?? null;
+      }
+
+      if (!rec.pn && rec.code) {
+        rec.pn = rec.code;
+      }
+
       buildPnIfMissing(rec, pnTemplate);
+
+      const pnMissing = !rec.pn || String(rec.pn).trim() === '';
+      if (pnMissing && (pnWasTemplate || codeWasTemplate)) {
+        if (physicalCols.has('last_error')) rec.last_error = 'template_render_failed';
+        result.skipped.push({ reason: 'invalid_code', detail: 'template_render_failed' });
+        continue;
+      }
 
       const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });
       if (!guard.ok) {
@@ -591,7 +745,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
       rec.code_norm = codeNorm;
 
-      const naturalKey = `${rec.brand_norm ?? ''}::${codeNorm}`;
+      const naturalKey = `${rec.brand_norm ?? ''}::${pnNorm}`;
       if (seenNatural.has(naturalKey)) {
         result.skipped.push({ reason: 'duplicate_code' });
         continue;
@@ -657,4 +811,4 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   return result;
 }
 
-module.exports = { saveExtractedSpecs };
+module.exports = { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate };

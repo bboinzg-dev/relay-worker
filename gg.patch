@@ -1,215 +1,483 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 8eec92ff25ba3caf7bb8e6d5ec7a86709647bd74..d8e7e5499b3892a7aae29f93e44068ee3b9f9771 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -120,52 +120,210 @@ function normalizeSpecKeyName(value) {
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 2a5ecd91ebf1d55c763baa133193e9c6e92935b6..b67f31870b72a03c19ba5a110bb13b4813aa525f 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -4,51 +4,51 @@ const { pool } = require('../../db');
+ const { getColumnsOf } = require('./ensure-spec-columns');
+ 
+ const META_KEYS = new Set([
+   'family_slug',
+   'brand',
+   'brand_norm',
+   'pn',
+   'pn_norm',
+   'code',
+   'code_norm',
+   'mfr_full',
+   'datasheet_uri',
+   'verified_in_doc',
+   'display_name',
+   'displayname',
+   'image_uri',
+   'cover',
+   'series',
+   'series_code',
+   'raw_json',
+   'last_error',
+   'created_at',
+   'updated_at',
+ ]);
+ 
+-const CONFLICT_KEYS = ['brand_norm', 'code_norm'];
++const CONFLICT_KEYS = ['brand_norm', 'pn'];
+ 
+ const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
+ const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
+ const BANNED_PREFIX = /^(pdf|page|figure|table|sheet|rev|ver|draft)\b/i;
+ const BANNED_EXACT = /^pdf-?1(\.\d+)?$/i;
+ 
+ const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const SCALE_MAP = {
+   k: 1e3,
+   m: 1e-3,
+   g: 1e9,
+   'µ': 1e-6,
+   u: 1e-6,
+   n: 1e-9,
+   p: 1e-12,
+ };
+ 
+ function normKey(key) {
+   return String(key || '')
+     .trim()
+     .toLowerCase();
  }
  
- function escapeRegex(str) {
-   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+ function isValidPnValue(value) {
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 2a5ecd91ebf1d55c763baa133193e9c6e92935b6..b67f31870b72a03c19ba5a110bb13b4813aa525f 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -202,80 +202,208 @@ async function normalizeBrand(raw, docTextLower = '') {
+     const aliasRows = await loadAliasRows();
+     const lowerRaw = key;
+     for (const row of aliasRows) {
+       const brandNorm = String(row?.brand_norm || '').trim().toLowerCase();
+       if (!brandNorm) continue;
+       const aliases = Array.isArray(row?.aliases) ? row.aliases : [];
+       const rawMatch = lowerRaw.includes(brandNorm);
+       const docMatch = docLower.includes(brandNorm) || aliases.some((alias) => {
+         const lowerAlias = String(alias || '').trim().toLowerCase();
+         return lowerAlias && docLower.includes(lowerAlias);
+       });
+       if (rawMatch || docMatch) {
+         resolved = brandNorm;
+         break;
+       }
+     }
+   }
+ 
+   if (resolved) {
+     brandCache.set(key, resolved);
+     brandCache.set(resolved, resolved);
+   }
+   return resolved;
  }
  
- function textContainsExact(text, pn) {
-   if (!text || !pn) return false;
-   const pattern = escapeRegex(String(pn).trim());
-   if (!pattern) return false;
-   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
-   return re.test(String(text));
- }
- 
- function normLower(s){ return String(s||'').trim().toLowerCase(); }
- 
- function isValidCode(s) {
-   const v = String(s || '').trim();
-   if (!v) return false;
-   if (v.length < 2 || v.length > 64) return false;
-   if (!/[0-9A-Za-z]/.test(v)) return false;
-   if (/\s{2,}/.test(v)) return false;
-   return true;
- }
- 
-+const KEY_ALIASES = {
-+  form: ['form', 'contact_form', 'contact_arrangement', 'configuration', 'arrangement', 'poles_form'],
-+  voltage: ['voltage', 'coil_voltage_vdc', 'voltage_vdc', 'rated_voltage_vdc', 'vdc', 'coil_voltage'],
-+  case: ['case', 'case_code', 'package', 'pkg'],
-+  capacitance: ['capacitance', 'capacitance_uF', 'capacitance_f', 'c'],
-+  resistance: ['resistance', 'resistance_ohm', 'r_ohm', 'r'],
-+  tolerance: ['tolerance', 'tolerance_pct'],
-+  length_mm: ['length_mm', 'dim_l_mm'],
-+  width_mm: ['width_mm', 'dim_w_mm'],
-+  height_mm: ['height_mm', 'dim_h_mm'],
-+  series: ['series', 'series_code']
-+};
+-function applyPnTemplateOptions(value, optionStr) {
++function escapeRegExp(str) {
++  return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++}
 +
-+const ENUM_MAP = {
-+  form: { SPST: '1A', SPDT: '1C', DPDT: '2C' }
-+};
-+
-+function pickField(rec, aliases = []) {
-+  if (!rec || typeof rec !== 'object') return null;
-+  for (const key of aliases) {
-+    const raw = rec?.[key];
-+    if (raw == null) continue;
-+    if (Array.isArray(raw)) {
-+      const first = raw.find((v) => v != null && String(v).trim() !== '');
-+      if (first != null) return first;
++function applyTemplateOptions(value, options = []) {
+   if (value == null) return value;
+-  if (!optionStr) return value;
+   let out = String(value);
+-  for (const token of String(optionStr).split(',').map((t) => t.trim()).filter(Boolean)) {
+-    const [key, rawVal] = token.split('=').map((t) => t.trim());
+-    if (!key) continue;
+-    if (key === 'pad') {
+-      const width = Number(rawVal);
++  for (const rawToken of options) {
++    const token = String(rawToken || '').trim();
++    if (!token) continue;
++    const [opRaw, argRaw = ''] = token.split('=').map((t) => t.trim());
++    const op = opRaw.toLowerCase();
++    if (!op) continue;
++    if (op === 'pad') {
++      const width = Number(argRaw);
+       if (Number.isFinite(width) && width > 0) out = out.padStart(width, '0');
 +      continue;
 +    }
-+    if (typeof raw === 'object') {
-+      if ('value' in raw && raw.value != null && String(raw.value).trim() !== '') {
-+        return raw.value;
++    if (op === 'upcase' || op === 'upper' || op === 'uppercase') {
++      out = out.toUpperCase();
++      continue;
++    }
++    if (op === 'downcase' || op === 'lower' || op === 'lowercase') {
++      out = out.toLowerCase();
++      continue;
++    }
++    if (op === 'trim') {
++      out = out.trim();
++      continue;
++    }
++    if (op === 'prefix') {
++      out = `${argRaw}${out}`;
++      continue;
++    }
++    if (op === 'suffix') {
++      out = `${out}${argRaw}`;
++      continue;
++    }
++    if (op === 'replace' && argRaw) {
++      const [search, replacement = ''] = argRaw.split(':');
++      if (search != null) {
++        const matcher = new RegExp(escapeRegExp(search), 'g');
++        out = out.replace(matcher, replacement);
 +      }
 +      continue;
-+    }
-+    const trimmed = String(raw).trim();
-+    if (trimmed !== '') return raw;
+     }
+   }
+   return out;
+ }
+ 
+-function renderPnTemplate(template, record = {}) {
+-  if (!template) return null;
++function looksLikeTemplate(value) {
++  return typeof value === 'string' && value.includes('{') && value.includes('}');
++}
++
++function resolveTemplateValue(record, field) {
++  const rawKey = String(field || '').trim();
++  if (!rawKey) return null;
++  const norm = normKey(rawKey);
++  const candidates = [];
++  const push = (key) => {
++    if (!key) return;
++    if (!candidates.includes(key)) candidates.push(key);
++  };
++  push(rawKey);
++  if (norm && norm !== rawKey) push(norm);
++  if (norm) {
++    push(`${norm}_code`);
++    push(`${norm}_text`);
++    push(`${norm}_value`);
++    push(`${norm}_raw`);
 +  }
++  if (rawKey && rawKey !== norm) {
++    push(`${rawKey}_code`);
++    push(`${rawKey}_text`);
++    push(`${rawKey}_value`);
++    push(`${rawKey}_raw`);
++  }
++
++  const extract = (value) => {
++    if (value == null) return null;
++    if (Array.isArray(value)) {
++      const first = value.find((v) => v != null && String(v).trim() !== '');
++      return first != null ? first : null;
++    }
++    if (typeof value === 'object') {
++      if ('value' in value && value.value != null && String(value.value).trim() !== '') {
++        return value.value;
++      }
++      if ('text' in value && value.text != null && String(value.text).trim() !== '') {
++        return value.text;
++      }
++      return null;
++    }
++    const str = String(value).trim();
++    if (str === '') return null;
++    return value;
++  };
++
++  for (const key of candidates) {
++    if (!key) continue;
++    const resolved = extract(record[key]);
++    if (resolved != null) return resolved;
++  }
++
++  if (norm) {
++    const normalizedOrder = [norm, `${norm}_code`, `${norm}_text`, `${norm}_value`, `${norm}_raw`];
++    for (const target of normalizedOrder) {
++      for (const [key, value] of Object.entries(record || {})) {
++        if (normKey(key) !== target) continue;
++        const resolved = extract(value);
++        if (resolved != null) return resolved;
++      }
++    }
++  }
++
 +  return null;
 +}
 +
-+function applyOps(val, ops) {
-+  let current = Array.isArray(val) ? val[0] : val;
-+  let s = current == null ? '' : String(current);
-+  for (const rawOp of ops) {
-+    if (!rawOp) continue;
-+    const opToken = rawOp.includes('=') ? rawOp.replace('=', ':') : rawOp;
-+    const op = opToken.trim();
-+    const lower = op.toLowerCase();
-+    if (lower === 'first') {
-+      s = s.split(',')[0].trim();
-+      continue;
-+    }
-+    if (lower === 'upper') {
-+      s = s.toUpperCase();
-+      continue;
-+    }
-+    if (lower === 'alnum') {
-+      s = s.replace(/[^0-9A-Z]/gi, '');
-+      continue;
-+    }
-+    if (lower === 'digits') {
-+      const digits = s.match(/\d+/g) || [''];
-+      s = digits.join('');
-+      continue;
-+    }
-+    if (lower === 'num') {
-+      const match = s.match(/-?\d+(?:\.\d+)?/);
-+      s = match ? match[0] : '';
-+      continue;
-+    }
-+    if (lower.startsWith('pad:')) {
-+      const [, widthRaw] = op.split(':');
-+      const width = Number(widthRaw) || 2;
-+      s = s.padStart(width, '0');
-+      continue;
-+    }
-+    if (lower.startsWith('slice:')) {
-+      const parts = op.split(':');
-+      const start = Number(parts[1]) || 0;
-+      const end = parts.length > 2 && parts[2] !== '' ? Number(parts[2]) : undefined;
-+      s = s.slice(start, Number.isNaN(end) ? undefined : end);
-+      continue;
-+    }
-+    if (lower.startsWith('map:')) {
-+      const mapPairs = op.slice(4).split(',');
-+      const mapping = Object.create(null);
-+      for (const pair of mapPairs) {
-+        const [from, to] = pair.split('>');
-+        if (!from || to == null) continue;
-+        mapping[String(from).trim().toUpperCase()] = String(to).trim();
-+      }
-+      const key = String(s).trim().toUpperCase();
-+      s = mapping[key] ?? s;
-+      continue;
-+    }
-+  }
-+  return s;
-+}
-+
-+function resolveToken(base, rec, ctxText = '') {
-+  const aliases = KEY_ALIASES[base] || [base];
-+  let value = pickField(rec, aliases);
-+
-+  if (base === 'form') {
-+    if (!value) {
-+      value = pickField(rec, ['contact_arrangement', 'configuration']);
-+    }
-+
-+    if (value) {
-+      const match = String(value).match(/(\d)\s*form\s*([ABC])/i);
-+      if (match) {
-+        value = `${match[1]}${match[2].toUpperCase()}`;
-+      }
-+    }
-+
-+    if (!value && ctxText) {
-+      const match = ctxText.match(/(\d)\s*form\s*([ABC])/i);
-+      if (match) {
-+        value = `${match[1]}${match[2].toUpperCase()}`;
-+      } else {
-+        const poleMatch = ctxText.match(/\b(SPST|SPDT|DPDT)\b/i);
-+        if (poleMatch) value = poleMatch[1].toUpperCase();
-+      }
-+    }
-+  }
-+
-+  if (!value && base === 'case' && ctxText) {
-+    const match = ctxText.match(/\b(SOT-?23|TO-220|DFN\d+x\d+)\b/i);
-+    if (match) value = match[1];
-+  }
-+
-+  if (value) {
-+    const enumMap = ENUM_MAP[base];
-+    if (enumMap) {
-+      const normalized = String(value).trim().toUpperCase();
-+      value = enumMap[normalized] ?? enumMap[normalized.replace(/\s+/g, '')] ?? value;
-+    }
-+  }
-+
-+  return value ?? '';
-+}
-+
-+function renderTemplate(tpl, rec, ctxText = '') {
-+  if (!tpl) return '';
-+  const input = String(tpl);
-+  const rendered = input.replace(/\{([^}]+)\}/g, (_, body) => {
-+    const parts = body.split('|').map((part) => part.trim()).filter(Boolean);
++function renderTemplateWithPattern(template, record, pattern) {
+   let used = false;
+-  const rendered = String(template).replace(/\{\{\s*([^}|]+?)(?:\|([^}]+))?\s*\}\}/g, (_, key, options) => {
+-    const field = String(key || '').trim();
+-    if (!field) return '';
+-    const value = record[field];
++  const rendered = String(template).replace(pattern, (_, body) => {
++    const parts = String(body || '')
++      .split('|')
++      .map((part) => part.trim())
++      .filter(Boolean);
 +    if (!parts.length) return '';
-+    const base = (parts.shift() || '').toLowerCase();
-+    const raw = resolveToken(base, rec, ctxText);
-+    return applyOps(raw, parts);
-+  });
-+  return rendered.replace(/\s+/g, '').trim();
++    const base = parts.shift();
++    const value = resolveTemplateValue(record, base);
+     if (value == null || value === '') return '';
+     used = true;
+-    const applied = applyPnTemplateOptions(String(value), options);
++    const applied = applyTemplateOptions(String(value), parts);
+     return applied == null ? '' : String(applied);
+   });
+-  const cleaned = rendered.replace(/\s+/g, '');
+-  if (!used || !cleaned.trim()) return null;
+-  return cleaned.trim();
++  return { rendered, used };
 +}
 +
- function renderFromTemplate(rec, pnTemplate, variantKeys = []) {
-   if (!pnTemplate) return null;
-+  const ctxText = rec?._doc_text || rec?.doc_text || '';
-+  const advanced = renderTemplate(pnTemplate, rec, ctxText);
-+  if (advanced != null && advanced !== '') return advanced;
++function renderAnyTemplate(template, record = {}, { collapseWhitespace = true } = {}) {
++  if (!template) return null;
++  const context = record && typeof record === 'object' ? record : {};
++  let working = String(template);
++  let used = false;
 +
-   let out = pnTemplate;
-   const dict = new Map(Object.entries(rec || {}));
-   for (const k of variantKeys) if (!dict.has(k)) dict.set(k, rec?.[k]);
-   dict.set('series', rec?.series ?? rec?.series_code ?? '');
-   dict.set('series_code', rec?.series_code ?? rec?.series ?? '');
-   out = out.replace(/\{([a-z0-9_]+)\}/ig, (_, k) => String(dict.get(k) ?? ''));
-   out = out.replace(/\s+/g,'').trim();
-   return out || null;
++  const double = renderTemplateWithPattern(working, context, /\{\{\s*([^{}]+?)\s*\}\}/g);
++  working = double.rendered;
++  if (double.used) used = true;
++
++  const single = renderTemplateWithPattern(working, context, /\{\s*([^{}]+?)\s*\}/g);
++  working = single.rendered;
++  if (single.used) used = true;
++
++  if (!used) return null;
++  let cleaned = collapseWhitespace ? working.replace(/\s+/g, '') : working;
++  cleaned = cleaned.trim();
++  return cleaned || null;
++}
++
++function renderPnTemplate(template, record = {}) {
++  return renderAnyTemplate(template, record);
  }
  
- function recoverCode(rec, { pnTemplate, variantKeys }) {
-   let c = rec.code || rec.pn || null;
-   if (isValidCode(c)) return c;
- 
-   const fromTpl = renderFromTemplate(rec, pnTemplate, variantKeys);
-   if (isValidCode(fromTpl)) return fromTpl;
- 
-   const parts = [];
-   if (rec.series_code || rec.series) parts.push(rec.series_code || rec.series);
-   for (const k of (Array.isArray(variantKeys) ? variantKeys : [])) {
-     if (rec[k] != null) parts.push(String(rec[k]));
+ function buildPnIfMissing(record = {}, pnTemplate) {
+   const existing = String(record.pn || '').trim();
+   if (existing) return;
+   const fromTemplate = renderPnTemplate(pnTemplate, record);
+   if (fromTemplate) {
+     record.pn = fromTemplate;
+     if (!record.code) record.code = fromTemplate;
+     return;
    }
-   const guess = parts.join('');
-   if (isValidCode(guess)) return guess;
+   const code = String(record.code || '').trim();
+   if (code) record.pn = code;
+ }
  
+ function hasCoreSpecValue(value) {
+   if (value == null) return false;
+   if (Array.isArray(value)) return value.some((v) => hasCoreSpecValue(v));
+   if (typeof value === 'boolean') return true;
+   if (typeof value === 'number') return Number.isFinite(value);
+   const str = String(value).trim();
+   return Boolean(str);
+ }
+ 
+ function hasCoreSpec(row, keys = [], candidateKeys = []) {
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 2a5ecd91ebf1d55c763baa133193e9c6e92935b6..b67f31870b72a03c19ba5a110bb13b4813aa525f 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -489,131 +617,157 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+ 
+   for (const row of rows) {
+     for (const key of Object.keys(row || {})) {
+       const normalized = normKey(key);
+       if (physicalCols.has(normalized)) allKeys.add(normalized);
+     }
+   }
+ 
+   if (!allKeys.size) {
+     result.skipped.push({ reason: 'schema_not_ready' });
+     return result;
+   }
+ 
+   const colList = Array.from(allKeys).sort();
+   candidateSpecKeys = colList.filter((key) => !META_KEYS.has(key) && key !== 'raw_json');
+   const placeholders = colList.map((_, i) => `$${i + 1}`).join(',');
+ 
+   const updateCols = colList.filter((col) => !CONFLICT_KEYS.includes(col));
+   const updateSql = updateCols.length
+     ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ')
+     : null;
+ 
+   const sql = [
+     `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
+     `VALUES (${placeholders})`,
+-    'ON CONFLICT (brand_norm, code_norm)',
++    'ON CONFLICT (brand_norm, pn)',
+     updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
+     'RETURNING pn',
+   ].join('\n');
+ 
+   const client = await pool.connect();
+   const warnings = new Set();
+   const seenNatural = new Set();
+ 
+   try {
+     for (const row of rows) {
+       result.processed += 1;
+       const rec = {};
+       for (const [key, value] of Object.entries(row || {})) {
+         rec[normKey(key)] = value;
+       }
+ 
+       if ((!rec.brand || String(rec.brand).trim() === '') && options?.brand) {
+         rec.brand = options.brand;
+       }
+ 
+       const docTextLower = String(rec._doc_text || '').toLowerCase();
+       const brandCandidates = [options?.brand, rec.brand, rec.brand_norm];
+       let brandKey = null;
+       for (const candidate of brandCandidates) {
+         if (!candidate) continue;
+         const trimmed = String(candidate).trim();
+         if (!trimmed) continue;
+         brandKey = await normalizeBrand(trimmed, docTextLower);
+         if (brandKey) break;
+       }
+       if (brandKey) {
+         if (!rec.brand || !String(rec.brand).trim()) {
+           rec.brand = options?.brand || brandKey;
+         }
+         rec.brand_norm = brandKey;
+       } else if (physicalCols.has('brand_norm')) {
+         rec.brand_norm = null;
+       }
+       if (physicalCols.has('last_error')) rec.last_error = null;
+ 
++      const templateContext = { ...rec };
++      const pnWasTemplate = looksLikeTemplate(templateContext.pn);
++      const codeWasTemplate = looksLikeTemplate(templateContext.code);
++
++      if (pnWasTemplate) {
++        const renderedPn = renderAnyTemplate(templateContext.pn, templateContext);
++        rec.pn = renderedPn ?? null;
++      }
++
++      if (codeWasTemplate) {
++        const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
++        const renderedCode = renderAnyTemplate(templateContext.code, contextForCode);
++        rec.code = renderedCode ?? null;
++      }
++
++      if (!rec.pn && rec.code) {
++        rec.pn = rec.code;
++      }
++
+       buildPnIfMissing(rec, pnTemplate);
+ 
++      const pnMissing = !rec.pn || String(rec.pn).trim() === '';
++      if (pnMissing && (pnWasTemplate || codeWasTemplate)) {
++        if (physicalCols.has('last_error')) rec.last_error = 'template_render_failed';
++        result.skipped.push({ reason: 'invalid_code', detail: 'template_render_failed' });
++        continue;
++      }
++
+       const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });
+       if (!guard.ok) {
+         const skip = { reason: guard.reason, detail: guard.detail || null };
+         if (rec.last_error) skip.last_error = rec.last_error;
+         result.skipped.push(skip);
+         continue;
+       }
+ 
+       const pnValue = String(rec.pn || rec.code || '').trim();
+       if (!pnValue || !isValidPnValue(pnValue) || FORBIDDEN_RE.test(pnValue)) {
+         const skippedCode = pnValue || String(rec.code || rec.pn || '').trim() || '(no-code)';
+         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
+         result.skipped.push({ reason: 'invalid_code', code: skippedCode, last_error: 'invalid_code' });
+         continue;
+       }
+ 
+       rec.pn = pnValue;
+       if (rec.code == null || String(rec.code).trim() === '') {
+         rec.code = pnValue;
+       }
+ 
+       const pnNorm = normKey(pnValue);
+       if (!pnNorm) {
+         if (physicalCols.has('last_error')) rec.last_error = 'missing_pn';
+         result.skipped.push({ reason: 'missing_pn', last_error: 'missing_pn' });
+         continue;
+       }
+       if (physicalCols.has('pn_norm')) rec.pn_norm = pnNorm;
+ 
+       const codeNorm = normKey(rec.code);
+       if (!codeNorm) {
+         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
+         result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });
+         continue;
+       }
+       rec.code_norm = codeNorm;
+ 
+-      const naturalKey = `${rec.brand_norm ?? ''}::${codeNorm}`;
++      const naturalKey = `${rec.brand_norm ?? ''}::${pnNorm}`;
+       if (seenNatural.has(naturalKey)) {
+         result.skipped.push({ reason: 'duplicate_code' });
+         continue;
+       }
+       seenNatural.add(naturalKey);
+ 
+       rec.family_slug = familySlug;
+ 
+       const display = rec.display_name || `${rec.brand} ${rec.pn}`;
+       rec.display_name = display;
+       if (rec.displayname == null) rec.displayname = display;
+ 
+       let rawJson = {};
+       if (rec.raw_json && typeof rec.raw_json === 'object' && !Array.isArray(rec.raw_json)) {
+         rawJson = { ...rec.raw_json };
+       } else if (typeof rec.raw_json === 'string') {
+         try {
+           const parsed = JSON.parse(rec.raw_json);
+           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) rawJson = parsed;
+         } catch (_) {}
+       }
+ 
+       const sanitized = {};
+       for (const col of colList) {
+         if (col === 'raw_json') continue;
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 2a5ecd91ebf1d55c763baa133193e9c6e92935b6..b67f31870b72a03c19ba5a110bb13b4813aa525f 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -635,26 +789,26 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+         if (appNameSuffix) {
+           await client.query(
+             `SET LOCAL application_name = current_setting('application_name', true) || $1`,
+             [appNameSuffix],
+           );
+         }
+         const res = await client.query(sql, vals);
+         await client.query('COMMIT');
+         const delta = res.rowCount || 0;
+         result.upserts += delta;
+         result.affected += delta;
+         if (res.rows?.[0]?.pn) result.written.push(res.rows[0].pn);
+       } catch (err) {
+         await client.query('ROLLBACK').catch(() => {});
+         result.skipped.push({ reason: 'db_error', detail: err?.message || String(err) });
+       }
+     }
+   } finally {
+     client.release();
+   }
+ 
+   result.warnings = Array.from(warnings);
+   return result;
+ }
+ 
+-module.exports = { saveExtractedSpecs };
++module.exports = { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate };

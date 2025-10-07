@@ -27,6 +27,7 @@ const META_KEYS = new Set([
 ]);
 
 const CONFLICT_KEYS = ['brand_norm', 'pn'];
+const NEVER_INSERT = new Set(['id', 'brand_norm', 'code_norm', 'pn_norm', 'created_at', 'updated_at']);
 
 const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
 const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
@@ -629,15 +630,17 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
 
   const colList = Array.from(allKeys).sort();
   candidateSpecKeys = colList.filter((key) => !META_KEYS.has(key) && key !== 'raw_json');
-  const placeholders = colList.map((_, i) => `$${i + 1}`).join(',');
 
-  const updateCols = colList.filter((col) => !CONFLICT_KEYS.includes(col));
+  const insertCols = colList.filter((col) => !NEVER_INSERT.has(col));
+  const placeholders = insertCols.map((_, i) => `$${i + 1}`).join(',');
+
+  const updateCols = insertCols.filter((col) => !CONFLICT_KEYS.includes(col));
   const updateSql = updateCols.length
     ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ')
     : null;
 
   const sql = [
-    `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
+    `INSERT INTO ${targetTable} (${insertCols.map((c) => `"${c}"`).join(',')})`,
     `VALUES (${placeholders})`,
     'ON CONFLICT (brand_norm, pn)',
     updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
@@ -779,7 +782,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         sanitized.raw_json = Object.keys(rawJson).length ? JSON.stringify(rawJson) : null;
       }
 
-      const vals = colList.map((col) => {
+      const vals = insertCols.map((col) => {
         if (col === 'raw_json') return sanitized.raw_json ?? null;
         return sanitized[col] ?? null;
       });

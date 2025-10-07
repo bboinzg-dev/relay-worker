@@ -1,92 +1,182 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 5302d7cc564cab15557e8996a4f5a56a214b0a05..fb131a053873658d6ce84bd1f835be57bbed76c1 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -1817,60 +1817,81 @@ async function runAutoIngest(payload = {}) {
-       VALUES ($1, $2, 'RUNNING', now(), now())
-       ON CONFLICT (id) DO NOTHING
-     `,
-     [runId, normalizedPayload.gcsUri || normalizedPayload.gsUri || null],
-   );
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 3ac687395fe852110a3dfa738edd5e5fc69bb5fd..361e0a4f5647a2e15ee91646d6869f07319b675d 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -5,50 +5,51 @@ const { getColumnsOf } = require('./ensure-spec-columns');
  
-   const watchdogMs = Number(process.env.INGEST_WATCHDOG_MS || 870000);
-   const watchdog = setTimeout(async () => {
-     try {
-       await db.query(
-         `
-           UPDATE public.ingest_run_logs
-              SET status='FAILED', event='WATCHDOG_TIMEOUT', error_message='watchdog timeout', finished_at=now(), ts=now()
-            WHERE id = $1 AND status='RUNNING'
-         `,
-         [runId],
-       );
-     } catch (err) {
-       console.warn('[ingest] watchdog update failed:', err?.message || err);
+ const META_KEYS = new Set([
+   'family_slug',
+   'brand',
+   'brand_norm',
+   'pn',
+   'pn_norm',
+   'code',
+   'code_norm',
+   'mfr_full',
+   'datasheet_uri',
+   'verified_in_doc',
+   'display_name',
+   'displayname',
+   'image_uri',
+   'cover',
+   'series',
+   'series_code',
+   'raw_json',
+   'last_error',
+   'created_at',
+   'updated_at',
+ ]);
+ 
+ const CONFLICT_KEYS = ['brand_norm', 'pn'];
++const NEVER_INSERT = new Set(['id', 'brand_norm', 'code_norm', 'pn_norm', 'created_at', 'updated_at']);
+ 
+ const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
+ const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
+ const BANNED_PREFIX = /^(pdf|page|figure|table|sheet|rev|ver|draft)\b/i;
+ const BANNED_EXACT = /^pdf-?1(\.\d+)?$/i;
+ 
+ const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const SCALE_MAP = {
+   k: 1e3,
+   m: 1e-3,
+   g: 1e9,
+   'µ': 1e-6,
+   u: 1e-6,
+   n: 1e-9,
+   p: 1e-12,
+ };
+ 
+ function normKey(key) {
+   return String(key || '')
+     .trim()
+     .toLowerCase();
+ }
+ 
+ function isValidPnValue(value) {
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 3ac687395fe852110a3dfa738edd5e5fc69bb5fd..361e0a4f5647a2e15ee91646d6869f07319b675d 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -607,59 +608,61 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+ 
+   const allKeys = new Set();
+   for (const meta of META_KEYS) {
+     if (physicalCols.has(meta)) allKeys.add(meta);
+   }
+   for (const col of columnTypes.keys()) {
+     if (/_min(?:_[a-z0-9]+)?$/.test(col) || /_max(?:_[a-z0-9]+)?$/.test(col)) {
+       allKeys.add(col);
      }
-   }, watchdogMs);
-   if (typeof watchdog?.unref === 'function') watchdog.unref();
+   }
+ 
+   for (const row of rows) {
+     for (const key of Object.keys(row || {})) {
+       const normalized = normKey(key);
+       if (physicalCols.has(normalized)) allKeys.add(normalized);
+     }
+   }
+ 
+   if (!allKeys.size) {
+     result.skipped.push({ reason: 'schema_not_ready' });
+     return result;
+   }
+ 
+   const colList = Array.from(allKeys).sort();
+   candidateSpecKeys = colList.filter((key) => !META_KEYS.has(key) && key !== 'raw_json');
+-  const placeholders = colList.map((_, i) => `$${i + 1}`).join(',');
+ 
+-  const updateCols = colList.filter((col) => !CONFLICT_KEYS.includes(col));
++  const insertCols = colList.filter((col) => !NEVER_INSERT.has(col));
++  const placeholders = insertCols.map((_, i) => `$${i + 1}`).join(',');
++
++  const updateCols = insertCols.filter((col) => !CONFLICT_KEYS.includes(col));
+   const updateSql = updateCols.length
+     ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ')
+     : null;
+ 
+   const sql = [
+-    `INSERT INTO ${targetTable} (${colList.map((c) => `"${c}"`).join(',')})`,
++    `INSERT INTO ${targetTable} (${insertCols.map((c) => `"${c}"`).join(',')})`,
+     `VALUES (${placeholders})`,
+     'ON CONFLICT (brand_norm, pn)',
+     updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
+     'RETURNING pn',
+   ].join('\n');
+ 
+   const client = await pool.connect();
+   const warnings = new Set();
+   const seenNatural = new Set();
  
    try {
-     const result = await doIngestPipeline(normalizedPayload, runId);
-+    const affected = Number(result?.affected ?? result?.rows ?? 0);
-+    const ok = Boolean(result?.ok) && affected > 0;
-     await db.query(
-       `
-         UPDATE public.ingest_run_logs
--           SET status='SUCCEEDED',
--               event='PERSIST_DONE',
--               error_message=NULL,
--               finished_at=now(), ts=now()
--         WHERE id=$1
-+           SET status       = $2,
-+               event        = $3,
-+               final_table  = $4,
-+               final_family = $5,
-+               final_brand  = $6,
-+               final_code   = $7,
-+               final_datasheet = $8,
-+               error_message   = $9,
-+               finished_at  = now(), ts = now()
-+         WHERE id = $1
-       `,
--      [runId],
-+      [
-+        runId,
-+        ok ? 'SUCCEEDED' : 'FAILED',
-+        ok ? 'PERSIST_DONE' : 'PERSIST_ZERO',
-+        result?.specs_table || result?.final_table || null,
-+        result?.family || null,
-+        result?.brand || null,
-+        Array.isArray(result?.codes) ? result.codes[0] : (result?.code || null),
-+        result?.datasheet_uri || null,
-+        ok
-+          ? null
-+          : Array.isArray(result?.reject_reasons)
-+              ? result.reject_reasons.join(',')
-+              : null,
-+      ],
-     );
-     return result;
-   } catch (e) {
-     const msg = (e && e.message ? String(e.message) : 'error').slice(0, 500);
-     try {
-       await db.query(
-         `
-           UPDATE public.ingest_run_logs
-              SET status='FAILED',
-                  event='EXCEPTION',
-                  error_message=$2,
-                  finished_at=now(), ts=now()
-            WHERE id=$1
-         `,
-         [runId, msg],
-       );
-     } catch (err) {
-       console.warn('[ingest] failure update failed:', err?.message || err);
+     for (const row of rows) {
+       result.processed += 1;
+       const rec = {};
+       for (const [key, value] of Object.entries(row || {})) {
+         rec[normKey(key)] = value;
+       }
+ 
+       if ((!rec.brand || String(rec.brand).trim() === '') && options?.brand) {
+         rec.brand = options.brand;
+       }
+ 
+       const docTextLower = String(rec._doc_text || '').toLowerCase();
+       const brandCandidates = [options?.brand, rec.brand, rec.brand_norm];
+       let brandKey = null;
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 3ac687395fe852110a3dfa738edd5e5fc69bb5fd..361e0a4f5647a2e15ee91646d6869f07319b675d 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -757,51 +760,51 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+       const display = rec.display_name || `${rec.brand} ${rec.pn}`;
+       rec.display_name = display;
+       if (rec.displayname == null) rec.displayname = display;
+ 
+       let rawJson = {};
+       if (rec.raw_json && typeof rec.raw_json === 'object' && !Array.isArray(rec.raw_json)) {
+         rawJson = { ...rec.raw_json };
+       } else if (typeof rec.raw_json === 'string') {
+         try {
+           const parsed = JSON.parse(rec.raw_json);
+           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) rawJson = parsed;
+         } catch (_) {}
+       }
+ 
+       const sanitized = {};
+       for (const col of colList) {
+         if (col === 'raw_json') continue;
+         const original = rec[col];
+         sanitized[col] = coerceColumnValue(col, original, columnTypes, rec, rawJson, warnings);
+       }
+ 
+       if (physicalCols.has('raw_json')) {
+         sanitized.raw_json = Object.keys(rawJson).length ? JSON.stringify(rawJson) : null;
+       }
+ 
+-      const vals = colList.map((col) => {
++      const vals = insertCols.map((col) => {
+         if (col === 'raw_json') return sanitized.raw_json ?? null;
+         return sanitized[col] ?? null;
+       });
+ 
+       try {
+         await client.query('BEGIN');
+         if (appNameSuffix) {
+           await client.query(
+             `SET LOCAL application_name = current_setting('application_name', true) || $1`,
+             [appNameSuffix],
+           );
+         }
+         const res = await client.query(sql, vals);
+         await client.query('COMMIT');
+         const delta = res.rowCount || 0;
+         result.upserts += delta;
+         result.affected += delta;
+         if (res.rows?.[0]?.pn) result.written.push(res.rows[0].pn);
+       } catch (err) {
+         await client.query('ROLLBACK').catch(() => {});
+         result.skipped.push({ reason: 'db_error', detail: err?.message || String(err) });
+       }
      }
-     throw e;
    } finally {
-     clearTimeout(watchdog);
-     try { await db.query('SELECT pg_advisory_unlock(hashtextextended($1))', [runId]); } catch {}
-     try { await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]); } catch {}
-   }
+     client.release();

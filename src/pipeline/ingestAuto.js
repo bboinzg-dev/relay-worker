@@ -1713,71 +1713,109 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     meta: processedMeta = null,
   } = processed || {};
 
+  // persist: Cloud Tasks가 별도 요청으로 호출 → 매번 family/table/colTypes 재확정 필수
   const normalizeFamily = (value) => {
     if (!value) return null;
     const trimmed = String(value).trim();
     return trimmed || null;
   };
 
-  const metaFamily =
-    normalizeFamily(processedMeta?.family) ||
-    normalizeFamily(processedMeta?.family_slug);
-  const overridesFamily =
-    normalizeFamily(overrides?.family) ||
-    normalizeFamily(overrides?.family_slug);
-  const family =
-    normalizeFamily(processedFamily) ||
-    normalizeFamily(processedFamilySlug) ||
-    metaFamily ||
-    overridesFamily ||
-    null;
+  const pickFamily = (...values) => {
+    for (const value of values) {
+      const normalized = normalizeFamily(value);
+      if (normalized) return normalized;
+    }
+    return null;
+  };
 
+  const family = pickFamily(
+    processedFamily,
+    processedFamilySlug,
+    processedMeta?.family,
+    processedMeta?.family_slug,
+    overrides?.family,
+    overrides?.family_slug,
+  );
+
+  const sanitizePart = (value) => String(value || '').replace(/[^a-zA-Z0-9_]/g, '');
   const sanitizeIdentifier = (value) => {
     const trimmed = String(value || '').trim();
     if (!trimmed) return '';
     if (trimmed.includes('.')) {
       const [schemaRaw, tableRaw] = trimmed.split('.', 2);
-      const schemaSafe = String(schemaRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
-      const tableSafe = String(tableRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
+      const schemaSafe = sanitizePart(schemaRaw);
+      const tableSafe = sanitizePart(tableRaw);
       if (!schemaSafe || !tableSafe) return '';
       return `${schemaSafe}.${tableSafe}`;
     }
-    return trimmed.replace(/[^a-zA-Z0-9_]/g, '');
+    return sanitizePart(trimmed);
   };
 
-  const pickTableCandidate = (...values) => {
-    for (const value of values) {
-      const normalized = sanitizeIdentifier(value);
-      if (normalized) return normalized;
+  const extractQualified = (value) => {
+    const normalized = sanitizeIdentifier(value);
+    if (!normalized) return { table: '', qualified: '' };
+    if (normalized.includes('.')) {
+      const [schema, tbl] = normalized.split('.', 2);
+      return { table: tbl, qualified: `${schema}.${tbl}` };
     }
-    return '';
+    return { table: normalized, qualified: '' };
   };
 
-  let table = pickTableCandidate(processedSpecsTable, processedTable, qualifiedInput);
+  const tableCandidates = [
+    processedSpecsTable,
+    processedTable,
+    qualifiedInput,
+    overrides?.specs_table,
+    overrides?.table,
+    overrides?.qualified,
+  ];
+
+  let table = '';
+  let qualified = '';
+  for (const candidate of tableCandidates) {
+    const { table: tbl, qualified: qual } = extractQualified(candidate);
+    if (tbl) {
+      table = tbl;
+      if (qual) qualified = qual;
+      break;
+    }
+  }
+
   if (!table && family) {
     try {
       const r = await db.query(
         `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
         [family],
       );
-      table = pickTableCandidate(r.rows?.[0]?.specs_table);
+      const { table: tbl, qualified: qual } = extractQualified(r.rows?.[0]?.specs_table);
+      if (tbl) {
+        table = tbl;
+        if (qual) qualified = qual;
+      }
     } catch (err) {
       console.warn('[persist] specs_table lookup failed:', err?.message || err);
     }
   }
+
   if (!table && family) {
-    table = sanitizeIdentifier(`${family}_specs`);
+    const fallback = sanitizePart(`${family}_specs`);
+    if (fallback) table = fallback;
   }
-  const qualified = qualifiedInput || (table ? (table.includes('.') ? table : `public.${table}`) : null);
+
+  if (!table) {
+    throw new Error('persist_no_table');
+  }
+
+  if (!qualified) {
+    qualified = table.includes('.') ? table : `public.${table}`;
+  }
 
   let colTypes = new Map();
-  if (qualified) {
-    try {
-      colTypes = await getColumnTypes(qualified);
-    } catch (err) {
-      console.warn('[persist] column type fetch failed:', err?.message || err);
-      colTypes = new Map();
-    }
+  try {
+    colTypes = await getColumnTypes(qualified);
+  } catch (err) {
+    console.warn('[persist] column type fetch failed:', err?.message || err);
+    colTypes = new Map();
   }
 
   const recordsSource = Array.isArray(initialRecords) && initialRecords.length

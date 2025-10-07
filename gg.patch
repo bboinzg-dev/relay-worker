@@ -1,39 +1,14 @@
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 8b954f856bb798b672724608e86e320dde77e849..c49e32fc83fcc3d82170577b83aa1f4701226225 100644
+index c49e32fc83fcc3d82170577b83aa1f4701226225..8eec92ff25ba3caf7bb8e6d5ec7a86709647bd74 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -1668,70 +1668,140 @@ async function runAutoIngest(payload = {}) {
-         `
-           UPDATE public.ingest_run_logs
-              SET status='FAILED',
-                  event='EXCEPTION',
-                  error_message=$2,
-                  finished_at=now(), ts=now()
-            WHERE id=$1
-         `,
-         [runId, msg],
-       );
-     } catch (err) {
-       console.warn('[ingest] failure update failed:', err?.message || err);
-     }
-     throw e;
-   } finally {
-     clearTimeout(watchdog);
-     try { await db.query('SELECT pg_advisory_unlock(hashtextextended($1))', [runId]); } catch {}
-     try { await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]); } catch {}
-   }
- }
- 
- async function persistProcessedData(processed = {}, overrides = {}) {
-   const {
+@@ -1691,115 +1691,153 @@ async function persistProcessedData(processed = {}, overrides = {}) {
      started = Date.now(),
      gcsUri = null,
--    family = null,
--    table = null,
-+    family: processedFamily = null,
-+    family_slug: processedFamilySlug = null,
-+    table: processedTable = null,
-+    specs_table: processedSpecsTable = null,
+     family: processedFamily = null,
+     family_slug: processedFamilySlug = null,
+     table: processedTable = null,
+     specs_table: processedSpecsTable = null,
      qualified: qualifiedInput = null,
      pnTemplate = null,
      requiredFields = [],
@@ -50,76 +25,145 @@ index 8b954f856bb798b672724608e86e320dde77e849..c49e32fc83fcc3d82170577b83aa1f47
      brand_effective: processedEffective = null,
      brand_source: processedBrandSource = null,
      variant_keys_runtime: processedVariantKeys = [],
-+    meta: processedMeta = null,
+     meta: processedMeta = null,
    } = processed || {};
  
-+  const normalizeFamily = (value) => {
-+    if (!value) return null;
-+    const trimmed = String(value).trim();
-+    return trimmed || null;
-+  };
-+
-+  const metaFamily =
-+    normalizeFamily(processedMeta?.family) ||
-+    normalizeFamily(processedMeta?.family_slug);
-+  const overridesFamily =
-+    normalizeFamily(overrides?.family) ||
-+    normalizeFamily(overrides?.family_slug);
-+  const family =
-+    normalizeFamily(processedFamily) ||
-+    normalizeFamily(processedFamilySlug) ||
-+    metaFamily ||
-+    overridesFamily ||
-+    null;
-+
-+  const sanitizeIdentifier = (value) => {
-+    const trimmed = String(value || '').trim();
-+    if (!trimmed) return '';
-+    if (trimmed.includes('.')) {
-+      const [schemaRaw, tableRaw] = trimmed.split('.', 2);
-+      const schemaSafe = String(schemaRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
-+      const tableSafe = String(tableRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
-+      if (!schemaSafe || !tableSafe) return '';
-+      return `${schemaSafe}.${tableSafe}`;
-+    }
-+    return trimmed.replace(/[^a-zA-Z0-9_]/g, '');
-+  };
-+
-+  const pickTableCandidate = (...values) => {
++  // persist: Cloud Tasks가 별도 요청으로 호출 → 매번 family/table/colTypes 재확정 필수
+   const normalizeFamily = (value) => {
+     if (!value) return null;
+     const trimmed = String(value).trim();
+     return trimmed || null;
+   };
+ 
+-  const metaFamily =
+-    normalizeFamily(processedMeta?.family) ||
+-    normalizeFamily(processedMeta?.family_slug);
+-  const overridesFamily =
+-    normalizeFamily(overrides?.family) ||
+-    normalizeFamily(overrides?.family_slug);
+-  const family =
+-    normalizeFamily(processedFamily) ||
+-    normalizeFamily(processedFamilySlug) ||
+-    metaFamily ||
+-    overridesFamily ||
+-    null;
++  const pickFamily = (...values) => {
 +    for (const value of values) {
-+      const normalized = sanitizeIdentifier(value);
++      const normalized = normalizeFamily(value);
 +      if (normalized) return normalized;
 +    }
-+    return '';
++    return null;
 +  };
 +
-+  let table = pickTableCandidate(processedSpecsTable, processedTable, qualifiedInput);
-+  if (!table && family) {
-+    try {
-+      const r = await db.query(
-+        `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
-+        [family],
-+      );
-+      table = pickTableCandidate(r.rows?.[0]?.specs_table);
-+    } catch (err) {
-+      console.warn('[persist] specs_table lookup failed:', err?.message || err);
++  const family = pickFamily(
++    processedFamily,
++    processedFamilySlug,
++    processedMeta?.family,
++    processedMeta?.family_slug,
++    overrides?.family,
++    overrides?.family_slug,
++  );
+ 
++  const sanitizePart = (value) => String(value || '').replace(/[^a-zA-Z0-9_]/g, '');
+   const sanitizeIdentifier = (value) => {
+     const trimmed = String(value || '').trim();
+     if (!trimmed) return '';
+     if (trimmed.includes('.')) {
+       const [schemaRaw, tableRaw] = trimmed.split('.', 2);
+-      const schemaSafe = String(schemaRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
+-      const tableSafe = String(tableRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
++      const schemaSafe = sanitizePart(schemaRaw);
++      const tableSafe = sanitizePart(tableRaw);
+       if (!schemaSafe || !tableSafe) return '';
+       return `${schemaSafe}.${tableSafe}`;
+     }
+-    return trimmed.replace(/[^a-zA-Z0-9_]/g, '');
++    return sanitizePart(trimmed);
+   };
+ 
+-  const pickTableCandidate = (...values) => {
+-    for (const value of values) {
+-      const normalized = sanitizeIdentifier(value);
+-      if (normalized) return normalized;
++  const extractQualified = (value) => {
++    const normalized = sanitizeIdentifier(value);
++    if (!normalized) return { table: '', qualified: '' };
++    if (normalized.includes('.')) {
++      const [schema, tbl] = normalized.split('.', 2);
++      return { table: tbl, qualified: `${schema}.${tbl}` };
+     }
+-    return '';
++    return { table: normalized, qualified: '' };
+   };
+ 
+-  let table = pickTableCandidate(processedSpecsTable, processedTable, qualifiedInput);
++  const tableCandidates = [
++    processedSpecsTable,
++    processedTable,
++    qualifiedInput,
++    overrides?.specs_table,
++    overrides?.table,
++    overrides?.qualified,
++  ];
++
++  let table = '';
++  let qualified = '';
++  for (const candidate of tableCandidates) {
++    const { table: tbl, qualified: qual } = extractQualified(candidate);
++    if (tbl) {
++      table = tbl;
++      if (qual) qualified = qual;
++      break;
 +    }
 +  }
-+  if (!table && family) {
-+    table = sanitizeIdentifier(`${family}_specs`);
-+  }
-+  const qualified = qualifiedInput || (table ? (table.includes('.') ? table : `public.${table}`) : null);
 +
-+  let colTypes = new Map();
-+  if (qualified) {
-+    try {
-+      colTypes = await getColumnTypes(qualified);
-+    } catch (err) {
-+      console.warn('[persist] column type fetch failed:', err?.message || err);
-+      colTypes = new Map();
-+    }
+   if (!table && family) {
+     try {
+       const r = await db.query(
+         `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+         [family],
+       );
+-      table = pickTableCandidate(r.rows?.[0]?.specs_table);
++      const { table: tbl, qualified: qual } = extractQualified(r.rows?.[0]?.specs_table);
++      if (tbl) {
++        table = tbl;
++        if (qual) qualified = qual;
++      }
+     } catch (err) {
+       console.warn('[persist] specs_table lookup failed:', err?.message || err);
+     }
+   }
++
+   if (!table && family) {
+-    table = sanitizeIdentifier(`${family}_specs`);
++    const fallback = sanitizePart(`${family}_specs`);
++    if (fallback) table = fallback;
 +  }
 +
++  if (!table) {
++    throw new Error('persist_no_table');
++  }
++
++  if (!qualified) {
++    qualified = table.includes('.') ? table : `public.${table}`;
+   }
+-  const qualified = qualifiedInput || (table ? (table.includes('.') ? table : `public.${table}`) : null);
+ 
+   let colTypes = new Map();
+-  if (qualified) {
+-    try {
+-      colTypes = await getColumnTypes(qualified);
+-    } catch (err) {
+-      console.warn('[persist] column type fetch failed:', err?.message || err);
+-      colTypes = new Map();
+-    }
++  try {
++    colTypes = await getColumnTypes(qualified);
++  } catch (err) {
++    console.warn('[persist] column type fetch failed:', err?.message || err);
++    colTypes = new Map();
+   }
+ 
    const recordsSource = Array.isArray(initialRecords) && initialRecords.length
      ? initialRecords
      : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
@@ -143,61 +187,3 @@ index 8b954f856bb798b672724608e86e320dde77e849..c49e32fc83fcc3d82170577b83aa1f47
    };
    const brandSeed =
      normalizeSeedBrand(processedEffective) ||
-     normalizeSeedBrand(processedBrand) ||
-     normalizeSeedBrand(processedDetected) ||
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 8b954f856bb798b672724608e86e320dde77e849..c49e32fc83fcc3d82170577b83aa1f4701226225 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -1741,51 +1811,50 @@ async function persistProcessedData(processed = {}, overrides = {}) {
-     if (!row || typeof row !== 'object') return;
-     row.raw_json = mergeRuntimeMetadata(row.raw_json, runtimeMeta);
-   };
-   if ((docText && docText.length) || brandSeed) {
-     const applyRowHints = (row) => {
-       if (!row || typeof row !== 'object') return;
-       if (docText && (row._doc_text == null || row._doc_text === '')) {
-         row._doc_text = docText;
-       }
-       if (brandSeed && (!row.brand || !String(row.brand).trim())) {
-         row.brand = brandSeed;
-       }
-       attachRuntimeMeta(row);
-     };
-     for (const row of records) applyRowHints(row);
-     if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
-       for (const row of processedRowsInput) applyRowHints(row);
-     }
-   } else if (hasRuntimeMeta) {
-     for (const row of records) attachRuntimeMeta(row);
-     if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
-       for (const row of processedRowsInput) attachRuntimeMeta(row);
-     }
-   }
- 
--  const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
-   const runId = processed?.runId ?? processed?.run_id ?? overrides?.runId ?? overrides?.run_id ?? null;
-   const jobId = processed?.jobId ?? processed?.job_id ?? overrides?.jobId ?? overrides?.job_id ?? null;
- 
-   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
-   if (qualified && family && records.length) {
-     const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
-     const requiredList = Array.isArray(requiredFields) ? requiredFields : [];
-     const effectiveRequired = allowMinimal ? [] : requiredList;
- 
-     const safeBrand = (value) => {
-       if (value == null) return null;
-       const trimmed = String(value).trim();
-       if (!trimmed) return null;
-       if (trimmed.toLowerCase() === 'unknown') return null;
-       return trimmed;
-     };
- 
-     let brandOverride = safeBrand(overrides?.brand)
-       || safeBrand(processedEffective)
-       || safeBrand(processedBrand)
-       || safeBrand(brandName)
-       || safeBrand(extractedBrand)
-       || safeBrand(processedDetected)
-       || null;
- 

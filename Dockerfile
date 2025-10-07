@@ -9,6 +9,10 @@ RUN apt-get update \
 
 WORKDIR /app
 ENV NODE_ENV=production PORT=8080
+ENV VERTEX_LOCATION=asia-northeast3
+ENV GOOGLE_GENAI_USE_VERTEXAI=true
+ENV GEMINI_MODEL_CLASSIFY=gemini-2.5-flash
+ENV GEMINI_MODEL_EXTRACT=gemini-2.5-flash
 
 COPY package*.json ./
 RUN npm ci --omit=dev

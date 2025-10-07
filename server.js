@@ -1154,19 +1154,20 @@ async function handleWorkerIngest(req, res) {
         display_name: payload?.display_name ?? null,
       });
 
-      const failureReasons = new Set(Array.isArray(out?.reject_reasons) ? out.reject_reasons : []);
-      const warningReasons = new Set(Array.isArray(out?.warnings) ? out.warnings : []);
-
+      const reasons = new Set([...(out?.reject_reasons || []), ...(out?.warnings || [])]);
       if (!out?.ok) {
-        const reasonList = Array.from(new Set([...failureReasons, ...warningReasons]));
-        const message = reasonList.length ? reasonList.join(',') : 'ingest_rejected';
+        const list = [...reasons];
+        const hard = list.some((r) => /missing_|invalid_|no_records|reject/i.test(r));
         await markFailed({
           ...baseContext,
-          error: message,
+          error: list.join(',') || 'ingest_rejected',
           durationMs: out?.ms ?? (Date.now() - startedAt),
         });
         failureMarked = true;
-        return res.status(500).json({ ok: false, error: message, runId, phase });
+        if (hard) {
+          return res.status(200).json({ ok: false, runId, phase, reasons: list });
+        }
+        return res.status(500).json({ ok: false, runId, phase, reasons: list });
       }
 
       await markSucceeded({

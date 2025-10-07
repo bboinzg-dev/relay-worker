@@ -1,105 +1,139 @@
-diff --git a/server.js b/server.js
-index a2cae8edc13afca520c9ec21f59e18ce86251fb7..361363ae6b8c35c88ba7093ecfb0dd024364e122 100644
---- a/server.js
-+++ b/server.js
-@@ -106,74 +106,98 @@ const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_
- const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
- const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
- // step 라우트 폐지 → ingest 하나로 통일
- const WORKER_TASK_URL = process.env.WORKER_TASK_URL || process.env.WORKER_STEP_URL || 'https://<YOUR-RUN-URL>/api/worker/ingest';
- const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
+diff --git a/src/services/vertex.js b/src/services/vertex.js
+index b89a702fb22fdef41d57b95f8d3ed72d63002840..f02ed6a1baf4e62987cf5f4dfc8bf533afbdc0ca 100644
+--- a/src/services/vertex.js
++++ b/src/services/vertex.js
+@@ -1,100 +1,115 @@
+ 'use strict';
  
- // ⚠️ 외부 API(예: Vertex/HTTP) 가능성이 있는 부팅 태스크는 가드 안에서만 실행
- //   → 아래 부팅 IIFE 내부의  if (!EXT_CALLS_OFF)  블록으로 이동
- //try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
+ const { VertexAI } = require('@google-cloud/vertexai');
+ const db = require('../../db');
  
- // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
- let _tasks = null;
- let _queuePath = null;
- function getTasks() {
-   if (!_tasks) {
-     if (!CloudTasksClient) throw new Error('@google-cloud/tasks unavailable');
-     // 지역 엔드포인트 + REST fallback(HTTP/1)
-     _tasks = new CloudTasksClient({
-       fallback: true,
-     });
-     _queuePath = _tasks.queuePath(PROJECT_ID, TASKS_LOCATION, QUEUE_NAME);
-   }
-   return { tasks: _tasks, queuePath: _queuePath };
++const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
++const VERTEX_LOCATION = process.env.VERTEX_LOCATION || 'asia-northeast3';
++
++const MODEL_CLASSIFY = process.env.GEMINI_MODEL_CLASSIFY || 'gemini-2.5-flash';
++const MODEL_EXTRACT = process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash';
++
++function isNotFound(err) {
++  const msg = (err?.message || err?.toString() || '').toLowerCase();
++  return err?.code === 404 || msg.includes('not found');
++}
++
++async function callGemini({ modelName, contents, generationConfig, safetySettings }) {
++  if (!PROJECT_ID) {
++    throw new Error('GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT) is required for VertexAI');
++  }
++  const vertex = new VertexAI({ project: PROJECT_ID, location: VERTEX_LOCATION });
++  let gm = vertex.getGenerativeModel({ model: modelName });
++  console.info('[vertex] model=%s region=%s', modelName, VERTEX_LOCATION);
++  try {
++    return await gm.generateContent({ contents, generationConfig, safetySettings });
++  } catch (e) {
++    if (isNotFound(e) && modelName !== 'gemini-1.5-flash-002') {
++      console.warn('[vertex] 404 on', modelName, '→ fallback gemini-1.5-flash-002');
++      gm = vertex.getGenerativeModel({ model: 'gemini-1.5-flash-002' });
++      return await gm.generateContent({ contents, generationConfig, safetySettings });
++    }
++    throw e;
++  }
++}
++
+ async function getFamilies() {
+   const r = await db.query(
+     `SELECT family_slug FROM public.component_registry ORDER BY family_slug`
+   );
+   return r.rows.map((row) => row.family_slug);
  }
  
-+function resolveWorkerTaskUrl() {
-+  const rawUrl = WORKER_TASK_URL;
-+  if (!rawUrl || /<YOUR-RUN-URL>/i.test(rawUrl)) {
-+    throw new Error('WORKER_TASK_URL not configured');
-+  }
-+  try {
-+    return new URL(rawUrl).toString();
-+  } catch (err) {
-+    const reason = err?.message || err;
-+    throw new Error(`Invalid WORKER_TASK_URL: ${reason}`);
-+  }
-+}
-+
-+function resolveWorkerAudience(workerUrl) {
-+  if (process.env.WORKER_AUDIENCE) return process.env.WORKER_AUDIENCE;
-+  try {
-+    return new URL(workerUrl).origin;
-+  } catch (err) {
-+    const reason = err?.message || err;
-+    throw new Error(`Unable to derive WORKER audience: ${reason}`);
-+  }
-+}
-+
- async function enqueueIngestTask(payload = {}) {
-   const { tasks, queuePath } = getTasks();
-   if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
--  const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
-+  const workerUrl = resolveWorkerTaskUrl();
-+  const audience = resolveWorkerAudience(workerUrl);
+ async function getFields(family) {
+   const r = await db.query(
+     `SELECT fields_json FROM public.component_spec_blueprint WHERE family_slug=$1`,
+     [family],
+   );
+   if (!r.rows[0]) throw new Error(`Blueprint not found: ${family}`);
+   return r.rows[0].fields_json;
+ }
  
-   const bodyPayload = {
-     fromTasks: true,
-     payload,
-   };
-   const body = Buffer.from(JSON.stringify(bodyPayload), 'utf8').toString('base64');
- 
-   const nowSeconds = Math.floor(Date.now() / 1000);
-   const rawDeadline = Number(process.env.TASKS_DEADLINE_SEC || 900);
-   const deadlineSeconds = Math.min(Math.max(Number.isFinite(rawDeadline) ? rawDeadline : 900, 30), 1800);
-   const delaySeconds = Number(process.env.TASKS_DELAY_SEC || 5);
-   const maxAttempts = Number(process.env.TASKS_MAX_ATTEMPTS || 12);
-   const minBackoffSeconds = Number(process.env.TASKS_MIN_BACKOFF_SEC || 1);
-   const maxBackoffSeconds = Number(process.env.TASKS_MAX_BACKOFF_SEC || 60);
-   const maxDoublings = Number(process.env.TASKS_MAX_DOUBLINGS || 4);
- 
-   const task = {
-     httpRequest: {
-       httpMethod: 'POST',
--      url: WORKER_TASK_URL,            // ★ ingest 하나로 통일
-+      url: workerUrl,            // ★ ingest 하나로 통일
-       headers: { 'Content-Type': 'application/json' },
-       body,
-       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } } : {}),
-     },
-     // gRPC Duration 객체 (REST가 아님)
-     // Cloud Tasks HTTP deadline: default 15m, clamped to [30s, 30m]
-     dispatchDeadline: { seconds: deadlineSeconds, nanos: 0 },
-     // 콜드스타트/일시 에러 완충
-     scheduleTime: { seconds: nowSeconds + delaySeconds },
-     retryConfig: {
-       maxAttempts,
-       minBackoff: { seconds: minBackoffSeconds },
-       maxBackoff: { seconds: maxBackoffSeconds },
-       maxDoublings,
-     },
-   };
- 
+-function model(name, def) {
+-  const project =
+-    process.env.GCP_PROJECT_ID ||
+-    process.env.GOOGLE_CLOUD_PROJECT ||
+-    process.env.PROJECT_ID;
+-  const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
+-  if (!project) {
+-    throw new Error('GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT) is required for VertexAI');
+-  }
+-  const v = new VertexAI({ project, location });
+-  return v.getGenerativeModel({
+-    model: process.env[name] || def || 'gemini-2.5-flash',
+-  });
+-}
+-
+ async function classifyByGcs(gcsUri, filename = 'datasheet.pdf') {
+   const fams = await getFamilies();
+-  const mdl = model('GEMINI_MODEL_CLASSIFY', 'gemini-2.5-flash');
+   const prompt = [
+     `PDF 전체를 읽고 {"family_slug","brand","code","series"} JSON만 반환. 파일명: ${filename}`,
+     `- family_slug는 반드시 다음 중 하나: ${fams.map((f) => `"${f}"`).join(', ')}`,
+   ].join('\n');
+-  const resp = await mdl.generateContent({
++  const resp = await callGemini({
++    modelName: MODEL_CLASSIFY,
+     contents: [
+       {
+         role: 'user',
+         parts: [
+           { fileData: { fileUri: gcsUri, mimeType: 'application/pdf' } },
+           { text: prompt },
+         ],
+       },
+     ],
+     generationConfig: { responseMimeType: 'application/json' },
+   });
+   const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
+   const text = parts.map((p) => p.text || '').join('');
+   if (!text) return {};
    try {
-     await tasks.createTask({ parent: queuePath, task }, { timeout: 10000 });
+     return JSON.parse(text);
    } catch (err) {
-     const detail = err?.response?.data || err?.message || String(err);
-     console.warn('[tasks.createTask] failed', {
-       code: err?.code,
-       detail,
-       queuePath,
+     console.warn('[vertex] classify parse failed:', err?.message || err);
+     return {};
+   }
+ }
+ 
+ async function extractValuesByGcs(gcsUri, family) {
+   const fields = await getFields(family);
+-  const mdl = model('GEMINI_MODEL_EXTRACT', 'gemini-2.5-flash');
+   const prompt = [
+     `다음 PDF에서 ${family} 부품의 스펙을 추출합니다.`,
+     '아래 DB 컬럼만 채우고 없으면 null.',
+     '반드시 {"values":{ "<컬럼명>": 값 }} 만 출력.',
+     `columns: ${JSON.stringify(fields)}`,
+   ].join('\n');
+-  const resp = await mdl.generateContent({
++  const resp = await callGemini({
++    modelName: MODEL_EXTRACT,
+     contents: [
+       {
+         role: 'user',
+         parts: [
+           { text: prompt },
+           { fileData: { fileUri: gcsUri, mimeType: 'application/pdf' } },
+         ],
+       },
+     ],
+     generationConfig: { responseMimeType: 'application/json' },
+   });
+   const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
+   const raw = parts.map((p) => p.text || '').join('');
+   if (!raw) return {};
+   try {
+     const parsed = JSON.parse(raw);
+     return parsed.values || {};
+   } catch (err) {
+     console.warn('[vertex] extract parse failed:', err?.message || err);
+     return {};
+   }
+ }
+ 
+ module.exports = { classifyByGcs, extractValuesByGcs };

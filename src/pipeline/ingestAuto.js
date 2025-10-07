@@ -142,8 +142,166 @@ function isValidCode(s) {
   return true;
 }
 
+const KEY_ALIASES = {
+  form: ['form', 'contact_form', 'contact_arrangement', 'configuration', 'arrangement', 'poles_form'],
+  voltage: ['voltage', 'coil_voltage_vdc', 'voltage_vdc', 'rated_voltage_vdc', 'vdc', 'coil_voltage'],
+  case: ['case', 'case_code', 'package', 'pkg'],
+  capacitance: ['capacitance', 'capacitance_uF', 'capacitance_f', 'c'],
+  resistance: ['resistance', 'resistance_ohm', 'r_ohm', 'r'],
+  tolerance: ['tolerance', 'tolerance_pct'],
+  length_mm: ['length_mm', 'dim_l_mm'],
+  width_mm: ['width_mm', 'dim_w_mm'],
+  height_mm: ['height_mm', 'dim_h_mm'],
+  series: ['series', 'series_code']
+};
+
+const ENUM_MAP = {
+  form: { SPST: '1A', SPDT: '1C', DPDT: '2C' }
+};
+
+function pickField(rec, aliases = []) {
+  if (!rec || typeof rec !== 'object') return null;
+  for (const key of aliases) {
+    const raw = rec?.[key];
+    if (raw == null) continue;
+    if (Array.isArray(raw)) {
+      const first = raw.find((v) => v != null && String(v).trim() !== '');
+      if (first != null) return first;
+      continue;
+    }
+    if (typeof raw === 'object') {
+      if ('value' in raw && raw.value != null && String(raw.value).trim() !== '') {
+        return raw.value;
+      }
+      continue;
+    }
+    const trimmed = String(raw).trim();
+    if (trimmed !== '') return raw;
+  }
+  return null;
+}
+
+function applyOps(val, ops) {
+  let current = Array.isArray(val) ? val[0] : val;
+  let s = current == null ? '' : String(current);
+  for (const rawOp of ops) {
+    if (!rawOp) continue;
+    const opToken = rawOp.includes('=') ? rawOp.replace('=', ':') : rawOp;
+    const op = opToken.trim();
+    const lower = op.toLowerCase();
+    if (lower === 'first') {
+      s = s.split(',')[0].trim();
+      continue;
+    }
+    if (lower === 'upper') {
+      s = s.toUpperCase();
+      continue;
+    }
+    if (lower === 'alnum') {
+      s = s.replace(/[^0-9A-Z]/gi, '');
+      continue;
+    }
+    if (lower === 'digits') {
+      const digits = s.match(/\d+/g) || [''];
+      s = digits.join('');
+      continue;
+    }
+    if (lower === 'num') {
+      const match = s.match(/-?\d+(?:\.\d+)?/);
+      s = match ? match[0] : '';
+      continue;
+    }
+    if (lower.startsWith('pad:')) {
+      const [, widthRaw] = op.split(':');
+      const width = Number(widthRaw) || 2;
+      s = s.padStart(width, '0');
+      continue;
+    }
+    if (lower.startsWith('slice:')) {
+      const parts = op.split(':');
+      const start = Number(parts[1]) || 0;
+      const end = parts.length > 2 && parts[2] !== '' ? Number(parts[2]) : undefined;
+      s = s.slice(start, Number.isNaN(end) ? undefined : end);
+      continue;
+    }
+    if (lower.startsWith('map:')) {
+      const mapPairs = op.slice(4).split(',');
+      const mapping = Object.create(null);
+      for (const pair of mapPairs) {
+        const [from, to] = pair.split('>');
+        if (!from || to == null) continue;
+        mapping[String(from).trim().toUpperCase()] = String(to).trim();
+      }
+      const key = String(s).trim().toUpperCase();
+      s = mapping[key] ?? s;
+      continue;
+    }
+  }
+  return s;
+}
+
+function resolveToken(base, rec, ctxText = '') {
+  const aliases = KEY_ALIASES[base] || [base];
+  let value = pickField(rec, aliases);
+
+  if (base === 'form') {
+    if (!value) {
+      value = pickField(rec, ['contact_arrangement', 'configuration']);
+    }
+
+    if (value) {
+      const match = String(value).match(/(\d)\s*form\s*([ABC])/i);
+      if (match) {
+        value = `${match[1]}${match[2].toUpperCase()}`;
+      }
+    }
+
+    if (!value && ctxText) {
+      const match = ctxText.match(/(\d)\s*form\s*([ABC])/i);
+      if (match) {
+        value = `${match[1]}${match[2].toUpperCase()}`;
+      } else {
+        const poleMatch = ctxText.match(/\b(SPST|SPDT|DPDT)\b/i);
+        if (poleMatch) value = poleMatch[1].toUpperCase();
+      }
+    }
+  }
+
+  if (!value && base === 'case' && ctxText) {
+    const match = ctxText.match(/\b(SOT-?23|TO-220|DFN\d+x\d+)\b/i);
+    if (match) value = match[1];
+  }
+
+  if (value) {
+    const enumMap = ENUM_MAP[base];
+    if (enumMap) {
+      const normalized = String(value).trim().toUpperCase();
+      value = enumMap[normalized] ?? enumMap[normalized.replace(/\s+/g, '')] ?? value;
+    }
+  }
+
+  return value ?? '';
+}
+
+function renderTemplate(tpl, rec, ctxText = '') {
+  if (!tpl) return '';
+  const input = String(tpl);
+  const rendered = input.replace(/\{([^}]+)\}/g, (_, body) => {
+    const parts = body.split('|').map((part) => part.trim()).filter(Boolean);
+    if (!parts.length) return '';
+    const base = (parts.shift() || '').toLowerCase();
+    const raw = resolveToken(base, rec, ctxText);
+    return applyOps(raw, parts);
+  });
+  return rendered.replace(/\s+/g, '').trim();
+}
+
 function renderFromTemplate(rec, pnTemplate, variantKeys = []) {
   if (!pnTemplate) return null;
+  const ctxText = rec?._doc_text || rec?.doc_text || '';
+  const advanced = renderTemplate(pnTemplate, rec, ctxText);
+  if (advanced != null && advanced !== '') return advanced;
+
   let out = pnTemplate;
   const dict = new Map(Object.entries(rec || {}));
   for (const k of variantKeys) if (!dict.has(k)) dict.set(k, rec?.[k]);

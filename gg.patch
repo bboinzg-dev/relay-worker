@@ -1,140 +1,215 @@
-diff --git a/server.js b/server.js
-index b3e9c0ae19c00acdb67d8b0d611217c09551ba53..54f9dfda3488a1da6da2efe133de7d57ec677172 100644
---- a/server.js
-+++ b/server.js
-@@ -1051,63 +1051,71 @@ async function handleWorkerIngest(req, res) {
-       const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-       const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
-       const nextOverrides = {
-         ...(payload?.overrides || {}),
-         brand: overrideBrand,
-         series: overrideSeries,
-       };
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 8eec92ff25ba3caf7bb8e6d5ec7a86709647bd74..d8e7e5499b3892a7aae29f93e44068ee3b9f9771 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -120,52 +120,210 @@ function normalizeSpecKeyName(value) {
+ }
  
-       const result = await getIngest().runAutoIngest({
-         ...payload,
-         runId,
-         run_id: runId,
-         gcsUri,
-         gcs_uri: gcsUri,
-         skipPersist: true,
-         overrides: nextOverrides,
-       });
+ function escapeRegex(str) {
+   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+ }
  
-       const processed = result?.processed;
-       if (!processed || !Array.isArray(processed.records)) {
-         throw new Error('process_no_records');
-       }
+ function textContainsExact(text, pn) {
+   if (!text || !pn) return false;
+   const pattern = escapeRegex(String(pn).trim());
+   if (!pattern) return false;
+   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
+   return re.test(String(text));
+ }
  
-       await markRunning(baseContext);
+ function normLower(s){ return String(s||'').trim().toLowerCase(); }
  
-+      await db.query(
-+        `UPDATE public.ingest_run_logs
-+            SET detail = jsonb_set(coalesce(detail,'{}'::jsonb), '{processed}', $2::jsonb, true),
-+                updated_at = now()
-+          WHERE id = $1`,
-+        [runId, JSON.stringify(processed)]
-+      );
+ function isValidCode(s) {
+   const v = String(s || '').trim();
+   if (!v) return false;
+   if (v.length < 2 || v.length > 64) return false;
+   if (!/[0-9A-Za-z]/.test(v)) return false;
+   if (/\s{2,}/.test(v)) return false;
+   return true;
+ }
+ 
++const KEY_ALIASES = {
++  form: ['form', 'contact_form', 'contact_arrangement', 'configuration', 'arrangement', 'poles_form'],
++  voltage: ['voltage', 'coil_voltage_vdc', 'voltage_vdc', 'rated_voltage_vdc', 'vdc', 'coil_voltage'],
++  case: ['case', 'case_code', 'package', 'pkg'],
++  capacitance: ['capacitance', 'capacitance_uF', 'capacitance_f', 'c'],
++  resistance: ['resistance', 'resistance_ohm', 'r_ohm', 'r'],
++  tolerance: ['tolerance', 'tolerance_pct'],
++  length_mm: ['length_mm', 'dim_l_mm'],
++  width_mm: ['width_mm', 'dim_w_mm'],
++  height_mm: ['height_mm', 'dim_h_mm'],
++  series: ['series', 'series_code']
++};
 +
-       const nextPayload = {
-         runId,
-         run_id: runId,
-         gcsUri,
-         gcs_uri: gcsUri,
-         family_slug: payload?.family_slug ?? null,
-         brand: payload?.brand ?? null,
-         code: payload?.code ?? null,
-         series: payload?.series ?? null,
-         display_name: payload?.display_name ?? null,
-         uploader_id: payload?.uploader_id ?? null,
-         phase: 'persist',
--        processed,
-+        // processed는 싣지 않음. DB에서 가져와 사용.
-         overrides: nextOverrides,
-       };
- 
-       try {
-         await enqueueIngestTask(nextPayload);
-         return res.status(200).json({ ok: true, runId, phase, queued: 'persist' });
-       } catch (err) {
-         console.error(
-           '[enqueue error]',
-           err?.code || err?.response?.status || err?.message,
-           err?.response?.data ? JSON.stringify(err.response.data) : (err?.details || '')
-         );
-         console.warn('[ingest][persist fallback] attempting inline persist', { runId });
- 
-         await markPersisting(baseContext);
-         const inlineResult = await getIngest().persistProcessedData(processed || {}, {
-           brand: overrideBrand,
-           code: payload?.code ?? null,
-           series: overrideSeries,
-           display_name: payload?.display_name ?? null,
-         });
- 
-         const failureReasons = new Set(Array.isArray(inlineResult?.reject_reasons) ? inlineResult.reject_reasons : []);
-         const warningReasons = new Set(Array.isArray(inlineResult?.warnings) ? inlineResult.warnings : []);
- 
-diff --git a/server.js b/server.js
-index b3e9c0ae19c00acdb67d8b0d611217c09551ba53..54f9dfda3488a1da6da2efe133de7d57ec677172 100644
---- a/server.js
-+++ b/server.js
-@@ -1125,51 +1133,57 @@ async function handleWorkerIngest(req, res) {
- 
-         await markSucceeded({
-           ...baseContext,
-           result: inlineResult,
-           gcsUri,
-           durationMs: inlineResult?.ms ?? (Date.now() - startedAt),
-           meta: payload,
-         });
- 
-         return res.status(200).json({
-           ok: true,
-           runId,
-           phase,
-           persisted_inline: true,
-           specs_table: inlineResult?.specs_table || null,
-         });
-       }
-     }
- 
-     if (phase === 'persist') {
-       await markPersisting(baseContext);
- 
-       const overrideBrand = payload?.overrides?.brand ?? payload?.brand ?? null;
-       const overrideSeries = payload?.overrides?.series ?? payload?.series ?? null;
- 
--      const out = await getIngest().persistProcessedData(payload?.processed || {}, {
-+      let proc = payload?.processed || null;
-+      if (!proc) {
-+        const r = await db.query(`SELECT detail->'processed' AS p FROM public.ingest_run_logs WHERE id=$1`, [runId]);
-+        proc = r.rows?.[0]?.p || null;
++const ENUM_MAP = {
++  form: { SPST: '1A', SPDT: '1C', DPDT: '2C' }
++};
++
++function pickField(rec, aliases = []) {
++  if (!rec || typeof rec !== 'object') return null;
++  for (const key of aliases) {
++    const raw = rec?.[key];
++    if (raw == null) continue;
++    if (Array.isArray(raw)) {
++      const first = raw.find((v) => v != null && String(v).trim() !== '');
++      if (first != null) return first;
++      continue;
++    }
++    if (typeof raw === 'object') {
++      if ('value' in raw && raw.value != null && String(raw.value).trim() !== '') {
++        return raw.value;
 +      }
++      continue;
++    }
++    const trimmed = String(raw).trim();
++    if (trimmed !== '') return raw;
++  }
++  return null;
++}
 +
-+      const out = await getIngest().persistProcessedData(proc || {}, {
-         brand: overrideBrand,
-         code: payload?.code ?? null,
-         series: overrideSeries,
-         display_name: payload?.display_name ?? null,
-       });
++function applyOps(val, ops) {
++  let current = Array.isArray(val) ? val[0] : val;
++  let s = current == null ? '' : String(current);
++  for (const rawOp of ops) {
++    if (!rawOp) continue;
++    const opToken = rawOp.includes('=') ? rawOp.replace('=', ':') : rawOp;
++    const op = opToken.trim();
++    const lower = op.toLowerCase();
++    if (lower === 'first') {
++      s = s.split(',')[0].trim();
++      continue;
++    }
++    if (lower === 'upper') {
++      s = s.toUpperCase();
++      continue;
++    }
++    if (lower === 'alnum') {
++      s = s.replace(/[^0-9A-Z]/gi, '');
++      continue;
++    }
++    if (lower === 'digits') {
++      const digits = s.match(/\d+/g) || [''];
++      s = digits.join('');
++      continue;
++    }
++    if (lower === 'num') {
++      const match = s.match(/-?\d+(?:\.\d+)?/);
++      s = match ? match[0] : '';
++      continue;
++    }
++    if (lower.startsWith('pad:')) {
++      const [, widthRaw] = op.split(':');
++      const width = Number(widthRaw) || 2;
++      s = s.padStart(width, '0');
++      continue;
++    }
++    if (lower.startsWith('slice:')) {
++      const parts = op.split(':');
++      const start = Number(parts[1]) || 0;
++      const end = parts.length > 2 && parts[2] !== '' ? Number(parts[2]) : undefined;
++      s = s.slice(start, Number.isNaN(end) ? undefined : end);
++      continue;
++    }
++    if (lower.startsWith('map:')) {
++      const mapPairs = op.slice(4).split(',');
++      const mapping = Object.create(null);
++      for (const pair of mapPairs) {
++        const [from, to] = pair.split('>');
++        if (!from || to == null) continue;
++        mapping[String(from).trim().toUpperCase()] = String(to).trim();
++      }
++      const key = String(s).trim().toUpperCase();
++      s = mapping[key] ?? s;
++      continue;
++    }
++  }
++  return s;
++}
++
++function resolveToken(base, rec, ctxText = '') {
++  const aliases = KEY_ALIASES[base] || [base];
++  let value = pickField(rec, aliases);
++
++  if (base === 'form') {
++    if (!value) {
++      value = pickField(rec, ['contact_arrangement', 'configuration']);
++    }
++
++    if (value) {
++      const match = String(value).match(/(\d)\s*form\s*([ABC])/i);
++      if (match) {
++        value = `${match[1]}${match[2].toUpperCase()}`;
++      }
++    }
++
++    if (!value && ctxText) {
++      const match = ctxText.match(/(\d)\s*form\s*([ABC])/i);
++      if (match) {
++        value = `${match[1]}${match[2].toUpperCase()}`;
++      } else {
++        const poleMatch = ctxText.match(/\b(SPST|SPDT|DPDT)\b/i);
++        if (poleMatch) value = poleMatch[1].toUpperCase();
++      }
++    }
++  }
++
++  if (!value && base === 'case' && ctxText) {
++    const match = ctxText.match(/\b(SOT-?23|TO-220|DFN\d+x\d+)\b/i);
++    if (match) value = match[1];
++  }
++
++  if (value) {
++    const enumMap = ENUM_MAP[base];
++    if (enumMap) {
++      const normalized = String(value).trim().toUpperCase();
++      value = enumMap[normalized] ?? enumMap[normalized.replace(/\s+/g, '')] ?? value;
++    }
++  }
++
++  return value ?? '';
++}
++
++function renderTemplate(tpl, rec, ctxText = '') {
++  if (!tpl) return '';
++  const input = String(tpl);
++  const rendered = input.replace(/\{([^}]+)\}/g, (_, body) => {
++    const parts = body.split('|').map((part) => part.trim()).filter(Boolean);
++    if (!parts.length) return '';
++    const base = (parts.shift() || '').toLowerCase();
++    const raw = resolveToken(base, rec, ctxText);
++    return applyOps(raw, parts);
++  });
++  return rendered.replace(/\s+/g, '').trim();
++}
++
+ function renderFromTemplate(rec, pnTemplate, variantKeys = []) {
+   if (!pnTemplate) return null;
++  const ctxText = rec?._doc_text || rec?.doc_text || '';
++  const advanced = renderTemplate(pnTemplate, rec, ctxText);
++  if (advanced != null && advanced !== '') return advanced;
++
+   let out = pnTemplate;
+   const dict = new Map(Object.entries(rec || {}));
+   for (const k of variantKeys) if (!dict.has(k)) dict.set(k, rec?.[k]);
+   dict.set('series', rec?.series ?? rec?.series_code ?? '');
+   dict.set('series_code', rec?.series_code ?? rec?.series ?? '');
+   out = out.replace(/\{([a-z0-9_]+)\}/ig, (_, k) => String(dict.get(k) ?? ''));
+   out = out.replace(/\s+/g,'').trim();
+   return out || null;
+ }
  
-       const reasons = new Set([...(out?.reject_reasons || []), ...(out?.warnings || [])]);
-       if (!out?.ok) {
-         const list = [...reasons];
-         const hard = list.some((r) => /missing_|invalid_|no_records|reject/i.test(r));
-         await markFailed({
-           ...baseContext,
-           error: list.join(',') || 'ingest_rejected',
-           durationMs: out?.ms ?? (Date.now() - startedAt),
-         });
-         failureMarked = true;
-         if (hard) {
-           return res.status(200).json({ ok: false, runId, phase, reasons: list });
-         }
-         return res.status(500).json({ ok: false, runId, phase, reasons: list });
-       }
+ function recoverCode(rec, { pnTemplate, variantKeys }) {
+   let c = rec.code || rec.pn || null;
+   if (isValidCode(c)) return c;
  
-       await markSucceeded({
-         ...baseContext,
-         result: out,
+   const fromTpl = renderFromTemplate(rec, pnTemplate, variantKeys);
+   if (isValidCode(fromTpl)) return fromTpl;
+ 
+   const parts = [];
+   if (rec.series_code || rec.series) parts.push(rec.series_code || rec.series);
+   for (const k of (Array.isArray(variantKeys) ? variantKeys : [])) {
+     if (rec[k] != null) parts.push(String(rec[k]));
+   }
+   const guess = parts.join('');
+   if (isValidCode(guess)) return guess;
+ 

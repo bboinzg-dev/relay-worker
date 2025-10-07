@@ -17,11 +17,14 @@ const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
 // fieldsJson: {"coil_voltage_vdc":"numeric", "contact_form":"text", ...}
 function buildSchema(fieldsJson = {}) {
   const schema = [];
-  for (const [k, t] of Object.entries(fieldsJson)) {
-    const type = String(t || 'text').toLowerCase();
-    if (type.startsWith('num')) schema.push({ name: k, type: 'numeric' });
-    else if (type.startsWith('bool')) schema.push({ name: k, type: 'boolean' });
-    else schema.push({ name: k, type: 'text' });
+  for (const [k0, t0] of Object.entries(fieldsJson)) {
+    let type = String(t0 || 'text').toLowerCase();
+    if (/^(length_mm|width_mm|height_mm|dim_[lwh]_mm)$/i.test(k0)) {
+      type = 'numeric';
+    }
+    if (type.startsWith('num')) schema.push({ name: k0, type: 'numeric' });
+    else if (type.startsWith('bool')) schema.push({ name: k0, type: 'boolean' });
+    else schema.push({ name: k0, type: 'text' });
   }
   // 자주 쓰는 치수 필드는 기본 보강
   const have = new Set(schema.map(s => s.name));

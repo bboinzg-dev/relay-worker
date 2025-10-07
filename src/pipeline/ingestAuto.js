@@ -303,6 +303,21 @@ function coerceNumeric(x) {
   return Number.isFinite(n) ? n : null;
 }
 
+function toInt(v){
+  if (v==null || v==='') return null;
+  const s = String(v).replace(/[^0-9\-]/g,'');
+  const n = parseInt(s, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+function toBool(v){
+  const s = String(v ?? '').trim().toLowerCase();
+  if (!s) return null;
+  if (/^(true|1|y|yes|on)$/i.test(s))  return true;
+  if (/^(false|0|n|no|off)$/i.test(s)) return false;
+  return null;
+}
+
 function normTableText(value) {
   return String(value || '')
     .normalize('NFKC')
@@ -1241,6 +1256,35 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   await ensureSpecColumnsForBlueprint(qualified, blueprint);
   colTypes = await getColumnTypes(qualified);
 
+  if (process.env.AUTO_FIX_BLUEPRINT_TYPES === '1' && colTypes instanceof Map && colTypes.size && family) {
+    const currentFields = blueprint?.fields && typeof blueprint.fields === 'object' ? blueprint.fields : {};
+    const patch = {};
+    for (const [col, t] of colTypes.entries()) {
+      if (t === 'numeric' || t === 'int' || t === 'bool') {
+        const now = currentFields[col];
+        if (!now || String(now).toLowerCase() === 'text') {
+          patch[col] = t === 'int' ? 'int' : t;
+        }
+      }
+    }
+    if (Object.keys(patch).length) {
+      await db.query(
+        `UPDATE public.component_spec_blueprint
+           SET fields_json = fields_json || $2::jsonb,
+               version = COALESCE(version,0)+1,
+               updated_at = now()
+         WHERE family_slug = $1`,
+        [family, JSON.stringify(patch)]
+      );
+      if (blueprint && typeof blueprint === 'object') {
+        if (!blueprint.fields || typeof blueprint.fields !== 'object') {
+          blueprint.fields = {};
+        }
+        Object.assign(blueprint.fields, patch);
+      }
+    }
+  }
+
   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
   const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
 
@@ -1815,6 +1859,19 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     }
 
     if (records.length) {
+      if (colTypes instanceof Map && colTypes.size) {
+        for (const rec of records) {
+          if (!rec || typeof rec !== 'object') continue;
+          for (const [k, v] of Object.entries(rec)) {
+            const keyLower = String(k || '').toLowerCase();
+            const t = colTypes.get(keyLower) || colTypes.get(k);
+            if (!t) continue;
+            if (t === 'numeric')      rec[k] = coerceNumeric(v);
+            else if (t === 'int')     rec[k] = toInt(v);
+            else if (t === 'bool')    rec[k] = toBool(v);
+          }
+        }
+      }
       persistResult = await saveExtractedSpecs(qualified, family, records, {
         brand: brandOverride,
         pnTemplate,

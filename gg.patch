@@ -1,139 +1,223 @@
-diff --git a/src/services/vertex.js b/src/services/vertex.js
-index b89a702fb22fdef41d57b95f8d3ed72d63002840..f02ed6a1baf4e62987cf5f4dfc8bf533afbdc0ca 100644
---- a/src/services/vertex.js
-+++ b/src/services/vertex.js
-@@ -1,100 +1,115 @@
- 'use strict';
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index bf6089af82dc18792a46e410ad368e7354130a91..8b954f856bb798b672724608e86e320dde77e849 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -281,50 +281,65 @@ async function getColumnTypes(qualified) {
+   const out = new Map();
+   for (const { col, dt } of rows) {
+     if (/(integer|bigint|smallint)/.test(dt)) out.set(col, 'int');
+     else if (/(numeric|decimal|double precision|real)/.test(dt)) out.set(col, 'numeric');
+     else if (/boolean/.test(dt)) out.set(col, 'bool');
+     else out.set(col, 'text');
+   }
+   return out;
+ }
  
- const { VertexAI } = require('@google-cloud/vertexai');
- const db = require('../../db');
+ // 숫자 강제정규화(콤마/단위/리스트/범위 허용 → 첫 숫자만)
+ function coerceNumeric(x) {
+   if (x == null || x === '') return null;
+   if (typeof x === 'number') return x;
+   let s = String(x).toLowerCase().replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
+   if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/.test(s)) return null;
+   const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
+   if (!m) return null;
+   let n = parseFloat(m[1]);
+   const mul = (m[2] || '').toLowerCase();
+   const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
+   if (mul && scale[mul] != null) n *= scale[mul];
+   return Number.isFinite(n) ? n : null;
+ }
  
-+const PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-+const VERTEX_LOCATION = process.env.VERTEX_LOCATION || 'asia-northeast3';
-+
-+const MODEL_CLASSIFY = process.env.GEMINI_MODEL_CLASSIFY || 'gemini-2.5-flash';
-+const MODEL_EXTRACT = process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash';
-+
-+function isNotFound(err) {
-+  const msg = (err?.message || err?.toString() || '').toLowerCase();
-+  return err?.code === 404 || msg.includes('not found');
++function toInt(v){
++  if (v==null || v==='') return null;
++  const s = String(v).replace(/[^0-9\-]/g,'');
++  const n = parseInt(s, 10);
++  return Number.isFinite(n) ? n : null;
 +}
 +
-+async function callGemini({ modelName, contents, generationConfig, safetySettings }) {
-+  if (!PROJECT_ID) {
-+    throw new Error('GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT) is required for VertexAI');
-+  }
-+  const vertex = new VertexAI({ project: PROJECT_ID, location: VERTEX_LOCATION });
-+  let gm = vertex.getGenerativeModel({ model: modelName });
-+  console.info('[vertex] model=%s region=%s', modelName, VERTEX_LOCATION);
-+  try {
-+    return await gm.generateContent({ contents, generationConfig, safetySettings });
-+  } catch (e) {
-+    if (isNotFound(e) && modelName !== 'gemini-1.5-flash-002') {
-+      console.warn('[vertex] 404 on', modelName, '→ fallback gemini-1.5-flash-002');
-+      gm = vertex.getGenerativeModel({ model: 'gemini-1.5-flash-002' });
-+      return await gm.generateContent({ contents, generationConfig, safetySettings });
++function toBool(v){
++  const s = String(v ?? '').trim().toLowerCase();
++  if (!s) return null;
++  if (/^(true|1|y|yes|on)$/i.test(s))  return true;
++  if (/^(false|0|n|no|off)$/i.test(s)) return false;
++  return null;
++}
++
+ function normTableText(value) {
+   return String(value || '')
+     .normalize('NFKC')
+     .replace(/[–—−]/g, '-')
+     .replace(/\s+/g, ' ')
+     .trim();
+ }
+ 
+ function pickSkuListFromTables(extracted = {}) {
+   const tables = Array.isArray(extracted.tables) ? extracted.tables : [];
+   if (!tables.length) return [];
+ 
+   const PN_HEADER = /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|catalog\s*(?:no\.?|number)|model|品番|型式|형명|주문\s*번호|order(?:ing)?\s*code)/i;
+   const TABLE_HINT = /(ordering|part\s*number|type\s*number|catalog|selection|list\s*of\s*types|品番|型式|형명)/i;
+ 
+   const set = new Set();
+   for (const table of tables) {
+     if (!table || typeof table !== 'object') continue;
+     const headers = Array.isArray(table.headers) ? table.headers : [];
+     if (!headers.length) continue;
+     const headerNorms = headers.map((h) => normTableText(h));
+     if (!headerNorms.length) continue;
+     const headerText = headerNorms.join(' ');
+     if (!TABLE_HINT.test(headerText) && !headerNorms.some((h) => PN_HEADER.test(h))) continue;
+ 
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index bf6089af82dc18792a46e410ad368e7354130a91..8b954f856bb798b672724608e86e320dde77e849 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1219,50 +1234,79 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+       }
+     }
+ 
+     if (Array.isArray(freshKeys) && freshKeys.length) {
+       console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
+     }
+   } catch (err) {
+     console.warn('[variant] inferVariantKeys failed:', err?.message || err);
+   }
+ 
+   if (!disableEnsure) {
+     await ensureSpecsTableByFamily(family);
+     if (!variantColumnsEnsured) {
+       try {
+         await ensureBlueprintVariantColumns(family);
+         variantColumnsEnsured = true;
+       } catch (err) {
+         console.warn('[variant] ensure_blueprint_variant_columns fallback failed:', err?.message || err);
+       }
+     }
+   }
+ 
+   await ensureSpecColumnsForBlueprint(qualified, blueprint);
+   colTypes = await getColumnTypes(qualified);
+ 
++  if (process.env.AUTO_FIX_BLUEPRINT_TYPES === '1' && colTypes instanceof Map && colTypes.size && family) {
++    const currentFields = blueprint?.fields && typeof blueprint.fields === 'object' ? blueprint.fields : {};
++    const patch = {};
++    for (const [col, t] of colTypes.entries()) {
++      if (t === 'numeric' || t === 'int' || t === 'bool') {
++        const now = currentFields[col];
++        if (!now || String(now).toLowerCase() === 'text') {
++          patch[col] = t === 'int' ? 'int' : t;
++        }
++      }
 +    }
-+    throw e;
++    if (Object.keys(patch).length) {
++      await db.query(
++        `UPDATE public.component_spec_blueprint
++           SET fields_json = fields_json || $2::jsonb,
++               version = COALESCE(version,0)+1,
++               updated_at = now()
++         WHERE family_slug = $1`,
++        [family, JSON.stringify(patch)]
++      );
++      if (blueprint && typeof blueprint === 'object') {
++        if (!blueprint.fields || typeof blueprint.fields !== 'object') {
++          blueprint.fields = {};
++        }
++        Object.assign(blueprint.fields, patch);
++      }
++    }
 +  }
-+}
 +
- async function getFamilies() {
-   const r = await db.query(
-     `SELECT family_slug FROM public.component_registry ORDER BY family_slug`
-   );
-   return r.rows.map((row) => row.family_slug);
- }
+   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
+   const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
  
- async function getFields(family) {
-   const r = await db.query(
-     `SELECT fields_json FROM public.component_spec_blueprint WHERE family_slug=$1`,
-     [family],
-   );
-   if (!r.rows[0]) throw new Error(`Blueprint not found: ${family}`);
-   return r.rows[0].fields_json;
- }
+   const aiCanonicalMap = new Map();
+   const aiCanonicalMapLower = new Map();
+   if (process.env.AUTO_CANON_KEYS === '1' && runtimeSpecKeys.size) {
+     const specCols = colTypes ? Array.from(colTypes.keys()) : [];
+     const blueprintFieldKeys = blueprint?.fields && typeof blueprint.fields === 'object'
+       ? Object.keys(blueprint.fields).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+       : [];
+     const knownKeys = Array.from(new Set([
+       ...specCols,
+       ...blueprintFieldKeys,
+       ...(Array.isArray(variantKeys) ? variantKeys : []),
+     ]));
  
--function model(name, def) {
--  const project =
--    process.env.GCP_PROJECT_ID ||
--    process.env.GOOGLE_CLOUD_PROJECT ||
--    process.env.PROJECT_ID;
--  const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
--  if (!project) {
--    throw new Error('GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT) is required for VertexAI');
--  }
--  const v = new VertexAI({ project, location });
--  return v.getGenerativeModel({
--    model: process.env[name] || def || 'gemini-2.5-flash',
--  });
--}
--
- async function classifyByGcs(gcsUri, filename = 'datasheet.pdf') {
-   const fams = await getFamilies();
--  const mdl = model('GEMINI_MODEL_CLASSIFY', 'gemini-2.5-flash');
-   const prompt = [
-     `PDF 전체를 읽고 {"family_slug","brand","code","series"} JSON만 반환. 파일명: ${filename}`,
-     `- family_slug는 반드시 다음 중 하나: ${fams.map((f) => `"${f}"`).join(', ')}`,
-   ].join('\n');
--  const resp = await mdl.generateContent({
-+  const resp = await callGemini({
-+    modelName: MODEL_CLASSIFY,
-     contents: [
-       {
-         role: 'user',
-         parts: [
-           { fileData: { fileUri: gcsUri, mimeType: 'application/pdf' } },
-           { text: prompt },
-         ],
-       },
-     ],
-     generationConfig: { responseMimeType: 'application/json' },
-   });
-   const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
-   const text = parts.map((p) => p.text || '').join('');
-   if (!text) return {};
-   try {
-     return JSON.parse(text);
-   } catch (err) {
-     console.warn('[vertex] classify parse failed:', err?.message || err);
-     return {};
+     try {
+       const { map, newKeys } = await aiCanonicalizeKeys(
+         family,
+         Array.from(runtimeSpecKeys),
+         knownKeys
+       );
+ 
+       const knownLower = new Set(knownKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
+       const newKeySet = new Set((Array.isArray(newKeys) ? newKeys : []).map((k) => String(k || '').trim()).filter(Boolean));
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index bf6089af82dc18792a46e410ad368e7354130a91..8b954f856bb798b672724608e86e320dde77e849 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1793,50 +1837,63 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+       }
+     }
+ 
+     const variantKeys = Array.isArray(variantKeysSource)
+       ? variantKeysSource.map((k) => String(k || '').trim()).filter(Boolean)
+       : [];
+ 
+     for (const r of records) {
+       if (!r || typeof r !== 'object') continue;
+       if (!Array.isArray(r.candidates) && Array.isArray(processed?.candidateCodes)) {
+         r.candidates = processed.candidateCodes;
+       }
+       const fixed = recoverCode(r, { pnTemplate, variantKeys });
+       if (fixed) {
+         if (!r.code) r.code = fixed;
+         if (!r.pn) r.pn = fixed;
+       }
+     }
+ 
+     records = records.filter((r) => isValidCode(r?.pn || r?.code));
+     if (!records.length) {
+       persistResult.skipped = [{ reason: 'missing_pn' }];
+     }
+ 
+     if (records.length) {
++      if (colTypes instanceof Map && colTypes.size) {
++        for (const rec of records) {
++          if (!rec || typeof rec !== 'object') continue;
++          for (const [k, v] of Object.entries(rec)) {
++            const keyLower = String(k || '').toLowerCase();
++            const t = colTypes.get(keyLower) || colTypes.get(k);
++            if (!t) continue;
++            if (t === 'numeric')      rec[k] = coerceNumeric(v);
++            else if (t === 'int')     rec[k] = toInt(v);
++            else if (t === 'bool')    rec[k] = toBool(v);
++          }
++        }
++      }
+       persistResult = await saveExtractedSpecs(qualified, family, records, {
+         brand: brandOverride,
+         pnTemplate,
+         requiredKeys: effectiveRequired,
+         coreSpecKeys: effectiveRequired,
+         runId,
+         run_id: runId,
+         jobId,
+         job_id: jobId,
+       }) || persistResult;
+     }
+   } else if (!records.length) {
+     persistResult.skipped = [{ reason: 'missing_pn' }];
    }
- }
  
- async function extractValuesByGcs(gcsUri, family) {
-   const fields = await getFields(family);
--  const mdl = model('GEMINI_MODEL_EXTRACT', 'gemini-2.5-flash');
-   const prompt = [
-     `다음 PDF에서 ${family} 부품의 스펙을 추출합니다.`,
-     '아래 DB 컬럼만 채우고 없으면 null.',
-     '반드시 {"values":{ "<컬럼명>": 값 }} 만 출력.',
-     `columns: ${JSON.stringify(fields)}`,
-   ].join('\n');
--  const resp = await mdl.generateContent({
-+  const resp = await callGemini({
-+    modelName: MODEL_EXTRACT,
-     contents: [
-       {
-         role: 'user',
-         parts: [
-           { text: prompt },
-           { fileData: { fileUri: gcsUri, mimeType: 'application/pdf' } },
-         ],
-       },
-     ],
-     generationConfig: { responseMimeType: 'application/json' },
-   });
-   const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
-   const raw = parts.map((p) => p.text || '').join('');
-   if (!raw) return {};
-   try {
-     const parsed = JSON.parse(raw);
-     return parsed.values || {};
-   } catch (err) {
-     console.warn('[vertex] extract parse failed:', err?.message || err);
-     return {};
-   }
- }
+   const persistedCodes = new Set(
+     (persistResult.written || [])
+       .map((pn) => String(pn || '').trim())
+       .filter(Boolean)
+   );
  
- module.exports = { classifyByGcs, extractValuesByGcs };
+   if (!persistedCodes.size && records.length) {
+     for (const rec of records) {
+       const pn = String(rec.pn || rec.code || '').trim();
+       if (pn) persistedCodes.add(pn);
+

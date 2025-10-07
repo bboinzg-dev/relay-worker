@@ -1,223 +1,203 @@
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index bf6089af82dc18792a46e410ad368e7354130a91..8b954f856bb798b672724608e86e320dde77e849 100644
+index 8b954f856bb798b672724608e86e320dde77e849..c49e32fc83fcc3d82170577b83aa1f4701226225 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -281,50 +281,65 @@ async function getColumnTypes(qualified) {
-   const out = new Map();
-   for (const { col, dt } of rows) {
-     if (/(integer|bigint|smallint)/.test(dt)) out.set(col, 'int');
-     else if (/(numeric|decimal|double precision|real)/.test(dt)) out.set(col, 'numeric');
-     else if (/boolean/.test(dt)) out.set(col, 'bool');
-     else out.set(col, 'text');
+@@ -1668,70 +1668,140 @@ async function runAutoIngest(payload = {}) {
+         `
+           UPDATE public.ingest_run_logs
+              SET status='FAILED',
+                  event='EXCEPTION',
+                  error_message=$2,
+                  finished_at=now(), ts=now()
+            WHERE id=$1
+         `,
+         [runId, msg],
+       );
+     } catch (err) {
+       console.warn('[ingest] failure update failed:', err?.message || err);
+     }
+     throw e;
+   } finally {
+     clearTimeout(watchdog);
+     try { await db.query('SELECT pg_advisory_unlock(hashtextextended($1))', [runId]); } catch {}
+     try { await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]); } catch {}
    }
-   return out;
  }
  
- // 숫자 강제정규화(콤마/단위/리스트/범위 허용 → 첫 숫자만)
- function coerceNumeric(x) {
-   if (x == null || x === '') return null;
-   if (typeof x === 'number') return x;
-   let s = String(x).toLowerCase().replace(/(?<=\d),(?=\d{3}\b)/g, '').replace(/\s+/g, ' ').trim();
-   if (/-?\d+(?:\.\d+)?\s*(?:to|~|–|—|-)\s*-?\d+(?:\.\d+)?/.test(s)) return null;
-   const m = s.match(/(-?\d+(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i);
-   if (!m) return null;
-   let n = parseFloat(m[1]);
-   const mul = (m[2] || '').toLowerCase();
-   const scale = { k:1e3, m:1e-3, 'µ':1e-6, u:1e-6, n:1e-9, p:1e-12, g:1e9 };
-   if (mul && scale[mul] != null) n *= scale[mul];
-   return Number.isFinite(n) ? n : null;
- }
+ async function persistProcessedData(processed = {}, overrides = {}) {
+   const {
+     started = Date.now(),
+     gcsUri = null,
+-    family = null,
+-    table = null,
++    family: processedFamily = null,
++    family_slug: processedFamilySlug = null,
++    table: processedTable = null,
++    specs_table: processedSpecsTable = null,
+     qualified: qualifiedInput = null,
+     pnTemplate = null,
+     requiredFields = [],
+     coverUri = null,
+     records: initialRecords = [],
+     rows: processedRowsInput = [],
+     mpnList = [],
+     extractedBrand = null,
+     brandName = null,
+     baseSeries = null,
+     text: processedText = null,
+     brand: processedBrand = null,
+     brand_detected: processedDetected = null,
+     brand_effective: processedEffective = null,
+     brand_source: processedBrandSource = null,
+     variant_keys_runtime: processedVariantKeys = [],
++    meta: processedMeta = null,
+   } = processed || {};
  
-+function toInt(v){
-+  if (v==null || v==='') return null;
-+  const s = String(v).replace(/[^0-9\-]/g,'');
-+  const n = parseInt(s, 10);
-+  return Number.isFinite(n) ? n : null;
-+}
++  const normalizeFamily = (value) => {
++    if (!value) return null;
++    const trimmed = String(value).trim();
++    return trimmed || null;
++  };
 +
-+function toBool(v){
-+  const s = String(v ?? '').trim().toLowerCase();
-+  if (!s) return null;
-+  if (/^(true|1|y|yes|on)$/i.test(s))  return true;
-+  if (/^(false|0|n|no|off)$/i.test(s)) return false;
-+  return null;
-+}
++  const metaFamily =
++    normalizeFamily(processedMeta?.family) ||
++    normalizeFamily(processedMeta?.family_slug);
++  const overridesFamily =
++    normalizeFamily(overrides?.family) ||
++    normalizeFamily(overrides?.family_slug);
++  const family =
++    normalizeFamily(processedFamily) ||
++    normalizeFamily(processedFamilySlug) ||
++    metaFamily ||
++    overridesFamily ||
++    null;
 +
- function normTableText(value) {
-   return String(value || '')
-     .normalize('NFKC')
-     .replace(/[–—−]/g, '-')
-     .replace(/\s+/g, ' ')
-     .trim();
- }
- 
- function pickSkuListFromTables(extracted = {}) {
-   const tables = Array.isArray(extracted.tables) ? extracted.tables : [];
-   if (!tables.length) return [];
- 
-   const PN_HEADER = /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|catalog\s*(?:no\.?|number)|model|品番|型式|형명|주문\s*번호|order(?:ing)?\s*code)/i;
-   const TABLE_HINT = /(ordering|part\s*number|type\s*number|catalog|selection|list\s*of\s*types|品番|型式|형명)/i;
- 
-   const set = new Set();
-   for (const table of tables) {
-     if (!table || typeof table !== 'object') continue;
-     const headers = Array.isArray(table.headers) ? table.headers : [];
-     if (!headers.length) continue;
-     const headerNorms = headers.map((h) => normTableText(h));
-     if (!headerNorms.length) continue;
-     const headerText = headerNorms.join(' ');
-     if (!TABLE_HINT.test(headerText) && !headerNorms.some((h) => PN_HEADER.test(h))) continue;
- 
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index bf6089af82dc18792a46e410ad368e7354130a91..8b954f856bb798b672724608e86e320dde77e849 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -1219,50 +1234,79 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
-       }
-     }
- 
-     if (Array.isArray(freshKeys) && freshKeys.length) {
-       console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
-     }
-   } catch (err) {
-     console.warn('[variant] inferVariantKeys failed:', err?.message || err);
-   }
- 
-   if (!disableEnsure) {
-     await ensureSpecsTableByFamily(family);
-     if (!variantColumnsEnsured) {
-       try {
-         await ensureBlueprintVariantColumns(family);
-         variantColumnsEnsured = true;
-       } catch (err) {
-         console.warn('[variant] ensure_blueprint_variant_columns fallback failed:', err?.message || err);
-       }
-     }
-   }
- 
-   await ensureSpecColumnsForBlueprint(qualified, blueprint);
-   colTypes = await getColumnTypes(qualified);
- 
-+  if (process.env.AUTO_FIX_BLUEPRINT_TYPES === '1' && colTypes instanceof Map && colTypes.size && family) {
-+    const currentFields = blueprint?.fields && typeof blueprint.fields === 'object' ? blueprint.fields : {};
-+    const patch = {};
-+    for (const [col, t] of colTypes.entries()) {
-+      if (t === 'numeric' || t === 'int' || t === 'bool') {
-+        const now = currentFields[col];
-+        if (!now || String(now).toLowerCase() === 'text') {
-+          patch[col] = t === 'int' ? 'int' : t;
-+        }
-+      }
++  const sanitizeIdentifier = (value) => {
++    const trimmed = String(value || '').trim();
++    if (!trimmed) return '';
++    if (trimmed.includes('.')) {
++      const [schemaRaw, tableRaw] = trimmed.split('.', 2);
++      const schemaSafe = String(schemaRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
++      const tableSafe = String(tableRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
++      if (!schemaSafe || !tableSafe) return '';
++      return `${schemaSafe}.${tableSafe}`;
 +    }
-+    if (Object.keys(patch).length) {
-+      await db.query(
-+        `UPDATE public.component_spec_blueprint
-+           SET fields_json = fields_json || $2::jsonb,
-+               version = COALESCE(version,0)+1,
-+               updated_at = now()
-+         WHERE family_slug = $1`,
-+        [family, JSON.stringify(patch)]
++    return trimmed.replace(/[^a-zA-Z0-9_]/g, '');
++  };
++
++  const pickTableCandidate = (...values) => {
++    for (const value of values) {
++      const normalized = sanitizeIdentifier(value);
++      if (normalized) return normalized;
++    }
++    return '';
++  };
++
++  let table = pickTableCandidate(processedSpecsTable, processedTable, qualifiedInput);
++  if (!table && family) {
++    try {
++      const r = await db.query(
++        `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
++        [family],
 +      );
-+      if (blueprint && typeof blueprint === 'object') {
-+        if (!blueprint.fields || typeof blueprint.fields !== 'object') {
-+          blueprint.fields = {};
-+        }
-+        Object.assign(blueprint.fields, patch);
-+      }
++      table = pickTableCandidate(r.rows?.[0]?.specs_table);
++    } catch (err) {
++      console.warn('[persist] specs_table lookup failed:', err?.message || err);
++    }
++  }
++  if (!table && family) {
++    table = sanitizeIdentifier(`${family}_specs`);
++  }
++  const qualified = qualifiedInput || (table ? (table.includes('.') ? table : `public.${table}`) : null);
++
++  let colTypes = new Map();
++  if (qualified) {
++    try {
++      colTypes = await getColumnTypes(qualified);
++    } catch (err) {
++      console.warn('[persist] column type fetch failed:', err?.message || err);
++      colTypes = new Map();
 +    }
 +  }
 +
-   const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
-   const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
- 
-   const aiCanonicalMap = new Map();
-   const aiCanonicalMapLower = new Map();
-   if (process.env.AUTO_CANON_KEYS === '1' && runtimeSpecKeys.size) {
-     const specCols = colTypes ? Array.from(colTypes.keys()) : [];
-     const blueprintFieldKeys = blueprint?.fields && typeof blueprint.fields === 'object'
-       ? Object.keys(blueprint.fields).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-       : [];
-     const knownKeys = Array.from(new Set([
-       ...specCols,
-       ...blueprintFieldKeys,
-       ...(Array.isArray(variantKeys) ? variantKeys : []),
-     ]));
- 
-     try {
-       const { map, newKeys } = await aiCanonicalizeKeys(
-         family,
-         Array.from(runtimeSpecKeys),
-         knownKeys
-       );
- 
-       const knownLower = new Set(knownKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
-       const newKeySet = new Set((Array.isArray(newKeys) ? newKeys : []).map((k) => String(k || '').trim()).filter(Boolean));
+   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
+     ? initialRecords
+     : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
+   let records = Array.isArray(recordsSource) ? recordsSource : [];
+   const runtimeMeta = {
+     brand_source: processedBrandSource ?? null,
+     variant_keys_runtime: Array.isArray(processedVariantKeys) ? processedVariantKeys : [],
+   };
+   const hasRuntimeMeta =
+     runtimeMeta.brand_source != null ||
+     (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
+   const docText = typeof processedText === 'string'
+     ? processedText
+     : (processedText != null ? String(processedText) : '');
+   const normalizeSeedBrand = (value) => {
+     if (value == null) return null;
+     const trimmed = String(value).trim();
+     if (!trimmed) return null;
+     if (trimmed.toLowerCase() === 'unknown') return null;
+     return trimmed;
+   };
+   const brandSeed =
+     normalizeSeedBrand(processedEffective) ||
+     normalizeSeedBrand(processedBrand) ||
+     normalizeSeedBrand(processedDetected) ||
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index bf6089af82dc18792a46e410ad368e7354130a91..8b954f856bb798b672724608e86e320dde77e849 100644
+index 8b954f856bb798b672724608e86e320dde77e849..c49e32fc83fcc3d82170577b83aa1f4701226225 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -1793,50 +1837,63 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+@@ -1741,51 +1811,50 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+     if (!row || typeof row !== 'object') return;
+     row.raw_json = mergeRuntimeMetadata(row.raw_json, runtimeMeta);
+   };
+   if ((docText && docText.length) || brandSeed) {
+     const applyRowHints = (row) => {
+       if (!row || typeof row !== 'object') return;
+       if (docText && (row._doc_text == null || row._doc_text === '')) {
+         row._doc_text = docText;
        }
-     }
- 
-     const variantKeys = Array.isArray(variantKeysSource)
-       ? variantKeysSource.map((k) => String(k || '').trim()).filter(Boolean)
-       : [];
- 
-     for (const r of records) {
-       if (!r || typeof r !== 'object') continue;
-       if (!Array.isArray(r.candidates) && Array.isArray(processed?.candidateCodes)) {
-         r.candidates = processed.candidateCodes;
+       if (brandSeed && (!row.brand || !String(row.brand).trim())) {
+         row.brand = brandSeed;
        }
-       const fixed = recoverCode(r, { pnTemplate, variantKeys });
-       if (fixed) {
-         if (!r.code) r.code = fixed;
-         if (!r.pn) r.pn = fixed;
-       }
+       attachRuntimeMeta(row);
+     };
+     for (const row of records) applyRowHints(row);
+     if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+       for (const row of processedRowsInput) applyRowHints(row);
      }
- 
-     records = records.filter((r) => isValidCode(r?.pn || r?.code));
-     if (!records.length) {
-       persistResult.skipped = [{ reason: 'missing_pn' }];
+   } else if (hasRuntimeMeta) {
+     for (const row of records) attachRuntimeMeta(row);
+     if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+       for (const row of processedRowsInput) attachRuntimeMeta(row);
      }
- 
-     if (records.length) {
-+      if (colTypes instanceof Map && colTypes.size) {
-+        for (const rec of records) {
-+          if (!rec || typeof rec !== 'object') continue;
-+          for (const [k, v] of Object.entries(rec)) {
-+            const keyLower = String(k || '').toLowerCase();
-+            const t = colTypes.get(keyLower) || colTypes.get(k);
-+            if (!t) continue;
-+            if (t === 'numeric')      rec[k] = coerceNumeric(v);
-+            else if (t === 'int')     rec[k] = toInt(v);
-+            else if (t === 'bool')    rec[k] = toBool(v);
-+          }
-+        }
-+      }
-       persistResult = await saveExtractedSpecs(qualified, family, records, {
-         brand: brandOverride,
-         pnTemplate,
-         requiredKeys: effectiveRequired,
-         coreSpecKeys: effectiveRequired,
-         runId,
-         run_id: runId,
-         jobId,
-         job_id: jobId,
-       }) || persistResult;
-     }
-   } else if (!records.length) {
-     persistResult.skipped = [{ reason: 'missing_pn' }];
    }
  
-   const persistedCodes = new Set(
-     (persistResult.written || [])
-       .map((pn) => String(pn || '').trim())
-       .filter(Boolean)
-   );
+-  const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
+   const runId = processed?.runId ?? processed?.run_id ?? overrides?.runId ?? overrides?.run_id ?? null;
+   const jobId = processed?.jobId ?? processed?.job_id ?? overrides?.jobId ?? overrides?.job_id ?? null;
  
-   if (!persistedCodes.size && records.length) {
-     for (const rec of records) {
-       const pn = String(rec.pn || rec.code || '').trim();
-       if (pn) persistedCodes.add(pn);
-
+   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
+   if (qualified && family && records.length) {
+     const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
+     const requiredList = Array.isArray(requiredFields) ? requiredFields : [];
+     const effectiveRequired = allowMinimal ? [] : requiredList;
+ 
+     const safeBrand = (value) => {
+       if (value == null) return null;
+       const trimmed = String(value).trim();
+       if (!trimmed) return null;
+       if (trimmed.toLowerCase() === 'unknown') return null;
+       return trimmed;
+     };
+ 
+     let brandOverride = safeBrand(overrides?.brand)
+       || safeBrand(processedEffective)
+       || safeBrand(processedBrand)
+       || safeBrand(brandName)
+       || safeBrand(extractedBrand)
+       || safeBrand(processedDetected)
+       || null;
+ 

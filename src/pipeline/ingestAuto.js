@@ -1690,8 +1690,10 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   const {
     started = Date.now(),
     gcsUri = null,
-    family = null,
-    table = null,
+    family: processedFamily = null,
+    family_slug: processedFamilySlug = null,
+    table: processedTable = null,
+    specs_table: processedSpecsTable = null,
     qualified: qualifiedInput = null,
     pnTemplate = null,
     requiredFields = [],
@@ -1708,7 +1710,75 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     brand_effective: processedEffective = null,
     brand_source: processedBrandSource = null,
     variant_keys_runtime: processedVariantKeys = [],
+    meta: processedMeta = null,
   } = processed || {};
+
+  const normalizeFamily = (value) => {
+    if (!value) return null;
+    const trimmed = String(value).trim();
+    return trimmed || null;
+  };
+
+  const metaFamily =
+    normalizeFamily(processedMeta?.family) ||
+    normalizeFamily(processedMeta?.family_slug);
+  const overridesFamily =
+    normalizeFamily(overrides?.family) ||
+    normalizeFamily(overrides?.family_slug);
+  const family =
+    normalizeFamily(processedFamily) ||
+    normalizeFamily(processedFamilySlug) ||
+    metaFamily ||
+    overridesFamily ||
+    null;
+
+  const sanitizeIdentifier = (value) => {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) return '';
+    if (trimmed.includes('.')) {
+      const [schemaRaw, tableRaw] = trimmed.split('.', 2);
+      const schemaSafe = String(schemaRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
+      const tableSafe = String(tableRaw || '').replace(/[^a-zA-Z0-9_]/g, '');
+      if (!schemaSafe || !tableSafe) return '';
+      return `${schemaSafe}.${tableSafe}`;
+    }
+    return trimmed.replace(/[^a-zA-Z0-9_]/g, '');
+  };
+
+  const pickTableCandidate = (...values) => {
+    for (const value of values) {
+      const normalized = sanitizeIdentifier(value);
+      if (normalized) return normalized;
+    }
+    return '';
+  };
+
+  let table = pickTableCandidate(processedSpecsTable, processedTable, qualifiedInput);
+  if (!table && family) {
+    try {
+      const r = await db.query(
+        `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+        [family],
+      );
+      table = pickTableCandidate(r.rows?.[0]?.specs_table);
+    } catch (err) {
+      console.warn('[persist] specs_table lookup failed:', err?.message || err);
+    }
+  }
+  if (!table && family) {
+    table = sanitizeIdentifier(`${family}_specs`);
+  }
+  const qualified = qualifiedInput || (table ? (table.includes('.') ? table : `public.${table}`) : null);
+
+  let colTypes = new Map();
+  if (qualified) {
+    try {
+      colTypes = await getColumnTypes(qualified);
+    } catch (err) {
+      console.warn('[persist] column type fetch failed:', err?.message || err);
+      colTypes = new Map();
+    }
+  }
 
   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
     ? initialRecords
@@ -1763,7 +1833,6 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     }
   }
 
-  const qualified = qualifiedInput || (table ? (table.startsWith('public.') ? table : `public.${table}`) : null);
   const runId = processed?.runId ?? processed?.run_id ?? overrides?.runId ?? overrides?.run_id ?? null;
   const jobId = processed?.jobId ?? processed?.job_id ?? overrides?.jobId ?? overrides?.job_id ?? null;
 

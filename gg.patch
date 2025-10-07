@@ -1,57 +1,92 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index b67f31870b72a03c19ba5a110bb13b4813aa525f..3ac687395fe852110a3dfa738edd5e5fc69bb5fd 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -723,51 +723,51 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
-         result.skipped.push({ reason: 'invalid_code', code: skippedCode, last_error: 'invalid_code' });
-         continue;
-       }
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 5302d7cc564cab15557e8996a4f5a56a214b0a05..fb131a053873658d6ce84bd1f835be57bbed76c1 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1817,60 +1817,81 @@ async function runAutoIngest(payload = {}) {
+       VALUES ($1, $2, 'RUNNING', now(), now())
+       ON CONFLICT (id) DO NOTHING
+     `,
+     [runId, normalizedPayload.gcsUri || normalizedPayload.gsUri || null],
+   );
  
-       rec.pn = pnValue;
-       if (rec.code == null || String(rec.code).trim() === '') {
-         rec.code = pnValue;
-       }
+   const watchdogMs = Number(process.env.INGEST_WATCHDOG_MS || 870000);
+   const watchdog = setTimeout(async () => {
+     try {
+       await db.query(
+         `
+           UPDATE public.ingest_run_logs
+              SET status='FAILED', event='WATCHDOG_TIMEOUT', error_message='watchdog timeout', finished_at=now(), ts=now()
+            WHERE id = $1 AND status='RUNNING'
+         `,
+         [runId],
+       );
+     } catch (err) {
+       console.warn('[ingest] watchdog update failed:', err?.message || err);
+     }
+   }, watchdogMs);
+   if (typeof watchdog?.unref === 'function') watchdog.unref();
  
-       const pnNorm = normKey(pnValue);
-       if (!pnNorm) {
-         if (physicalCols.has('last_error')) rec.last_error = 'missing_pn';
-         result.skipped.push({ reason: 'missing_pn', last_error: 'missing_pn' });
-         continue;
-       }
-       if (physicalCols.has('pn_norm')) rec.pn_norm = pnNorm;
- 
-       const codeNorm = normKey(rec.code);
-       if (!codeNorm) {
-         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
-         result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });
-         continue;
-       }
-       rec.code_norm = codeNorm;
- 
--      const naturalKey = `${rec.brand_norm ?? ''}::${pnNorm}`;
-+      const naturalKey = `${rec.brand_norm ?? ''}::${rec.pn_norm ?? pnNorm ?? normKey(rec.pn)}`;
-       if (seenNatural.has(naturalKey)) {
-         result.skipped.push({ reason: 'duplicate_code' });
-         continue;
-       }
-       seenNatural.add(naturalKey);
- 
-       rec.family_slug = familySlug;
- 
-       const display = rec.display_name || `${rec.brand} ${rec.pn}`;
-       rec.display_name = display;
-       if (rec.displayname == null) rec.displayname = display;
- 
-       let rawJson = {};
-       if (rec.raw_json && typeof rec.raw_json === 'object' && !Array.isArray(rec.raw_json)) {
-         rawJson = { ...rec.raw_json };
-       } else if (typeof rec.raw_json === 'string') {
-         try {
-           const parsed = JSON.parse(rec.raw_json);
-           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) rawJson = parsed;
-         } catch (_) {}
-       }
- 
-       const sanitized = {};
-       for (const col of colList) {
-         if (col === 'raw_json') continue;
+   try {
+     const result = await doIngestPipeline(normalizedPayload, runId);
++    const affected = Number(result?.affected ?? result?.rows ?? 0);
++    const ok = Boolean(result?.ok) && affected > 0;
+     await db.query(
+       `
+         UPDATE public.ingest_run_logs
+-           SET status='SUCCEEDED',
+-               event='PERSIST_DONE',
+-               error_message=NULL,
+-               finished_at=now(), ts=now()
+-         WHERE id=$1
++           SET status       = $2,
++               event        = $3,
++               final_table  = $4,
++               final_family = $5,
++               final_brand  = $6,
++               final_code   = $7,
++               final_datasheet = $8,
++               error_message   = $9,
++               finished_at  = now(), ts = now()
++         WHERE id = $1
+       `,
+-      [runId],
++      [
++        runId,
++        ok ? 'SUCCEEDED' : 'FAILED',
++        ok ? 'PERSIST_DONE' : 'PERSIST_ZERO',
++        result?.specs_table || result?.final_table || null,
++        result?.family || null,
++        result?.brand || null,
++        Array.isArray(result?.codes) ? result.codes[0] : (result?.code || null),
++        result?.datasheet_uri || null,
++        ok
++          ? null
++          : Array.isArray(result?.reject_reasons)
++              ? result.reject_reasons.join(',')
++              : null,
++      ],
+     );
+     return result;
+   } catch (e) {
+     const msg = (e && e.message ? String(e.message) : 'error').slice(0, 500);
+     try {
+       await db.query(
+         `
+           UPDATE public.ingest_run_logs
+              SET status='FAILED',
+                  event='EXCEPTION',
+                  error_message=$2,
+                  finished_at=now(), ts=now()
+            WHERE id=$1
+         `,
+         [runId, msg],
+       );
+     } catch (err) {
+       console.warn('[ingest] failure update failed:', err?.message || err);
+     }
+     throw e;
+   } finally {
+     clearTimeout(watchdog);
+     try { await db.query('SELECT pg_advisory_unlock(hashtextextended($1))', [runId]); } catch {}
+     try { await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]); } catch {}
+   }

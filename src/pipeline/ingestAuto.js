@@ -1839,16 +1839,37 @@ async function runAutoIngest(payload = {}) {
 
   try {
     const result = await doIngestPipeline(normalizedPayload, runId);
+    const affected = Number(result?.affected ?? result?.rows ?? 0);
+    const ok = Boolean(result?.ok) && affected > 0;
     await db.query(
       `
         UPDATE public.ingest_run_logs
-           SET status='SUCCEEDED',
-               event='PERSIST_DONE',
-               error_message=NULL,
-               finished_at=now(), ts=now()
-         WHERE id=$1
+           SET status       = $2,
+               event        = $3,
+               final_table  = $4,
+               final_family = $5,
+               final_brand  = $6,
+               final_code   = $7,
+               final_datasheet = $8,
+               error_message   = $9,
+               finished_at  = now(), ts = now()
+         WHERE id = $1
       `,
-      [runId],
+      [
+        runId,
+        ok ? 'SUCCEEDED' : 'FAILED',
+        ok ? 'PERSIST_DONE' : 'PERSIST_ZERO',
+        result?.specs_table || result?.final_table || null,
+        result?.family || null,
+        result?.brand || null,
+        Array.isArray(result?.codes) ? result.codes[0] : (result?.code || null),
+        result?.datasheet_uri || null,
+        ok
+          ? null
+          : Array.isArray(result?.reject_reasons)
+              ? result.reject_reasons.join(',')
+              : null,
+      ],
     );
     return result;
   } catch (e) {

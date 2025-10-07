@@ -254,6 +254,19 @@ function applyTemplateOptions(value, options = []) {
       if (Number.isFinite(width) && width > 0) out = out.padStart(width, '0');
       continue;
     }
+    if (op === 'first') {
+      out = out.split(',')[0].trim();
+      continue;
+    }
+    if (op === 'alnum') {
+      out = out.replace(/[^0-9A-Z]/gi, '');
+      continue;
+    }
+    if (op === 'digits') {
+      const m = out.match(/\d+/g) || [''];
+      out = m.join('');
+      continue;
+    }
     if (op === 'upcase' || op === 'upper' || op === 'uppercase') {
       out = out.toUpperCase();
       continue;
@@ -709,7 +722,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         rec[normKey(key)] = value;
       }
 
-      if ((!rec.brand || String(rec.brand).trim() === '') && options?.brand) {
+      if (options?.brand) {
         rec.brand = options.brand;
       }
 

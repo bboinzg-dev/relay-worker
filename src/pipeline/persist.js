@@ -636,7 +636,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
 
   const updateCols = insertCols.filter((col) => !CONFLICT_KEYS.includes(col));
   const updateSql = updateCols.length
-    ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ')
+    ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ') + `, "updated_at" = now()`
     : null;
 
   const sql = [

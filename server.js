@@ -916,12 +916,20 @@ async function markRunning(context) {
   return markRunningState(context);
 }
 
-async function markFailed({ runId, taskName, retryCount, error, durationMs, gcsUri }) {
+async function markFailed({ runId, taskName, retryCount, error, durationMs, gcsUri, detail }) {
   const errMsg = (error && typeof error === 'object' && error.message)
     ? String(error.message)
     : String(error || 'ingest_failed');
   const safeRetryCount = Number.isFinite(retryCount) ? retryCount : 0;
   const ms = Number.isFinite(durationMs) ? durationMs : 0;
+  const detailText = detail == null
+    ? null
+    : typeof detail === 'string'
+      ? detail
+      : (() => {
+          try { return JSON.stringify(detail); }
+          catch { return String(detail); }
+        })();
   try {
     await db.query(
       `UPDATE public.ingest_run_logs
@@ -930,9 +938,14 @@ async function markFailed({ runId, taskName, retryCount, error, durationMs, gcsU
               status = 'FAILED',
               task_name = $3,
               retry_count = $4,
-              error_message = $5
+              error_message = $5,
+              detail = CASE
+                WHEN $6::text IS NOT NULL AND length($6::text) > 0
+                  THEN jsonb_set(coalesce(detail,'{}'::jsonb), '{last_error}', to_jsonb($6::text), true)
+                ELSE detail
+              END
         WHERE id = $1`,
-      [runId, ms, taskName || null, safeRetryCount, errMsg]
+      [runId, ms, taskName || null, safeRetryCount, errMsg, detailText]
     );
   } catch (err) {
     console.error('[ingest markFailed]', err?.message || err);
@@ -1175,6 +1188,7 @@ async function handleWorkerIngest(req, res) {
         await markFailed({
           ...baseContext,
           error: list.join(',') || 'ingest_rejected',
+          detail: out?.detail || out?.last_error || null,
           durationMs: out?.ms ?? (Date.now() - startedAt),
         });
         failureMarked = true;

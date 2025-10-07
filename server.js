@@ -128,10 +128,34 @@ function getTasks() {
   return { tasks: _tasks, queuePath: _queuePath };
 }
 
+function resolveWorkerTaskUrl() {
+  const rawUrl = WORKER_TASK_URL;
+  if (!rawUrl || /<YOUR-RUN-URL>/i.test(rawUrl)) {
+    throw new Error('WORKER_TASK_URL not configured');
+  }
+  try {
+    return new URL(rawUrl).toString();
+  } catch (err) {
+    const reason = err?.message || err;
+    throw new Error(`Invalid WORKER_TASK_URL: ${reason}`);
+  }
+}
+
+function resolveWorkerAudience(workerUrl) {
+  if (process.env.WORKER_AUDIENCE) return process.env.WORKER_AUDIENCE;
+  try {
+    return new URL(workerUrl).origin;
+  } catch (err) {
+    const reason = err?.message || err;
+    throw new Error(`Unable to derive WORKER audience: ${reason}`);
+  }
+}
+
 async function enqueueIngestTask(payload = {}) {
   const { tasks, queuePath } = getTasks();
   if (!TASKS_INVOKER_SA) throw new Error('TASKS_INVOKER_SA not set');
-  const audience = process.env.WORKER_AUDIENCE || new URL(WORKER_TASK_URL).origin;
+  const workerUrl = resolveWorkerTaskUrl();
+  const audience = resolveWorkerAudience(workerUrl);
 
   const bodyPayload = {
     fromTasks: true,
@@ -151,7 +175,7 @@ async function enqueueIngestTask(payload = {}) {
   const task = {
     httpRequest: {
       httpMethod: 'POST',
-      url: WORKER_TASK_URL,            // ★ ingest 하나로 통일
+      url: workerUrl,            // ★ ingest 하나로 통일
       headers: { 'Content-Type': 'application/json' },
       body,
       ...(TASKS_INVOKER_SA ? { oidcToken: { serviceAccountEmail: TASKS_INVOKER_SA, audience } } : {}),

@@ -1,223 +1,83 @@
-diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
-index eb49148f9849cd7143ea70586e231d042c11ad0c..bcf6a9a72891389a18ddfc522e0bbb1730f9107a 100644
---- a/src/utils/mpn-exploder.js
-+++ b/src/utils/mpn-exploder.js
-@@ -1,32 +1,88 @@
+diff --git a/src/utils/ai.js b/src/utils/ai.js
+index 8c726040578a200529119087b5d84270c480bd40..f1a0ede8b2883e02f316d2ca17ac53d6d8453702 100644
+--- a/src/utils/ai.js
++++ b/src/utils/ai.js
+@@ -1,45 +1,77 @@
  'use strict';
  
- const LIST_SEP = /[\s,;/|·•]+/;
-+const CONTACT_FORM_PATTERNS = [
-+  { regex: /(1\s*form\s*a|1a|spst-?no)/i, value: '1A' },
-+  { regex: /(2\s*form\s*a|2a|dpst-?no)/i, value: '2A' },
-+];
-+const CONTACT_FORM_ALLOWED = new Set(['1A', '2A']);
-+const SERIES_STRIP_WORDS = /\b(relays?|series|relay|power|signal)\b/gi;
- const NON_MPN_WORDS = new Set([
-   'relay', 'relays', 'coil', 'vdc', 'vac', 'form', 'series', 'typ', 'max', 'min'
- ]);
- 
-+function normalizeSeriesCode(value) {
-+  if (value == null) return null;
-+  const raw = Array.isArray(value) ? value[0] : value;
-+  if (raw == null) return null;
-+  const str = String(raw).trim();
-+  if (!str) return null;
-+  const cleaned = str
-+    .replace(SERIES_STRIP_WORDS, '')
-+    .replace(/\s+/g, '')
-+    .trim();
-+  const upper = cleaned.toUpperCase();
-+  return upper || null;
-+}
++const { callModelJson } = require('./vertex');
 +
-+function normalizeContactForm(value) {
-+  if (value == null) return null;
-+  const raw = Array.isArray(value) ? value[0] : value;
-+  if (raw == null) return null;
-+  const str = String(raw).trim();
-+  if (!str) return null;
-+  for (const { regex, value: mapped } of CONTACT_FORM_PATTERNS) {
-+    if (regex.test(str)) return mapped;
-+  }
-+  const compact = str.replace(/\s+/g, '').toUpperCase();
-+  if (CONTACT_FORM_ALLOWED.has(compact)) return compact;
-+  if (compact === 'SPST' || compact === 'SPSTNO') return '1A';
-+  if (compact === 'DPST' || compact === 'DPSTNO') return '2A';
-+  return null;
-+}
-+
-+function normalizeCoilVoltage(value) {
-+  if (value == null) return null;
-+  const raw = Array.isArray(value) ? value[0] : value;
-+  if (raw == null) return null;
-+  const str = String(raw).trim();
-+  if (!str) return null;
-+  const digits = str.match(/\d+/g);
-+  if (!digits || !digits.length) return null;
-+  const joined = digits.join('');
-+  if (!joined) return null;
-+  return joined;
-+}
-+
-+function isLikelyPn(value) {
-+  if (value == null) return false;
-+  const str = String(value).trim();
-+  if (!str) return false;
-+  return /^[A-Z]{1,4}[A-Z0-9\-_/]{2,}$/i.test(str);
-+}
-+
- function derivePrefix(token) {
-   if (!token) return '';
-   const trimmed = token.trim();
-   if (!trimmed) return '';
+ let client = null;
  
-   // 가장 흔한 패턴: 마지막 구분자(-/_/) 직전까지를 prefix로 본다.
-   const delimiterMatch = trimmed.match(/^(.*[\-_/])[A-Za-z0-9]+$/);
-   if (delimiterMatch) return delimiterMatch[1];
- 
-   // 구분자가 없으면 최초의 영문자로 시작하는 시퀀스를 prefix로 사용
-   const headMatch = trimmed.match(/^([A-Za-z][A-Za-z0-9]*)/);
-   if (headMatch) return headMatch[1];
- 
-   return '';
+ function getClient() {
+   if (client) return client;
+   try {
+     const { VertexAI } = require('@google-cloud/vertexai');
+     const project  = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+     const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
+     client = new VertexAI({ project, location });
+   } catch {
+     client = null; // Vertex 미사용(또는 의존성 없음) 시 null 유지
+   }
+   return client;
  }
  
- function normalizeSuffix(token) {
-   if (!token) return '';
-   return token.replace(/^[\-_/]+/, '');
- }
+ /**
+  * JSON 스키마 기반 생성. 실패 시 null 리턴(폴백 용이)
+  */
+ async function generateJSON({ system, input, schema, model }) {
+   const c = getClient();
+   if (!c) return null;
  
- function splitAndCarryPrefix(raw) {
-   if (!raw) return [];
-   const tokens = String(raw)
-     .split(LIST_SEP)
-diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
-index eb49148f9849cd7143ea70586e231d042c11ad0c..bcf6a9a72891389a18ddfc522e0bbb1730f9107a 100644
---- a/src/utils/mpn-exploder.js
-+++ b/src/utils/mpn-exploder.js
-@@ -172,74 +228,122 @@ function explodeToRows(base, options = {}) {
-     const fromExact = values[key];
-     if (fromExact != null) {
-       const normed = normalizeList(fromExact);
-       return normed.length ? normed : [fromExact];
-     }
-     const lower = key.toLowerCase();
-     if (values[lower] != null) {
-       const normed = normalizeList(values[lower]);
-       return normed.length ? normed : [values[lower]];
-     }
-     return [null];
+   const m = c.getGenerativeModel({
+     model: model || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash',
+     generationConfig: {
+       temperature: 0.2,
+       maxOutputTokens: 2048,
+       responseMimeType: 'application/json',
+     },
+     ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
    });
  
-   const combos = lists.length ? cartesian(lists) : [[]];
-   const mpnCandidates = collectMpnSeeds(base);
- 
-   const rows = [];
-   combos.forEach((combo, idx) => {
-     const rowValues = { ...values };
-     variantKeys.forEach((key, keyIdx) => {
-       const val = combo[keyIdx];
-       if (val == null || val === '') return;
-       assignValue(rowValues, key, val);
-     });
- 
-+    const normalizedSeries = normalizeSeriesCode(
-+      rowValues.series_code
-+        ?? rowValues.series
-+        ?? base?.series_code
-+        ?? base?.series
-+        ?? null,
-+    );
-+    if (normalizedSeries) {
-+      assignValue(rowValues, 'series_code', normalizedSeries);
-+      if (rowValues.series == null) assignValue(rowValues, 'series', normalizedSeries);
-+    }
-+
-+    const normalizedContactForm = normalizeContactForm(
-+      rowValues.contact_form
-+        ?? rowValues.contact_arrangement
-+        ?? rowValues.form
-+        ?? null,
-+    );
-+    if (normalizedContactForm) assignValue(rowValues, 'contact_form', normalizedContactForm);
-+    else {
-+      delete rowValues.contact_form;
-+      delete rowValues.contactform;
-+    }
-+
-+    const normalizedCoilVoltage = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
-+    if (normalizedCoilVoltage) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltage);
-+    else {
-+      delete rowValues.coil_voltage_vdc;
-+      delete rowValues.coil_voltagevdc;
-+    }
-+
-+    const canUseTemplate = pnTemplate
-+      && normalizedSeries
-+      && normalizedContactForm
-+      && CONTACT_FORM_ALLOWED.has(normalizedContactForm)
-+      && normalizedCoilVoltage;
-+
-+    let generatedByTemplate = false;
-+    let generatedByFallback = false;
-     let code = null;
-+
-     if (pnTemplate) {
-+      if (!canUseTemplate) return;
-       code = renderTemplate(pnTemplate, {
-         ...rowValues,
--        series: base?.series ?? base?.series_code ?? rowValues.series ?? rowValues.series_code ?? '',
--        series_code: base?.series_code ?? rowValues.series_code ?? '',
-+        series: normalizedSeries,
-+        series_code: normalizedSeries,
-+        contact_form: normalizedContactForm,
-+        coil_voltage_vdc: normalizedCoilVoltage,
-       });
-+      generatedByTemplate = true;
-     } else if (mpnCandidates[idx]) {
-       code = mpnCandidates[idx];
-     } else if (mpnCandidates.length) {
-       code = mpnCandidates[0];
-     } else {
-       const parts = [];
--      if (base?.series) parts.push(base.series);
-+      if (normalizedSeries) parts.push(normalizedSeries);
-+      else if (base?.series) parts.push(base.series);
-       else if (base?.series_code) parts.push(base.series_code);
-       const suffix = variantKeys
-         .map((key) => rowValues[key] ?? rowValues[key?.toLowerCase()])
-         .filter((v) => v != null && v !== '')
-         .map((v) => String(v))
-         .join('');
-       if (suffix) parts.push(suffix);
-       code = parts.join('');
-+      generatedByFallback = true;
-     }
- 
-     code = String(code || '').trim();
-     if (!code) return;
- 
-+    if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
-+
-     const codeNorm = code.toLowerCase();
-     if (rows.some((r) => r.code_norm === codeNorm)) return;
- 
-     rows.push({
-       code,
-       code_norm: codeNorm,
-       values: rowValues,
-     });
+   const res = await m.generateContent({
+     contents: [{ role: 'user', parts: [{ text: JSON.stringify({ input, schema }) }]}],
    });
  
-   return rows;
+   const text =
+     res?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+ 
+   try { return JSON.parse(text); } catch { return null; }
  }
  
- module.exports = {
-   LIST_SEP,
-   NON_MPN_WORDS,
-   splitAndCarryPrefix,
-   normalizeList,
-   cartesian,
-   renderTemplate,
-   explodeToRows,
- };
+-module.exports = { generateJSON };
++async function normalizeValueLLM({ family, key, raw, enumValues = null }) {
++  const sys = [
++    'You map free-text spec values to canonical catalog values.',
++    'Always return strict JSON with fields: normalized, confidence, unit, magnitude.',
++    'normalized: canonical string or empty if cannot map.',
++    'If enum_values are provided, choose one of them exactly (case-insensitive).',
++    'For numeric values, also extract magnitude (number) and unit (string) if present.',
++  ].join('\n');
++
++  const usr = JSON.stringify({
++    family,
++    key,
++    raw: String(raw ?? ''),
++    enum_values: enumValues && enumValues.length ? enumValues : null,
++  });
++
++  const out = await callModelJson(sys, usr, {
++    temperature: 0.1,
++    topP: 0.2,
++    maxOutputTokens: 800,
++  });
++
++  return {
++    normalized: out && typeof out.normalized === 'string' ? out.normalized.trim() : null,
++    confidence: Number(out?.confidence ?? 0) || 0,
++    unit: out && typeof out.unit === 'string' ? out.unit.trim() : null,
++    magnitude: out && out.magnitude != null ? Number(out.magnitude) : null,
++  };
++}
++
++module.exports = { generateJSON, normalizeValueLLM };

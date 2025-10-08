@@ -1,5 +1,7 @@
 'use strict';
 
+const { callModelJson } = require('./vertex');
+
 let client = null;
 
 function getClient() {
@@ -42,4 +44,34 @@ async function generateJSON({ system, input, schema, model }) {
   try { return JSON.parse(text); } catch { return null; }
 }
 
-module.exports = { generateJSON };
+async function normalizeValueLLM({ family, key, raw, enumValues = null }) {
+  const sys = [
+    'You map free-text spec values to canonical catalog values.',
+    'Always return strict JSON with fields: normalized, confidence, unit, magnitude.',
+    'normalized: canonical string or empty if cannot map.',
+    'If enum_values are provided, choose one of them exactly (case-insensitive).',
+    'For numeric values, also extract magnitude (number) and unit (string) if present.',
+  ].join('\n');
+
+  const usr = JSON.stringify({
+    family,
+    key,
+    raw: String(raw ?? ''),
+    enum_values: enumValues && enumValues.length ? enumValues : null,
+  });
+
+  const out = await callModelJson(sys, usr, {
+    temperature: 0.1,
+    topP: 0.2,
+    maxOutputTokens: 800,
+  });
+
+  return {
+    normalized: out && typeof out.normalized === 'string' ? out.normalized.trim() : null,
+    confidence: Number(out?.confidence ?? 0) || 0,
+    unit: out && typeof out.unit === 'string' ? out.unit.trim() : null,
+    magnitude: out && out.magnitude != null ? Number(out.magnitude) : null,
+  };
+}
+
+module.exports = { generateJSON, normalizeValueLLM };

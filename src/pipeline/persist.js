@@ -4,6 +4,7 @@ const crypto = require('crypto');
 
 const { pool } = require('../../db');
 const { getColumnsOf } = require('./ensure-spec-columns');
+const { normalizeValueLLM } = require('../utils/ai');
 
 const META_KEYS = new Set([
   'family_slug',
@@ -47,6 +48,93 @@ const SCALE_MAP = {
   n: 1e-9,
   p: 1e-12,
 };
+
+const LLM_CONFIDENCE_THRESHOLD = (() => {
+  const raw = Number(process.env.SPEC_AI_CONFIDENCE_MIN ?? process.env.SPEC_NORMALIZE_CONFIDENCE ?? 0.6);
+  return Number.isFinite(raw) ? raw : 0.6;
+})();
+
+const llmNormalizationCache = new Map();
+
+function buildBlueprintFieldMap(blueprint) {
+  const map = new Map();
+  if (!blueprint) return map;
+
+  const raw =
+    (blueprint.fields && typeof blueprint.fields === 'object' && blueprint.fields) ||
+    blueprint.fields_json ||
+    blueprint;
+
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      if (!entry || typeof entry !== 'object') continue;
+      const key = normKey(entry.name || entry.key || entry.field);
+      if (!key) continue;
+      map.set(key, entry);
+    }
+    return map;
+  }
+
+  if (raw && typeof raw === 'object') {
+    for (const [name, meta] of Object.entries(raw)) {
+      const key = normKey(name);
+      if (!key) continue;
+      if (meta && typeof meta === 'object') map.set(key, meta);
+      else map.set(key, { type: meta });
+    }
+  }
+  return map;
+}
+
+function buildAllowedKeySet(blueprint) {
+  const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
+  const set = new Set();
+  for (const key of allowed) {
+    const norm = normKey(key);
+    if (norm) set.add(norm);
+  }
+  return set;
+}
+
+function enumValuesFromMeta(meta) {
+  if (!meta || typeof meta !== 'object') return null;
+  if (Array.isArray(meta.enum) && meta.enum.length) return meta.enum;
+  if (Array.isArray(meta.allowed) && meta.allowed.length) return meta.allowed;
+  if (Array.isArray(meta.values) && meta.values.length) return meta.values;
+  return null;
+}
+
+function makeNormalizationCacheKey({ family, key, raw, enumValues }) {
+  const enumKey = Array.isArray(enumValues) && enumValues.length
+    ? enumValues.map((v) => String(v ?? '').toLowerCase()).sort().join('|')
+    : '';
+  return [family || '', key || '', String(raw ?? ''), enumKey].join('::');
+}
+
+async function normalizeValueWithCache(params) {
+  const cacheKey = makeNormalizationCacheKey(params);
+  if (llmNormalizationCache.has(cacheKey)) {
+    const cached = llmNormalizationCache.get(cacheKey);
+    if (cached && typeof cached.then === 'function') {
+      return cached;
+    }
+    return cached;
+  }
+
+  const task = normalizeValueLLM(params)
+    .then((result) => {
+      llmNormalizationCache.set(cacheKey, result);
+      return result;
+    })
+    .catch(() => {
+      const fallback = { normalized: null, confidence: 0, unit: null, magnitude: null };
+      llmNormalizationCache.set(cacheKey, fallback);
+      return fallback;
+    });
+
+  llmNormalizationCache.set(cacheKey, task);
+  return task;
+}
 
 function normKey(key) {
   return String(key || '')
@@ -125,6 +213,66 @@ function parseNumericOrRange(value) {
   }
 
   return { value: null };
+}
+
+async function applyAiNormalization({
+  record,
+  keys,
+  columnTypes,
+  fieldMetaMap,
+  allowedKeySet,
+  family,
+}) {
+  if (!record || typeof record !== 'object') return;
+  if (!Array.isArray(keys) || !keys.length) return;
+
+  for (const key of keys) {
+    if (!key) continue;
+    if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+    if (allowedKeySet?.size && !allowedKeySet.has(key)) continue;
+
+    const original = record[key];
+    if (original == null) continue;
+    if (Array.isArray(original)) continue;
+    if (typeof original === 'object') continue;
+    if (typeof original === 'boolean') continue;
+    if (typeof original === 'number' && !Number.isFinite(original)) continue;
+
+    const type = columnTypes.get(key);
+    const lowerType = String(type || '').toLowerCase();
+    if (lowerType.includes('bool')) continue;
+
+    if (typeof original === 'number' && isNumericType(type)) continue;
+
+    const str = String(original).trim();
+    if (!str) continue;
+
+    const meta = fieldMetaMap.get(key);
+    const enumValuesRaw = enumValuesFromMeta(meta);
+    const enumCandidates = Array.isArray(enumValuesRaw) && enumValuesRaw.length
+      ? enumValuesRaw.map((v) => String(v ?? '').trim()).filter(Boolean)
+      : [];
+    const enumValues = enumCandidates.length ? enumCandidates : null;
+
+    try {
+      const { normalized, confidence, magnitude } = await normalizeValueWithCache({
+        family,
+        key,
+        raw: str,
+        enumValues,
+      });
+
+      if (!Number.isFinite(confidence) || confidence < LLM_CONFIDENCE_THRESHOLD) continue;
+
+      if (isNumericType(type) && typeof magnitude === 'number' && Number.isFinite(magnitude)) {
+        record[key] = magnitude;
+      } else if (normalized && typeof normalized === 'string' && normalized.trim()) {
+        record[key] = normalized.trim();
+      }
+    } catch (_) {
+      // Vertex 호출 실패는 치명적이지 않으므로 조용히 무시
+    }
+  }
 }
 
 function deriveRangePrefixes(base) {
@@ -676,6 +824,9 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   }
 
   const columnTypes = await getColumnTypes(targetTable);
+  const blueprintMeta = options?.blueprint || null;
+  const blueprintFieldMap = buildBlueprintFieldMap(blueprintMeta);
+  const blueprintAllowedSet = buildAllowedKeySet(blueprintMeta);
   const pnTemplate = typeof options.pnTemplate === 'string' && options.pnTemplate ? options.pnTemplate : null;
   const requiredKeys = Array.isArray(options.requiredKeys)
     ? options.requiredKeys.map((k) => normKey(k)).filter(Boolean)
@@ -895,6 +1046,17 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           const parsed = JSON.parse(rec.raw_json);
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) rawJson = parsed;
         } catch (_) {}
+      }
+
+      if (candidateSpecKeys.length) {
+        await applyAiNormalization({
+          record: rec,
+          keys: candidateSpecKeys,
+          columnTypes,
+          fieldMetaMap: blueprintFieldMap,
+          allowedKeySet: blueprintAllowedSet,
+          family: familySlug,
+        });
       }
 
       const sanitized = {};

@@ -2290,6 +2290,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         pnTemplate,
         requiredKeys: effectiveRequired,
         coreSpecKeys: effectiveRequired,
+        blueprint,
         runId,
         run_id: runId,
         jobId,

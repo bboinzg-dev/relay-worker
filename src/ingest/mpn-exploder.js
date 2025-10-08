@@ -1,6 +1,27 @@
 'use strict';
 
 const LIST_SEP = /[\,\s/;|·•]+/;
+// 🔹 키 별칭(범용): 템플릿 키 → 실제 필드명 후보
+const KEY_ALIASES = {
+  contact_form: [
+    'contact_form',
+    'contact_arrangement',
+    'configuration',
+    'arrangement',
+    'poles_form',
+    'form',
+  ],
+  coil_voltage_vdc: [
+    'coil_voltage_vdc',
+    'voltage_vdc',
+    'rated_voltage_vdc',
+    'vdc',
+    'coil_voltage',
+    'voltage',
+  ],
+  series: ['series', 'series_code'],
+  suffix: ['suffix', 'packing', 'package', 'packaging', 'mount_type', 'mounting', 'terminal'],
+};
 const CANDIDATE_KEYS = [
   'candidates',
   'codes',
@@ -17,6 +38,25 @@ const CONTACT_FORM_ENUM = {
   DPDT: '2C',
   DPST: '2A',
 };
+
+function pick(obj, key) {
+  const cand = new Set([key, String(key || '').toLowerCase()]);
+  for (const a of KEY_ALIASES[String(key || '').toLowerCase()] || []) {
+    cand.add(a);
+    cand.add(String(a).toLowerCase());
+  }
+  for (const k of cand) {
+    const v = obj?.[k];
+    if (v == null) continue;
+    if (Array.isArray(v)) {
+      const first = v.find((x) => x != null && String(x).trim() !== '');
+      if (first != null) return first;
+    }
+    const s = String(v).trim();
+    if (s !== '') return v;
+  }
+  return null;
+}
 
 function normalizeList(raw) {
   if (raw == null) return [];
@@ -148,7 +188,8 @@ function renderTemplate(tpl, obj) {
     if (!parts.length) return '';
     const rawKey = parts.shift();
     if (!rawKey) return '';
-    const value = normalizeTemplateValue(rawKey, obj[rawKey]);
+    // 🔹 별칭까지 고려해 값 선택
+    const value = normalizeTemplateValue(rawKey, pick(obj, rawKey));
     if (value == null || value === '') return '';
     const applied = applyTemplateMods(value, parts);
     return applied == null ? '' : String(applied);
@@ -157,6 +198,8 @@ function renderTemplate(tpl, obj) {
   let out = String(tpl);
   out = render(out, /\{\{\s*([^{}]+?)\s*\}\}/g);
   out = render(out, /\{\s*([^{}]+?)\s*\}/g);
+  // 🔹 미치환 토큰 방지: 남은 중괄호 제거(=치환 실패 → 공백)
+  out = out.replace(/\{[^{}]+\}/g, '');
   return out.replace(/\s+/g, '').trim();
 }
 

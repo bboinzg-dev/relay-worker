@@ -1,64 +1,62 @@
-diff --git a/src/ingest/mpn-exploder.js b/src/ingest/mpn-exploder.js
-index ce4d999d155c0004cb701a1cf175efcee481b06f..58a3725ed946150db9c00bdd581bea55eff9da43 100644
---- a/src/ingest/mpn-exploder.js
-+++ b/src/ingest/mpn-exploder.js
-@@ -29,50 +29,59 @@ function normalizeList(raw) {
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 2478747ad00f60932e3d925ea261d6b9fdebeab8..15d6bd33187075ceb269b820ee858c5162bf445e 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -779,50 +779,57 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+         const fallbackPn = `pdf:${base}#${rowIndex + 1}`;
+         rec.pn = fallbackPn;
+         if (!rec.code || !isValidCode(rec.code)) {
+           rec.code = fallbackPn;
+         }
+         if (physicalCols.has('last_error')) {
+           rec.last_error = rec.last_error || 'invalid_code_fallback';
+         }
+         warnings.add('minimal_pn_fallback');
+       }
  
- function escapeRegExp(str) {
-   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
- }
+       if (!isValidCode(rec.pn)) {
+         rec.pn = null;
+       }
  
- function applyTemplateMods(value, mods = []) {
-   if (value == null) return '';
+       if (!rec.pn && rec.code) {
+         rec.pn = rec.code;
+       }
  
-   let out = Array.isArray(value) ? value[0] : value;
-   if (out == null) return '';
-   if (typeof out !== 'string') out = String(out);
+       buildPnIfMissing(rec, pnTemplate);
  
-   for (const rawMod of mods) {
-     const token = String(rawMod || '').trim();
-     if (!token) continue;
-     const [opRaw, argRaw = ''] = token.split('=').map((t) => t.trim());
-     const op = opRaw.toLowerCase();
-     if (!op) continue;
+       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
+         rec.pn = rec.code;
+       }
  
-     if (op === 'pad') {
-       const width = Number(argRaw);
-       if (Number.isFinite(width) && width > 0) out = out.padStart(width, '0');
-       continue;
-     }
- 
-+    if (op === 'map') {
-+      try {
-+        const lut = JSON.parse(argRaw);
-+        const key = String(out);
-+        if (lut[key] != null) out = lut[key];
-+      } catch {}
-+      continue;
-+    }
++      // 🔹 템플릿 미치환 차단: 아직 { } 가 남아있다면 유효 PN 아님
++      if (looksLikeTemplate(rec.pn) || looksLikeTemplate(rec.code)) {
++        if (physicalCols.has('last_error')) rec.last_error = 'template_unresolved';
++        result.skipped.push({ reason: 'invalid_code', detail: 'template_unresolved' });
++        continue;
++      }
 +
-     if (op === 'first') {
-       const parts = out.split(',');
-       out = parts.length ? parts[0].trim() : out;
-       continue;
-     }
+       const pnMissing = !isValidCode(rec.pn);
+       if (pnMissing && (pnWasTemplate || codeWasTemplate)) {
+         if (physicalCols.has('last_error')) rec.last_error = 'template_render_failed';
+         result.skipped.push({ reason: 'invalid_code', detail: 'template_render_failed' });
+         continue;
+       }
  
-     if (op === 'alnum') {
-       out = out.replace(/[^0-9A-Z]/gi, '');
-       continue;
-     }
+       if (!isValidCode(rec.code) && isValidCode(rec.pn)) {
+         rec.code = rec.pn;
+       }
  
-     if (op === 'digits') {
-       const match = out.match(/\d+/g) || [''];
-       out = match.join('');
-       continue;
-     }
+       const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });
+       if (!guard.ok) {
+         const skip = { reason: guard.reason, detail: guard.detail || null };
+         if (rec.last_error) skip.last_error = rec.last_error;
+         result.skipped.push(skip);
+         continue;
+       }
  
-     if (op === 'upper' || op === 'upcase' || op === 'uppercase') {
-       out = out.toUpperCase();
-       continue;
-     }
- 
-     if (op === 'lower' || op === 'downcase' || op === 'lowercase') {
-       out = out.toLowerCase();
-       continue;
+       const pnValue = String(rec.pn || rec.code || '').trim();
+       const pnIsFallback = isMinimalFallbackPn(pnValue);
+       if (!pnValue || !isValidCode(pnValue) || (!pnIsFallback && FORBIDDEN_RE.test(pnValue))) {
+         const skippedCode = pnValue || String(rec.code || rec.pn || '').trim() || '(no-code)';
+         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
+         result.skipped.push({ reason: 'invalid_code', code: skippedCode, last_error: 'invalid_code' });

@@ -801,6 +801,13 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         rec.pn = rec.code;
       }
 
+      // 🔹 템플릿 미치환 차단: 아직 { } 가 남아있다면 유효 PN 아님
+      if (looksLikeTemplate(rec.pn) || looksLikeTemplate(rec.code)) {
+        if (physicalCols.has('last_error')) rec.last_error = 'template_unresolved';
+        result.skipped.push({ reason: 'invalid_code', detail: 'template_unresolved' });
+        continue;
+      }
+
       const pnMissing = !isValidCode(rec.pn);
       if (pnMissing && (pnWasTemplate || codeWasTemplate)) {
         if (physicalCols.has('last_error')) rec.last_error = 'template_render_failed';

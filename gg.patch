@@ -1,125 +1,55 @@
 diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index ebedf86368a13bea46d0316a5b7c136d8310f8e7..108f7e71310b8bd61a2f4721624546e1a217a709 100644
+index 108f7e71310b8bd61a2f4721624546e1a217a709..2478747ad00f60932e3d925ea261d6b9fdebeab8 100644
 --- a/src/pipeline/persist.js
 +++ b/src/pipeline/persist.js
-@@ -232,50 +232,63 @@ async function normalizeBrand(raw, docTextLower = '') {
-   if (resolved) {
-     brandCache.set(key, resolved);
-     brandCache.set(resolved, resolved);
-   }
-   return resolved;
- }
- 
- function escapeRegExp(str) {
-   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
- }
- 
- function applyTemplateOptions(value, options = []) {
-   if (value == null) return value;
-   let out = String(value);
-   for (const rawToken of options) {
-     const token = String(rawToken || '').trim();
-     if (!token) continue;
-     const [opRaw, argRaw = ''] = token.split('=').map((t) => t.trim());
-     const op = opRaw.toLowerCase();
-     if (!op) continue;
-     if (op === 'pad') {
-       const width = Number(argRaw);
-       if (Number.isFinite(width) && width > 0) out = out.padStart(width, '0');
-       continue;
-     }
-+    if (op === 'first') {
-+      out = out.split(',')[0].trim();
-+      continue;
-+    }
-+    if (op === 'alnum') {
-+      out = out.replace(/[^0-9A-Z]/gi, '');
-+      continue;
-+    }
-+    if (op === 'digits') {
-+      const m = out.match(/\d+/g) || [''];
-+      out = m.join('');
-+      continue;
-+    }
-     if (op === 'upcase' || op === 'upper' || op === 'uppercase') {
-       out = out.toUpperCase();
-       continue;
-     }
-     if (op === 'downcase' || op === 'lower' || op === 'lowercase') {
-       out = out.toLowerCase();
-       continue;
-     }
-     if (op === 'trim') {
-       out = out.trim();
-       continue;
-     }
-     if (op === 'prefix') {
-       out = `${argRaw}${out}`;
-       continue;
-     }
-     if (op === 'suffix') {
-       out = `${out}${argRaw}`;
-       continue;
-     }
-     if (op === 'replace' && argRaw) {
-       const [search, replacement = ''] = argRaw.split(':');
-       if (search != null) {
-         const matcher = new RegExp(escapeRegExp(search), 'g');
-         out = out.replace(matcher, replacement);
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index ebedf86368a13bea46d0316a5b7c136d8310f8e7..108f7e71310b8bd61a2f4721624546e1a217a709 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -687,51 +700,51 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
-   const updateCols = insertCols.filter((col) => !CONFLICT_KEYS.includes(col));
-   const updateSql = updateCols.length
-     ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ') + `, "updated_at" = now()`
-     : null;
- 
-   const sql = [
-     `INSERT INTO ${targetTable} (${insertCols.map((c) => `"${c}"`).join(',')})`,
-     `VALUES (${placeholders})`,
-     'ON CONFLICT (brand_norm, pn)',
-     updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
-     'RETURNING pn',
-   ].join('\n');
- 
-   const client = await pool.connect();
-   const warnings = new Set();
-   const seenNatural = new Set();
- 
-   try {
-     for (const [rowIndex, row] of rows.entries()) {
-       result.processed += 1;
-       const rec = {};
-       for (const [key, value] of Object.entries(row || {})) {
-         rec[normKey(key)] = value;
+@@ -871,49 +871,49 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+           const parsed = JSON.parse(rec.raw_json);
+           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) rawJson = parsed;
+         } catch (_) {}
        }
  
--      if ((!rec.brand || String(rec.brand).trim() === '') && options?.brand) {
-+      if (options?.brand) {
-         rec.brand = options.brand;
+       const sanitized = {};
+       for (const col of colList) {
+         if (col === 'raw_json') continue;
+         const original = rec[col];
+         sanitized[col] = coerceColumnValue(col, original, columnTypes, rec, rawJson, warnings);
        }
  
-       const docTextRaw = String(
-         rec._doc_text ??
-           rec.doc_text ??
-           row?._doc_text ??
-           row?.doc_text ??
-           (options?.docText || options?.doc_text) ??
-           '',
-       );
-       const docTextLower = docTextRaw.toLowerCase();
-       const brandCandidates = [options?.brand, rec.brand, rec.brand_norm];
-       let brandKey = null;
-       for (const candidate of brandCandidates) {
-         if (!candidate) continue;
-         const trimmed = String(candidate).trim();
-         if (!trimmed) continue;
-         brandKey = await normalizeBrand(trimmed, docTextLower);
-         if (brandKey) break;
+       if (physicalCols.has('raw_json')) {
+         sanitized.raw_json = Object.keys(rawJson).length ? JSON.stringify(rawJson) : null;
        }
-       if (brandKey) {
-         if (!rec.brand || !String(rec.brand).trim()) {
-           rec.brand = options?.brand || brandKey;
+ 
+       const vals = insertCols.map((col) => {
+         if (col === 'raw_json') return sanitized.raw_json ?? null;
+         return sanitized[col] ?? null;
+       });
+ 
+       try {
+         await client.query('BEGIN');
+         if (appNameSuffix) {
+           await client.query(
+-            `SET LOCAL application_name = current_setting('application_name', true) || $1`,
++            `SELECT set_config('application_name', current_setting('application_name', true) || $1, true)`,
+             [appNameSuffix],
+           );
          }
+         const res = await client.query(sql, vals);
+         await client.query('COMMIT');
+         const delta = res.rowCount || 0;
+         result.upserts += delta;
+         result.affected += delta;
+         if (res.rows?.[0]?.pn) result.written.push(res.rows[0].pn);
+       } catch (err) {
+         await client.query('ROLLBACK').catch(() => {});
+         result.skipped.push({ reason: 'db_error', detail: err?.message || String(err) });
+       }
+     }
+   } finally {
+     client.release();
+   }
+ 
+   result.warnings = Array.from(warnings);
+   return result;
+ }
+ 
+ module.exports = { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate };

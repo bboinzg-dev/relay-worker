@@ -893,7 +893,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         await client.query('BEGIN');
         if (appNameSuffix) {
           await client.query(
-            `SET LOCAL application_name = current_setting('application_name', true) || $1`,
+            `SELECT set_config('application_name', current_setting('application_name', true) || $1, true)`,
             [appNameSuffix],
           );
         }

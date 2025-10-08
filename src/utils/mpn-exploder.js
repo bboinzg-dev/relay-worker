@@ -1,9 +1,65 @@
 'use strict';
 
 const LIST_SEP = /[\s,;/|·•]+/;
+const CONTACT_FORM_PATTERNS = [
+  { regex: /(1\s*form\s*a|1a|spst-?no)/i, value: '1A' },
+  { regex: /(2\s*form\s*a|2a|dpst-?no)/i, value: '2A' },
+];
+const CONTACT_FORM_ALLOWED = new Set(['1A', '2A']);
+const SERIES_STRIP_WORDS = /\b(relays?|series|relay|power|signal)\b/gi;
 const NON_MPN_WORDS = new Set([
   'relay', 'relays', 'coil', 'vdc', 'vac', 'form', 'series', 'typ', 'max', 'min'
 ]);
+
+function normalizeSeriesCode(value) {
+  if (value == null) return null;
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (raw == null) return null;
+  const str = String(raw).trim();
+  if (!str) return null;
+  const cleaned = str
+    .replace(SERIES_STRIP_WORDS, '')
+    .replace(/\s+/g, '')
+    .trim();
+  const upper = cleaned.toUpperCase();
+  return upper || null;
+}
+
+function normalizeContactForm(value) {
+  if (value == null) return null;
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (raw == null) return null;
+  const str = String(raw).trim();
+  if (!str) return null;
+  for (const { regex, value: mapped } of CONTACT_FORM_PATTERNS) {
+    if (regex.test(str)) return mapped;
+  }
+  const compact = str.replace(/\s+/g, '').toUpperCase();
+  if (CONTACT_FORM_ALLOWED.has(compact)) return compact;
+  if (compact === 'SPST' || compact === 'SPSTNO') return '1A';
+  if (compact === 'DPST' || compact === 'DPSTNO') return '2A';
+  return null;
+}
+
+function normalizeCoilVoltage(value) {
+  if (value == null) return null;
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (raw == null) return null;
+  const str = String(raw).trim();
+  if (!str) return null;
+  const digits = str.match(/\d+/g);
+  if (!digits || !digits.length) return null;
+  const joined = digits.join('');
+  if (!joined) return null;
+  return joined;
+}
+
+function isLikelyPn(value) {
+  if (value == null) return false;
+  const str = String(value).trim();
+  if (!str) return false;
+  return /^[A-Z]{1,4}[A-Z0-9\-_/]{2,}$/i.test(str);
+}
 
 function derivePrefix(token) {
   if (!token) return '';
@@ -194,20 +250,65 @@ function explodeToRows(base, options = {}) {
       assignValue(rowValues, key, val);
     });
 
+        const normalizedSeries = normalizeSeriesCode(
+      rowValues.series_code
+        ?? rowValues.series
+        ?? base?.series_code
+        ?? base?.series
+        ?? null,
+    );
+    if (normalizedSeries) {
+      assignValue(rowValues, 'series_code', normalizedSeries);
+      if (rowValues.series == null) assignValue(rowValues, 'series', normalizedSeries);
+    }
+
+    const normalizedContactForm = normalizeContactForm(
+      rowValues.contact_form
+        ?? rowValues.contact_arrangement
+        ?? rowValues.form
+        ?? null,
+    );
+    if (normalizedContactForm) assignValue(rowValues, 'contact_form', normalizedContactForm);
+    else {
+      delete rowValues.contact_form;
+      delete rowValues.contactform;
+    }
+
+    const normalizedCoilVoltage = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
+    if (normalizedCoilVoltage) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltage);
+    else {
+      delete rowValues.coil_voltage_vdc;
+      delete rowValues.coil_voltagevdc;
+    }
+
+    const canUseTemplate = pnTemplate
+      && normalizedSeries
+      && normalizedContactForm
+      && CONTACT_FORM_ALLOWED.has(normalizedContactForm)
+      && normalizedCoilVoltage;
+
+    let generatedByTemplate = false;
+    let generatedByFallback = false;
     let code = null;
+
     if (pnTemplate) {
+            if (!canUseTemplate) return;
       code = renderTemplate(pnTemplate, {
         ...rowValues,
-        series: base?.series ?? base?.series_code ?? rowValues.series ?? rowValues.series_code ?? '',
-        series_code: base?.series_code ?? rowValues.series_code ?? '',
+        series: normalizedSeries,
+        series_code: normalizedSeries,
+        contact_form: normalizedContactForm,
+        coil_voltage_vdc: normalizedCoilVoltage,
       });
+            generatedByTemplate = true;
     } else if (mpnCandidates[idx]) {
       code = mpnCandidates[idx];
     } else if (mpnCandidates.length) {
       code = mpnCandidates[0];
     } else {
       const parts = [];
-      if (base?.series) parts.push(base.series);
+      if (normalizedSeries) parts.push(normalizedSeries);
+      else if (base?.series) parts.push(base.series);
       else if (base?.series_code) parts.push(base.series_code);
       const suffix = variantKeys
         .map((key) => rowValues[key] ?? rowValues[key?.toLowerCase()])
@@ -216,10 +317,13 @@ function explodeToRows(base, options = {}) {
         .join('');
       if (suffix) parts.push(suffix);
       code = parts.join('');
+            generatedByFallback = true;
     }
 
     code = String(code || '').trim();
     if (!code) return;
+
+        if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
 
     const codeNorm = code.toLowerCase();
     if (rows.some((r) => r.code_norm === codeNorm)) return;

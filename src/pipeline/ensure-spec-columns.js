@@ -43,16 +43,17 @@ async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
     : Array.isArray(blueprint?.variant_keys)
       ? blueprint.variant_keys
       : [];
+        const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
+  const fieldKeys = Object.keys(fieldMeta);
 
   const wantedList = [
     ...new Set(
-      [...allowed, ...variants]
+      [...allowed, ...variants, ...fieldKeys]
         .map(normKey)
         .filter(Boolean)
     ),
   ];
 
-  const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
   const toAdd = [];
   for (const key of wantedList) {
     if (have.has(key)) continue;

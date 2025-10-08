@@ -1,93 +1,257 @@
-diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
-index 65126cc139a2cf755c172cf405b6edcf92127859..eb49148f9849cd7143ea70586e231d042c11ad0c 100644
---- a/src/utils/mpn-exploder.js
-+++ b/src/utils/mpn-exploder.js
-@@ -1,56 +1,81 @@
+diff --git a/src/ingest/mpn-exploder.js b/src/ingest/mpn-exploder.js
+index c70ce61d1d181c136c63ec85bd9f7cdc0262629e..837d8ed7a079d244de03c8e647173152410cd62e 100644
+--- a/src/ingest/mpn-exploder.js
++++ b/src/ingest/mpn-exploder.js
+@@ -1,62 +1,176 @@
  'use strict';
  
- const LIST_SEP = /[\s,;/|·•]+/;
- const NON_MPN_WORDS = new Set([
-   'relay', 'relays', 'coil', 'vdc', 'vac', 'form', 'series', 'typ', 'max', 'min'
- ]);
+ const LIST_SEP = /[\,\s/;|·•]+/;
+ const CANDIDATE_KEYS = [
+   'candidates',
+   'codes',
+   'mpn_candidates',
+   'mpnCandidates',
+   'mpn_list',
+   'mpnList',
+   'mpns',
+ ];
  
-+function derivePrefix(token) {
-+  if (!token) return '';
-+  const trimmed = token.trim();
-+  if (!trimmed) return '';
++const CONTACT_FORM_ENUM = {
++  SPST: '1A',
++  SPDT: '1C',
++  DPDT: '2C',
++  DPST: '2A',
++};
 +
-+  // 가장 흔한 패턴: 마지막 구분자(-/_/) 직전까지를 prefix로 본다.
-+  const delimiterMatch = trimmed.match(/^(.*[\-_/])[A-Za-z0-9]+$/);
-+  if (delimiterMatch) return delimiterMatch[1];
+ function normalizeList(raw) {
+   if (raw == null) return [];
+   if (Array.isArray(raw)) return raw.filter(v => v != null && String(v).trim() !== '');
+   const s = String(raw).trim();
+   if (!s) return [];
+   // "DC5V", "5 V", "05" 등에서 숫자만 뽑아 pad에 쓰기 좋게
+   return s.split(LIST_SEP).map(tok => tok.trim()).filter(Boolean);
+ }
+ 
+-function pad(val, n = 2) {
+-  const s = String(val).replace(/\D+/g, '') || String(val);
+-  return s.padStart(n, '0');
++function escapeRegExp(str) {
++  return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+ }
+ 
+-function renderTemplate(tpl, obj) {
+-  return String(tpl || '').replace(/\{\{([^}]+)\}\}/g, (_, expr) => {
+-    const [rawKey, ...mods] = expr.split('|').map(s => s.trim());
+-    let v = obj[rawKey];
+-    for (const mod of mods) {
+-      const m = /^pad=(\d+)$/.exec(mod);
+-      if (m) v = pad(v, Number(m[1]));
++function applyTemplateMods(value, mods = []) {
++  if (value == null) return '';
 +
-+  // 구분자가 없으면 최초의 영문자로 시작하는 시퀀스를 prefix로 사용
-+  const headMatch = trimmed.match(/^([A-Za-z][A-Za-z0-9]*)/);
-+  if (headMatch) return headMatch[1];
++  let out = Array.isArray(value) ? value[0] : value;
++  if (out == null) return '';
++  if (typeof out !== 'string') out = String(out);
 +
-+  return '';
++  for (const rawMod of mods) {
++    const token = String(rawMod || '').trim();
++    if (!token) continue;
++    const [opRaw, argRaw = ''] = token.split('=').map((t) => t.trim());
++    const op = opRaw.toLowerCase();
++    if (!op) continue;
++
++    if (op === 'pad') {
++      const width = Number(argRaw);
++      if (Number.isFinite(width) && width > 0) out = out.padStart(width, '0');
++      continue;
++    }
++
++    if (op === 'first') {
++      const parts = out.split(',');
++      out = parts.length ? parts[0].trim() : out;
++      continue;
++    }
++
++    if (op === 'alnum') {
++      out = out.replace(/[^0-9A-Z]/gi, '');
++      continue;
++    }
++
++    if (op === 'digits') {
++      const match = out.match(/\d+/g) || [''];
++      out = match.join('');
++      continue;
++    }
++
++    if (op === 'upper' || op === 'upcase' || op === 'uppercase') {
++      out = out.toUpperCase();
++      continue;
++    }
++
++    if (op === 'lower' || op === 'downcase' || op === 'lowercase') {
++      out = out.toLowerCase();
++      continue;
+     }
+-    return v == null ? '' : String(v);
++
++    if (op === 'trim') {
++      out = out.trim();
++      continue;
++    }
++
++    if (op === 'prefix') {
++      out = `${argRaw}${out}`;
++      continue;
++    }
++
++    if (op === 'suffix') {
++      out = `${out}${argRaw}`;
++      continue;
++    }
++
++    if (op === 'replace' && argRaw) {
++      const [search, replacement = ''] = argRaw.split(':');
++      if (search != null) {
++        const matcher = new RegExp(escapeRegExp(search), 'g');
++        out = out.replace(matcher, replacement);
++      }
++      continue;
++    }
++  }
++
++  return out;
 +}
 +
-+function normalizeSuffix(token) {
-+  if (!token) return '';
-+  return token.replace(/^[\-_/]+/, '');
++function normalizeTemplateValue(key, value) {
++  if (value == null) return value;
++  let out = Array.isArray(value) ? value[0] : value;
++  if (out == null) return out;
++  let str = typeof out === 'string' ? out : String(out);
++
++  const keyNorm = String(key || '').toLowerCase();
++  if (keyNorm.includes('contact')) {
++    const formMatch = str.match(/(\d)\s*form\s*([ABC])/i);
++    if (formMatch) {
++      str = `${formMatch[1]}${formMatch[2].toUpperCase()}`;
++    } else {
++      const compact = str.replace(/\s+/g, '').toUpperCase();
++      if (CONTACT_FORM_ENUM[compact]) {
++        str = CONTACT_FORM_ENUM[compact];
++      }
++    }
++  }
++
++  return str;
 +}
 +
- function splitAndCarryPrefix(raw) {
-   if (!raw) return [];
-   const tokens = String(raw)
-     .split(LIST_SEP)
-     .map((t) => t.trim())
-     .filter(Boolean);
++function renderTemplate(tpl, obj) {
++  if (!tpl) return '';
++
++  const render = (template, pattern) => template.replace(pattern, (_, expr) => {
++    const parts = String(expr || '')
++      .split('|')
++      .map((s) => s.trim())
++      .filter(Boolean);
++    if (!parts.length) return '';
++    const rawKey = parts.shift();
++    if (!rawKey) return '';
++    const value = normalizeTemplateValue(rawKey, obj[rawKey]);
++    if (value == null || value === '') return '';
++    const applied = applyTemplateMods(value, parts);
++    return applied == null ? '' : String(applied);
+   });
++
++  let out = String(tpl);
++  out = render(out, /\{\{\s*([^{}]+?)\s*\}\}/g);
++  out = render(out, /\{\s*([^{}]+?)\s*\}/g);
++  return out.replace(/\s+/g, '').trim();
+ }
  
+ // 곱집합
+ function cartesian(arrays) {
+   return arrays.reduce((acc, arr) => {
+     const out = [];
+     for (const a of acc) for (const b of arr) out.push(a.concat([b]));
+     return out;
+   }, [[]]);
+ }
+ 
+ function collectCandidates(row = {}) {
    const out = [];
-   let lastPrefix = '';
--  const prefixRegex = /^([A-Za-z][A-Za-z0-9\-_/]*?)(?=\d|$)/;
+   const seen = new Set();
  
-   for (const token of tokens) {
-     const lower = token.toLowerCase();
-     if (NON_MPN_WORDS.has(lower)) continue;
--    if (/^[0-9]/.test(token)) {
--      if (lastPrefix) {
--        out.push(lastPrefix + token);
-+
-+    const leading = token[0];
-+    const isLeadingDelimiter = leading != null && /[\-_/]/.test(leading);
-+
-+    if ((/^[0-9]/.test(token) || isLeadingDelimiter) && lastPrefix) {
-+      const suffix = normalizeSuffix(token);
-+      if (suffix && /[A-Za-z]/.test(suffix)) {
-+        out.push(lastPrefix + suffix);
-+        continue;
+   const push = (val) => {
+     if (val == null) return;
+     if (Array.isArray(val)) {
+       for (const v of val) push(v);
+       return;
+     }
+     if (typeof val === 'object') {
+       if (val.raw != null) push(val.raw);
+       if (val.code != null) push(val.code);
+       return;
+diff --git a/src/ingest/mpn-exploder.js b/src/ingest/mpn-exploder.js
+index c70ce61d1d181c136c63ec85bd9f7cdc0262629e..837d8ed7a079d244de03c8e647173152410cd62e 100644
+--- a/src/ingest/mpn-exploder.js
++++ b/src/ingest/mpn-exploder.js
+@@ -123,59 +237,58 @@ function explodeToRows(blueprint, rows = [], options = {}) {
+   for (const row0 of baseRows) {
+     const row = { ...(row0 || {}) };
+     const candidates = collectCandidates(row);
+     stripCandidateFields(row);
+ 
+     if (Array.isArray(candidates) && candidates.length) {
+       const seen = new Set();
+       for (const raw of candidates) {
+         const code = String(raw || '').trim();
+         if (!code) continue;
+         const norm = code.toLowerCase();
+         if (seen.has(norm)) continue;
+         seen.add(norm);
+ 
+         const v = parseVariantsFromCode
+           ? parseVariantsFromCode(code, blueprint?.code_rules || {})
+           : {};
+ 
+         candidateRows.push({
+           ...row,
+           ...v,
+           code,
+           code_norm: norm,
+         });
        }
--      continue;
+-     continue;
      }
  
-     out.push(token);
--    const m = token.match(prefixRegex);
--    if (m) lastPrefix = m[1];
-+    const prefix = derivePrefix(token);
-+    if (prefix) lastPrefix = prefix;
+     const series = row.series_code || row.series || '';
+ 
+     const lists = variantKeys.map((k) => {
+       const v = row[k];
+       const list = normalizeList(v);
+       return list.length ? list : [null];
+     });
+ 
+     const combos = lists.length ? cartesian(lists) : [[]];
+     for (const combo of combos) {
+       const r = { ...row };
+       variantKeys.forEach((k, i) => { r[k] = combo[i]; });
+ 
+       let code = tpl
+         ? renderTemplate(tpl, { ...r, series })
+         : [series, ...variantKeys.map((k) => r[k]).filter(Boolean)].join('');
+ 
+       code = String(code).replace(/\s+/g, '').trim();
+       if (!code) continue;
+ 
+       r.code = code;
+       r.code_norm = code.toLowerCase();
+       expandedRows.push(r);
+     }
    }
  
-   const seen = new Set();
-   const deduped = [];
-   for (const token of out) {
-     const norm = token.toLowerCase();
-     if (seen.has(norm)) continue;
-     seen.add(norm);
-     deduped.push(token);
-   }
-   return deduped;
+   const rowsOut = [...expandedRows, ...candidateRows];
+   return dedupeByBrandCode(rowsOut);
  }
  
- function normalizeList(value) {
-   if (value == null) return [];
-   if (Array.isArray(value)) return value.flatMap(normalizeList);
-   if (typeof value === 'string') {
-     return value
-       .split(LIST_SEP)
-       .map((s) => s.trim())
-       .filter(Boolean);
-   }
-   return [value];
- }
- 
+-module.exports = { explodeToRows, renderTemplate, normalizeList, cartesian };
++module.exports = { explodeToRows, renderTemplate, normalizeList, cartesian };

@@ -1353,7 +1353,7 @@ async function seedExtractionRecipe() {
 }
 
 async function ensureRelayPowerPnTemplate() {
-  const template = '{{series}}{{contact_form|upper|alnum}}{{coil_voltage_vdc|first|digits|pad=2}}{{suffix|upper}}';
+  const template = '{{series}}{{contact_form|upper|alnum}}{{coil_voltage_vdc|digits|pad=2}}{{suffix|upper}}';
   try {
     const res = await db.query(
       `UPDATE public.component_spec_blueprint
@@ -1373,6 +1373,30 @@ async function ensureRelayPowerPnTemplate() {
     }
   } catch (err) {
     console.warn('[BOOT] relay_power pn_template update skipped:', err?.message || err);
+  }
+}
+
+async function ensureRelaySignalPnTemplate() {
+  const template = '{series}{contact_form|alnum|upper}{coil_voltage_vdc|digits|pad=2}{suffix|upper}';
+  try {
+    const res = await db.query(
+      `UPDATE public.component_spec_blueprint
+         SET ingest_options = jsonb_set(
+               COALESCE(ingest_options, '{}'::jsonb),
+               '{pn_template}',
+               to_jsonb($1::text),
+               true
+             ),
+             version = COALESCE(version, 0) + 1
+      WHERE family_slug = 'relay_signal'
+        AND COALESCE(ingest_options->>'pn_template', '') <> $1`,
+      [template]
+    );
+    if (res.rowCount > 0) {
+      console.log('[BOOT] updated relay_signal pn_template');
+    }
+  } catch (err) {
+    console.warn('[BOOT] relay_signal pn_template update skipped:', err?.message || err);
   }
 }
 
@@ -1412,6 +1436,7 @@ async function ensureMarketTables() {
     await seedManufacturerAliases();
     await seedExtractionRecipe();
     await ensureRelayPowerPnTemplate();
+    await ensureRelaySignalPnTemplate();
     await ensureMarketTables();
     console.log('[BOOT] ensured ingest_run_logs');
     

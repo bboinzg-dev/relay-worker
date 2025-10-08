@@ -76,7 +76,7 @@ function ensureFamilyOverrides(blueprint, registryRow) {
 
   if (family === 'relay_power') {
     addVariantKeys(['coil_voltage_vdc', 'contact_form', 'suffix']);
-    ensureTemplate('{{series}}{{contact_form|upper|alnum}}{{coil_voltage_vdc|digits|pad=2}}{{suffix|upper}}');
+    ensureTemplate('{{series_code}}{{contact_form}}{{coil_voltage_vdc|pad=2}}{{suffix}}');
   }
 
   if (family === 'relay_signal') {

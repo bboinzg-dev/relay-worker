@@ -90,6 +90,29 @@ function gatherRuntimeSpecKeys(rows) {
 const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
 const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
 
+function sanitizeDatasheetUrl(url) {
+  if (url == null) return null;
+  const str = typeof url === 'string' ? url.trim() : String(url || '').trim();
+  if (!str) return null;
+  try {
+    const parsed = new URL(str);
+    const pathname = (parsed.pathname || '').trim();
+    if (!pathname) return null;
+    const lowerPath = pathname.toLowerCase();
+    if (!lowerPath.endsWith('.pdf')) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function pickDatasheetUrl(rawUrl, fallbackUrl) {
+  const sanitized = sanitizeDatasheetUrl(rawUrl);
+  if (sanitized) return sanitized;
+  const fallback = typeof fallbackUrl === 'string' ? fallbackUrl.trim() : String(fallbackUrl || '').trim();
+  return fallback || null;
+}
+
 const RESERVED_SPEC_KEYS = new Set([
   'id',
   'created_at',
@@ -1727,8 +1750,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     rec.series_code = row.series_code ?? row.series ?? baseSeries ?? null;
     if (row.series != null && physicalCols.has('series')) rec.series = row.series;
     rec.datasheet_uri = row.datasheet_uri || gcsUri;
-    if (row.datasheet_url) rec.datasheet_url = row.datasheet_url;
-    else if (rec.datasheet_uri && rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
+    rec.datasheet_url = pickDatasheetUrl(row.datasheet_url, rec.datasheet_uri);
     if (row.mfr_full != null) rec.mfr_full = row.mfr_full;
     let verified;
     if (row.verified_in_doc != null) {
@@ -1797,7 +1819,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
         rec.raw_json = mergeRuntimeMetadata(rec.raw_json, runtimeMeta);
       }
       if (physicalCols.has('series') && fallbackSeries != null) rec.series = fallbackSeries;
-      if (rec.datasheet_url == null) rec.datasheet_url = rec.datasheet_uri;
+      rec.datasheet_url = pickDatasheetUrl(null, rec.datasheet_uri);
       if (rec.display_name != null && rec.displayname == null) rec.displayname = rec.display_name;
       records.push(rec);
     }

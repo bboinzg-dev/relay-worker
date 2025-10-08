@@ -486,6 +486,7 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
 
   let pn = String(row.pn || row.code || '').trim();
   const allowMinimal = isMinimalInsertEnabled();
+  const relaxPnValidation = allowMinimal && !isMinimalInsertStrict();
   const minimalFallback = allowMinimal && isMinimalFallbackPn(pn);
   if (!isValidCode(pn)) {
     if (minimalFallback) {
@@ -500,10 +501,18 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
       pn = fixed;
     } else if (allowMinimal) {
       const fallbackPn = repairPn(String(row.series || row.code || ''));
-      if (fallbackPn && fallbackPn.length >= 3) {
+      if (fallbackPn && isValidCode(fallbackPn)) {
         console.warn('[persist] pn fallback applied', { original: pn, fallback: fallbackPn });
         pn = fallbackPn;
         row.last_error = row.last_error || 'invalid_code_fallback';
+      } else if (relaxPnValidation) {
+        const seed = [row.brand, row.code, row.series, pn]
+          .map((v) => String(v || '').trim())
+          .filter(Boolean)
+          .join(':');
+        const hash = sha1(seed || `relax:${Date.now()}`);
+        pn = `pdf:${hash.slice(0, 12)}`;
+        row.last_error = row.last_error || 'invalid_code_relaxed';
       } else {
         row.last_error = 'invalid_code';
         return { ok: false, reason: 'invalid_code' };
@@ -519,6 +528,14 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
         console.warn('[persist] pn repaired', { original: pn, fixed });
         row.last_error = row.last_error || 'invalid_code_fixed';
         pn = fixed;
+      } else if (relaxPnValidation) {
+        const seed = [row.brand, row.code, row.series, pn]
+          .map((v) => String(v || '').trim())
+          .filter(Boolean)
+          .join(':');
+        const hash = sha1(seed || `relax:${Date.now()}`);
+        pn = `pdf:${hash.slice(0, 12)}`;
+        row.last_error = row.last_error || 'invalid_code_relaxed';
       } else {
         row.last_error = 'invalid_code';
         return { ok: false, reason: 'invalid_code' };

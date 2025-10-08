@@ -1,6 +1,22 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const db = require('../../db');
+
+function isMinimalInsertEnabled() {
+  return /^(1|true|on)$/i.test(String(process.env.ALLOW_MINIMAL_INSERT || '').trim());
+}
+
+function buildMinimalPnFallback(values = {}) {
+  const uri = values?.datasheet_uri || values?.datasheet_url || values?.gcs_uri || values?.gcsUri || '';
+  const brand = values?.brand || '';
+  const code = values?.code || '';
+  const series = values?.series || values?.series_code || '';
+  const seed = String(uri || `${brand}:${code}:${series}` || '').trim();
+  if (!seed) return null;
+  const hash = crypto.createHash('sha1').update(seed).digest('hex');
+  return `pdf:${hash.slice(0, 12)}`;
+}
 
 function normalizeIdentifier(name) {
   return String(name || '')
@@ -58,8 +74,8 @@ async function upsertByBrandCode(tableName, values = {}) {
   const { schema, table, qualified } = parseTableName(tableName);
 
   const brand = values?.brand ?? null;
-  const code = values?.code ?? null;
-  const pn = values?.pn ?? values?.code ?? null;
+  let code = values?.code ?? null;
+  let pn = values?.pn ?? values?.code ?? null;
   const rest = { ...values };
   const brandNormInput = rest.brand_norm;
   const codeNormInput = rest.code_norm;
@@ -71,6 +87,23 @@ async function upsertByBrandCode(tableName, values = {}) {
   delete rest.code_norm;
   delete rest.pn_norm;
 
+  const allowMinimal = isMinimalInsertEnabled();
+  if (typeof pn === 'string' && !pn.trim()) pn = null;
+  if (!pn && allowMinimal) {
+    const candidate = values?.series ?? values?.series_code ?? null;
+    if (candidate && String(candidate).trim()) {
+      pn = candidate;
+    }
+  }
+  if (!pn && allowMinimal) {
+    const fallbackPn = buildMinimalPnFallback(values);
+    if (fallbackPn) pn = fallbackPn;
+  }
+  if (!pn) {
+    throw new Error('pn required');
+  }
+  if (!code && pn) code = pn;
+
   const payload = canonKeys({
     brand,
     code,
@@ -80,10 +113,6 @@ async function upsertByBrandCode(tableName, values = {}) {
     pn_norm: pn ? String(pn).toLowerCase() : pnNormInput ?? null,
     ...rest,
   });
-
-  if (!payload.pn) {
-    throw new Error('pn required');
-  }
 
   const cols = Object.keys(payload);
   if (!cols.length) return null;

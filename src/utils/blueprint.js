@@ -44,6 +44,61 @@ function deriveVariantKeys(blueprintRow = {}) {
   return [];
 }
 
+function ensureFamilyOverrides(blueprint, registryRow) {
+  if (!blueprint) return blueprint;
+
+  const ingestOptions = blueprint.ingestOptions || {};
+  const family = String(blueprint.family_slug || '').trim().toLowerCase();
+  const forcedVariantKeys = new Set(blueprint.variant_keys || []);
+
+  const addVariantKeys = (keys = []) => {
+    for (const key of keys) {
+      const norm = normalizeKeyList([key])[0];
+      if (!norm) continue;
+      forcedVariantKeys.add(norm);
+    }
+  };
+
+  const ensureTemplate = (template) => {
+    if (!template) return;
+    if (!ingestOptions.pn_template && !ingestOptions.pnTemplate) {
+      ingestOptions.pn_template = template;
+      ingestOptions.pnTemplate = template;
+      return;
+    }
+    if (!ingestOptions.pn_template && ingestOptions.pnTemplate) {
+      ingestOptions.pn_template = ingestOptions.pnTemplate;
+    }
+    if (!ingestOptions.pnTemplate && ingestOptions.pn_template) {
+      ingestOptions.pnTemplate = ingestOptions.pn_template;
+    }
+  };
+
+  if (family === 'relay_power') {
+    addVariantKeys(['coil_voltage_vdc', 'contact_form', 'suffix']);
+    ensureTemplate('{{series}}{{contact_form|upper|alnum}}{{coil_voltage_vdc|digits|pad=2}}{{suffix|upper}}');
+  }
+
+  if (family === 'relay_signal') {
+    addVariantKeys(['coil_voltage_vdc', 'contact_arrangement', 'contact_form', 'suffix']);
+    ensureTemplate('{{series}}{{contact_arrangement|upper|alnum}}{{coil_voltage_vdc|digits|pad=2}}{{suffix|upper}}');
+  }
+
+  const variantKeys = Array.from(forcedVariantKeys);
+  blueprint.variant_keys = variantKeys;
+  ingestOptions.variant_keys = variantKeys;
+  blueprint.ingestOptions = ingestOptions;
+
+  const allowed = Array.isArray(blueprint.allowedKeys) ? blueprint.allowedKeys : [];
+  blueprint.allowedKeys = Array.from(new Set([...allowed, ...variantKeys]));
+
+  if (registryRow?.specs_table && !blueprint.specsTable) {
+    blueprint.specsTable = registryRow.specs_table;
+  }
+
+  return blueprint;
+}
+
 function normalizeBlueprint(row, registryRow) {
   if (!row) return null;
   const fields = row.fields_json || row.fields || {};
@@ -64,7 +119,7 @@ function normalizeBlueprint(row, registryRow) {
 
   const allowedKeysFinal = Array.from(new Set([...(allowedKeys || []), ...variantKeys]));
 
-  return {
+  const blueprint = {
     family_slug: row.family_slug,
     fields,
     ingestOptions,
@@ -73,6 +128,8 @@ function normalizeBlueprint(row, registryRow) {
     variant_keys: variantKeys,
     specsTable,
   };
+
+  return ensureFamilyOverrides(blueprint, registryRow);
 }
 
 function computeFastKeys(blueprint) {

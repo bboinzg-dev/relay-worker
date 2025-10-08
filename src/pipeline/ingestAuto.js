@@ -104,6 +104,11 @@ const RESERVED_SPEC_KEYS = new Set([
   'datasheet_uri',
 ]);
 
+const SPEC_KEY_ALIAS_MAP = new Map([
+  ['contact_form', 'contact_arrangement'],
+  ['contactform', 'contact_arrangement'],
+]);
+
 function normalizeSpecKeyName(value) {
   if (value == null) return null;
   let s = String(value).trim().toLowerCase();
@@ -659,25 +664,53 @@ async function extractCoverToGcs(gcsPdfUri, { family, brand, code }) {
   } catch { return null; }
 }
 
-function guessFamilySlug({ fileName = '', previewText = '' }) {
-  const s = (fileName + ' ' + previewText).toLowerCase();
+function guessFamilySlug({ fileName = '', previewText = '', brand = '' }) {
+  const haystack = [fileName, previewText, brand]
+    .filter((part) => part != null && String(part).trim() !== '')
+    .join(' ')
+    .toLowerCase();
 
-  // 1) 우선 매칭: 시그널 릴레이의 대표 키워드
-  if (/\bsignal\s+relay\b/.test(s) ||
-      /\bsubminiature\b.*\brelay\b/.test(s) ||
-      /\btelecom\b.*\brelay\b/.test(s) ||
-      /\bty\b(?![a-z0-9])/i.test(s)) {
+  if (!haystack) return null;
+
+  const hasRelay = /\brelay\b/.test(haystack);
+  const hasSignal = /\bsignal\s+relay\b/.test(haystack) ||
+    /\bsubminiature\b.*\brelay\b/.test(haystack) ||
+    /\btelecom\b.*\brelay\b/.test(haystack) ||
+    /\bminiature\s+relay\b/.test(haystack);
+
+  if (hasSignal || /\bty\b(?![a-z0-9])/i.test(haystack)) {
     return 'relay_signal';
   }
 
-  // 2) 그 외 일반 릴레이는 power로 폴백
-  if (/\b(relay|coil|omron|finder)\b/.test(s)) return 'relay_power';
+  if (/\breed\b.*\brelay\b/.test(haystack)) {
+    return 'relay_reed';
+  }
 
-  // 3) 기존 다른 부품군 규칙 유지
-  if (/\b(resistor|r-clamp|ohm)\b/.test(s)) return 'resistor_chip';
-  if (/\b(capacitor|mlcc|electrolytic|tantalum)\b/.test(s)) return 'capacitor_mlcc';
-  if (/\b(inductor|choke)\b/.test(s)) return 'inductor_power';
-  if (/\b(bridge|rectifier|diode)\b/.test(s)) return 'bridge_rectifier';
+  if (/\b(ssr|solid\s+state)\b.*\brelay\b/.test(haystack)) {
+    return 'relay_ssr';
+  }
+
+  if (/\b(automotive|vehicle|car)\b.*\brelay\b/.test(haystack)) {
+    return 'relay_automotive';
+  }
+
+  if (hasRelay) {
+    const signalBrand = /\b(axicom|takamisawa|nec\s*tokin|fujitsu)\b/.test(haystack);
+    if (signalBrand) {
+      return 'relay_signal';
+    }
+
+    const powerHints = /\b(power\s+relay|general\s+purpose\s+relay|high\s+power|power\s+load|heavy\s+duty)\b/;
+    if (powerHints.test(haystack)) {
+      return 'relay_power';
+    }
+  }
+
+  if (/\b(resistor|r-clamp|ohm)\b/.test(haystack)) return 'resistor_chip';
+  if (/\b(capacitor|mlcc|electrolytic|tantalum)\b/.test(haystack)) return 'capacitor_mlcc';
+  if (/\b(inductor|choke)\b/.test(haystack)) return 'inductor_power';
+  if (/\b(bridge|rectifier|diode)\b/.test(haystack)) return 'bridge_rectifier';
+
   return null;
 }
 
@@ -955,15 +988,45 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     series = vertexClassification.series;
   }
 
-  let family = (family_slug||'').toLowerCase() || guessFamilySlug({ fileName }) || 'relay_power';
-  if (!family && !FAST) {
+  const explicitFamily = normLower(family_slug);
+  const vertexFamily = normLower(vertexClassification?.family_slug);
+  const brandGuessInput = overridesBrand || brand || detectedBrand || vertexClassification?.brand || '';
+  const initialGuess = guessFamilySlug({ fileName, brand: brandGuessInput });
+
+  let previewText = '';
+  let docAiText = typeof docAiResult?.text === 'string' ? docAiResult.text : '';
+  let docAiTables = Array.isArray(docAiResult?.tables) ? docAiResult.tables : [];
+
+  if (!FAST) {
     try {
-     const text = await readText(gcsUri, 256*1024);
-     family = guessFamilySlug({ fileName, previewText: text }) || 'relay_power';
-     // ★ 강제 보정: 제목/본문에 Signal Relay가 있으면 무조건 signal로
-     if (/subminiature\s+signal\s+relay|signal\s+relay/i.test(text)) family = 'relay_signal';
-   } catch { family = 'relay_power'; }
+      previewText = await readText(gcsUri, 256 * 1024);
+    } catch {}
   }
+
+  if ((!previewText || previewText.length < 1000) && !FAST) {
+    try {
+      const r = await extractText(gcsUri);
+      previewText = r?.text || previewText;
+    } catch {}
+  }
+
+  if (docAiText && docAiText.length > (previewText?.length || 0)) {
+    previewText = docAiText;
+  }
+
+  let family = explicitFamily || vertexFamily || initialGuess || null;
+  const previewGuess = guessFamilySlug({ fileName, previewText, brand: brandGuessInput });
+
+  if (!explicitFamily) {
+    if (previewGuess && (!family || family === 'relay_power' || family === vertexFamily)) {
+      family = previewGuess;
+    }
+    if ((!family || family === 'relay_power') && /subminiature\s+signal\s+relay|signal\s+relay/i.test(previewText)) {
+      family = 'relay_signal';
+    }
+  }
+
+  if (!family) family = 'relay_power';
 
   const overrideBrandLog = overridesBrand ?? brand ?? '';
   console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''}`);
@@ -1023,16 +1086,21 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
 
   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
-  let previewText = '';
-  try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
-  if (!previewText || previewText.length < 1000) {
+  if (!previewText && !FAST) {
+    try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
+  }
+  if ((!previewText || previewText.length < 1000) && !FAST) {
     try {
       const r = await extractText(gcsUri);
       previewText = r?.text || previewText;
     } catch {}
   }
-  const docAiText = typeof docAiResult?.text === 'string' ? docAiResult.text : '';
-  const docAiTables = Array.isArray(docAiResult?.tables) ? docAiResult.tables : [];
+  if (!docAiText) {
+    docAiText = typeof docAiResult?.text === 'string' ? docAiResult.text : '';
+  }
+  if (!Array.isArray(docAiTables) || !docAiTables.length) {
+    docAiTables = Array.isArray(docAiResult?.tables) ? docAiResult.tables : [];
+  }
   if (docAiText && docAiText.length > (previewText?.length || 0)) {
     previewText = docAiText;
   }
@@ -1178,10 +1246,11 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
         }
         const canon = normalizeSpecKeyName(key);
         if (!canon) continue;
-        canonicalRuntimeSpecKeys.add(canon);
-        const existing = Object.prototype.hasOwnProperty.call(out, canon) ? out[canon] : undefined;
-        if (!Object.prototype.hasOwnProperty.call(out, canon) || existing == null || existing === '') {
-          out[canon] = rawValue;
+        const mapped = SPEC_KEY_ALIAS_MAP.get(canon) || canon;
+        canonicalRuntimeSpecKeys.add(mapped);
+        const existing = Object.prototype.hasOwnProperty.call(out, mapped) ? out[mapped] : undefined;
+        if (!Object.prototype.hasOwnProperty.call(out, mapped) || existing == null || existing === '') {
+          out[mapped] = rawValue;
         }
       }
       return out;

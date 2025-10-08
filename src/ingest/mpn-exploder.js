@@ -11,6 +11,13 @@ const CANDIDATE_KEYS = [
   'mpns',
 ];
 
+const CONTACT_FORM_ENUM = {
+  SPST: '1A',
+  SPDT: '1C',
+  DPDT: '2C',
+  DPST: '2A',
+};
+
 function normalizeList(raw) {
   if (raw == null) return [];
   if (Array.isArray(raw)) return raw.filter(v => v != null && String(v).trim() !== '');
@@ -20,21 +27,128 @@ function normalizeList(raw) {
   return s.split(LIST_SEP).map(tok => tok.trim()).filter(Boolean);
 }
 
-function pad(val, n = 2) {
-  const s = String(val).replace(/\D+/g, '') || String(val);
-  return s.padStart(n, '0');
+function escapeRegExp(str) {
+  return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function applyTemplateMods(value, mods = []) {
+  if (value == null) return '';
+
+  let out = Array.isArray(value) ? value[0] : value;
+  if (out == null) return '';
+  if (typeof out !== 'string') out = String(out);
+
+  for (const rawMod of mods) {
+    const token = String(rawMod || '').trim();
+    if (!token) continue;
+    const [opRaw, argRaw = ''] = token.split('=').map((t) => t.trim());
+    const op = opRaw.toLowerCase();
+    if (!op) continue;
+
+    if (op === 'pad') {
+      const width = Number(argRaw);
+      if (Number.isFinite(width) && width > 0) out = out.padStart(width, '0');
+      continue;
+    }
+
+    if (op === 'first') {
+      const parts = out.split(',');
+      out = parts.length ? parts[0].trim() : out;
+      continue;
+    }
+
+    if (op === 'alnum') {
+      out = out.replace(/[^0-9A-Z]/gi, '');
+      continue;
+    }
+
+    if (op === 'digits') {
+      const match = out.match(/\d+/g) || [''];
+      out = match.join('');
+      continue;
+    }
+
+    if (op === 'upper' || op === 'upcase' || op === 'uppercase') {
+      out = out.toUpperCase();
+      continue;
+    }
+
+    if (op === 'lower' || op === 'downcase' || op === 'lowercase') {
+      out = out.toLowerCase();
+      continue;
+    }
+
+    if (op === 'trim') {
+      out = out.trim();
+      continue;
+    }
+
+    if (op === 'prefix') {
+      out = `${argRaw}${out}`;
+      continue;
+    }
+
+    if (op === 'suffix') {
+      out = `${out}${argRaw}`;
+      continue;
+    }
+
+    if (op === 'replace' && argRaw) {
+      const [search, replacement = ''] = argRaw.split(':');
+      if (search != null) {
+        const matcher = new RegExp(escapeRegExp(search), 'g');
+        out = out.replace(matcher, replacement);
+      }
+      continue;
+    }
+  }
+
+  return out;
+}
+
+function normalizeTemplateValue(key, value) {
+  if (value == null) return value;
+  let out = Array.isArray(value) ? value[0] : value;
+  if (out == null) return out;
+  let str = typeof out === 'string' ? out : String(out);
+
+  const keyNorm = String(key || '').toLowerCase();
+  if (keyNorm.includes('contact')) {
+    const formMatch = str.match(/(\d)\s*form\s*([ABC])/i);
+    if (formMatch) {
+      str = `${formMatch[1]}${formMatch[2].toUpperCase()}`;
+    } else {
+      const compact = str.replace(/\s+/g, '').toUpperCase();
+      if (CONTACT_FORM_ENUM[compact]) {
+        str = CONTACT_FORM_ENUM[compact];
+      }
+    }
+  }
+
+  return str;
 }
 
 function renderTemplate(tpl, obj) {
-  return String(tpl || '').replace(/\{\{([^}]+)\}\}/g, (_, expr) => {
-    const [rawKey, ...mods] = expr.split('|').map(s => s.trim());
-    let v = obj[rawKey];
-    for (const mod of mods) {
-      const m = /^pad=(\d+)$/.exec(mod);
-      if (m) v = pad(v, Number(m[1]));
-    }
-    return v == null ? '' : String(v);
+  if (!tpl) return '';
+
+  const render = (template, pattern) => template.replace(pattern, (_, expr) => {
+    const parts = String(expr || '')
+      .split('|')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!parts.length) return '';
+    const rawKey = parts.shift();
+    if (!rawKey) return '';
+    const value = normalizeTemplateValue(rawKey, obj[rawKey]);
+    if (value == null || value === '') return '';
+    const applied = applyTemplateMods(value, parts);
+    return applied == null ? '' : String(applied);
   });
+
+  let out = String(tpl);
+  out = render(out, /\{\{\s*([^{}]+?)\s*\}\}/g);
+  out = render(out, /\{\s*([^{}]+?)\s*\}/g);
+  return out.replace(/\s+/g, '').trim();
 }
 
 // 곱집합
@@ -145,7 +259,6 @@ function explodeToRows(blueprint, rows = [], options = {}) {
           code_norm: norm,
         });
       }
-     continue;
     }
 
     const series = row.series_code || row.series || '';

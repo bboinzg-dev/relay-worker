@@ -284,7 +284,7 @@ function normalizeTemplateValue(key, value) {
 
   const keyNorm = String(key || '').toLowerCase();
   if (keyNorm.includes('contact')) {
-const normalized = normalizeContactForm(str);
+    const normalized = normalizeContactForm(str);
     return normalized ?? '';
   }
 
@@ -415,315 +415,6 @@ function explodeToRows(blueprint, rows = [], options = {}) {
     const candidates = collectCandidates(row);
     stripCandidateFields(row);
 
-        const rowCandidateRows = [];
-    if (Array.isArray(candidates) && candidates.length) {
-      const seen = new Set();
-      for (const raw of candidates) {
-        const code = String(raw || '').trim();
-        if (!code) continue;
-        const norm = code.toLowerCase();
-        if (seen.has(norm)) continue;
-        seen.add(norm);
-
-        const v = parseVariantsFromCode
-          ? parseVariantsFromCode(code, blueprint?.code_rules || {})
-          : {};
-
-    rowCandidateRows.push({
-          ...row,
-          ...v,
-          code,
-          code_norm: norm,
-        });
-      }
-    }
-
-    const validRowCandidates = rowCandidateRows.filter((cand) => isLikelyPn(cand.code));
-    const shouldSkipTemplate = validRowCandidates.length > 0;
-    candidateRows.push(...(validRowCandidates.length ? validRowCandidates : rowCandidateRows));
-
-    const series = row.series_code || row.series || '';
-
-    const variantInfo = variantKeys.map((k) => {
-      const { list, sourceKey } = collectVariantList(row, k);
-      return {
-        key: k,
-        sourceKey,
-        list: list.length ? list : [null],
-      };
-    });
-
-        const lists = variantInfo.map((info) => info.list);
-
-    const combos = shouldSkipTemplate ? [] : (lists.length ? cartesian(lists) : [[]]);
-    for (const combo of combos) {
-      const r = { ...row };
-      variantInfo.forEach((info, idx) => {
-        const value = combo[idx];
-        const targetKey = info.key;
-        const sourceKey = info.sourceKey;
-        if (sourceKey) r[sourceKey] = value;
-        if (targetKey && targetKey !== sourceKey) r[targetKey] = value;
-      });
-
-      const normalizedSeries = normalizeSeriesCode(r.series_code ?? r.series ?? series);
-      if (normalizedSeries) {
-        r.series_code = normalizedSeries;
-        if (!r.series) r.series = normalizedSeries;
-      }
-
-      const normalizedContactForm = normalizeContactForm(
-        r.contact_form ?? r.contact_arrangement ?? r.form ?? null,
-      );
-      if (normalizedContactForm) r.contact_form = normalizedContactForm;
-      else delete r.contact_form;
-
-      const normalizedCoilVoltage = normalizeCoilVoltage(r.coil_voltage_vdc);
-      if (normalizedCoilVoltage) r.coil_voltage_vdc = normalizedCoilVoltage;
-      else delete r.coil_voltage_vdc;
-
-      const canUseTemplate = tpl
-        && normalizedSeries
-        && normalizedContactForm
-        && CONTACT_FORM_ALLOWED.has(normalizedContactForm)
-        && normalizedCoilVoltage;
-
-      if (!tpl) {
-        const parts = [normalizedSeries || series];
-        for (const key of variantKeys) {
-          const val = r[key];
-          if (val != null && val !== '') parts.push(String(val));
-        }
-        let code = parts.filter(Boolean).join('');
-        code = String(code).replace(/\s+/g, '').trim();
-        if (!code || !isLikelyPn(code)) continue;
-        r.code = code;
-        r.code_norm = code.toLowerCase();
-        expandedRows.push(r);
-        continue;
-      }
-
-      if (!canUseTemplate) continue;
-
-      let code = renderTemplate(tpl, {
-        ...r,
-        series,
-        series_code: normalizedSeries,
-      });
-
-      code = String(code).replace(/\s+/g, '').trim();
-      if (!code) continue;
-      @@ -10,56 +10,106 @@ const KEY_ALIASES = {
-    'arrangement',
-    'poles_form',
-    'form',
-  ],
-  coil_voltage_vdc: [
-    'coil_voltage_vdc',
-    'voltage_vdc',
-    'rated_voltage_vdc',
-    'vdc',
-    'coil_voltage',
-    'voltage',
-  ],
-  series: ['series', 'series_code'],
-  suffix: ['suffix', 'packing', 'package', 'packaging', 'mount_type', 'mounting', 'terminal'],
-};
-const CANDIDATE_KEYS = [
-  'candidates',
-  'codes',
-  'mpn_candidates',
-  'mpnCandidates',
-  'mpn_list',
-  'mpnList',
-  'mpns',
-];
-
-const CONTACT_FORM_ENUM = {
-  SPST: '1A',
-  SPDT: '1C',
-  DPDT: '2C',
-  DPST: '2A',
-};
-const CONTACT_FORM_PATTERNS = [
-  { regex: /(1\s*form\s*a|1a|spst-?no)/i, value: '1A' },
-  { regex: /(2\s*form\s*a|2a|dpst-?no)/i, value: '2A' },
-];
-const CONTACT_FORM_ALLOWED = new Set(['1A', '2A']);
-const SERIES_STRIP_WORDS = /\b(relays?|series|relay|power|signal)\b/gi;
-
-function normalizeSeriesCode(value) {
-  if (value == null) return null;
-  const raw = Array.isArray(value) ? value[0] : value;
-  if (raw == null) return null;
-  const str = String(raw).trim();
-  if (!str) return null;
-  const cleaned = str
-    .replace(SERIES_STRIP_WORDS, '')
-    .replace(/\s+/g, '')
-    .trim();
-  const upper = cleaned.toUpperCase();
-  return upper || null;
-}
-
-function normalizeContactForm(value) {
-  if (value == null) return null;
-  const raw = Array.isArray(value) ? value[0] : value;
-  if (raw == null) return null;
-  const str = String(raw).trim();
-  if (!str) return null;
-  for (const { regex, value: mapped } of CONTACT_FORM_PATTERNS) {
-    if (regex.test(str)) return mapped;
-  }
-  const compact = str.replace(/\s+/g, '').toUpperCase();
-  if (CONTACT_FORM_ALLOWED.has(compact)) return compact;
-  if (compact === 'SPST' || compact === 'SPSTNO') return '1A';
-  if (compact === 'DPST' || compact === 'DPSTNO') return '2A';
-  return null;
-}
-
-function normalizeCoilVoltage(value) {
-  if (value == null) return null;
-  const raw = Array.isArray(value) ? value[0] : value;
-  if (raw == null) return null;
-  const str = String(raw).trim();
-  if (!str) return null;
-  const digits = str.match(/\d+/g);
-  if (!digits || !digits.length) return null;
-  const joined = digits.join('');
-  if (!joined) return null;
-  return joined;
-}
-
-function isLikelyPn(value) {
-  if (value == null) return false;
-  const str = String(value).trim();
-  if (!str) return false;
-  return /^[A-Z]{1,4}[A-Z0-9\-_/]{2,}$/i.test(str);
-}
-
-function pick(obj, key) {
-  const cand = new Set([key, String(key || '').toLowerCase()]);
-  for (const a of KEY_ALIASES[String(key || '').toLowerCase()] || []) {
-    cand.add(a);
-    cand.add(String(a).toLowerCase());
-  }
-  for (const k of cand) {
-    const v = obj?.[k];
-    if (v == null) continue;
-    if (Array.isArray(v)) {
-      const first = v.find((x) => x != null && String(x).trim() !== '');
-      if (first != null) return first;
-    }
-    const s = String(v).trim();
-    if (s !== '') return v;
-  }
-  return null;
-}
-
-function normalizeList(raw) {
-  if (raw == null) return [];
-  if (Array.isArray(raw)) return raw.filter(v => v != null && String(v).trim() !== '');
-  const s = String(raw).trim();
-  if (!s) return [];
-@@ -212,59 +262,62 @@ function applyTemplateMods(value, mods = []) {
-      out = `${out}${argRaw}`;
-      continue;
-    }
-
-    if (op === 'replace' && argRaw) {
-      const [search, replacement = ''] = argRaw.split(':');
-      if (search != null) {
-        const matcher = new RegExp(escapeRegExp(search), 'g');
-        out = out.replace(matcher, replacement);
-      }
-      continue;
-    }
-  }
-
-  return out;
-}
-
-function normalizeTemplateValue(key, value) {
-  if (value == null) return value;
-  let out = Array.isArray(value) ? value[0] : value;
-  if (out == null) return out;
-  let str = typeof out === 'string' ? out : String(out);
-
-  const keyNorm = String(key || '').toLowerCase();
-  if (keyNorm.includes('contact')) {
-    const formMatch = str.match(/(\d)\s*form\s*([ABC])/i);
-    if (formMatch) {
-      str = `${formMatch[1]}${formMatch[2].toUpperCase()}`;
-    } else {
-      const compact = str.replace(/\s+/g, '').toUpperCase();
-      if (CONTACT_FORM_ENUM[compact]) {
-        str = CONTACT_FORM_ENUM[compact];
-      }
-    }
-    const normalized = normalizeContactForm(str);
-    return normalized ?? '';
-  }
-
-  if (keyNorm === 'series_code' || keyNorm === 'series') {
-    const normalized = normalizeSeriesCode(str);
-    return normalized ?? '';
-  }
-
-  if (keyNorm.includes('coil_voltage')) {
-    const normalized = normalizeCoilVoltage(str);
-    return normalized ?? '';
-  }
-
-  return str;
-}
-
-function renderTemplate(tpl, obj) {
-  if (!tpl) return '';
-
-  const render = (template, pattern) => template.replace(pattern, (_, expr) => {
-    const parts = String(expr || '')
-      .split('|')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (!parts.length) return '';
-    const rawKey = parts.shift();
-    if (!rawKey) return '';
-    // 🔹 별칭까지 고려해 값 선택
-    const value = normalizeTemplateValue(rawKey, pick(obj, rawKey));
-    if (value == null || value === '') return '';
-    const applied = applyTemplateMods(value, parts);
-    return applied == null ? '' : String(applied);
-  });
-
-  let out = String(tpl);
-  out = render(out, /\{\{\s*([^{}]+?)\s*\}\}/g);
-@@ -340,89 +393,136 @@ function dedupeByBrandCode(rows = []) {
-}
-
-/**
- * @param {object} blueprint - { ingest_options: { variant_keys, pn_template }, ... }
- * @param {Array<object>} rows - 추출된 행(스펙행). 각 행은 { series, series_code, ..., field:value }
- * @returns {Array<object>} - 변형 축을 모두 풀어낸 행들. code/code_norm 포함
- */
-function explodeToRows(blueprint, rows = [], options = {}) {
-  const ingest = blueprint?.ingest_options || blueprint?.ingestOptions || {};
-  const variantKeys = Array.isArray(ingest.variant_keys) ? ingest.variant_keys : [];
-  const tpl = ingest.pn_template || ingest.pnTemplate || null;
-
-  const parseVariantsFromCode = typeof options.parseVariantsFromCode === 'function'
-    ? options.parseVariantsFromCode
-    : null;
-
-  const baseRows = rows.length ? rows : [{}];
-  const candidateRows = [];
-  const expandedRows = [];
-
-  for (const row0 of baseRows) {
-    const row = { ...(row0 || {}) };
-    const candidates = collectCandidates(row);
-    stripCandidateFields(row);
-
     const rowCandidateRows = [];
     if (Array.isArray(candidates) && candidates.length) {
       const seen = new Set();
@@ -738,7 +429,6 @@ function explodeToRows(blueprint, rows = [], options = {}) {
           ? parseVariantsFromCode(code, blueprint?.code_rules || {})
           : {};
 
-        candidateRows.push({
         rowCandidateRows.push({
           ...row,
           ...v,
@@ -763,9 +453,8 @@ function explodeToRows(blueprint, rows = [], options = {}) {
       };
     });
 
-        const lists = variantInfo.map((info) => info.list);
+    const lists = variantInfo.map((info) => info.list);
 
-    const combos = lists.length ? cartesian(lists) : [[]];
     const combos = shouldSkipTemplate ? [] : (lists.length ? cartesian(lists) : [[]]);
     for (const combo of combos) {
       const r = { ...row };
@@ -777,9 +466,6 @@ function explodeToRows(blueprint, rows = [], options = {}) {
         if (targetKey && targetKey !== sourceKey) r[targetKey] = value;
       });
 
-      let code = tpl
-        ? renderTemplate(tpl, { ...r, series })
-        : [series, ...variantKeys.map((k) => r[k]).filter(Boolean)].join('');
       const normalizedSeries = normalizeSeriesCode(r.series_code ?? r.series ?? series);
       if (normalizedSeries) {
         r.series_code = normalizedSeries;

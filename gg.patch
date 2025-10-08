@@ -1,83 +1,533 @@
-diff --git a/src/utils/ai.js b/src/utils/ai.js
-index 8c726040578a200529119087b5d84270c480bd40..f1a0ede8b2883e02f316d2ca17ac53d6d8453702 100644
---- a/src/utils/ai.js
-+++ b/src/utils/ai.js
-@@ -1,45 +1,77 @@
- 'use strict';
+diff --git a/src/ingest/mpn-exploder.js b/src/ingest/mpn-exploder.js
+index 191a23f1b35b72359cce9f75a898e20e0d23668b..2f60eb755daadbd22146e6665277235f5be15a27 100644
+--- a/src/ingest/mpn-exploder.js
++++ b/src/ingest/mpn-exploder.js
+@@ -262,51 +262,51 @@ function applyTemplateMods(value, mods = []) {
+       out = `${out}${argRaw}`;
+       continue;
+     }
  
-+const { callModelJson } = require('./vertex');
-+
- let client = null;
- 
- function getClient() {
-   if (client) return client;
-   try {
-     const { VertexAI } = require('@google-cloud/vertexai');
-     const project  = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-     const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
-     client = new VertexAI({ project, location });
-   } catch {
-     client = null; // Vertex 미사용(또는 의존성 없음) 시 null 유지
+     if (op === 'replace' && argRaw) {
+       const [search, replacement = ''] = argRaw.split(':');
+       if (search != null) {
+         const matcher = new RegExp(escapeRegExp(search), 'g');
+         out = out.replace(matcher, replacement);
+       }
+       continue;
+     }
    }
-   return client;
+ 
+   return out;
  }
  
+ function normalizeTemplateValue(key, value) {
+   if (value == null) return value;
+   let out = Array.isArray(value) ? value[0] : value;
+   if (out == null) return out;
+   let str = typeof out === 'string' ? out : String(out);
+ 
+   const keyNorm = String(key || '').toLowerCase();
+   if (keyNorm.includes('contact')) {
+-const normalized = normalizeContactForm(str);
++    const normalized = normalizeContactForm(str);
+     return normalized ?? '';
+   }
+ 
+   if (keyNorm === 'series_code' || keyNorm === 'series') {
+     const normalized = normalizeSeriesCode(str);
+     return normalized ?? '';
+   }
+ 
+   if (keyNorm.includes('coil_voltage')) {
+     const normalized = normalizeCoilVoltage(str);
+     return normalized ?? '';
+   }
+ 
+   return str;
+ }
+ 
+ function renderTemplate(tpl, obj) {
+   if (!tpl) return '';
+ 
+   const render = (template, pattern) => template.replace(pattern, (_, expr) => {
+     const parts = String(expr || '')
+       .split('|')
+       .map((s) => s.trim())
+       .filter(Boolean);
+     if (!parts.length) return '';
+diff --git a/src/ingest/mpn-exploder.js b/src/ingest/mpn-exploder.js
+index 191a23f1b35b72359cce9f75a898e20e0d23668b..2f60eb755daadbd22146e6665277235f5be15a27 100644
+--- a/src/ingest/mpn-exploder.js
++++ b/src/ingest/mpn-exploder.js
+@@ -370,438 +370,124 @@ function stripCandidateFields(target) {
+   for (const key of CANDIDATE_KEYS) {
+     if (key in target) delete target[key];
+   }
+ }
+ 
+ function dedupeByBrandCode(rows = []) {
+   const out = [];
+   const seen = new Set();
+   for (const row of rows) {
+     if (!row || typeof row !== 'object') continue;
+     let code = row.code;
+     if (code == null || code === '') continue;
+     code = String(code).trim();
+     if (!code) continue;
+     const codeNorm = (row.code_norm || code.toLowerCase());
+     const brandNorm = String(row.brand_norm || row.brand || '').trim().toLowerCase();
+     const key = `${brandNorm}::${codeNorm}`;
+     if (seen.has(key)) continue;
+     if (!row.code_norm) row.code_norm = codeNorm;
+     seen.add(key);
+     out.push(row);
+   }
+   return out;
+ }
+ 
+-/**
+- * @param {object} blueprint - { ingest_options: { variant_keys, pn_template }, ... }
+- * @param {Array<object>} rows - 추출된 행(스펙행). 각 행은 { series, series_code, ..., field:value }
+- * @returns {Array<object>} - 변형 축을 모두 풀어낸 행들. code/code_norm 포함
+- */
+-function explodeToRows(blueprint, rows = [], options = {}) {
+-  const ingest = blueprint?.ingest_options || blueprint?.ingestOptions || {};
+-  const variantKeys = Array.isArray(ingest.variant_keys) ? ingest.variant_keys : [];
+-  const tpl = ingest.pn_template || ingest.pnTemplate || null;
+-
+-  const parseVariantsFromCode = typeof options.parseVariantsFromCode === 'function'
+-    ? options.parseVariantsFromCode
+-    : null;
+-
+-  const baseRows = rows.length ? rows : [{}];
+-  const candidateRows = [];
+-  const expandedRows = [];
+-
+-  for (const row0 of baseRows) {
+-    const row = { ...(row0 || {}) };
+-    const candidates = collectCandidates(row);
+-    stripCandidateFields(row);
+-
+-        const rowCandidateRows = [];
+-    if (Array.isArray(candidates) && candidates.length) {
+-      const seen = new Set();
+-      for (const raw of candidates) {
+-        const code = String(raw || '').trim();
+-        if (!code) continue;
+-        const norm = code.toLowerCase();
+-        if (seen.has(norm)) continue;
+-        seen.add(norm);
+-
+-        const v = parseVariantsFromCode
+-          ? parseVariantsFromCode(code, blueprint?.code_rules || {})
+-          : {};
+-
+-    rowCandidateRows.push({
+-          ...row,
+-          ...v,
+-          code,
+-          code_norm: norm,
+-        });
+-      }
+-    }
+-
+-    const validRowCandidates = rowCandidateRows.filter((cand) => isLikelyPn(cand.code));
+-    const shouldSkipTemplate = validRowCandidates.length > 0;
+-    candidateRows.push(...(validRowCandidates.length ? validRowCandidates : rowCandidateRows));
+-
+-    const series = row.series_code || row.series || '';
+-
+-    const variantInfo = variantKeys.map((k) => {
+-      const { list, sourceKey } = collectVariantList(row, k);
+-      return {
+-        key: k,
+-        sourceKey,
+-        list: list.length ? list : [null],
+-      };
+-    });
+-
+-        const lists = variantInfo.map((info) => info.list);
+-
+-    const combos = shouldSkipTemplate ? [] : (lists.length ? cartesian(lists) : [[]]);
+-    for (const combo of combos) {
+-      const r = { ...row };
+-      variantInfo.forEach((info, idx) => {
+-        const value = combo[idx];
+-        const targetKey = info.key;
+-        const sourceKey = info.sourceKey;
+-        if (sourceKey) r[sourceKey] = value;
+-        if (targetKey && targetKey !== sourceKey) r[targetKey] = value;
+-      });
+-
+-      const normalizedSeries = normalizeSeriesCode(r.series_code ?? r.series ?? series);
+-      if (normalizedSeries) {
+-        r.series_code = normalizedSeries;
+-        if (!r.series) r.series = normalizedSeries;
+-      }
+-
+-      const normalizedContactForm = normalizeContactForm(
+-        r.contact_form ?? r.contact_arrangement ?? r.form ?? null,
+-      );
+-      if (normalizedContactForm) r.contact_form = normalizedContactForm;
+-      else delete r.contact_form;
+-
+-      const normalizedCoilVoltage = normalizeCoilVoltage(r.coil_voltage_vdc);
+-      if (normalizedCoilVoltage) r.coil_voltage_vdc = normalizedCoilVoltage;
+-      else delete r.coil_voltage_vdc;
+-
+-      const canUseTemplate = tpl
+-        && normalizedSeries
+-        && normalizedContactForm
+-        && CONTACT_FORM_ALLOWED.has(normalizedContactForm)
+-        && normalizedCoilVoltage;
+-
+-      if (!tpl) {
+-        const parts = [normalizedSeries || series];
+-        for (const key of variantKeys) {
+-          const val = r[key];
+-          if (val != null && val !== '') parts.push(String(val));
+-        }
+-        let code = parts.filter(Boolean).join('');
+-        code = String(code).replace(/\s+/g, '').trim();
+-        if (!code || !isLikelyPn(code)) continue;
+-        r.code = code;
+-        r.code_norm = code.toLowerCase();
+-        expandedRows.push(r);
+-        continue;
+-      }
+-
+-      if (!canUseTemplate) continue;
+-
+-      let code = renderTemplate(tpl, {
+-        ...r,
+-        series,
+-        series_code: normalizedSeries,
+-      });
+-
+-      code = String(code).replace(/\s+/g, '').trim();
+-      if (!code) continue;
+-      @@ -10,56 +10,106 @@ const KEY_ALIASES = {
+-    'arrangement',
+-    'poles_form',
+-    'form',
+-  ],
+-  coil_voltage_vdc: [
+-    'coil_voltage_vdc',
+-    'voltage_vdc',
+-    'rated_voltage_vdc',
+-    'vdc',
+-    'coil_voltage',
+-    'voltage',
+-  ],
+-  series: ['series', 'series_code'],
+-  suffix: ['suffix', 'packing', 'package', 'packaging', 'mount_type', 'mounting', 'terminal'],
+-};
+-const CANDIDATE_KEYS = [
+-  'candidates',
+-  'codes',
+-  'mpn_candidates',
+-  'mpnCandidates',
+-  'mpn_list',
+-  'mpnList',
+-  'mpns',
+-];
+-
+-const CONTACT_FORM_ENUM = {
+-  SPST: '1A',
+-  SPDT: '1C',
+-  DPDT: '2C',
+-  DPST: '2A',
+-};
+-const CONTACT_FORM_PATTERNS = [
+-  { regex: /(1\s*form\s*a|1a|spst-?no)/i, value: '1A' },
+-  { regex: /(2\s*form\s*a|2a|dpst-?no)/i, value: '2A' },
+-];
+-const CONTACT_FORM_ALLOWED = new Set(['1A', '2A']);
+-const SERIES_STRIP_WORDS = /\b(relays?|series|relay|power|signal)\b/gi;
+-
+-function normalizeSeriesCode(value) {
+-  if (value == null) return null;
+-  const raw = Array.isArray(value) ? value[0] : value;
+-  if (raw == null) return null;
+-  const str = String(raw).trim();
+-  if (!str) return null;
+-  const cleaned = str
+-    .replace(SERIES_STRIP_WORDS, '')
+-    .replace(/\s+/g, '')
+-    .trim();
+-  const upper = cleaned.toUpperCase();
+-  return upper || null;
+-}
+-
+-function normalizeContactForm(value) {
+-  if (value == null) return null;
+-  const raw = Array.isArray(value) ? value[0] : value;
+-  if (raw == null) return null;
+-  const str = String(raw).trim();
+-  if (!str) return null;
+-  for (const { regex, value: mapped } of CONTACT_FORM_PATTERNS) {
+-    if (regex.test(str)) return mapped;
+-  }
+-  const compact = str.replace(/\s+/g, '').toUpperCase();
+-  if (CONTACT_FORM_ALLOWED.has(compact)) return compact;
+-  if (compact === 'SPST' || compact === 'SPSTNO') return '1A';
+-  if (compact === 'DPST' || compact === 'DPSTNO') return '2A';
+-  return null;
+-}
+-
+-function normalizeCoilVoltage(value) {
+-  if (value == null) return null;
+-  const raw = Array.isArray(value) ? value[0] : value;
+-  if (raw == null) return null;
+-  const str = String(raw).trim();
+-  if (!str) return null;
+-  const digits = str.match(/\d+/g);
+-  if (!digits || !digits.length) return null;
+-  const joined = digits.join('');
+-  if (!joined) return null;
+-  return joined;
+-}
+-
+-function isLikelyPn(value) {
+-  if (value == null) return false;
+-  const str = String(value).trim();
+-  if (!str) return false;
+-  return /^[A-Z]{1,4}[A-Z0-9\-_/]{2,}$/i.test(str);
+-}
+-
+-function pick(obj, key) {
+-  const cand = new Set([key, String(key || '').toLowerCase()]);
+-  for (const a of KEY_ALIASES[String(key || '').toLowerCase()] || []) {
+-    cand.add(a);
+-    cand.add(String(a).toLowerCase());
+-  }
+-  for (const k of cand) {
+-    const v = obj?.[k];
+-    if (v == null) continue;
+-    if (Array.isArray(v)) {
+-      const first = v.find((x) => x != null && String(x).trim() !== '');
+-      if (first != null) return first;
+-    }
+-    const s = String(v).trim();
+-    if (s !== '') return v;
+-  }
+-  return null;
+-}
+-
+-function normalizeList(raw) {
+-  if (raw == null) return [];
+-  if (Array.isArray(raw)) return raw.filter(v => v != null && String(v).trim() !== '');
+-  const s = String(raw).trim();
+-  if (!s) return [];
+-@@ -212,59 +262,62 @@ function applyTemplateMods(value, mods = []) {
+-      out = `${out}${argRaw}`;
+-      continue;
+-    }
+-
+-    if (op === 'replace' && argRaw) {
+-      const [search, replacement = ''] = argRaw.split(':');
+-      if (search != null) {
+-        const matcher = new RegExp(escapeRegExp(search), 'g');
+-        out = out.replace(matcher, replacement);
+-      }
+-      continue;
+-    }
+-  }
+-
+-  return out;
+-}
+-
+-function normalizeTemplateValue(key, value) {
+-  if (value == null) return value;
+-  let out = Array.isArray(value) ? value[0] : value;
+-  if (out == null) return out;
+-  let str = typeof out === 'string' ? out : String(out);
+-
+-  const keyNorm = String(key || '').toLowerCase();
+-  if (keyNorm.includes('contact')) {
+-    const formMatch = str.match(/(\d)\s*form\s*([ABC])/i);
+-    if (formMatch) {
+-      str = `${formMatch[1]}${formMatch[2].toUpperCase()}`;
+-    } else {
+-      const compact = str.replace(/\s+/g, '').toUpperCase();
+-      if (CONTACT_FORM_ENUM[compact]) {
+-        str = CONTACT_FORM_ENUM[compact];
+-      }
+-    }
+-    const normalized = normalizeContactForm(str);
+-    return normalized ?? '';
+-  }
+-
+-  if (keyNorm === 'series_code' || keyNorm === 'series') {
+-    const normalized = normalizeSeriesCode(str);
+-    return normalized ?? '';
+-  }
+-
+-  if (keyNorm.includes('coil_voltage')) {
+-    const normalized = normalizeCoilVoltage(str);
+-    return normalized ?? '';
+-  }
+-
+-  return str;
+-}
+-
+-function renderTemplate(tpl, obj) {
+-  if (!tpl) return '';
+-
+-  const render = (template, pattern) => template.replace(pattern, (_, expr) => {
+-    const parts = String(expr || '')
+-      .split('|')
+-      .map((s) => s.trim())
+-      .filter(Boolean);
+-    if (!parts.length) return '';
+-    const rawKey = parts.shift();
+-    if (!rawKey) return '';
+-    // 🔹 별칭까지 고려해 값 선택
+-    const value = normalizeTemplateValue(rawKey, pick(obj, rawKey));
+-    if (value == null || value === '') return '';
+-    const applied = applyTemplateMods(value, parts);
+-    return applied == null ? '' : String(applied);
+-  });
+-
+-  let out = String(tpl);
+-  out = render(out, /\{\{\s*([^{}]+?)\s*\}\}/g);
+-@@ -340,89 +393,136 @@ function dedupeByBrandCode(rows = []) {
+-}
+-
  /**
-  * JSON 스키마 기반 생성. 실패 시 null 리턴(폴백 용이)
+  * @param {object} blueprint - { ingest_options: { variant_keys, pn_template }, ... }
+  * @param {Array<object>} rows - 추출된 행(스펙행). 각 행은 { series, series_code, ..., field:value }
+  * @returns {Array<object>} - 변형 축을 모두 풀어낸 행들. code/code_norm 포함
   */
- async function generateJSON({ system, input, schema, model }) {
-   const c = getClient();
-   if (!c) return null;
+ function explodeToRows(blueprint, rows = [], options = {}) {
+   const ingest = blueprint?.ingest_options || blueprint?.ingestOptions || {};
+   const variantKeys = Array.isArray(ingest.variant_keys) ? ingest.variant_keys : [];
+   const tpl = ingest.pn_template || ingest.pnTemplate || null;
  
-   const m = c.getGenerativeModel({
-     model: model || process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash',
-     generationConfig: {
-       temperature: 0.2,
-       maxOutputTokens: 2048,
-       responseMimeType: 'application/json',
-     },
-     ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
-   });
+   const parseVariantsFromCode = typeof options.parseVariantsFromCode === 'function'
+     ? options.parseVariantsFromCode
+     : null;
  
-   const res = await m.generateContent({
-     contents: [{ role: 'user', parts: [{ text: JSON.stringify({ input, schema }) }]}],
-   });
+   const baseRows = rows.length ? rows : [{}];
+   const candidateRows = [];
+   const expandedRows = [];
  
-   const text =
-     res?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+   for (const row0 of baseRows) {
+     const row = { ...(row0 || {}) };
+     const candidates = collectCandidates(row);
+     stripCandidateFields(row);
  
-   try { return JSON.parse(text); } catch { return null; }
+     const rowCandidateRows = [];
+     if (Array.isArray(candidates) && candidates.length) {
+       const seen = new Set();
+       for (const raw of candidates) {
+         const code = String(raw || '').trim();
+         if (!code) continue;
+         const norm = code.toLowerCase();
+         if (seen.has(norm)) continue;
+         seen.add(norm);
+ 
+         const v = parseVariantsFromCode
+           ? parseVariantsFromCode(code, blueprint?.code_rules || {})
+           : {};
+ 
+-        candidateRows.push({
+         rowCandidateRows.push({
+           ...row,
+           ...v,
+           code,
+           code_norm: norm,
+         });
+       }
+     }
+ 
+     const validRowCandidates = rowCandidateRows.filter((cand) => isLikelyPn(cand.code));
+     const shouldSkipTemplate = validRowCandidates.length > 0;
+     candidateRows.push(...(validRowCandidates.length ? validRowCandidates : rowCandidateRows));
+ 
+     const series = row.series_code || row.series || '';
+ 
+     const variantInfo = variantKeys.map((k) => {
+       const { list, sourceKey } = collectVariantList(row, k);
+       return {
+         key: k,
+         sourceKey,
+         list: list.length ? list : [null],
+       };
+     });
+ 
+-        const lists = variantInfo.map((info) => info.list);
++    const lists = variantInfo.map((info) => info.list);
+ 
+-    const combos = lists.length ? cartesian(lists) : [[]];
+     const combos = shouldSkipTemplate ? [] : (lists.length ? cartesian(lists) : [[]]);
+     for (const combo of combos) {
+       const r = { ...row };
+       variantInfo.forEach((info, idx) => {
+         const value = combo[idx];
+         const targetKey = info.key;
+         const sourceKey = info.sourceKey;
+         if (sourceKey) r[sourceKey] = value;
+         if (targetKey && targetKey !== sourceKey) r[targetKey] = value;
+       });
+ 
+-      let code = tpl
+-        ? renderTemplate(tpl, { ...r, series })
+-        : [series, ...variantKeys.map((k) => r[k]).filter(Boolean)].join('');
+       const normalizedSeries = normalizeSeriesCode(r.series_code ?? r.series ?? series);
+       if (normalizedSeries) {
+         r.series_code = normalizedSeries;
+         if (!r.series) r.series = normalizedSeries;
+       }
+ 
+       const normalizedContactForm = normalizeContactForm(
+         r.contact_form ?? r.contact_arrangement ?? r.form ?? null,
+       );
+       if (normalizedContactForm) r.contact_form = normalizedContactForm;
+       else delete r.contact_form;
+ 
+       const normalizedCoilVoltage = normalizeCoilVoltage(r.coil_voltage_vdc);
+       if (normalizedCoilVoltage) r.coil_voltage_vdc = normalizedCoilVoltage;
+       else delete r.coil_voltage_vdc;
+ 
+       const canUseTemplate = tpl
+         && normalizedSeries
+         && normalizedContactForm
+         && CONTACT_FORM_ALLOWED.has(normalizedContactForm)
+         && normalizedCoilVoltage;
+ 
+       if (!tpl) {
+         const parts = [normalizedSeries || series];
+         for (const key of variantKeys) {
+diff --git a/src/ingest/mpn-exploder.js b/src/ingest/mpn-exploder.js
+index 191a23f1b35b72359cce9f75a898e20e0d23668b..2f60eb755daadbd22146e6665277235f5be15a27 100644
+--- a/src/ingest/mpn-exploder.js
++++ b/src/ingest/mpn-exploder.js
+@@ -817,26 +503,26 @@ function explodeToRows(blueprint, rows = [], options = {}) {
+         continue;
+       }
+ 
+       if (!canUseTemplate) continue;
+ 
+       let code = renderTemplate(tpl, {
+         ...r,
+         series,
+         series_code: normalizedSeries,
+       });
+ 
+       code = String(code).replace(/\s+/g, '').trim();
+       if (!code) continue;
+       if (!isLikelyPn(code)) continue;
+ 
+       r.code = code;
+       r.code_norm = code.toLowerCase();
+       expandedRows.push(r);
+     }
+   }
+ 
+   const rowsOut = [...expandedRows, ...candidateRows];
+   return dedupeByBrandCode(rowsOut);
  }
  
--module.exports = { generateJSON };
-+async function normalizeValueLLM({ family, key, raw, enumValues = null }) {
-+  const sys = [
-+    'You map free-text spec values to canonical catalog values.',
-+    'Always return strict JSON with fields: normalized, confidence, unit, magnitude.',
-+    'normalized: canonical string or empty if cannot map.',
-+    'If enum_values are provided, choose one of them exactly (case-insensitive).',
-+    'For numeric values, also extract magnitude (number) and unit (string) if present.',
-+  ].join('\n');
-+
-+  const usr = JSON.stringify({
-+    family,
-+    key,
-+    raw: String(raw ?? ''),
-+    enum_values: enumValues && enumValues.length ? enumValues : null,
-+  });
-+
-+  const out = await callModelJson(sys, usr, {
-+    temperature: 0.1,
-+    topP: 0.2,
-+    maxOutputTokens: 800,
-+  });
-+
-+  return {
-+    normalized: out && typeof out.normalized === 'string' ? out.normalized.trim() : null,
-+    confidence: Number(out?.confidence ?? 0) || 0,
-+    unit: out && typeof out.unit === 'string' ? out.unit.trim() : null,
-+    magnitude: out && out.magnitude != null ? Number(out.magnitude) : null,
-+  };
-+}
-+
-+module.exports = { generateJSON, normalizeValueLLM };
+-module.exports = { explodeToRows, renderTemplate, normalizeList, cartesian };
++module.exports = { explodeToRows, renderTemplate, normalizeList, cartesian };

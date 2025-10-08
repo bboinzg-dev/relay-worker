@@ -163,30 +163,98 @@ function looksLikeCode(x) {
   const s = String(x || '').trim();
   if (!/^[A-Za-z0-9][A-Za-z0-9\-_/\.]{2,}$/.test(s)) return false;
   if (!/\d/.test(s)) return false;
+  if (!/[A-Za-z]/.test(s) && !/[-_/]/.test(s)) return false;
   if (/\b(OHM|Ω|VDC|VAC|AMP|A|V|W|HZ|MS|SEC|UL|ROHS|REACH|DATE|PAGE)\b/i.test(s)) return false;
   return true;
 }
 function mapHeaderToKey(h) {
   const s = String(h || '').trim().toLowerCase().replace(/\s+/g, ' ');
-  if (/\b(part( no\.?| number)|model|type|ordering code|catalog( no\.?| number))\b/.test(s)) return 'code';
+  if (/\b(part( no\.?| number)|model|type|pn|ordering( code| number)?|catalog( no\.?| number)|item code|product code)\b/.test(s)) return 'code';
+  if (/(부품|제품|주문|형명|品番|型番)/.test(s)) return 'code';
   return null;
+}
+function extractCodesFromCell(cell) {
+  const chunks = String(cell || '')
+    .split(/[\s,;\/|]+/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+  const out = [];
+  for (const chunk of chunks) {
+    const normalized = chunk.toUpperCase();
+    if (!looksLikeCode(normalized)) continue;
+    out.push(normalized);
+  }
+  return out;
 }
 function codesFromDocAiTables(tables) {
   const set = new Set();
   for (const t of (tables || [])) {
-    const idx = {};
-    (t.headers || []).forEach((h, i) => { const k = mapHeaderToKey(h); if (k) idx[k] = i; });
-    if (idx.code == null) continue;
-    for (const r of (t.rows || [])) {
-      const code = String(r[idx.code] || '').trim().toUpperCase();
-      if (looksLikeCode(code)) set.add(code);
+    const headers = Array.isArray(t.headers) ? t.headers : [];
+    const rows = Array.isArray(t.rows) ? t.rows : [];
+    const width = Math.max(headers.length, ...rows.map((r) => (Array.isArray(r) ? r.length : 0)));
+    if (!width) continue;
+
+    const stats = Array.from({ length: width }, () => ({
+      cells: 0,
+      rowsWithCodes: 0,
+      distinct: new Set(),
+    }));
+
+    const headerCodeCols = new Set();
+    headers.forEach((h, i) => {
+      const key = mapHeaderToKey(h);
+      if (key === 'code') headerCodeCols.add(i);
+    });
+
+    rows.forEach((row) => {
+      if (!Array.isArray(row)) return;
+      for (let i = 0; i < width; i += 1) {
+        const cell = row[i];
+        if (cell == null) continue;
+        const text = String(cell).trim();
+        if (!text) continue;
+        const codes = extractCodesFromCell(text);
+        if (!codes.length) {
+          stats[i].cells += 1;
+          continue;
+        }
+        stats[i].cells += 1;
+        stats[i].rowsWithCodes += 1;
+        for (const code of codes) stats[i].distinct.add(code);
+      }
+    });
+
+    const heuristicCols = new Set();
+    stats.forEach((info, i) => {
+      const distinctCount = info.distinct.size;
+      if (!distinctCount) return;
+      const ratio = info.rowsWithCodes / Math.max(info.cells, 1);
+      if (ratio >= 0.4 || distinctCount >= 3 || headerCodeCols.has(i)) {
+        heuristicCols.add(i);
+      }
+    });
+
+    if (!heuristicCols.size && headerCodeCols.size) {
+      headerCodeCols.forEach((i) => heuristicCols.add(i));
     }
+    if (!heuristicCols.size) continue;
+
+    rows.forEach((row) => {
+      if (!Array.isArray(row)) return;
+      heuristicCols.forEach((colIdx) => {
+        const cell = row[colIdx];
+        if (cell == null) return;
+        const text = String(cell).trim();
+        if (!text) return;
+        for (const code of extractCodesFromCell(text)) set.add(code);
+      });
+    });
   }
   return Array.from(set);
 }
 function codesFromFreeText(txt) {
   const set = new Set();
-  const re = /\b([A-Z]{2,6}[A-Z0-9\-_/\.]{2,})\b/g;
+  const re = /\b([A-Z0-9][A-Z0-9\-_/\.]{2,})\b/g;
   let m; while ((m = re.exec(txt)) !== null) {
     const cand = m[1].toUpperCase();
     if (looksLikeCode(cand)) set.add(cand);

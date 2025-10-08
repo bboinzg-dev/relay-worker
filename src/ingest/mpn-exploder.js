@@ -67,6 +67,77 @@ function normalizeList(raw) {
   return s.split(LIST_SEP).map(tok => tok.trim()).filter(Boolean);
 }
 
+function getAliasKeys(key) {
+  const raw = String(key || '').trim();
+  if (!raw) return [];
+  const lower = raw.toLowerCase();
+  const seen = new Set([raw]);
+  const out = [raw];
+
+  const direct = KEY_ALIASES[lower];
+  if (Array.isArray(direct)) {
+    for (const alias of direct) {
+      const token = String(alias || '').trim();
+      if (!token || seen.has(token)) continue;
+      seen.add(token);
+      out.push(token);
+    }
+  }
+
+  for (const [base, list] of Object.entries(KEY_ALIASES)) {
+    if (!Array.isArray(list) || !list.length) continue;
+    if (!list.some((alias) => String(alias || '').trim().toLowerCase() === lower)) continue;
+    const canonical = String(base || '').trim();
+    if (canonical && !seen.has(canonical)) {
+      seen.add(canonical);
+      out.push(canonical);
+    }
+    for (const alias of list) {
+      const token = String(alias || '').trim();
+      if (!token || seen.has(token)) continue;
+      seen.add(token);
+      out.push(token);
+    }
+  }
+
+  // 대소문자 변형도 허용
+  const normalized = new Set([...out]);
+  for (const token of out) {
+    const lowerToken = token.toLowerCase();
+    if (!normalized.has(lowerToken)) {
+      normalized.add(lowerToken);
+      seen.add(lowerToken);
+    }
+  }
+
+  return Array.from(seen);
+}
+
+function readRowValue(row, key) {
+  if (!row || typeof row !== 'object') return undefined;
+  if (key in row) return row[key];
+  const lower = String(key || '').toLowerCase();
+  if (lower in row) return row[lower];
+  const upper = String(key || '').toUpperCase();
+  if (upper in row) return row[upper];
+  return undefined;
+}
+
+function collectVariantList(row, key) {
+  const direct = normalizeList(readRowValue(row, key));
+  if (direct.length) return { list: direct, sourceKey: key };
+
+  const aliases = getAliasKeys(key);
+  for (const alias of aliases) {
+    if (String(alias || '') === String(key || '')) continue;
+    const values = normalizeList(readRowValue(row, alias));
+    if (!values.length) continue;
+    return { list: values, sourceKey: alias };
+  }
+
+  return { list: [], sourceKey: key };
+}
+
 function escapeRegExp(str) {
   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -315,16 +386,27 @@ function explodeToRows(blueprint, rows = [], options = {}) {
 
     const series = row.series_code || row.series || '';
 
-    const lists = variantKeys.map((k) => {
-      const v = row[k];
-      const list = normalizeList(v);
-      return list.length ? list : [null];
+    const variantInfo = variantKeys.map((k) => {
+      const { list, sourceKey } = collectVariantList(row, k);
+      return {
+        key: k,
+        sourceKey,
+        list: list.length ? list : [null],
+      };
     });
+
+        const lists = variantInfo.map((info) => info.list);
 
     const combos = lists.length ? cartesian(lists) : [[]];
     for (const combo of combos) {
       const r = { ...row };
-      variantKeys.forEach((k, i) => { r[k] = combo[i]; });
+      variantInfo.forEach((info, idx) => {
+        const value = combo[idx];
+        const targetKey = info.key;
+        const sourceKey = info.sourceKey;
+        if (sourceKey) r[sourceKey] = value;
+        if (targetKey && targetKey !== sourceKey) r[targetKey] = value;
+      });
 
       let code = tpl
         ? renderTemplate(tpl, { ...r, series })

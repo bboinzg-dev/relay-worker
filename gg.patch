@@ -1,106 +1,201 @@
-diff --git a/src/schema/manager.js b/src/schema/manager.js
-index 3e014012e184d57c64b3702e4a650e018017cdfb..ab3c0e43effb30de7079bbc33e512885abd0561b 100644
---- a/src/schema/manager.js
-+++ b/src/schema/manager.js
-@@ -44,60 +44,95 @@ function diffColumns(fields, cols){
-   const desired = new Map();
-   for (const f of fields) {
-     desired.set(f.name, mapTypeToPg(f.type));
+diff --git a/src/ingest/mpn-exploder.js b/src/ingest/mpn-exploder.js
+index ae2a4d10a647c7b530f3ecd829e07a21d628710c..42043910ebb04adf35c34fe4169b5ab1d9d5b360 100644
+--- a/src/ingest/mpn-exploder.js
++++ b/src/ingest/mpn-exploder.js
+@@ -45,50 +45,121 @@ function pick(obj, key) {
+     cand.add(a);
+     cand.add(String(a).toLowerCase());
    }
-   const have = new Map();
-   cols.forEach(c => have.set(c.name, c.type));
- 
-   const missing = [];
-   const typeMismatch = [];
-   for (const [name, typ] of desired.entries()) {
-     if (!have.has(name)) missing.push({ name, want: typ });
-     else {
-       const got = have.get(name);
-       if (String(got).toLowerCase() !== String(typ).toLowerCase()) typeMismatch.push({ name, have: got, want: typ });
+   for (const k of cand) {
+     const v = obj?.[k];
+     if (v == null) continue;
+     if (Array.isArray(v)) {
+       const first = v.find((x) => x != null && String(x).trim() !== '');
+       if (first != null) return first;
      }
+     const s = String(v).trim();
+     if (s !== '') return v;
    }
-   const extra = [];
-   for (const [name, typ] of have.entries()) {
-     if (!desired.has(name) && !['id','brand','code','brand_norm','code_norm','series','display_name','family_slug','datasheet_url','cover','source_gcs_uri','embedding','raw_json','tenant_id','owner_id','created_by','updated_by','created_at','updated_at'].includes(name)) {
-       extra.push({ name, have: typ });
-     }
-   }
-   return { missing, typeMismatch, extra };
+   return null;
  }
  
--function sqlForDiff(table, diff){
-+function sqlForDiff(table, diff, cols = []){
-   const stmts = [];
-   for (const m of diff.missing) {
-     stmts.push(`ALTER TABLE public.${table} ADD COLUMN IF NOT EXISTS ${m.name} ${m.want};`);
-   }
-   for (const t of diff.typeMismatch) {
-     // safe cast attempt for numeric/text only
-     if (String(t.have).startsWith('text') && String(t.want).startsWith('numeric')) {
-       stmts.push(`ALTER TABLE public.${table} ALTER COLUMN ${t.name} TYPE numeric USING NULLIF(regexp_replace(${t.name}::text, '[^0-9eE+\-\.]','', 'g'),'')::numeric;`);
-     } else if (String(t.want).startsWith('text')) {
-       stmts.push(`ALTER TABLE public.${table} ALTER COLUMN ${t.name} TYPE text USING ${t.name}::text;`);
-     } else {
-       // generic
-       stmts.push(`-- REVIEW: ALTER TABLE public.${table} ALTER COLUMN ${t.name} TYPE ${t.want};`);
+ function normalizeList(raw) {
+   if (raw == null) return [];
+   if (Array.isArray(raw)) return raw.filter(v => v != null && String(v).trim() !== '');
+   const s = String(raw).trim();
+   if (!s) return [];
+   // "DC5V", "5 V", "05" 등에서 숫자만 뽑아 pad에 쓰기 좋게
+   return s.split(LIST_SEP).map(tok => tok.trim()).filter(Boolean);
+ }
+ 
++function getAliasKeys(key) {
++  const raw = String(key || '').trim();
++  if (!raw) return [];
++  const lower = raw.toLowerCase();
++  const seen = new Set([raw]);
++  const out = [raw];
++
++  const direct = KEY_ALIASES[lower];
++  if (Array.isArray(direct)) {
++    for (const alias of direct) {
++      const token = String(alias || '').trim();
++      if (!token || seen.has(token)) continue;
++      seen.add(token);
++      out.push(token);
++    }
++  }
++
++  for (const [base, list] of Object.entries(KEY_ALIASES)) {
++    if (!Array.isArray(list) || !list.length) continue;
++    if (!list.some((alias) => String(alias || '').trim().toLowerCase() === lower)) continue;
++    const canonical = String(base || '').trim();
++    if (canonical && !seen.has(canonical)) {
++      seen.add(canonical);
++      out.push(canonical);
++    }
++    for (const alias of list) {
++      const token = String(alias || '').trim();
++      if (!token || seen.has(token)) continue;
++      seen.add(token);
++      out.push(token);
++    }
++  }
++
++  // 대소문자 변형도 허용
++  const normalized = new Set([...out]);
++  for (const token of out) {
++    const lowerToken = token.toLowerCase();
++    if (!normalized.has(lowerToken)) {
++      normalized.add(lowerToken);
++      seen.add(lowerToken);
++    }
++  }
++
++  return Array.from(seen);
++}
++
++function readRowValue(row, key) {
++  if (!row || typeof row !== 'object') return undefined;
++  if (key in row) return row[key];
++  const lower = String(key || '').toLowerCase();
++  if (lower in row) return row[lower];
++  const upper = String(key || '').toUpperCase();
++  if (upper in row) return row[upper];
++  return undefined;
++}
++
++function collectVariantList(row, key) {
++  const direct = normalizeList(readRowValue(row, key));
++  if (direct.length) return { list: direct, sourceKey: key };
++
++  const aliases = getAliasKeys(key);
++  for (const alias of aliases) {
++    if (String(alias || '') === String(key || '')) continue;
++    const values = normalizeList(readRowValue(row, alias));
++    if (!values.length) continue;
++    return { list: values, sourceKey: alias };
++  }
++
++  return { list: [], sourceKey: key };
++}
++
+ function escapeRegExp(str) {
+   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+ }
+ 
+ function applyTemplateMods(value, mods = []) {
+   if (value == null) return '';
+ 
+   let out = Array.isArray(value) ? value[0] : value;
+   if (out == null) return '';
+   if (typeof out !== 'string') out = String(out);
+ 
+   for (const rawMod of mods) {
+     const token = String(rawMod || '').trim();
+     if (!token) continue;
+     const [opRaw, argRaw = ''] = token.split('=').map((t) => t.trim());
+     const op = opRaw.toLowerCase();
+     if (!op) continue;
+ 
+     if (op === 'pad') {
+       const width = Number(argRaw);
+       if (Number.isFinite(width) && width > 0) out = out.padStart(width, '0');
+       continue;
+     }
+ 
+     if (op === 'map') {
+diff --git a/src/ingest/mpn-exploder.js b/src/ingest/mpn-exploder.js
+index ae2a4d10a647c7b530f3ecd829e07a21d628710c..42043910ebb04adf35c34fe4169b5ab1d9d5b360 100644
+--- a/src/ingest/mpn-exploder.js
++++ b/src/ingest/mpn-exploder.js
+@@ -293,54 +364,65 @@ function explodeToRows(blueprint, rows = [], options = {}) {
+ 
+     if (Array.isArray(candidates) && candidates.length) {
+       const seen = new Set();
+       for (const raw of candidates) {
+         const code = String(raw || '').trim();
+         if (!code) continue;
+         const norm = code.toLowerCase();
+         if (seen.has(norm)) continue;
+         seen.add(norm);
+ 
+         const v = parseVariantsFromCode
+           ? parseVariantsFromCode(code, blueprint?.code_rules || {})
+           : {};
+ 
+         candidateRows.push({
+           ...row,
+           ...v,
+           code,
+           code_norm: norm,
+         });
+       }
+     }
+ 
+     const series = row.series_code || row.series || '';
+ 
+-    const lists = variantKeys.map((k) => {
+-      const v = row[k];
+-      const list = normalizeList(v);
+-      return list.length ? list : [null];
++    const variantInfo = variantKeys.map((k) => {
++      const { list, sourceKey } = collectVariantList(row, k);
++      return {
++        key: k,
++        sourceKey,
++        list: list.length ? list : [null],
++      };
+     });
+ 
++    const lists = variantInfo.map((info) => info.list);
++
+     const combos = lists.length ? cartesian(lists) : [[]];
+     for (const combo of combos) {
+       const r = { ...row };
+-      variantKeys.forEach((k, i) => { r[k] = combo[i]; });
++      variantInfo.forEach((info, idx) => {
++        const value = combo[idx];
++        const targetKey = info.key;
++        const sourceKey = info.sourceKey;
++        if (sourceKey) r[sourceKey] = value;
++        if (targetKey && targetKey !== sourceKey) r[targetKey] = value;
++      });
+ 
+       let code = tpl
+         ? renderTemplate(tpl, { ...r, series })
+         : [series, ...variantKeys.map((k) => r[k]).filter(Boolean)].join('');
+ 
+       code = String(code).replace(/\s+/g, '').trim();
+       if (!code) continue;
+ 
+       r.code = code;
+       r.code_norm = code.toLowerCase();
+       expandedRows.push(r);
      }
    }
--  // core indices
--  stmts.push(`CREATE UNIQUE INDEX IF NOT EXISTS ux_${table}_brand_code_norm ON public.${table} (lower(brand), lower(code));`);
--  stmts.push(`CREATE INDEX IF NOT EXISTS ix_${table}_trgm_code ON public.${table} USING gin (code gin_trgm_ops);`);
--  stmts.push(`CREATE INDEX IF NOT EXISTS ix_${table}_trgm_brand ON public.${table} USING gin (brand gin_trgm_ops);`);
-+  const colNames = new Set(cols.map((c) => c.name));
-+
-+  // legacy index cleanup
-+  stmts.push(`DROP INDEX IF EXISTS ux_${table}_brand_code_norm;`);
-+  stmts.push(`DROP INDEX IF EXISTS ix_${table}_trgm_code;`);
-+  stmts.push(`DROP INDEX IF EXISTS ix_${table}_trgm_brand;`);
-+
-+  const hasBrandNorm = colNames.has('brand_norm');
-+  const hasPn = colNames.has('pn');
-+  const hasPnNorm = colNames.has('pn_norm');
-+  const hasCodeNorm = colNames.has('code_norm');
-+  const hasRawJson = colNames.has('raw_json');
-+
-+  if (hasBrandNorm && hasPn) {
-+    stmts.push(
-+      `CREATE UNIQUE INDEX IF NOT EXISTS uq_${table}_brand_pn_und ON public.${table} (brand_norm, pn) NULLS NOT DISTINCT;`
-+    );
-+  }
-+
-+  if (hasBrandNorm) {
-+    stmts.push(
-+      `CREATE INDEX IF NOT EXISTS ix_${table}_trgm_brand_norm ON public.${table} USING gin (brand_norm gin_trgm_ops);`
-+    );
-+  }
-+  if (hasPnNorm) {
-+    stmts.push(
-+      `CREATE INDEX IF NOT EXISTS ix_${table}_trgm_pn_norm ON public.${table} USING gin (pn_norm gin_trgm_ops);`
-+    );
-+  }
-+  if (hasCodeNorm) {
-+    stmts.push(
-+      `CREATE INDEX IF NOT EXISTS ix_${table}_trgm_code_norm ON public.${table} USING gin (code_norm gin_trgm_ops);`
-+    );
-+  }
-+  if (hasRawJson) {
-+    stmts.push(
-+      `CREATE INDEX IF NOT EXISTS ix_${table}_raw_json ON public.${table} USING gin (raw_json jsonb_ops);`
-+    );
-+  }
-   return stmts;
+ 
+   const rowsOut = [...expandedRows, ...candidateRows];
+   return dedupeByBrandCode(rowsOut);
  }
  
- async function ensureSchema(table, fields_json){
-   const fields = normalizeFields(fields_json);
-   const cols = await currentColumns(table);
-   const diff = diffColumns(fields, cols);
--  const stmts = sqlForDiff(table, diff);
-+  const stmts = sqlForDiff(table, diff, cols);
-   for (const sql of stmts) {
-     await db.query(sql);
-   }
-   return { diff, stmts };
- }
- 
- module.exports = { loadBlueprint, currentColumns, normalizeFields, diffColumns, sqlForDiff, ensureSchema, mapTypeToPg };
+ module.exports = { explodeToRows, renderTemplate, normalizeList, cartesian };

@@ -51,6 +51,15 @@ function applyTemplateMods(value, mods = []) {
       continue;
     }
 
+    if (op === 'map') {
+      try {
+        const lut = JSON.parse(argRaw);
+        const key = String(out);
+        if (lut[key] != null) out = lut[key];
+      } catch {}
+      continue;
+    }
+
     if (op === 'first') {
       const parts = out.split(',');
       out = parts.length ? parts[0].trim() : out;

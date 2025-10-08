@@ -1,155 +1,93 @@
-diff --git a/src/ai/datasheetExtract.js b/src/ai/datasheetExtract.js
-index 534b8f02987846747908a728859e11acb63857bc..1d37a2692cc5228a1758620e1922a045021598b4 100644
---- a/src/ai/datasheetExtract.js
-+++ b/src/ai/datasheetExtract.js
-@@ -141,74 +141,142 @@ async function processWithDocAI(gcsUri) {
-     for (const t of (p.tables || [])) {
-       const headRow = t.headerRows?.[0];
-       const headers = (headRow?.cells || []).map(c => getTxt(c.layout));
-       const rows = [];
-       for (const br of (t.bodyRows || [])) rows.push((br.cells || []).map(c => getTxt(c.layout)));
-       tables.push({ headers, rows });
-     }
-   }
-   return { tables, fullText };
- }
+diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
+index 65126cc139a2cf755c172cf405b6edcf92127859..eb49148f9849cd7143ea70586e231d042c11ad0c 100644
+--- a/src/utils/mpn-exploder.js
++++ b/src/utils/mpn-exploder.js
+@@ -1,56 +1,81 @@
+ 'use strict';
  
- /* -------------------- pdf-parse fallback -------------------- */
- async function parseTextWithPdfParse(gcsUri) {
-   if (!pdfParse) return '';
-   const { bucket, name } = parseGcsUri(gcsUri);
-   const [buf] = await storage.bucket(bucket).file(name).download();
-   const out = await pdfParse(buf);
-   return out?.text || '';
- }
+ const LIST_SEP = /[\s,;/|·•]+/;
+ const NON_MPN_WORDS = new Set([
+   'relay', 'relays', 'coil', 'vdc', 'vac', 'form', 'series', 'typ', 'max', 'min'
+ ]);
  
- /* -------------------- code extraction -------------------- */
- function looksLikeCode(x) {
-   const s = String(x || '').trim();
-   if (!/^[A-Za-z0-9][A-Za-z0-9\-_/\.]{2,}$/.test(s)) return false;
-   if (!/\d/.test(s)) return false;
-+  if (!/[A-Za-z]/.test(s) && !/[-_/]/.test(s)) return false;
-   if (/\b(OHM|Ω|VDC|VAC|AMP|A|V|W|HZ|MS|SEC|UL|ROHS|REACH|DATE|PAGE)\b/i.test(s)) return false;
-   return true;
- }
- function mapHeaderToKey(h) {
-   const s = String(h || '').trim().toLowerCase().replace(/\s+/g, ' ');
--  if (/\b(part( no\.?| number)|model|type|ordering code|catalog( no\.?| number))\b/.test(s)) return 'code';
-+  if (/\b(part( no\.?| number)|model|type|pn|ordering( code| number)?|catalog( no\.?| number)|item code|product code)\b/.test(s)) return 'code';
-+  if (/(부품|제품|주문|형명|品番|型番)/.test(s)) return 'code';
-   return null;
- }
-+function extractCodesFromCell(cell) {
-+  const chunks = String(cell || '')
-+    .split(/[\s,;\/|]+/)
-+    .map((v) => v.trim())
-+    .filter(Boolean);
-+  const out = [];
-+  for (const chunk of chunks) {
-+    const normalized = chunk.toUpperCase();
-+    if (!looksLikeCode(normalized)) continue;
-+    out.push(normalized);
-+  }
-+  return out;
++function derivePrefix(token) {
++  if (!token) return '';
++  const trimmed = token.trim();
++  if (!trimmed) return '';
++
++  // 가장 흔한 패턴: 마지막 구분자(-/_/) 직전까지를 prefix로 본다.
++  const delimiterMatch = trimmed.match(/^(.*[\-_/])[A-Za-z0-9]+$/);
++  if (delimiterMatch) return delimiterMatch[1];
++
++  // 구분자가 없으면 최초의 영문자로 시작하는 시퀀스를 prefix로 사용
++  const headMatch = trimmed.match(/^([A-Za-z][A-Za-z0-9]*)/);
++  if (headMatch) return headMatch[1];
++
++  return '';
 +}
- function codesFromDocAiTables(tables) {
-   const set = new Set();
-   for (const t of (tables || [])) {
--    const idx = {};
--    (t.headers || []).forEach((h, i) => { const k = mapHeaderToKey(h); if (k) idx[k] = i; });
--    if (idx.code == null) continue;
--    for (const r of (t.rows || [])) {
--      const code = String(r[idx.code] || '').trim().toUpperCase();
--      if (looksLikeCode(code)) set.add(code);
-+    const headers = Array.isArray(t.headers) ? t.headers : [];
-+    const rows = Array.isArray(t.rows) ? t.rows : [];
-+    const width = Math.max(headers.length, ...rows.map((r) => (Array.isArray(r) ? r.length : 0)));
-+    if (!width) continue;
 +
-+    const stats = Array.from({ length: width }, () => ({
-+      cells: 0,
-+      rowsWithCodes: 0,
-+      distinct: new Set(),
-+    }));
++function normalizeSuffix(token) {
++  if (!token) return '';
++  return token.replace(/^[\-_/]+/, '');
++}
 +
-+    const headerCodeCols = new Set();
-+    headers.forEach((h, i) => {
-+      const key = mapHeaderToKey(h);
-+      if (key === 'code') headerCodeCols.add(i);
-+    });
+ function splitAndCarryPrefix(raw) {
+   if (!raw) return [];
+   const tokens = String(raw)
+     .split(LIST_SEP)
+     .map((t) => t.trim())
+     .filter(Boolean);
+ 
+   const out = [];
+   let lastPrefix = '';
+-  const prefixRegex = /^([A-Za-z][A-Za-z0-9\-_/]*?)(?=\d|$)/;
+ 
+   for (const token of tokens) {
+     const lower = token.toLowerCase();
+     if (NON_MPN_WORDS.has(lower)) continue;
+-    if (/^[0-9]/.test(token)) {
+-      if (lastPrefix) {
+-        out.push(lastPrefix + token);
 +
-+    rows.forEach((row) => {
-+      if (!Array.isArray(row)) return;
-+      for (let i = 0; i < width; i += 1) {
-+        const cell = row[i];
-+        if (cell == null) continue;
-+        const text = String(cell).trim();
-+        if (!text) continue;
-+        const codes = extractCodesFromCell(text);
-+        if (!codes.length) {
-+          stats[i].cells += 1;
-+          continue;
-+        }
-+        stats[i].cells += 1;
-+        stats[i].rowsWithCodes += 1;
-+        for (const code of codes) stats[i].distinct.add(code);
-+      }
-+    });
++    const leading = token[0];
++    const isLeadingDelimiter = leading != null && /[\-_/]/.test(leading);
 +
-+    const heuristicCols = new Set();
-+    stats.forEach((info, i) => {
-+      const distinctCount = info.distinct.size;
-+      if (!distinctCount) return;
-+      const ratio = info.rowsWithCodes / Math.max(info.cells, 1);
-+      if (ratio >= 0.4 || distinctCount >= 3 || headerCodeCols.has(i)) {
-+        heuristicCols.add(i);
-+      }
-+    });
-+
-+    if (!heuristicCols.size && headerCodeCols.size) {
-+      headerCodeCols.forEach((i) => heuristicCols.add(i));
++    if ((/^[0-9]/.test(token) || isLeadingDelimiter) && lastPrefix) {
++      const suffix = normalizeSuffix(token);
++      if (suffix && /[A-Za-z]/.test(suffix)) {
++        out.push(lastPrefix + suffix);
++        continue;
+       }
+-      continue;
      }
-+    if (!heuristicCols.size) continue;
-+
-+    rows.forEach((row) => {
-+      if (!Array.isArray(row)) return;
-+      heuristicCols.forEach((colIdx) => {
-+        const cell = row[colIdx];
-+        if (cell == null) return;
-+        const text = String(cell).trim();
-+        if (!text) return;
-+        for (const code of extractCodesFromCell(text)) set.add(code);
-+      });
-+    });
+ 
+     out.push(token);
+-    const m = token.match(prefixRegex);
+-    if (m) lastPrefix = m[1];
++    const prefix = derivePrefix(token);
++    if (prefix) lastPrefix = prefix;
    }
-   return Array.from(set);
- }
- function codesFromFreeText(txt) {
-   const set = new Set();
--  const re = /\b([A-Z]{2,6}[A-Z0-9\-_/\.]{2,})\b/g;
-+  const re = /\b([A-Z0-9][A-Z0-9\-_/\.]{2,})\b/g;
-   let m; while ((m = re.exec(txt)) !== null) {
-     const cand = m[1].toUpperCase();
-     if (looksLikeCode(cand)) set.add(cand);
-     if (set.size > MAX_PARTS) break;
+ 
+   const seen = new Set();
+   const deduped = [];
+   for (const token of out) {
+     const norm = token.toLowerCase();
+     if (seen.has(norm)) continue;
+     seen.add(norm);
+     deduped.push(token);
    }
-   return Array.from(set);
+   return deduped;
  }
  
- /* -------------------- Gemini mapping -------------------- */
- async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText, tablePreview }) {
-   const { project, location, model } = resolveGemini();
-   if (!VertexAI || !project) return [];
+ function normalizeList(value) {
+   if (value == null) return [];
+   if (Array.isArray(value)) return value.flatMap(normalizeList);
+   if (typeof value === 'string') {
+     return value
+       .split(LIST_SEP)
+       .map((s) => s.trim())
+       .filter(Boolean);
+   }
+   return [value];
+ }
  
-   const vertex = new VertexAI({ project, location });
-   const mdl = vertex.getGenerativeModel({
-     model,
-     systemInstruction: { parts: [{ text: [
-       `You extract component specs from datasheets.`,
-       `Category (family): "${family}".`,
-       `Return ONLY strict JSON. Schema: {"parts":[{"brand":"string","code":"string","values":{...}}]}.`,
-       `Allowed "values" keys: ${allowedKeys.join(', ') || '(none)'}. Do not invent keys.`,
-       `Only include codes from the provided list (do not fabricate).`,
-       `Normalize numbers to plain numbers (no units). Omit missing.`
-     ].join('\n') }] }
-   });

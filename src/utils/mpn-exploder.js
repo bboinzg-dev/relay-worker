@@ -5,6 +5,27 @@ const NON_MPN_WORDS = new Set([
   'relay', 'relays', 'coil', 'vdc', 'vac', 'form', 'series', 'typ', 'max', 'min'
 ]);
 
+function derivePrefix(token) {
+  if (!token) return '';
+  const trimmed = token.trim();
+  if (!trimmed) return '';
+
+  // 가장 흔한 패턴: 마지막 구분자(-/_/) 직전까지를 prefix로 본다.
+  const delimiterMatch = trimmed.match(/^(.*[\-_/])[A-Za-z0-9]+$/);
+  if (delimiterMatch) return delimiterMatch[1];
+
+  // 구분자가 없으면 최초의 영문자로 시작하는 시퀀스를 prefix로 사용
+  const headMatch = trimmed.match(/^([A-Za-z][A-Za-z0-9]*)/);
+  if (headMatch) return headMatch[1];
+
+  return '';
+}
+
+function normalizeSuffix(token) {
+  if (!token) return '';
+  return token.replace(/^[\-_/]+/, '');
+}
+
 function splitAndCarryPrefix(raw) {
   if (!raw) return [];
   const tokens = String(raw)
@@ -14,21 +35,25 @@ function splitAndCarryPrefix(raw) {
 
   const out = [];
   let lastPrefix = '';
-  const prefixRegex = /^([A-Za-z][A-Za-z0-9\-_/]*?)(?=\d|$)/;
 
   for (const token of tokens) {
     const lower = token.toLowerCase();
     if (NON_MPN_WORDS.has(lower)) continue;
-    if (/^[0-9]/.test(token)) {
-      if (lastPrefix) {
-        out.push(lastPrefix + token);
+
+    const leading = token[0];
+    const isLeadingDelimiter = leading != null && /[\-_/]/.test(leading);
+
+    if ((/^[0-9]/.test(token) || isLeadingDelimiter) && lastPrefix) {
+      const suffix = normalizeSuffix(token);
+      if (suffix && /[A-Za-z]/.test(suffix)) {
+        out.push(lastPrefix + suffix);
+        continue;
       }
-      continue;
     }
 
     out.push(token);
-    const m = token.match(prefixRegex);
-    if (m) lastPrefix = m[1];
+    const prefix = derivePrefix(token);
+    if (prefix) lastPrefix = prefix;
   }
 
   const seen = new Set();

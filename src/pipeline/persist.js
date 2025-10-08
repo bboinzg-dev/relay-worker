@@ -919,6 +919,25 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
     client.release();
   }
 
+  if (result.affected > 0 && options?.refreshViews !== false) {
+    const refresh = {};
+    try {
+      await pool.query('SELECT public.refresh_component_specs_view()');
+      refresh.component_specs_view = { ok: true };
+    } catch (err) {
+      refresh.component_specs_view = { ok: false, error: err?.message || String(err) };
+      warnings.add('refresh_component_specs_view_failed');
+    }
+    try {
+      await pool.query('SELECT retail.refresh_products_src_view()');
+      refresh.products_src_view = { ok: true };
+    } catch (err) {
+      refresh.products_src_view = { ok: false, error: err?.message || String(err) };
+      warnings.add('refresh_products_src_view_failed');
+    }
+    result.refresh = refresh;
+  }
+
   result.warnings = Array.from(warnings);
   return result;
 }

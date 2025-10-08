@@ -1,62 +1,106 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 2478747ad00f60932e3d925ea261d6b9fdebeab8..15d6bd33187075ceb269b820ee858c5162bf445e 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -779,50 +779,57 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
-         const fallbackPn = `pdf:${base}#${rowIndex + 1}`;
-         rec.pn = fallbackPn;
-         if (!rec.code || !isValidCode(rec.code)) {
-           rec.code = fallbackPn;
-         }
-         if (physicalCols.has('last_error')) {
-           rec.last_error = rec.last_error || 'invalid_code_fallback';
-         }
-         warnings.add('minimal_pn_fallback');
-       }
+diff --git a/src/schema/manager.js b/src/schema/manager.js
+index 3e014012e184d57c64b3702e4a650e018017cdfb..ab3c0e43effb30de7079bbc33e512885abd0561b 100644
+--- a/src/schema/manager.js
++++ b/src/schema/manager.js
+@@ -44,60 +44,95 @@ function diffColumns(fields, cols){
+   const desired = new Map();
+   for (const f of fields) {
+     desired.set(f.name, mapTypeToPg(f.type));
+   }
+   const have = new Map();
+   cols.forEach(c => have.set(c.name, c.type));
  
-       if (!isValidCode(rec.pn)) {
-         rec.pn = null;
-       }
+   const missing = [];
+   const typeMismatch = [];
+   for (const [name, typ] of desired.entries()) {
+     if (!have.has(name)) missing.push({ name, want: typ });
+     else {
+       const got = have.get(name);
+       if (String(got).toLowerCase() !== String(typ).toLowerCase()) typeMismatch.push({ name, have: got, want: typ });
+     }
+   }
+   const extra = [];
+   for (const [name, typ] of have.entries()) {
+     if (!desired.has(name) && !['id','brand','code','brand_norm','code_norm','series','display_name','family_slug','datasheet_url','cover','source_gcs_uri','embedding','raw_json','tenant_id','owner_id','created_by','updated_by','created_at','updated_at'].includes(name)) {
+       extra.push({ name, have: typ });
+     }
+   }
+   return { missing, typeMismatch, extra };
+ }
  
-       if (!rec.pn && rec.code) {
-         rec.pn = rec.code;
-       }
- 
-       buildPnIfMissing(rec, pnTemplate);
- 
-       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
-         rec.pn = rec.code;
-       }
- 
-+      // 🔹 템플릿 미치환 차단: 아직 { } 가 남아있다면 유효 PN 아님
-+      if (looksLikeTemplate(rec.pn) || looksLikeTemplate(rec.code)) {
-+        if (physicalCols.has('last_error')) rec.last_error = 'template_unresolved';
-+        result.skipped.push({ reason: 'invalid_code', detail: 'template_unresolved' });
-+        continue;
-+      }
+-function sqlForDiff(table, diff){
++function sqlForDiff(table, diff, cols = []){
+   const stmts = [];
+   for (const m of diff.missing) {
+     stmts.push(`ALTER TABLE public.${table} ADD COLUMN IF NOT EXISTS ${m.name} ${m.want};`);
+   }
+   for (const t of diff.typeMismatch) {
+     // safe cast attempt for numeric/text only
+     if (String(t.have).startsWith('text') && String(t.want).startsWith('numeric')) {
+       stmts.push(`ALTER TABLE public.${table} ALTER COLUMN ${t.name} TYPE numeric USING NULLIF(regexp_replace(${t.name}::text, '[^0-9eE+\-\.]','', 'g'),'')::numeric;`);
+     } else if (String(t.want).startsWith('text')) {
+       stmts.push(`ALTER TABLE public.${table} ALTER COLUMN ${t.name} TYPE text USING ${t.name}::text;`);
+     } else {
+       // generic
+       stmts.push(`-- REVIEW: ALTER TABLE public.${table} ALTER COLUMN ${t.name} TYPE ${t.want};`);
+     }
+   }
+-  // core indices
+-  stmts.push(`CREATE UNIQUE INDEX IF NOT EXISTS ux_${table}_brand_code_norm ON public.${table} (lower(brand), lower(code));`);
+-  stmts.push(`CREATE INDEX IF NOT EXISTS ix_${table}_trgm_code ON public.${table} USING gin (code gin_trgm_ops);`);
+-  stmts.push(`CREATE INDEX IF NOT EXISTS ix_${table}_trgm_brand ON public.${table} USING gin (brand gin_trgm_ops);`);
++  const colNames = new Set(cols.map((c) => c.name));
 +
-       const pnMissing = !isValidCode(rec.pn);
-       if (pnMissing && (pnWasTemplate || codeWasTemplate)) {
-         if (physicalCols.has('last_error')) rec.last_error = 'template_render_failed';
-         result.skipped.push({ reason: 'invalid_code', detail: 'template_render_failed' });
-         continue;
-       }
++  // legacy index cleanup
++  stmts.push(`DROP INDEX IF EXISTS ux_${table}_brand_code_norm;`);
++  stmts.push(`DROP INDEX IF EXISTS ix_${table}_trgm_code;`);
++  stmts.push(`DROP INDEX IF EXISTS ix_${table}_trgm_brand;`);
++
++  const hasBrandNorm = colNames.has('brand_norm');
++  const hasPn = colNames.has('pn');
++  const hasPnNorm = colNames.has('pn_norm');
++  const hasCodeNorm = colNames.has('code_norm');
++  const hasRawJson = colNames.has('raw_json');
++
++  if (hasBrandNorm && hasPn) {
++    stmts.push(
++      `CREATE UNIQUE INDEX IF NOT EXISTS uq_${table}_brand_pn_und ON public.${table} (brand_norm, pn) NULLS NOT DISTINCT;`
++    );
++  }
++
++  if (hasBrandNorm) {
++    stmts.push(
++      `CREATE INDEX IF NOT EXISTS ix_${table}_trgm_brand_norm ON public.${table} USING gin (brand_norm gin_trgm_ops);`
++    );
++  }
++  if (hasPnNorm) {
++    stmts.push(
++      `CREATE INDEX IF NOT EXISTS ix_${table}_trgm_pn_norm ON public.${table} USING gin (pn_norm gin_trgm_ops);`
++    );
++  }
++  if (hasCodeNorm) {
++    stmts.push(
++      `CREATE INDEX IF NOT EXISTS ix_${table}_trgm_code_norm ON public.${table} USING gin (code_norm gin_trgm_ops);`
++    );
++  }
++  if (hasRawJson) {
++    stmts.push(
++      `CREATE INDEX IF NOT EXISTS ix_${table}_raw_json ON public.${table} USING gin (raw_json jsonb_ops);`
++    );
++  }
+   return stmts;
+ }
  
-       if (!isValidCode(rec.code) && isValidCode(rec.pn)) {
-         rec.code = rec.pn;
-       }
+ async function ensureSchema(table, fields_json){
+   const fields = normalizeFields(fields_json);
+   const cols = await currentColumns(table);
+   const diff = diffColumns(fields, cols);
+-  const stmts = sqlForDiff(table, diff);
++  const stmts = sqlForDiff(table, diff, cols);
+   for (const sql of stmts) {
+     await db.query(sql);
+   }
+   return { diff, stmts };
+ }
  
-       const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });
-       if (!guard.ok) {
-         const skip = { reason: guard.reason, detail: guard.detail || null };
-         if (rec.last_error) skip.last_error = rec.last_error;
-         result.skipped.push(skip);
-         continue;
-       }
- 
-       const pnValue = String(rec.pn || rec.code || '').trim();
-       const pnIsFallback = isMinimalFallbackPn(pnValue);
-       if (!pnValue || !isValidCode(pnValue) || (!pnIsFallback && FORBIDDEN_RE.test(pnValue))) {
-         const skippedCode = pnValue || String(rec.code || rec.pn || '').trim() || '(no-code)';
-         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
-         result.skipped.push({ reason: 'invalid_code', code: skippedCode, last_error: 'invalid_code' });
+ module.exports = { loadBlueprint, currentColumns, normalizeFields, diffColumns, sqlForDiff, ensureSchema, mapTypeToPg };

@@ -66,7 +66,7 @@ function diffColumns(fields, cols){
   return { missing, typeMismatch, extra };
 }
 
-function sqlForDiff(table, diff){
+function sqlForDiff(table, diff, cols = []){
   const stmts = [];
   for (const m of diff.missing) {
     stmts.push(`ALTER TABLE public.${table} ADD COLUMN IF NOT EXISTS ${m.name} ${m.want};`);
@@ -82,10 +82,45 @@ function sqlForDiff(table, diff){
       stmts.push(`-- REVIEW: ALTER TABLE public.${table} ALTER COLUMN ${t.name} TYPE ${t.want};`);
     }
   }
-  // core indices
-  stmts.push(`CREATE UNIQUE INDEX IF NOT EXISTS ux_${table}_brand_code_norm ON public.${table} (lower(brand), lower(code));`);
-  stmts.push(`CREATE INDEX IF NOT EXISTS ix_${table}_trgm_code ON public.${table} USING gin (code gin_trgm_ops);`);
-  stmts.push(`CREATE INDEX IF NOT EXISTS ix_${table}_trgm_brand ON public.${table} USING gin (brand gin_trgm_ops);`);
+  const colNames = new Set(cols.map((c) => c.name));
+
+  // legacy index cleanup
+  stmts.push(`DROP INDEX IF EXISTS ux_${table}_brand_code_norm;`);
+  stmts.push(`DROP INDEX IF EXISTS ix_${table}_trgm_code;`);
+  stmts.push(`DROP INDEX IF EXISTS ix_${table}_trgm_brand;`);
+
+  const hasBrandNorm = colNames.has('brand_norm');
+  const hasPn = colNames.has('pn');
+  const hasPnNorm = colNames.has('pn_norm');
+  const hasCodeNorm = colNames.has('code_norm');
+  const hasRawJson = colNames.has('raw_json');
+
+  if (hasBrandNorm && hasPn) {
+    stmts.push(
+      `CREATE UNIQUE INDEX IF NOT EXISTS uq_${table}_brand_pn_und ON public.${table} (brand_norm, pn) NULLS NOT DISTINCT;`
+    );
+  }
+
+  if (hasBrandNorm) {
+    stmts.push(
+      `CREATE INDEX IF NOT EXISTS ix_${table}_trgm_brand_norm ON public.${table} USING gin (brand_norm gin_trgm_ops);`
+    );
+  }
+  if (hasPnNorm) {
+    stmts.push(
+      `CREATE INDEX IF NOT EXISTS ix_${table}_trgm_pn_norm ON public.${table} USING gin (pn_norm gin_trgm_ops);`
+    );
+  }
+  if (hasCodeNorm) {
+    stmts.push(
+      `CREATE INDEX IF NOT EXISTS ix_${table}_trgm_code_norm ON public.${table} USING gin (code_norm gin_trgm_ops);`
+    );
+  }
+  if (hasRawJson) {
+    stmts.push(
+      `CREATE INDEX IF NOT EXISTS ix_${table}_raw_json ON public.${table} USING gin (raw_json jsonb_ops);`
+    );
+  }
   return stmts;
 }
 
@@ -93,7 +128,7 @@ async function ensureSchema(table, fields_json){
   const fields = normalizeFields(fields_json);
   const cols = await currentColumns(table);
   const diff = diffColumns(fields, cols);
-  const stmts = sqlForDiff(table, diff);
+  const stmts = sqlForDiff(table, diff, cols);
   for (const sql of stmts) {
     await db.query(sql);
   }

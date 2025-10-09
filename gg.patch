@@ -1,113 +1,222 @@
-diff --git a/src/pipeline/ensure-spec-columns.js b/src/pipeline/ensure-spec-columns.js
-index 5bccf0c66c717153df4ff3daa872fe4e2df143f1..a9d2ef1e4da879ff710a9b4df4062f2e8b67c55e 100644
---- a/src/pipeline/ensure-spec-columns.js
-+++ b/src/pipeline/ensure-spec-columns.js
-@@ -1,75 +1,105 @@
- 'use strict';
+diff --git a/src/utils/schema.js b/src/utils/schema.js
+index 8df51be71b6c4a4907e2e4801d954c9c1b472b4b..6ae006717c568a642d093ed9d339eded85e64da3 100644
+--- a/src/utils/schema.js
++++ b/src/utils/schema.js
+@@ -46,50 +46,185 @@ function parseTableName(tableName) {
+   }
  
--const db = require('../../db');
-+const path = require('node:path');
-+
-+function tryRequire(paths) {
-+  const errors = [];
-+  for (const p of paths) {
-+    try {
-+      return require(p);
-+    } catch (err) {
-+      if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
-+        errors.push(err);
-+        continue;
-+      }
-+      throw err;
-+    }
-+  }
-+  const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
-+  error.code = 'MODULE_NOT_FOUND';
-+  error.attempts = errors.map((e) => e?.message || String(e));
-+  throw error;
-+}
-+
-+const db = tryRequire([
-+  path.join(__dirname, '../../db'),
-+  path.join(__dirname, '../db'),
-+  path.join(__dirname, './db'),
-+  path.join(process.cwd(), 'db'),
-+]);
+   schema = normalizeIdentifier(schema) || 'public';
+   table = normalizeIdentifier(table);
+   if (!table) throw new Error('invalid table name');
  
- const TYPE_MAP = {
-   int: 'integer',
-   integer: 'integer',
-   numeric: 'numeric',
-   number: 'numeric',
+   return {
+     schema,
+     table,
+     qualified: `${schema}.${table}`,
+   };
+ }
+ 
+ function canonKeys(obj = {}) {
+   const out = {};
+   for (const [rawKey, value] of Object.entries(obj)) {
+     const key = normalizeIdentifier(rawKey);
+     if (!key) continue;
+     if (!Object.prototype.hasOwnProperty.call(out, key)) {
+       out[key] = value;
+     }
+   }
+   return out;
+ }
+ 
++const FIELD_TYPE_MAP = {
++  int: 'integer',
++  integer: 'integer',
++  number: 'numeric',
++  numeric: 'numeric',
 +  float: 'double precision',
 +  double: 'double precision',
 +  'double precision': 'double precision',
 +  decimal: 'numeric',
-   bool: 'boolean',
-   boolean: 'boolean',
-   text: 'text',
-   string: 'text',
- };
++  bool: 'boolean',
++  boolean: 'boolean',
++  json: 'jsonb',
++  jsonb: 'jsonb',
++  text: 'text',
++  string: 'text',
++  date: 'date',
++  timestamp: 'timestamptz',
++  timestamptz: 'timestamptz',
++};
++
++function normalizeFieldEntries(fields = {}) {
++  const entries = [];
++  if (Array.isArray(fields)) {
++    for (const item of fields) {
++      if (!item || typeof item !== 'object') continue;
++      const key = normalizeIdentifier(item.name || item.key || item.field);
++      if (!key) continue;
++      const type = item.type ?? item.pgType ?? item.pg_type ?? item.data_type ?? 'text';
++      entries.push([key, type]);
++    }
++    return entries;
++  }
++
++  if (fields && typeof fields === 'object') {
++    for (const [rawKey, meta] of Object.entries(fields)) {
++      const key = normalizeIdentifier(rawKey);
++      if (!key) continue;
++      if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
++        const type = meta.type ?? meta.pgType ?? meta.pg_type ?? meta.data_type ?? 'text';
++        entries.push([key, type]);
++      } else {
++        entries.push([key, meta ?? 'text']);
++      }
++    }
++  }
++  return entries;
++}
++
++async function ensureSpecsTable(tableName, fields = {}) {
++  const { schema, table, qualified } = parseTableName(tableName);
++
++  await db.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
++  await db.query(`
++    CREATE TABLE IF NOT EXISTS ${qualified} (
++      id           BIGSERIAL PRIMARY KEY,
++      family_slug  text,
++      brand        text,
++      code         text,
++      pn           text,
++      series       text,
++      series_code  text,
++      display_name text,
++      displayname  text,
++      datasheet_uri text,
++      datasheet_url text,
++      image_uri    text,
++      cover        text,
++      source_gcs_uri text,
++      verified_in_doc boolean,
++      raw_json     jsonb,
++      last_error   text,
++      created_at   timestamptz DEFAULT now(),
++      updated_at   timestamptz DEFAULT now()
++    )
++  `);
++
++  const baseColumns = [
++    { name: 'family_slug', type: 'text' },
++    { name: 'brand', type: 'text' },
++    { name: 'code', type: 'text' },
++    { name: 'pn', type: 'text' },
++    { name: 'series', type: 'text' },
++    { name: 'series_code', type: 'text' },
++    { name: 'datasheet_uri', type: 'text' },
++    { name: 'datasheet_url', type: 'text' },
++    { name: 'image_uri', type: 'text' },
++    { name: 'cover', type: 'text' },
++    { name: 'display_name', type: 'text' },
++    { name: 'displayname', type: 'text' },
++    { name: 'source_gcs_uri', type: 'text' },
++    { name: 'verified_in_doc', type: 'boolean' },
++    { name: 'raw_json', type: 'jsonb' },
++    { name: 'last_error', type: 'text' },
++    { name: 'created_at', type: 'timestamptz', defaultSql: 'now()' },
++    { name: 'updated_at', type: 'timestamptz', defaultSql: 'now()' },
++  ];
++
++  for (const col of baseColumns) {
++    const defaultClause = col.defaultSql ? ` DEFAULT ${col.defaultSql}` : '';
++    await db.query(`ALTER TABLE ${qualified} ADD COLUMN IF NOT EXISTS "${col.name}" ${col.type}${defaultClause}`);
++    if (col.defaultSql) {
++      await db.query(`ALTER TABLE ${qualified} ALTER COLUMN "${col.name}" SET DEFAULT ${col.defaultSql}`);
++    }
++  }
++
++  const generatedColumns = [
++    { name: 'brand_norm', expression: 'lower(brand)' },
++    { name: 'code_norm', expression: 'lower(code)' },
++    { name: 'pn_norm', expression: 'lower(pn)' },
++  ];
++
++  for (const col of generatedColumns) {
++    await db.query(
++      `ALTER TABLE ${qualified} ADD COLUMN IF NOT EXISTS "${col.name}" text GENERATED ALWAYS AS (${col.expression}) STORED`
++    );
++  }
++
++  const fieldEntries = normalizeFieldEntries(fields);
++  const reserved = new Set([
++    'id',
++    ...baseColumns.map((c) => c.name),
++    ...generatedColumns.map((c) => c.name),
++  ]);
++
++  for (const [key, typeInput] of fieldEntries) {
++    if (!key || reserved.has(key)) continue;
++    const mapped = FIELD_TYPE_MAP[String(typeInput).toLowerCase()] || 'text';
++    await db.query(`ALTER TABLE ${qualified} ADD COLUMN IF NOT EXISTS "${key}" ${mapped}`);
++  }
++
++  await db.query(
++    `CREATE UNIQUE INDEX IF NOT EXISTS ux_${table}_brandpn_expr ON ${qualified} (lower(brand), lower(pn))`
++  );
++}
++
+ const NO_UPDATE = new Set(['id', 'created_at', 'updated_at', 'brand_norm', 'code_norm', 'pn', 'pn_norm']);
  
- function normKey(k) {
-   return String(k || '')
-     .trim()
-     .toLowerCase()
-     .replace(/[^a-z0-9_]/g, '');
- }
+ async function upsertByBrandCode(tableName, values = {}) {
+   const { schema, table, qualified } = parseTableName(tableName);
  
- async function getColumnsOf(qualified) {
-   const [schema, table] = qualified.includes('.')
-     ? qualified.split('.', 2)
-     : ['public', qualified];
-   const { rows } = await db.query(
-     `SELECT lower(column_name) AS col
-        FROM information_schema.columns
-       WHERE table_schema = $1
-         AND table_name   = $2`,
-     [schema, table]
-   );
-   return new Set(rows.map((r) => r.col));
- }
+   const brand = values?.brand ?? null;
+   let code = values?.code ?? null;
+   let pn = values?.pn ?? values?.code ?? null;
+   const rest = { ...values };
+   const brandNormInput = rest.brand_norm;
+   const codeNormInput = rest.code_norm;
+   const pnNormInput = rest.pn_norm;
+   delete rest.brand;
+   delete rest.code;
+   delete rest.pn;
+   delete rest.brand_norm;
+   delete rest.code_norm;
+   delete rest.pn_norm;
  
- async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
-   const have = await getColumnsOf(qualifiedTable);
- 
-   const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
-   const variants = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-     ? blueprint.ingestOptions.variant_keys
-     : Array.isArray(blueprint?.variant_keys)
-       ? blueprint.variant_keys
-       : [];
--        const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
-+  const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
-   const fieldKeys = Object.keys(fieldMeta);
- 
-   const wantedList = [
-     ...new Set(
-       [...allowed, ...variants, ...fieldKeys]
-         .map(normKey)
-         .filter(Boolean)
-     ),
-   ];
- 
-   const toAdd = [];
-   for (const key of wantedList) {
-     if (have.has(key)) continue;
-     const rawType = fieldMeta[key]?.type ?? fieldMeta[key] ?? 'text';
-     const pgType = TYPE_MAP[String(rawType).toLowerCase()] || 'text';
-     toAdd.push({ key, pgType });
+   const allowMinimal = isMinimalInsertEnabled();
+   if (typeof pn === 'string' && !pn.trim()) pn = null;
+   if (!pn && allowMinimal) {
+     const candidate = values?.series ?? values?.series_code ?? null;
+     if (candidate && String(candidate).trim()) {
+       pn = candidate;
+diff --git a/src/utils/schema.js b/src/utils/schema.js
+index 8df51be71b6c4a4907e2e4801d954c9c1b472b4b..6ae006717c568a642d093ed9d339eded85e64da3 100644
+--- a/src/utils/schema.js
++++ b/src/utils/schema.js
+@@ -140,26 +275,26 @@ async function upsertByBrandCode(tableName, values = {}) {
    }
+   if (!insertCols.length) return null;
  
-   if (!toAdd.length) return { added: 0 };
+   const params = insertCols.map((_, i) => `$${i + 1}`);
+   const updates = insertCols
+     .filter((col) => !NO_UPDATE.has(col))
+     .map((col) => `${col}=EXCLUDED.${col}`);
  
-   for (const { key, pgType } of toAdd) {
-     await db.query(
-       `ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`
-     );
-   }
-   return { added: toAdd.length, columns: toAdd };
+   // Spec tables enforce uniqueness via the expression index (lower(brand), lower(pn)).
+   // Prefer targeting the named index when available, but fall back to the raw expression.
+   const conflictByExpr = `ON CONFLICT ((lower(brand)), (lower(pn)))`;
+   const conflictByName = `ON CONFLICT ON CONSTRAINT ux_${table}_brandpn_expr`;
+   const conflict = table ? conflictByName : conflictByExpr;
+ 
+   const sql = `
+     insert into ${qualified} (${insertCols.join(',')})
+     values (${params.join(',')})
+     ${conflict}
+     do update set ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
+     returning *`;
+ 
+   const res = await db.query(sql, insertVals);
+   return res.rows?.[0] || null;
  }
  
--module.exports = { ensureSpecColumnsForBlueprint, getColumnsOf };
-+module.exports = { ensureSpecColumnsForBlueprint, getColumnsOf };
+-module.exports = { upsertByBrandCode };
++module.exports = { ensureSpecsTable, upsertByBrandCode };

@@ -8,7 +8,31 @@ const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const execFileP = promisify(execFile);
 
-const db = require('../../db');
+function tryRequire(paths) {
+  const errors = [];
+  for (const p of paths) {
+    try {
+      return require(p);
+    } catch (err) {
+      if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
+        errors.push(err);
+        continue;
+      }
+      throw err;
+    }
+  }
+  const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
+  error.code = 'MODULE_NOT_FOUND';
+  error.attempts = errors.map((e) => e?.message || String(e));
+  throw error;
+}
+
+const db = tryRequire([
+  path.join(__dirname, '../../db'),
+  path.join(__dirname, '../db'),
+  path.join(__dirname, './db'),
+  path.join(process.cwd(), 'db'),
+]);
 const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
 const { extractText } = require('../utils/extract');
 const { getBlueprint } = require('../utils/blueprint');
@@ -20,6 +44,12 @@ const { aiCanonicalizeKeys } = require('./ai/canonKeys');
 const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
 const { explodeToRows, splitAndCarryPrefix } = require('../utils/mpn-exploder');
 const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
+const { ensureSpecsTable } = tryRequire([
+  path.join(__dirname, '../utils/schema'),
+  path.join(__dirname, '../../utils/schema'),
+  path.join(__dirname, '../schema'),
+  path.join(process.cwd(), 'schema'),
+]);
 const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
 const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
 const { processDocument: processDocAi } = require('../services/docai');
@@ -657,8 +687,23 @@ function applyCodeRules(code, out, rules, colTypes) {
 
 
 // DB 함수로 스키마 보장 (ensure_specs_table)
-async function ensureSpecsTableByFamily(family){
-  await db.query(`SELECT public.ensure_specs_table($1)`, [family]);
+async function ensureSpecsTableByFamily(family, qualified){
+  if (!family) return;
+  try {
+    await db.query(`SELECT public.ensure_specs_table($1)`, [family]);
+    return;
+  } catch (err) {
+    console.warn('[schema] ensure_specs_table failed:', err?.message || err);
+    if (qualified) {
+      try {
+        await ensureSpecsTable(qualified);
+        return;
+      } catch (fallbackErr) {
+        console.warn('[schema] local ensureSpecsTable fallback failed:', fallbackErr?.message || fallbackErr);
+      }
+    }
+    throw err;
+  }
 }
 
 async function ensureBlueprintVariantColumns(family) {
@@ -1587,7 +1632,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
 
   if (!disableEnsure) {
-    await ensureSpecsTableByFamily(family);
+    await ensureSpecsTableByFamily(family, qualified);
     if (!variantColumnsEnsured) {
       try {
         await ensureBlueprintVariantColumns(family);

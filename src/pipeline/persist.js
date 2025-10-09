@@ -1,8 +1,39 @@
 'use strict';
 
 const crypto = require('crypto');
+const path = require('node:path');
 
-const { pool } = require('../../db');
+function tryRequire(paths) {
+  const errors = [];
+  for (const p of paths) {
+    try {
+      return require(p);
+    } catch (err) {
+      if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
+        errors.push(err);
+        continue;
+      }
+      throw err;
+    }
+  }
+  const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
+  error.code = 'MODULE_NOT_FOUND';
+  error.attempts = errors.map((e) => e?.message || String(e));
+  throw error;
+}
+
+const { pool } = tryRequire([
+  path.join(__dirname, '../../db'),
+  path.join(__dirname, '../db'),
+  path.join(__dirname, './db'),
+  path.join(process.cwd(), 'db'),
+]);
+const { ensureSpecsTable } = tryRequire([
+  path.join(__dirname, '../utils/schema'),
+  path.join(__dirname, '../../utils/schema'),
+  path.join(__dirname, '../schema'),
+  path.join(process.cwd(), 'schema'),
+]);
 const { getColumnsOf } = require('./ensure-spec-columns');
 const { normalizeValueLLM } = require('../utils/ai');
 
@@ -897,12 +928,21 @@ function coerceColumnValue(column, value, columnTypes, record, rawJson, warningS
   return coerceScalar(value, type);
 }
 
-async function ensureSchemaGuards(familySlug) {
+async function ensureSchemaGuards(familySlug, targetTable) {
   if (!familySlug) return { ok: true };
   try {
     await pool.query('SELECT public.ensure_specs_table($1)', [familySlug]);
   } catch (err) {
-    return { ok: false, reason: 'schema_not_ready', detail: err?.message || String(err) };
+    console.warn('[schema] ensure_specs_table failed (persist):', err?.message || err);
+    if (targetTable) {
+      try {
+        await ensureSpecsTable(targetTable);
+      } catch (fallbackErr) {
+        return { ok: false, reason: 'schema_not_ready', detail: fallbackErr?.message || String(fallbackErr) };
+      }
+    } else {
+      return { ok: false, reason: 'schema_not_ready', detail: err?.message || String(err) };
+    }
   }
   try {
     await pool.query('SELECT public.ensure_blueprint_variant_columns($1)', [familySlug]);
@@ -929,7 +969,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   if (jobId) suffixParts.push(`job:${jobId}`);
   const appNameSuffix = suffixParts.length ? ` ${suffixParts.join(' ')}` : '';
 
-  const guard = await ensureSchemaGuards(familySlug);
+  const guard = await ensureSchemaGuards(familySlug, targetTable);
   if (!guard.ok) {
     result.skipped.push({ reason: guard.reason || 'schema_not_ready', detail: guard.detail || null });
     return result;

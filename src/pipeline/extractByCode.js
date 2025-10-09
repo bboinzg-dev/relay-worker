@@ -4,11 +4,25 @@ const { toJsonSchema, callLLM } = require('../llm/structured');
 const { safeJsonParse } = require('../utils/safe-json');
 const { pool } = require('../../db'); // 공유 PG 풀
 const { getBlueprint } = require('../utils/blueprint'); // DB에서 fields_json/specs_table 읽는 함수(앞서 만들어둔 버전)
+const { ensureSpecsTable } = require('../utils/schema');
 
 exports.extractAndUpsertOne = async function extractAndUpsertOne({ pdfBase64, family, brand, code }) {
   const bp = await getBlueprint(pool, family); // { fields, specsTable }
   // 스키마 보장(ADD COLUMN만)
-  await pool.query('SELECT public.ensure_specs_table($1)', [family]);
+  try {
+    await pool.query('SELECT public.ensure_specs_table($1)', [family]);
+  } catch (err) {
+    console.warn('[schema] ensure_specs_table failed (extractByCode):', err?.message || err);
+    if (bp?.specsTable) {
+      try {
+        await ensureSpecsTable(bp.specsTable);
+      } catch (fallbackErr) {
+        throw fallbackErr;
+      }
+    } else {
+      throw err;
+    }
+  }
 
   const responseSchema = toJsonSchema(bp.fields);
   const prompt = `

@@ -1035,6 +1035,35 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
   const runnerPromise = (async () => {
 
+    const ensureExtractedShape = (value) => {
+      const base = value && typeof value === 'object' ? value : {};
+      if (!Array.isArray(base.tables)) base.tables = [];
+      if (!Array.isArray(base.rows)) base.rows = [];
+      if (typeof base.text !== 'string') base.text = '';
+      return base;
+    };
+
+    const mergeExtracted = (source) => {
+      if (!source || typeof source !== 'object') return;
+      if (typeof source.text === 'string') {
+        extracted.text = String(source.text);
+      }
+      if (Array.isArray(source.tables)) {
+        extracted.tables = source.tables;
+      }
+      if (Array.isArray(source.rows)) {
+        extracted.rows = source.rows;
+      }
+      for (const [key, value] of Object.entries(source)) {
+        if (key === 'text' || key === 'tables' || key === 'rows') continue;
+        extracted[key] = value;
+      }
+      ensureExtractedShape(extracted);
+    };
+
+    let extracted = ensureExtractedShape(input?.extracted);
+    let docExtractResult = null;
+
     // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
   let fileName = '';
   try { const { name } = parseGcsUri(gcsUri); fileName = path.basename(name); } catch {}
@@ -1092,8 +1121,9 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
   if ((!previewText || previewText.length < 1000) && !FAST) {
     try {
-      const r = await extractText(gcsUri);
-      previewText = r?.text || previewText;
+      docExtractResult = await extractText(gcsUri);
+      previewText = docExtractResult?.text || previewText;
+      extracted.text = String(docExtractResult?.text || extracted.text || '');
     } catch {}
   }
 
@@ -1196,8 +1226,9 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
   if ((!previewText || previewText.length < 1000) && !FAST) {
     try {
-      const r = await extractText(gcsUri);
-      previewText = r?.text || previewText;
+      docExtractResult = await extractText(gcsUri);
+      previewText = docExtractResult?.text || previewText;
+      extracted.text = String(docExtractResult?.text || extracted.text || '');
     } catch {}
   }
   if (!docAiText) {
@@ -1223,7 +1254,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
   // PDF → 품번/스펙 추출
   const brandHint = effectiveBrand || detectedBrand || null;
-  let extracted = { brand: brandHint || 'unknown', rows: [] };
+  extracted.brand = extracted.brand || brandHint || 'unknown';
   if (!effectiveBrand || !code) {
     try {
       if (FAST) {
@@ -1236,45 +1267,49 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           const fieldsJson = blueprint?.fields || {};
           const vals = await extractFields(raw, code || '', fieldsJson);
           const fallbackBrand = brandHint || 'unknown';
-          extracted = {
-            brand: fallbackBrand,
-            rows: [{ brand: fallbackBrand, code: code || (path.parse(fileName).name), ...(vals||{}) }],
-          };
+          extracted.brand = extracted.brand || fallbackBrand;
+          extracted.rows = [
+            {
+              brand: fallbackBrand,
+              code: code || path.parse(fileName).name,
+              ...(vals || {}),
+            },
+          ];
         } else {
           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
-          extracted = await withTimeout(
+          const pdfExtract = await withTimeout(
             extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
             EXTRACT_HARD_CAP_MS,
             'extract',
           );
+          mergeExtracted(pdfExtract);
         }
       } else {
-        extracted = await withTimeout(
+        const pdfExtract = await withTimeout(
           extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
           EXTRACT_HARD_CAP_MS,
           'extract',
         );
+        mergeExtracted(pdfExtract);
       }
     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
   }
 
   if (docAiText) {
-    if (!extracted || typeof extracted !== 'object') extracted = {};
     const existing = typeof extracted.text === 'string' ? extracted.text : '';
     if (!existing || docAiText.length > existing.length) {
       extracted.text = docAiText;
     }
   }
   if (docAiTables.length) {
-    if (!extracted || typeof extracted !== 'object') extracted = {};
-    if (!Array.isArray(extracted.tables) || !extracted.tables.length) {
+    if (!extracted.tables.length) {
       extracted.tables = docAiTables;
     }
   }
   if (vertexExtractValues && typeof vertexExtractValues === 'object') {
     const entries = Object.entries(vertexExtractValues);
     if (entries.length) {
-      if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
+      if (!extracted.rows.length) {
         extracted.rows = [{ ...vertexExtractValues }];
       } else {
         for (const row of extracted.rows) {
@@ -1290,6 +1325,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
     }
   }
+  ensureExtractedShape(extracted);
   const rawJsonPayload = {};
   if (docAiResult && (docAiText || docAiTables.length)) rawJsonPayload.docai = docAiResult;
   if (vertexClassification) rawJsonPayload.vertex_classify = vertexClassification;

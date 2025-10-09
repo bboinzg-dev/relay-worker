@@ -1,67 +1,312 @@
-diff --git a/server.js b/server.js
-index c3b18f039e967aa489f8a2b3355aa4af96e42b35..6b2dfde5c46a14b10639a2c87aaa0384bbfe0128 100644
---- a/server.js
-+++ b/server.js
-@@ -363,50 +363,62 @@ try {
-   const aiModule = require('./server.ai');
-   if (aiModule && typeof aiModule === 'function' && aiModule.stack) {
-     app.use('/api/ai', aiModule);
-     console.log('[BOOT] mounted AI routes at /api/ai/* (router export)');
-   } else if (typeof aiModule === 'function') {
-     aiModule(app);
-     console.log('[BOOT] mounted AI routes via function(export)');
-   } else if (aiModule) {
-     app.use('/api/ai', aiModule);
-     console.log('[BOOT] mounted AI routes at /api/ai/* (object export)');
-   } else {
-     console.warn('[BOOT] server.ai export missing or unsupported');
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 6dc2f2cc9281a3cd00aa566486569357b2717858..aa5c4cc374e7790823020b822232f5f610246ffa 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1013,50 +1013,79 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
    }
- } catch (e) {
-   console.error('[BOOT] ai mount failed', e?.message || e);
-   // 🔰 Fallback: server.ai.js 로딩 실패/누락 시에도 즉시 동작하도록 최소 라우트 제공
-   const express = require('express');
-   const fb = express.Router();
-   fb.get('/ping', (_req, res) => res.json({ ok: true, fallback: true }));
-   fb.get('/resolve', (req, res) => res.json({ ok: true, echo: String(req.query?.q || '') }));
-   fb.post('/resolve', (req, res) => res.json({ ok: true, echo: String((req.body && req.body.q) || '') }));
-   app.use('/api/ai', fb);
-   console.warn('[BOOT] fallback AI routes mounted at /api/ai/*');
- }
  
-+/* ---------------- Worker ingest endpoint (Cloud Tasks target) ---------------- */
-+app.post('/api/worker/ingest', async (req, res) => {
-+  try {
-+    const payload = (req.body?.payload) || req.body || {};
-+    const out = await getIngest().runAutoIngest(payload);
-+    return res.status(202).json({ ok: true, run: out?.runId || null });
-+  } catch (e) {
-+    console.error('[worker/ingest] error:', e?.message || e);
-+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-+  }
-+});
+   const releaseLock = async () => {
+     if (!lockAcquired || !runId) return;
+     lockAcquired = false;
+     try {
+       await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]);
+     } catch (err) {
+       console.warn('[ingest] advisory unlock failed:', err?.message || err);
+     }
+   };
+ 
+   const withTimeout = (p, ms, label) => new Promise((resolve, reject) => {
+     const timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
+     Promise.resolve(p)
+       .then((val) => { clearTimeout(timer); resolve(val); })
+       .catch((err) => { clearTimeout(timer); reject(err); });
+   });
+ 
+   let docAiResult = null;
+   let vertexClassification = null;
+   let vertexExtractValues = null;
+ 
+   const runnerPromise = (async () => {
+ 
++    const ensureExtractedShape = (value) => {
++      const base = value && typeof value === 'object' ? value : {};
++      if (!Array.isArray(base.tables)) base.tables = [];
++      if (!Array.isArray(base.rows)) base.rows = [];
++      if (typeof base.text !== 'string') base.text = '';
++      return base;
++    };
 +
- /* ---------------- Mount modular routers (after global middleware) ---------------- */
- try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
- try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
- try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
- try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
- try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
- try { app.use(require('./server.retail')); console.log('[BOOT] mounted /api/retail/*'); } catch (e) { console.error(e); }
- try { app.use(require('./server.retail.import')); console.log('[BOOT] mounted /api/retail/import'); } catch {}
- try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
- try { app.use(require('./server.ingest.status')); console.log('[BOOT] mounted /api/ingest/:id'); } catch {}
++    const mergeExtracted = (source) => {
++      if (!source || typeof source !== 'object') return;
++      if (typeof source.text === 'string') {
++        extracted.text = String(source.text);
++      }
++      if (Array.isArray(source.tables)) {
++        extracted.tables = source.tables;
++      }
++      if (Array.isArray(source.rows)) {
++        extracted.rows = source.rows;
++      }
++      for (const [key, value] of Object.entries(source)) {
++        if (key === 'text' || key === 'tables' || key === 'rows') continue;
++        extracted[key] = value;
++      }
++      ensureExtractedShape(extracted);
++    };
++
++    let extracted = ensureExtractedShape(input?.extracted);
++    let docExtractResult = null;
++
+     // family 추정 (미지정 시 일부 텍스트만 읽어 빠르게 추정)
+   let fileName = '';
+   try { const { name } = parseGcsUri(gcsUri); fileName = path.basename(name); } catch {}
  
- // 인라인 AI 라우터(간소 버전)는 제거 — server.ai.js 하나만 유지
+   if (!docAiResult) {
+     try {
+       docAiResult = await withDeadline(
+         processDocAi(gcsUri, { runId }),
+         HARD_CAP_MS,
+         'DOCAI_PROCESS',
+       );
+     } catch (err) {
+       console.warn('[docai] process failed:', err?.message || err);
+     }
+   }
  
- /* NOTE: The parts router already exists in your repo; keep it mounted. */
- try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
+   if (!vertexClassification) {
+     try {
+       vertexClassification = await classifyByGcs(gcsUri, fileName || 'datasheet.pdf');
+     } catch (err) {
+       console.warn('[vertex] classify failed:', err?.message || err);
+     }
+   }
  
- // ✅ ALWAYS-ON 디버그 엔드포인트 (환경변수와 무관하게 항상 열림)
- app.get('/_routes', (req, res) => {
+   if (!family_slug && vertexClassification?.family_slug) {
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 6dc2f2cc9281a3cd00aa566486569357b2717858..aa5c4cc374e7790823020b822232f5f610246ffa 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1070,52 +1099,53 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+   }
+   if (!code && vertexClassification?.code) {
+     code = vertexClassification.code;
+   }
+   if (!series && vertexClassification?.series) {
+     series = vertexClassification.series;
+   }
+ 
+   const explicitFamily = normLower(family_slug);
+   const vertexFamily = normLower(vertexClassification?.family_slug);
+   const brandGuessInput = overridesBrand || brand || detectedBrand || vertexClassification?.brand || '';
+   const initialGuess = guessFamilySlug({ fileName, brand: brandGuessInput });
+ 
+   let previewText = '';
+   let docAiText = typeof docAiResult?.text === 'string' ? docAiResult.text : '';
+   let docAiTables = Array.isArray(docAiResult?.tables) ? docAiResult.tables : [];
+ 
+   if (!FAST) {
+     try {
+       previewText = await readText(gcsUri, 256 * 1024);
+     } catch {}
+   }
+ 
+   if ((!previewText || previewText.length < 1000) && !FAST) {
+     try {
+-      const r = await extractText(gcsUri);
+-      previewText = r?.text || previewText;
++      docExtractResult = await extractText(gcsUri);
++      previewText = docExtractResult?.text || previewText;
++      extracted.text = String(docExtractResult?.text || extracted.text || '');
+     } catch {}
+   }
+ 
+   if (docAiText && docAiText.length > (previewText?.length || 0)) {
+     previewText = docAiText;
+   }
+ 
+   let family = explicitFamily || vertexFamily || initialGuess || null;
+   const previewGuess = guessFamilySlug({ fileName, previewText, brand: brandGuessInput });
+ 
+   if (!explicitFamily) {
+     if (previewGuess && (!family || family === 'relay_power' || family === vertexFamily)) {
+       family = previewGuess;
+     }
+     if ((!family || family === 'relay_power') && /subminiature\s+signal\s+relay|signal\s+relay/i.test(previewText)) {
+       family = 'relay_signal';
+     }
+   }
+ 
+   if (!family) family = 'relay_power';
+ 
+   const overrideBrandLog = overridesBrand ?? brand ?? '';
+   console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''}`);
+ 
+ // 목적 테이블
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 6dc2f2cc9281a3cd00aa566486569357b2717858..aa5c4cc374e7790823020b822232f5f610246ffa 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1174,144 +1204,150 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+         .toLowerCase()
+         .replace(/[^a-z0-9_]/g, '');
+       if (normalized && !requiredFields.includes(normalized)) {
+         requiredFields.push(normalized);
+       }
+     }
+   }
+ 
+   let colTypes;
+   const disableEnsure = /^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0');
+ 
+   // -------- 공용 강제정규화 유틸 --------
+ 
+   if (code && !/\d/.test(String(code))) {
+     // "AGN","TQ" 처럼 숫자 없는 시리즈는 series로 넘기고 code는 비움
+     series = code; code = null;
+   }
+ 
+ 
+   // ❶ PDF 텍스트 일부에서 품번 후보 우선 확보
+   if (!previewText && !FAST) {
+     try { previewText = await readText(gcsUri, PREVIEW_BYTES) || ''; } catch {}
+   }
+   if ((!previewText || previewText.length < 1000) && !FAST) {
+     try {
+-      const r = await extractText(gcsUri);
+-      previewText = r?.text || previewText;
++      docExtractResult = await extractText(gcsUri);
++      previewText = docExtractResult?.text || previewText;
++      extracted.text = String(docExtractResult?.text || extracted.text || '');
+     } catch {}
+   }
+   if (!docAiText) {
+     docAiText = typeof docAiResult?.text === 'string' ? docAiResult.text : '';
+   }
+   if (!Array.isArray(docAiTables) || !docAiTables.length) {
+     docAiTables = Array.isArray(docAiResult?.tables) ? docAiResult.tables : [];
+   }
+   if (docAiText && docAiText.length > (previewText?.length || 0)) {
+     previewText = docAiText;
+   }
+   if (!effectiveBrand) {
+     try {
+       detectedBrand = await detectBrandFromText(previewText, fileName);
+     } catch (err) {
+       console.warn('[brand detect] preview failed:', err?.message || err);
+     }
+   }
+   let candidates = [];
    try {
-     const list = [];
-     app._router.stack.forEach((m) => {
-       if (m.route && m.route.path) {
-         const methods = Object.keys(m.route.methods).join(',').toUpperCase();
-         list.push(`${methods.padEnd(6)} ${m.route.path}`);
-       } else if (m.name === 'router' && m.handle?.stack) {
+     candidates = await extractPartNumbersFromText(previewText, { series: series || code });
+   } catch { candidates = []; }
+ 
+   // PDF → 품번/스펙 추출
+   const brandHint = effectiveBrand || detectedBrand || null;
+-  let extracted = { brand: brandHint || 'unknown', rows: [] };
++  extracted.brand = extracted.brand || brandHint || 'unknown';
+   if (!effectiveBrand || !code) {
+     try {
+       if (FAST) {
+         // 텍스트만 빠르게 읽어 블루프린트 기반 추출
+         let raw = previewText;
+         if (!raw) {
+           try { raw = await readText(gcsUri, PREVIEW_BYTES); } catch { raw = ''; }
+         }
+         if (raw && raw.length > 1000) {
+           const fieldsJson = blueprint?.fields || {};
+           const vals = await extractFields(raw, code || '', fieldsJson);
+           const fallbackBrand = brandHint || 'unknown';
+-          extracted = {
+-            brand: fallbackBrand,
+-            rows: [{ brand: fallbackBrand, code: code || (path.parse(fileName).name), ...(vals||{}) }],
+-          };
++          extracted.brand = extracted.brand || fallbackBrand;
++          extracted.rows = [
++            {
++              brand: fallbackBrand,
++              code: code || path.parse(fileName).name,
++              ...(vals || {}),
++            },
++          ];
+         } else {
+           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
+-          extracted = await withTimeout(
++          const pdfExtract = await withTimeout(
+             extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
+             EXTRACT_HARD_CAP_MS,
+             'extract',
+           );
++          mergeExtracted(pdfExtract);
+         }
+       } else {
+-        extracted = await withTimeout(
++        const pdfExtract = await withTimeout(
+           extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
+           EXTRACT_HARD_CAP_MS,
+           'extract',
+         );
++        mergeExtracted(pdfExtract);
+       }
+     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
+   }
+ 
+   if (docAiText) {
+-    if (!extracted || typeof extracted !== 'object') extracted = {};
+     const existing = typeof extracted.text === 'string' ? extracted.text : '';
+     if (!existing || docAiText.length > existing.length) {
+       extracted.text = docAiText;
+     }
+   }
+   if (docAiTables.length) {
+-    if (!extracted || typeof extracted !== 'object') extracted = {};
+-    if (!Array.isArray(extracted.tables) || !extracted.tables.length) {
++    if (!extracted.tables.length) {
+       extracted.tables = docAiTables;
+     }
+   }
+   if (vertexExtractValues && typeof vertexExtractValues === 'object') {
+     const entries = Object.entries(vertexExtractValues);
+     if (entries.length) {
+-      if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
++      if (!extracted.rows.length) {
+         extracted.rows = [{ ...vertexExtractValues }];
+       } else {
+         for (const row of extracted.rows) {
+           if (!row || typeof row !== 'object') continue;
+           for (const [rawKey, rawValue] of entries) {
+             const key = String(rawKey || '').trim();
+             if (!key) continue;
+             if (row[key] == null || row[key] === '') {
+               row[key] = rawValue;
+             }
+           }
+         }
+       }
+     }
+   }
++  ensureExtractedShape(extracted);
+   const rawJsonPayload = {};
+   if (docAiResult && (docAiText || docAiTables.length)) rawJsonPayload.docai = docAiResult;
+   if (vertexClassification) rawJsonPayload.vertex_classify = vertexClassification;
+   if (vertexExtractValues && Object.keys(vertexExtractValues).length) {
+     rawJsonPayload.vertex_extract = vertexExtractValues;
+   }
+   if (typeof extracted?.doc_type === 'string' && extracted.doc_type) {
+     rawJsonPayload.doc_type = extracted.doc_type;
+   }
+   if (Object.keys(rawJsonPayload).length) {
+     if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
+       extracted.rows = [{}];
+     }
+     for (const row of extracted.rows) {
+       if (!row || typeof row !== 'object') continue;
+       if (row.raw_json == null) {
+         row.raw_json = rawJsonPayload;
+       }
+     }
+   }
+ 
+   if (detectedBrand && extracted && typeof extracted === 'object') {
+     const brandValue = String(extracted.brand || '').trim().toLowerCase();
+     if (!brandValue || brandValue === 'unknown') {
+       extracted.brand = detectedBrand;

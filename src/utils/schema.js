@@ -173,11 +173,7 @@ async function ensureSpecsTable(tableName, fields = {}) {
     }
   }
 
-  const generatedColumns = [
-    { name: 'brand_norm', expression: 'lower(brand)' },
-    { name: 'code_norm', expression: 'lower(code)' },
-    { name: 'pn_norm', expression: 'lower(pn)' },
-  ];
+  const generatedColumns = [{ name: 'brand_norm', expression: 'lower(brand)' }];
 
   for (const col of generatedColumns) {
     await db.query(

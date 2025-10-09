@@ -60,7 +60,7 @@ const META_KEYS = new Set([
   'updated_at',
 ]);
 
-const CONFLICT_KEYS = ['brand_norm', 'pn'];
+const CONFLICT_KEYS = ['brand', 'pn'];
 const NEVER_INSERT = new Set(['id', 'brand_norm', 'code_norm', 'pn_norm', 'created_at', 'updated_at']);
 
 const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
@@ -981,12 +981,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
     return result;
   }
 
-  if (
-    !physicalCols.has('pn') ||
-    !physicalCols.has('brand_norm') ||
-    !physicalCols.has('code_norm') ||
-    !physicalCols.has('pn_norm')
-  ) {
+  if (!physicalCols.has('pn') || !physicalCols.has('brand')) {
     result.skipped.push({ reason: 'schema_not_ready' });
     return result;
   }
@@ -1245,9 +1240,10 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });
         continue;
       }
-      rec.code_norm = codeNorm;
+      if (physicalCols.has('code_norm')) rec.code_norm = codeNorm;
 
-      const naturalKey = `${rec.brand_norm ?? ''}::${rec.pn_norm ?? pnNorm ?? normKey(rec.pn)}`;
+      const brandNatural = normKey(rec.brand) || rec.brand_norm || '';
+      const naturalKey = `${brandNatural}::${pnNorm}`;
       if (seenNatural.has(naturalKey)) {
         result.skipped.push({ reason: 'duplicate_code' });
         continue;

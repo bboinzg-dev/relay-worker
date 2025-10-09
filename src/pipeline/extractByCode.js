@@ -37,7 +37,7 @@ family=${family}, code="${code}"의 스펙만 추출하세요.
   const j = safeJsonParse(raw) || {};
   const values = j.values || {};
 
-  // UPSERT (brand_norm, pn)
+  // UPSERT by (lower(brand), lower(pn))
   const resolvedValues = values && typeof values === 'object' ? { ...values } : {};
   const pnCandidate = resolvedValues.pn != null ? resolvedValues.pn : code;
   const pnValue = String(pnCandidate || code || '').trim();
@@ -65,7 +65,7 @@ family=${family}, code="${code}"의 스펙만 추출하세요.
     INSERT INTO public.${bp.specsTable}
     (${insertCols.map((c) => `"${c}"`).join(', ')})
     VALUES (${placeholders.join(', ')})
-    ON CONFLICT (brand_norm, pn)
+    ON CONFLICT ((lower(brand)), (lower(pn)))
     DO UPDATE SET ${updateAssignments.join(', ')}
   `;
 

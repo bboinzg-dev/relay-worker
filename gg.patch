@@ -1,64 +1,8 @@
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 826d3787cbcaac7873fde47f8ea1198cad00e61d..65f8783b3236fdc938f68465773b1e9791e1d491 100644
+index 65f8783b3236fdc938f68465773b1e9791e1d491..65340b265b6cbc670a628d241e3d2a1104b9a744 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -105,50 +105,51 @@ const SKIP_SPEC_KEYS = new Set([
-   'rawspecs',
-   'raw_table',
-   'raw_tables',
-   'ordering_info',
-   'doc_type',
- ]);
- 
- function gatherRuntimeSpecKeys(rows) {
-   const set = new Set();
-   const list = Array.isArray(rows) ? rows : [];
-   for (const row of list) {
-     if (!row || typeof row !== 'object') continue;
-     for (const rawKey of Object.keys(row)) {
-       const trimmed = String(rawKey || '').trim();
-       if (!trimmed) continue;
-       const lower = trimmed.toLowerCase();
-       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
-       set.add(trimmed);
-     }
-   }
-   return set;
- }
- 
- const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
- const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
-+const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/]{1,62}[A-Z0-9)]$/i;
- 
- function sanitizeDatasheetUrl(url) {
-   if (url == null) return null;
-   const str = typeof url === 'string' ? url.trim() : String(url || '').trim();
-   if (!str) return null;
-   try {
-     const parsed = new URL(str);
-     const pathname = (parsed.pathname || '').trim();
-     if (!pathname) return null;
-     const lowerPath = pathname.toLowerCase();
-     if (!lowerPath.endsWith('.pdf')) return null;
-     return parsed.toString();
-   } catch {
-     return null;
-   }
- }
- 
- function pickDatasheetUrl(rawUrl, fallbackUrl) {
-   const sanitized = sanitizeDatasheetUrl(rawUrl);
-   if (sanitized) return sanitized;
-   const fallback = typeof fallbackUrl === 'string' ? fallbackUrl.trim() : String(fallbackUrl || '').trim();
-   return fallback || null;
- }
- 
- const RESERVED_SPEC_KEYS = new Set([
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 826d3787cbcaac7873fde47f8ea1198cad00e61d..65f8783b3236fdc938f68465773b1e9791e1d491 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -2402,50 +2403,60 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+@@ -2403,58 +2403,57 @@ async function persistProcessedData(processed = {}, overrides = {}) {
            variantKeysSource = Array.isArray(blueprint?.ingestOptions?.variant_keys)
              ? blueprint.ingestOptions.variant_keys
              : null;
@@ -84,16 +28,20 @@ index 826d3787cbcaac7873fde47f8ea1198cad00e61d..65f8783b3236fdc938f68465773b1e97
        }
      }
  
-+    // 저장 직전 PN 정합성 강화: 템플릿/가짜/링크 토큰 제거
-+    records = records.filter((r) => {
-+      const pn = String(r?.pn || r?.code || '').trim();
-+      if (!pn) return false;
-+      if (pn.startsWith('pdf:')) return false; // PDF 앵커 토큰 제거
-+      if (pn.includes('{') || pn.includes('}')) return false; // 템플릿 잔재 제거
-+      if (!PN_STRICT.test(pn)) return false; // 기초 포맷 체크
-+      return true;
-+    });
-+
+-    // 저장 직전 PN 정합성 강화: 템플릿/가짜/링크 토큰 제거
++    // 저장 직전 PN 정합성 강화
+     records = records.filter((r) => {
+       const pn = String(r?.pn || r?.code || '').trim();
+       if (!pn) return false;
+-      if (pn.startsWith('pdf:')) return false; // PDF 앵커 토큰 제거
+-      if (pn.includes('{') || pn.includes('}')) return false; // 템플릿 잔재 제거
+-      if (!PN_STRICT.test(pn)) return false; // 기초 포맷 체크
+-      return true;
++      if (pn.startsWith('pdf:')) return false; // PDF 앵커 토큰 컷
++      if (pn.includes('{') || pn.includes('}')) return false; // 템플릿 잔재 컷
++      return PN_STRICT.test(pn); // 기본 포맷 검증
+     });
+ 
      records = records.filter((r) => isValidCode(r?.pn || r?.code));
      if (!records.length) {
        persistResult.skipped = [{ reason: 'missing_pn' }];
@@ -117,5 +65,3 @@ index 826d3787cbcaac7873fde47f8ea1198cad00e61d..65f8783b3236fdc938f68465773b1e97
          '[DIAG] persist start table=%s family=%s records=%d required=%d',
          table,
          family,
-         Array.isArray(records) ? records.length : -1,
-         Array.isArray(effectiveRequired) ? effectiveRequired.length : -1,

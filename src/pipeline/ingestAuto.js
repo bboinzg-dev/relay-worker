@@ -2425,14 +2425,13 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       }
     }
 
-    // 저장 직전 PN 정합성 강화: 템플릿/가짜/링크 토큰 제거
+    // 저장 직전 PN 정합성 강화
     records = records.filter((r) => {
       const pn = String(r?.pn || r?.code || '').trim();
       if (!pn) return false;
-      if (pn.startsWith('pdf:')) return false; // PDF 앵커 토큰 제거
-      if (pn.includes('{') || pn.includes('}')) return false; // 템플릿 잔재 제거
-      if (!PN_STRICT.test(pn)) return false; // 기초 포맷 체크
-      return true;
+      if (pn.startsWith('pdf:')) return false; // PDF 앵커 토큰 컷
+      if (pn.includes('{') || pn.includes('}')) return false; // 템플릿 잔재 컷
+      return PN_STRICT.test(pn); // 기본 포맷 검증
     });
 
     records = records.filter((r) => isValidCode(r?.pn || r?.code));

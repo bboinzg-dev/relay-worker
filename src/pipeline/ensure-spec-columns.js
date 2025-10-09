@@ -1,12 +1,42 @@
 'use strict';
 
-const db = require('../../db');
+const path = require('node:path');
+
+function tryRequire(paths) {
+  const errors = [];
+  for (const p of paths) {
+    try {
+      return require(p);
+    } catch (err) {
+      if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
+        errors.push(err);
+        continue;
+      }
+      throw err;
+    }
+  }
+  const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
+  error.code = 'MODULE_NOT_FOUND';
+  error.attempts = errors.map((e) => e?.message || String(e));
+  throw error;
+}
+
+const db = tryRequire([
+  path.join(__dirname, '../../db'),
+  path.join(__dirname, '../db'),
+  path.join(__dirname, './db'),
+  path.join(process.cwd(), 'db'),
+]);
 
 const TYPE_MAP = {
   int: 'integer',
   integer: 'integer',
   numeric: 'numeric',
   number: 'numeric',
+    float: 'double precision',
+    double: 'double precision',
+    'double precision': 'double precision',
+    decimal: 'numeric',
   bool: 'boolean',
   boolean: 'boolean',
   text: 'text',
@@ -43,8 +73,8 @@ async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
     : Array.isArray(blueprint?.variant_keys)
       ? blueprint.variant_keys
       : [];
-        const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
-  const fieldKeys = Object.keys(fieldMeta);
+      const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
+      const fieldKeys = Object.keys(fieldMeta);
 
   const wantedList = [
     ...new Set(

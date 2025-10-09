@@ -28,6 +28,12 @@ const { rankPartNumbersFromOrderingSections } = require('../utils/ordering-secti
 
 const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
 
+const USE_CODE_RULES = /^(1|true|on)$/i.test(process.env.USE_CODE_RULES ?? '1');
+const USE_PN_TEMPLATE = /^(1|true|on)$/i.test(process.env.USE_PN_TEMPLATE ?? '1');
+const USE_VARIANT_KEYS = /^(1|true|on)$/i.test(
+  process.env.USE_VARIANT_KEYS ?? (process.env.USE_CODE_RULES ?? '1')
+);
+
 function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
   const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
   return new Promise((resolve, reject) => {
@@ -1090,12 +1096,30 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   let allowedKeys = Array.isArray(blueprint?.allowedKeys)
     ? [...blueprint.allowedKeys]
     : [];
-  let variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-    ? blueprint.ingestOptions.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-    : (Array.isArray(blueprint?.variant_keys)
-      ? blueprint.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-      : []);
-  const pnTemplate = blueprint?.ingestOptions?.pn_template || blueprint?.ingestOptions?.pnTemplate || null;
+  if ((!allowedKeys || !allowedKeys.length) && blueprint?.fields && typeof blueprint.fields === 'object') {
+    allowedKeys = Object.keys(blueprint.fields);
+  }
+  allowedKeys = Array.from(
+    new Set(
+      (allowedKeys || [])
+        .map((k) => String(k || '').trim())
+        .filter(Boolean)
+    )
+  );
+
+  let variantKeys = [];
+  if (USE_VARIANT_KEYS) {
+    variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+      ? blueprint.ingestOptions.variant_keys
+      : (Array.isArray(blueprint?.variant_keys) ? blueprint.variant_keys : []);
+    variantKeys = variantKeys
+      .map((k) => String(k || '').trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  const pnTemplate = USE_PN_TEMPLATE
+    ? (blueprint?.ingestOptions?.pn_template || blueprint?.ingestOptions?.pnTemplate || null)
+    : null;
   const requiredFields = [];
   if (blueprint?.fields && typeof blueprint.fields === 'object') {
     for (const [fieldKey, meta] of Object.entries(blueprint.fields)) {
@@ -1445,15 +1469,17 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
 
   let runtimeVariantKeys = [];
-  try {
-    runtimeVariantKeys = await detectVariantKeys({
-      rawText: extractedText,
-      family,
-      blueprintVariantKeys: variantKeys,
-    });
-  } catch (err) {
-    console.warn('[variant] runtime detect failed:', err?.message || err);
-    runtimeVariantKeys = Array.isArray(variantKeys) ? [...variantKeys] : [];
+  if (USE_VARIANT_KEYS) {
+    try {
+      runtimeVariantKeys = await detectVariantKeys({
+        rawText: extractedText,
+        family,
+        blueprintVariantKeys: variantKeys,
+      });
+    } catch (err) {
+      console.warn('[variant] runtime detect failed:', err?.message || err);
+      runtimeVariantKeys = Array.isArray(variantKeys) ? [...variantKeys] : [];
+    }
   }
 
   console.log('[PATH] brand resolved', {
@@ -1503,60 +1529,62 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     runtimeMeta.brand_source != null ||
     (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
 
-  let variantColumnsEnsured = false;
-  try {
-    const { detected: inferredKeys = [], newKeys: freshKeys = [] } = await inferVariantKeys({
-      family,
-      brand: brandName,
-      series: baseSeries,
-      blueprint,
-      extracted,
-    });
+  let variantColumnsEnsured = !USE_VARIANT_KEYS;
+  if (USE_VARIANT_KEYS) {
+    try {
+      const { detected: inferredKeys = [], newKeys: freshKeys = [] } = await inferVariantKeys({
+        family,
+        brand: brandName,
+        series: baseSeries,
+        blueprint,
+        extracted,
+      });
 
-    if (Array.isArray(inferredKeys) && inferredKeys.length) {
-      const brandSlug = normalizeSlug(brandName);
-      const seriesSlug = normalizeSlug(baseSeries);
-      try {
-        await db.query(
-          `SELECT public.upsert_variant_keys($1,$2,$3,$4::jsonb)`,
-          [family, brandSlug, seriesSlug, JSON.stringify(inferredKeys)],
-        );
-      } catch (err) {
-        console.warn('[variant] upsert_variant_keys failed:', err?.message || err);
-      }
-
-      const mergedVariant = new Set(variantKeys);
-      for (const key of inferredKeys) mergedVariant.add(key);
-      variantKeys = Array.from(mergedVariant);
-
-      const mergedAllowed = new Set(allowedKeys);
-      for (const key of variantKeys) mergedAllowed.add(key);
-      allowedKeys = Array.from(mergedAllowed);
-
-      if (!blueprint.ingestOptions || typeof blueprint.ingestOptions !== 'object') {
-        blueprint.ingestOptions = {};
-      }
-      blueprint.ingestOptions.variant_keys = variantKeys;
-      blueprint.variant_keys = variantKeys;
-      blueprint.allowedKeys = Array.isArray(blueprint.allowedKeys)
-        ? Array.from(new Set([...blueprint.allowedKeys, ...variantKeys]))
-        : [...allowedKeys];
-
-      if (!disableEnsure) {
+      if (Array.isArray(inferredKeys) && inferredKeys.length) {
+        const brandSlug = normalizeSlug(brandName);
+        const seriesSlug = normalizeSlug(baseSeries);
         try {
-          await ensureBlueprintVariantColumns(family);
-          variantColumnsEnsured = true;
+          await db.query(
+            `SELECT public.upsert_variant_keys($1,$2,$3,$4::jsonb)`,
+            [family, brandSlug, seriesSlug, JSON.stringify(inferredKeys)],
+          );
         } catch (err) {
-          console.warn('[variant] ensure_blueprint_variant_columns failed:', err?.message || err);
+          console.warn('[variant] upsert_variant_keys failed:', err?.message || err);
+        }
+
+        const mergedVariant = new Set(variantKeys);
+        for (const key of inferredKeys) mergedVariant.add(key);
+        variantKeys = Array.from(mergedVariant);
+
+        const mergedAllowed = new Set(allowedKeys);
+        for (const key of variantKeys) mergedAllowed.add(key);
+        allowedKeys = Array.from(mergedAllowed);
+
+        if (!blueprint.ingestOptions || typeof blueprint.ingestOptions !== 'object') {
+          blueprint.ingestOptions = {};
+        }
+        blueprint.ingestOptions.variant_keys = variantKeys;
+        blueprint.variant_keys = variantKeys;
+        blueprint.allowedKeys = Array.isArray(blueprint.allowedKeys)
+          ? Array.from(new Set([...blueprint.allowedKeys, ...variantKeys]))
+          : [...allowedKeys];
+
+        if (!disableEnsure) {
+          try {
+            await ensureBlueprintVariantColumns(family);
+            variantColumnsEnsured = true;
+          } catch (err) {
+            console.warn('[variant] ensure_blueprint_variant_columns failed:', err?.message || err);
+          }
         }
       }
-    }
 
-    if (Array.isArray(freshKeys) && freshKeys.length) {
-      console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
+      if (Array.isArray(freshKeys) && freshKeys.length) {
+        console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
+      }
+    } catch (err) {
+      console.warn('[variant] inferVariantKeys failed:', err?.message || err);
     }
-  } catch (err) {
-    console.warn('[variant] inferVariantKeys failed:', err?.message || err);
   }
 
   if (!disableEnsure) {
@@ -1741,7 +1769,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     return obj;
   });
 
-  const explodedRows = explodeToRows(blueprint, baseRows);
+  const explodedRows = USE_CODE_RULES ? explodeToRows(blueprint, baseRows) : baseRows;
   const physicalCols = new Set(colTypes ? [...colTypes.keys()] : []);
   const allowedSet = new Set((allowedKeys || []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
   const variantSet = new Set(variantKeys);
@@ -1826,7 +1854,9 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
     }
 
-    if (blueprint?.code_rules) applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
+    if (USE_CODE_RULES && blueprint?.code_rules) {
+      applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
+    }
     records.push(rec);
   }
 
@@ -2272,8 +2302,10 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     }
 
     let blueprint;
-    let variantKeysSource = Array.isArray(processedVariantKeys) ? processedVariantKeys : null;
-    if ((!Array.isArray(variantKeysSource) || !variantKeysSource.length) && family) {
+    let variantKeysSource = USE_VARIANT_KEYS && Array.isArray(processedVariantKeys)
+      ? processedVariantKeys
+      : null;
+    if (USE_VARIANT_KEYS && (!Array.isArray(variantKeysSource) || !variantKeysSource.length) && family) {
       try {
         blueprint = await getBlueprint(family);
         if (!Array.isArray(variantKeysSource) || !variantKeysSource.length) {
@@ -2286,7 +2318,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       }
     }
 
-    const variantKeys = Array.isArray(variantKeysSource)
+    const variantKeys = USE_VARIANT_KEYS && Array.isArray(variantKeysSource)
       ? variantKeysSource.map((k) => String(k || '').trim()).filter(Boolean)
       : [];
 

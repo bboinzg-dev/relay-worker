@@ -1,332 +1,562 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index fcc492783204886dca6364a0c3b8d17d62feb325..e897fc055784deabbfd83ee8151ab11e62fb1917 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -135,50 +135,173 @@ async function normalizeValueWithCache(params) {
-   llmNormalizationCache.set(cacheKey, task);
-   return task;
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 759ba3123a0211ea18fe2ced42238d28e9b63205..4c519a79c86dc67650069e7fc7059f2d9df455f0 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -6,50 +6,56 @@ const os = require('node:os');
+ const crypto = require('node:crypto');
+ const { execFile } = require('node:child_process');
+ const { promisify } = require('node:util');
+ const execFileP = promisify(execFile);
+ 
+ const db = require('../../db');
+ const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
+ const { extractText } = require('../utils/extract');
+ const { getBlueprint } = require('../utils/blueprint');
+ const { resolveBrand } = require('../utils/brand');
+ const { detectVariantKeys } = require('../utils/ordering');
+ const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
+ const { extractFields } = require('./extractByBlueprint');
+ const { aiCanonicalizeKeys } = require('./ai/canonKeys');
+ const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
+ const { explodeToRows } = require('../ingest/mpn-exploder');
+ const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
+ const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
+ const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
+ const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
+ const { processDocument: processDocAi } = require('../services/docai');
+ const { rankPartNumbersFromOrderingSections } = require('../utils/ordering-sections');
+ 
+ const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
+ 
++const USE_CODE_RULES = /^(1|true|on)$/i.test(process.env.USE_CODE_RULES ?? '1');
++const USE_PN_TEMPLATE = /^(1|true|on)$/i.test(process.env.USE_PN_TEMPLATE ?? '1');
++const USE_VARIANT_KEYS = /^(1|true|on)$/i.test(
++  process.env.USE_VARIANT_KEYS ?? (process.env.USE_CODE_RULES ?? '1')
++);
++
+ function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
+   const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
+   return new Promise((resolve, reject) => {
+     const timer = setTimeout(() => {
+       clearTimeout(timer);
+       reject(new Error(`${label}_TIMEOUT`));
+     }, timeout);
+     Promise.resolve(promise)
+       .then((value) => {
+         clearTimeout(timer);
+         resolve(value);
+       })
+       .catch((err) => {
+         clearTimeout(timer);
+         reject(err);
+       });
+   });
  }
  
- function normKey(key) {
-   return String(key || '')
-     .trim()
-     .toLowerCase();
- }
+ const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
+ const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
  
- function sha1(input) {
-   return crypto.createHash('sha1').update(String(input || '')).digest('hex');
- }
+ const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
+ const BASE_KEYS = new Set([
+   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 759ba3123a0211ea18fe2ced42238d28e9b63205..4c519a79c86dc67650069e7fc7059f2d9df455f0 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1068,56 +1074,74 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+   const overrideBrandLog = overridesBrand ?? brand ?? '';
+   console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''}`);
  
- function isMinimalFallbackPn(value) {
-   return typeof value === 'string' && value.startsWith('pdf:');
- }
+ // 목적 테이블
+   const reg = await db.query(
+     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+     [family]
+   );
+   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
+   const qualified = table.startsWith('public.')? table : `public.${table}`;
  
- function isValidCode(value) {
-   const trimmed = String(value || '').trim();
-   if (!trimmed) return false;
-   if (isMinimalFallbackPn(trimmed)) return true;
-   return PN_RE.test(trimmed);
- }
+   let blueprint = await getBlueprint(family);
  
-+function pickFiniteNumber(...candidates) {
-+  for (const candidate of candidates) {
-+    if (candidate == null || candidate === '') continue;
-+    const num = Number(candidate);
-+    if (Number.isFinite(num)) return num;
+   if (!vertexExtractValues && family) {
+     try {
+       vertexExtractValues = await extractValuesByGcs(gcsUri, family);
+     } catch (err) {
+       console.warn('[vertex] extract failed:', err?.message || err);
+     }
+   }
+ 
+   // 블루프린트 허용 키
+   let allowedKeys = Array.isArray(blueprint?.allowedKeys)
+     ? [...blueprint.allowedKeys]
+     : [];
+-  let variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+-    ? blueprint.ingestOptions.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+-    : (Array.isArray(blueprint?.variant_keys)
+-      ? blueprint.variant_keys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+-      : []);
+-  const pnTemplate = blueprint?.ingestOptions?.pn_template || blueprint?.ingestOptions?.pnTemplate || null;
++  if ((!allowedKeys || !allowedKeys.length) && blueprint?.fields && typeof blueprint.fields === 'object') {
++    allowedKeys = Object.keys(blueprint.fields);
 +  }
-+  return null;
-+}
-+
-+function normalizeDocType(value) {
-+  if (value == null) return null;
-+  const str = String(value).trim().toLowerCase();
-+  if (!str) return null;
-+  if (str.startsWith('order')) return 'ordering';
-+  if (str.startsWith('catalog') || str.startsWith('multi')) return 'catalog';
-+  if (str.startsWith('single') || str.startsWith('one')) return 'single';
-+  return null;
-+}
-+
-+function normalizeOrderingInfoPayload(raw) {
-+  if (raw == null) return null;
-+  let value = raw;
-+  if (typeof value === 'string') {
-+    const trimmed = value.trim();
-+    if (!trimmed) return null;
-+    try {
-+      value = JSON.parse(trimmed);
-+    } catch (_) {
-+      return null;
-+    }
-+  }
-+
-+  if (Array.isArray(value)) {
-+    const sections = value
-+      .map((entry) => normalizeOrderingInfoPayload(entry))
-+      .filter((entry) => entry && typeof entry === 'object');
-+    if (!sections.length) return null;
-+    if (sections.length === 1) return sections[0];
-+    return { sections };
-+  }
-+
-+  if (!value || typeof value !== 'object') return null;
-+
-+  const codes = [];
-+  const seenCodes = new Set();
-+  const collectCode = (input) => {
-+    const str = typeof input === 'string' ? input : String(input ?? '');
-+    const trimmed = str.trim();
-+    if (!trimmed) return;
-+    const normalized = trimmed.toUpperCase();
-+    if (seenCodes.has(normalized)) return;
-+    seenCodes.add(normalized);
-+    codes.push(normalized);
-+  };
-+
-+  if (Array.isArray(value.codes)) {
-+    for (const code of value.codes) collectCode(code);
-+  }
-+  if (!codes.length && Array.isArray(value.scored)) {
-+    for (const entry of value.scored) {
-+      if (!entry || typeof entry !== 'object') continue;
-+      collectCode(entry.code);
-+    }
-+  }
-+  if (!codes.length && Array.isArray(value.sections)) {
-+    for (const section of value.sections) {
-+      const normalized = normalizeOrderingInfoPayload(section);
-+      if (!normalized) continue;
-+      if (Array.isArray(normalized.codes)) {
-+        for (const code of normalized.codes) collectCode(code);
-+      }
-+    }
-+  }
-+
-+  if (!codes.length) return null;
-+
-+  const textSources = [
-+    value.text,
-+    value.window_text,
-+    value.windowText,
-+    value?.window?.text,
-+  ];
-+  let text = null;
-+  for (const candidate of textSources) {
-+    if (typeof candidate === 'string' && candidate.trim()) {
-+      text = candidate;
-+      break;
-+    }
-+  }
-+
-+  const start = pickFiniteNumber(value.start, value.window_start, value?.window?.start);
-+  const end = pickFiniteNumber(value.end, value.window_end, value?.window?.end);
-+  const anchorIndex = pickFiniteNumber(
-+    value.anchor_index,
-+    value.anchorIndex,
-+    value?.window?.anchor_index,
-+    value?.window?.anchorIndex,
++  allowedKeys = Array.from(
++    new Set(
++      (allowedKeys || [])
++        .map((k) => String(k || '').trim())
++        .filter(Boolean)
++    )
 +  );
 +
-+  const scored = Array.isArray(value.scored)
-+    ? value.scored
-+        .map((entry) => {
-+          if (!entry || typeof entry !== 'object') return null;
-+          const code = typeof entry.code === 'string' ? entry.code.trim().toUpperCase() : null;
-+          if (!code) return null;
-+          const score = Number(entry.score);
-+          const normalized = { code };
-+          if (Number.isFinite(score)) normalized.score = score;
-+          return normalized;
-+        })
-+        .filter(Boolean)
++  let variantKeys = [];
++  if (USE_VARIANT_KEYS) {
++    variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
++      ? blueprint.ingestOptions.variant_keys
++      : (Array.isArray(blueprint?.variant_keys) ? blueprint.variant_keys : []);
++    variantKeys = variantKeys
++      .map((k) => String(k || '').trim().toLowerCase())
++      .filter(Boolean);
++  }
++
++  const pnTemplate = USE_PN_TEMPLATE
++    ? (blueprint?.ingestOptions?.pn_template || blueprint?.ingestOptions?.pnTemplate || null)
 +    : null;
-+
-+  const payload = { codes };
-+  if (text) payload.text = text;
-+  if (start != null) payload.start = start;
-+  if (end != null) payload.end = end;
-+  if (anchorIndex != null) payload.anchor_index = anchorIndex;
-+  if (scored && scored.length) payload.scored = scored;
-+
-+  return payload;
-+}
-+
- function repairPn(raw) {
-   if (!raw) return null;
-   let s = String(raw).trim();
-   if (!s) return null;
-   if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
-   s = s.replace(/[–—―]/g, '-');
-   s = s.replace(/\s+/g, '');
-   s = s.replace(/[^0-9A-Za-z\-_/().]/g, '');
-   if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
-   return s.length >= 3 ? s : null;
- }
- 
- function isNumericType(type = '') {
-   const t = String(type || '').toLowerCase();
-   return (
-     t.includes('int') ||
-     t.includes('numeric') ||
-     t.includes('decimal') ||
-     t.includes('real') ||
-     t.includes('double')
-   );
- }
- 
- function parseNumberToken(token, suffix) {
-   if (!token) return null;
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index fcc492783204886dca6364a0c3b8d17d62feb325..e897fc055784deabbfd83ee8151ab11e62fb1917 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -806,50 +929,52 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
-   if (jobId) suffixParts.push(`job:${jobId}`);
-   const appNameSuffix = suffixParts.length ? ` ${suffixParts.join(' ')}` : '';
- 
-   const guard = await ensureSchemaGuards(familySlug);
-   if (!guard.ok) {
-     result.skipped.push({ reason: guard.reason || 'schema_not_ready', detail: guard.detail || null });
-     return result;
-   }
- 
-   const physicalCols = await getColumnsOf(targetTable);
-   if (!physicalCols.size) {
-     result.skipped.push({ reason: 'schema_not_ready' });
-     return result;
-   }
- 
-   if (!physicalCols.has('pn') || !physicalCols.has('brand_norm') || !physicalCols.has('code_norm')) {
-     result.skipped.push({ reason: 'schema_not_ready' });
-     return result;
-   }
- 
-   const columnTypes = await getColumnTypes(targetTable);
-   const blueprintMeta = options?.blueprint || null;
-   const blueprintFieldMap = buildBlueprintFieldMap(blueprintMeta);
-   const blueprintAllowedSet = buildAllowedKeySet(blueprintMeta);
-   const pnTemplate = typeof options.pnTemplate === 'string' && options.pnTemplate ? options.pnTemplate : null;
-+  const sharedOrderingInfo = normalizeOrderingInfoPayload(options?.orderingInfo);
-+  const sharedDocType = normalizeDocType(options?.docType);
-   const requiredKeys = Array.isArray(options.requiredKeys)
-     ? options.requiredKeys.map((k) => normKey(k)).filter(Boolean)
-     : [];
-   const explicitCoreKeys = Array.isArray(options.coreSpecKeys)
-     ? options.coreSpecKeys.map((k) => normKey(k)).filter(Boolean)
-     : [];
-   const guardKeys = explicitCoreKeys.length ? explicitCoreKeys : requiredKeys;
-   let candidateSpecKeys = [];
- 
-   const allKeys = new Set();
-   for (const meta of META_KEYS) {
-     if (physicalCols.has(meta)) allKeys.add(meta);
-   }
-   for (const col of columnTypes.keys()) {
-     if (/_min(?:_[a-z0-9]+)?$/.test(col) || /_max(?:_[a-z0-9]+)?$/.test(col)) {
-       allKeys.add(col);
+   const requiredFields = [];
+   if (blueprint?.fields && typeof blueprint.fields === 'object') {
+     for (const [fieldKey, meta] of Object.entries(blueprint.fields)) {
+       const isRequired = meta && typeof meta === 'object' && Boolean(meta.required);
+       if (!isRequired) continue;
+       const normalized = String(fieldKey || '')
+         .trim()
+         .toLowerCase()
+         .replace(/[^a-z0-9_]/g, '');
+       if (normalized && !requiredFields.includes(normalized)) {
+         requiredFields.push(normalized);
+       }
      }
    }
  
-   for (const row of rows) {
-     for (const key of Object.keys(row || {})) {
-       const normalized = normKey(key);
-       if (physicalCols.has(normalized)) allKeys.add(normalized);
-     }
+   let colTypes;
+   const disableEnsure = /^(1|true|on)$/i.test(process.env.NO_SCHEMA_ENSURE || '0');
+ 
+   // -------- 공용 강제정규화 유틸 --------
+ 
+   if (code && !/\d/.test(String(code))) {
+     // "AGN","TQ" 처럼 숫자 없는 시리즈는 series로 넘기고 code는 비움
+     series = code; code = null;
    }
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index fcc492783204886dca6364a0c3b8d17d62feb325..e897fc055784deabbfd83ee8151ab11e62fb1917 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -900,50 +1025,92 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
-           row?._doc_text ??
-           row?.doc_text ??
-           (options?.docText || options?.doc_text) ??
-           '',
+ 
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 759ba3123a0211ea18fe2ced42238d28e9b63205..4c519a79c86dc67650069e7fc7059f2d9df455f0 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1423,162 +1447,166 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+   } catch (err) {
+     console.warn('[brand resolve] failed:', err?.message || err);
+   }
+ 
+   const brandEffectiveResolved = pickBrandHint(
+     brandResolution?.brand_effective,
+     brandHintSeed,
+     effectiveBrand,
+     extracted?.brand,
+     detectedBrand,
+   ) || 'unknown';
+ 
+   let brandSource = brandResolution?.source || null;
+   if (!brandSource || brandSource === 'none') {
+     brandSource = brandHintSeed ? 'hint' : 'none';
+   }
+   if (!brandEffectiveResolved || brandEffectiveResolved.toLowerCase() === 'unknown') {
+     brandSource = 'none';
+   }
+ 
+   if (extracted && typeof extracted === 'object') {
+     extracted.brand = brandEffectiveResolved;
+   }
+ 
+   let runtimeVariantKeys = [];
+-  try {
+-    runtimeVariantKeys = await detectVariantKeys({
+-      rawText: extractedText,
+-      family,
+-      blueprintVariantKeys: variantKeys,
+-    });
+-  } catch (err) {
+-    console.warn('[variant] runtime detect failed:', err?.message || err);
+-    runtimeVariantKeys = Array.isArray(variantKeys) ? [...variantKeys] : [];
++  if (USE_VARIANT_KEYS) {
++    try {
++      runtimeVariantKeys = await detectVariantKeys({
++        rawText: extractedText,
++        family,
++        blueprintVariantKeys: variantKeys,
++      });
++    } catch (err) {
++      console.warn('[variant] runtime detect failed:', err?.message || err);
++      runtimeVariantKeys = Array.isArray(variantKeys) ? [...variantKeys] : [];
++    }
+   }
+ 
+   console.log('[PATH] brand resolved', {
+     runId,
+     family,
+     hint: brandHintSeed || null,
+     effective: brandEffectiveResolved,
+     source: brandSource,
+     vkeys_runtime: runtimeVariantKeys,
+   });
+ 
+ 
+   // 커버 추출 비활성(요청에 따라 완전 OFF)
+   let coverUri = null;
+   if (/^(1|true|on)$/i.test(process.env.COVER_CAPTURE || '0')) {
+     try {
+       const bForCover = brandEffectiveResolved || 'unknown';
+       const cForCover = code || extracted.rows?.[0]?.code || path.parse(fileName).name;
+       coverUri = await withTimeout(
+         extractCoverToGcs(gcsUri, { family, brand: bForCover, code: cForCover }),
+         Math.min(30000, Math.round(BUDGET * 0.15)),
+         'cover',
        );
-       const docTextLower = docTextRaw.toLowerCase();
-       const brandCandidates = [options?.brand, rec.brand, rec.brand_norm];
-       let brandKey = null;
-       for (const candidate of brandCandidates) {
-         if (!candidate) continue;
-         const trimmed = String(candidate).trim();
-         if (!trimmed) continue;
-         brandKey = await normalizeBrand(trimmed, docTextLower);
-         if (brandKey) break;
-       }
-       if (brandKey) {
-         if (!rec.brand || !String(rec.brand).trim()) {
-           rec.brand = options?.brand || brandKey;
-         }
-         rec.brand_norm = brandKey;
-       } else if (physicalCols.has('brand_norm')) {
-         rec.brand_norm = null;
-       }
-       if (physicalCols.has('last_error')) rec.last_error = null;
+     } catch (e) { console.warn('[cover fail]', e?.message || e); }
+   }
  
-+      let orderingPayload = sharedOrderingInfo;
-+      if (Object.prototype.hasOwnProperty.call(rec, 'ordering_info') && rec.ordering_info != null) {
-+        orderingPayload = normalizeOrderingInfoPayload(rec.ordering_info) || orderingPayload;
-+      }
-+
-+      let docTypeValue = sharedDocType;
-+      if (Object.prototype.hasOwnProperty.call(rec, 'doc_type')) {
-+        const normalizedRowDocType = normalizeDocType(rec.doc_type);
-+        if (normalizedRowDocType) docTypeValue = normalizedRowDocType;
-+      }
-+
-+      if (orderingPayload || docTypeValue) {
-+        let rawHolder = rec.raw_json;
-+        if (typeof rawHolder === 'string') {
+   if (code) {
+     const trimmedCode = String(code || '').trim();
+     if (trimmedCode) {
+       const norm = normalizeCode(trimmedCode);
+       if (!candidates.some((c) => normalizeCode(c) === norm)) {
+         candidates = [trimmedCode, ...candidates];
+       }
+     }
+   }
+ 
+   // 레코드 구성
+   const records = [];
+   const now = new Date();
+   const brandName = brandEffectiveResolved || 'unknown';
+   const baseSeries = series || code || null;
+   const runtimeMeta = {
+     brand_source: brandSource ?? null,
+     variant_keys_runtime: Array.isArray(runtimeVariantKeys) ? runtimeVariantKeys : [],
+   };
+   const hasRuntimeMeta =
+     runtimeMeta.brand_source != null ||
+     (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
+ 
+-  let variantColumnsEnsured = false;
+-  try {
+-    const { detected: inferredKeys = [], newKeys: freshKeys = [] } = await inferVariantKeys({
+-      family,
+-      brand: brandName,
+-      series: baseSeries,
+-      blueprint,
+-      extracted,
+-    });
++  let variantColumnsEnsured = !USE_VARIANT_KEYS;
++  if (USE_VARIANT_KEYS) {
++    try {
++      const { detected: inferredKeys = [], newKeys: freshKeys = [] } = await inferVariantKeys({
++        family,
++        brand: brandName,
++        series: baseSeries,
++        blueprint,
++        extracted,
++      });
+ 
+-    if (Array.isArray(inferredKeys) && inferredKeys.length) {
+-      const brandSlug = normalizeSlug(brandName);
+-      const seriesSlug = normalizeSlug(baseSeries);
+-      try {
+-        await db.query(
+-          `SELECT public.upsert_variant_keys($1,$2,$3,$4::jsonb)`,
+-          [family, brandSlug, seriesSlug, JSON.stringify(inferredKeys)],
+-        );
+-      } catch (err) {
+-        console.warn('[variant] upsert_variant_keys failed:', err?.message || err);
+-      }
++      if (Array.isArray(inferredKeys) && inferredKeys.length) {
++        const brandSlug = normalizeSlug(brandName);
++        const seriesSlug = normalizeSlug(baseSeries);
++        try {
++          await db.query(
++            `SELECT public.upsert_variant_keys($1,$2,$3,$4::jsonb)`,
++            [family, brandSlug, seriesSlug, JSON.stringify(inferredKeys)],
++          );
++        } catch (err) {
++          console.warn('[variant] upsert_variant_keys failed:', err?.message || err);
++        }
+ 
+-      const mergedVariant = new Set(variantKeys);
+-      for (const key of inferredKeys) mergedVariant.add(key);
+-      variantKeys = Array.from(mergedVariant);
++        const mergedVariant = new Set(variantKeys);
++        for (const key of inferredKeys) mergedVariant.add(key);
++        variantKeys = Array.from(mergedVariant);
+ 
+-      const mergedAllowed = new Set(allowedKeys);
+-      for (const key of variantKeys) mergedAllowed.add(key);
+-      allowedKeys = Array.from(mergedAllowed);
++        const mergedAllowed = new Set(allowedKeys);
++        for (const key of variantKeys) mergedAllowed.add(key);
++        allowedKeys = Array.from(mergedAllowed);
+ 
+-      if (!blueprint.ingestOptions || typeof blueprint.ingestOptions !== 'object') {
+-        blueprint.ingestOptions = {};
+-      }
+-      blueprint.ingestOptions.variant_keys = variantKeys;
+-      blueprint.variant_keys = variantKeys;
+-      blueprint.allowedKeys = Array.isArray(blueprint.allowedKeys)
+-        ? Array.from(new Set([...blueprint.allowedKeys, ...variantKeys]))
+-        : [...allowedKeys];
++        if (!blueprint.ingestOptions || typeof blueprint.ingestOptions !== 'object') {
++          blueprint.ingestOptions = {};
++        }
++        blueprint.ingestOptions.variant_keys = variantKeys;
++        blueprint.variant_keys = variantKeys;
++        blueprint.allowedKeys = Array.isArray(blueprint.allowedKeys)
++          ? Array.from(new Set([...blueprint.allowedKeys, ...variantKeys]))
++          : [...allowedKeys];
+ 
+-      if (!disableEnsure) {
+-        try {
+-          await ensureBlueprintVariantColumns(family);
+-          variantColumnsEnsured = true;
+-        } catch (err) {
+-          console.warn('[variant] ensure_blueprint_variant_columns failed:', err?.message || err);
++        if (!disableEnsure) {
 +          try {
-+            rawHolder = JSON.parse(rawHolder);
-+          } catch (_) {
-+            rawHolder = {};
++            await ensureBlueprintVariantColumns(family);
++            variantColumnsEnsured = true;
++          } catch (err) {
++            console.warn('[variant] ensure_blueprint_variant_columns failed:', err?.message || err);
 +          }
-+        }
-+        if (!rawHolder || typeof rawHolder !== 'object' || Array.isArray(rawHolder)) {
-+          rawHolder = {};
-+        }
-+        if (orderingPayload && !rawHolder.ordering_info) {
-+          let cloned = orderingPayload;
-+          try {
-+            cloned = JSON.parse(JSON.stringify(orderingPayload));
-+          } catch (_) {}
-+          rawHolder.ordering_info = cloned;
-+        }
-+        if (docTypeValue && !rawHolder.doc_type) {
-+          rawHolder.doc_type = docTypeValue;
-+        }
-+        rec.raw_json = rawHolder;
-+      }
-+      if (Object.prototype.hasOwnProperty.call(rec, 'ordering_info')) {
-+        delete rec.ordering_info;
-+      }
-+      if (Object.prototype.hasOwnProperty.call(rec, 'doc_type')) {
-+        delete rec.doc_type;
-+      }
-+
-       const templateContext = { ...rec };
-       const ctxText = docTextRaw;
-       const pnWasTemplate = looksLikeTemplate(templateContext.pn);
-       const codeWasTemplate = looksLikeTemplate(templateContext.code);
- 
-       if (pnWasTemplate) {
-         const renderedPn = renderAnyTemplate(templateContext.pn, templateContext, ctxText);
-         rec.pn = renderedPn ?? null;
+         }
        }
+-    }
  
-       if (codeWasTemplate) {
-         const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
-         const renderedCode = renderAnyTemplate(templateContext.code, contextForCode, ctxText);
-         rec.code = renderedCode ?? null;
+-    if (Array.isArray(freshKeys) && freshKeys.length) {
+-      console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
++      if (Array.isArray(freshKeys) && freshKeys.length) {
++        console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
++      }
++    } catch (err) {
++      console.warn('[variant] inferVariantKeys failed:', err?.message || err);
+     }
+-  } catch (err) {
+-    console.warn('[variant] inferVariantKeys failed:', err?.message || err);
+   }
+ 
+   if (!disableEnsure) {
+     await ensureSpecsTableByFamily(family);
+     if (!variantColumnsEnsured) {
+       try {
+         await ensureBlueprintVariantColumns(family);
+         variantColumnsEnsured = true;
+       } catch (err) {
+         console.warn('[variant] ensure_blueprint_variant_columns fallback failed:', err?.message || err);
        }
+     }
+   }
  
-       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
-         rec.pn = rec.code;
+   await ensureSpecColumnsForBlueprint(qualified, blueprint);
+   colTypes = await getColumnTypes(qualified);
+ 
+   if (process.env.AUTO_FIX_BLUEPRINT_TYPES === '1' && colTypes instanceof Map && colTypes.size && family) {
+     const currentFields = blueprint?.fields && typeof blueprint.fields === 'object' ? blueprint.fields : {};
+     const patch = {};
+     for (const [col, t] of colTypes.entries()) {
+       if (t === 'numeric' || t === 'int' || t === 'bool') {
+         const now = currentFields[col];
+         if (!now || String(now).toLowerCase() === 'text') {
+           patch[col] = t === 'int' ? 'int' : t;
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 759ba3123a0211ea18fe2ced42238d28e9b63205..4c519a79c86dc67650069e7fc7059f2d9df455f0 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1719,51 +1747,51 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+ 
+   const candidateMap = [];
+   const candidateNormSet = new Set();
+   for (const cand of candidates) {
+     const trimmed = typeof cand === 'string' ? cand.trim() : String(cand || '');
+     if (!trimmed) continue;
+     const norm = normalizeCode(trimmed);
+     if (!norm || candidateNormSet.has(norm)) continue;
+     candidateNormSet.add(norm);
+     candidateMap.push({ raw: trimmed, norm });
+   }
+ 
+   const baseRows = (rawRows.length ? rawRows : [{}]).map((row) => {
+     const obj = row && typeof row === 'object' ? { ...row } : {};
+     if (obj.brand == null) obj.brand = brandName;
+     const fallbackSeries = obj.series_code || obj.series || baseSeries || null;
+     if (fallbackSeries != null) {
+       if (obj.series == null) obj.series = fallbackSeries;
+       if (obj.series_code == null) obj.series_code = fallbackSeries;
+     }
+     if (obj.datasheet_uri == null) obj.datasheet_uri = gcsUri;
+     if (coverUri && obj.cover == null) obj.cover = coverUri;
+     return obj;
+   });
+ 
+-  const explodedRows = explodeToRows(blueprint, baseRows);
++  const explodedRows = USE_CODE_RULES ? explodeToRows(blueprint, baseRows) : baseRows;
+   const physicalCols = new Set(colTypes ? [...colTypes.keys()] : []);
+   const allowedSet = new Set((allowedKeys || []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
+   const variantSet = new Set(variantKeys);
+ 
+   const seenCodes = new Set();
+   for (const row of explodedRows) {
+     const seeds = [];
+     const seenSeed = new Set();
+     const pushSeed = (val) => {
+       if (val == null) return;
+       if (Array.isArray(val)) { val.forEach(pushSeed); return; }
+       const str = String(val).trim();
+       if (!str) return;
+       const parts = splitAndCarryPrefix(str);
+       if (parts.length > 1) { parts.forEach(pushSeed); return; }
+       const normed = str.toLowerCase();
+       if (seenSeed.has(normed)) return;
+       seenSeed.add(normed);
+       seeds.push(str);
+     };
+     pushSeed(row.code);
+     pushSeed(row.mpn);
+     pushSeed(row.part_number);
+     pushSeed(row.part_no);
+ 
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 759ba3123a0211ea18fe2ced42238d28e9b63205..4c519a79c86dc67650069e7fc7059f2d9df455f0 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1804,51 +1832,53 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+     const displayName = row.display_name || row.displayname || `${rec.brand} ${mpn}`;
+     rec.display_name = displayName;
+     if (rec.displayname == null && displayName != null) rec.displayname = displayName;
+     rec.updated_at = now;
+     // persist에서 브랜드 정규화할 때 쓰도록 원문 텍스트 전달
+     rec._doc_text = extractedText;
+     if (hasRuntimeMeta) {
+       rec.raw_json = mergeRuntimeMetadata(row.raw_json, runtimeMeta);
+     } else if (row.raw_json != null) {
+       rec.raw_json = row.raw_json;
+     }
+ 
+     for (const [rawKey, rawValue] of Object.entries(row)) {
+       const key = String(rawKey || '').trim();
+       if (!key) continue;
+       const lower = key.toLowerCase();
+       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
+       const mapped = aiCanonicalMap.get(key) || aiCanonicalMapLower.get(lower);
+       const target = mapped?.canonical || lower;
+       if (!target || META_KEYS.has(target) || BASE_KEYS.has(target)) continue;
+       if (physicalCols.has(target) || allowedSet.has(target) || variantSet.has(target)) {
+         rec[target] = rawValue;
        }
+     }
  
-       if (!isValidCode(rec.pn) && allowMinimalStrict) {
-         const base = fallbackHash || sha1(`${targetTable || ''}:${familySlug || ''}`);
-         const fallbackPn = `pdf:${base}#${rowIndex + 1}`;
-         rec.pn = fallbackPn;
-         if (!rec.code || !isValidCode(rec.code)) {
+-    if (blueprint?.code_rules) applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
++    if (USE_CODE_RULES && blueprint?.code_rules) {
++      applyCodeRules(rec.code, rec, blueprint.code_rules, colTypes);
++    }
+     records.push(rec);
+   }
+ 
+   if (candidateMap.length) {
+     const fallbackSeries = baseSeries || null;
+     for (const cand of candidateMap) {
+       const norm = cand.norm;
+       const naturalKey = `${normLower(brandName)}::${norm}`;
+       if (seenCodes.has(naturalKey)) continue;
+       seenCodes.add(naturalKey);
+       const verified = mpnNormFromDoc.has(norm);
+       const rec = {
+         family_slug: family,
+         brand: brandName,
+         pn: cand.raw,
+         code: cand.raw,
+         series_code: fallbackSeries,
+         datasheet_uri: gcsUri,
+         image_uri: coverUri || null,
+         display_name: `${brandName} ${cand.raw}`,
+         verified_in_doc: verified,
+         updated_at: now,
+       };
+       if (coverUri) rec.cover = coverUri;
+       if (hasRuntimeMeta) {
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 759ba3123a0211ea18fe2ced42238d28e9b63205..4c519a79c86dc67650069e7fc7059f2d9df455f0 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -2250,65 +2280,67 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+       } catch (err) {
+         console.warn('[brand detect] persist retry failed:', err?.message || err);
+       }
+     }
+ 
+     if (brandOverride) {
+       for (const row of records) {
+         if (!row || typeof row !== 'object') continue;
+         const current = String(row.brand || '').trim();
+         if (!current || current.toLowerCase() === 'unknown') {
+           row.brand = brandOverride;
+         }
+       }
+       if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+         for (const row of processedRowsInput) {
+           if (!row || typeof row !== 'object') continue;
+           const current = String(row.brand || '').trim();
+           if (!current || current.toLowerCase() === 'unknown') {
+             row.brand = brandOverride;
+           }
+         }
+       }
+     }
+ 
+     let blueprint;
+-    let variantKeysSource = Array.isArray(processedVariantKeys) ? processedVariantKeys : null;
+-    if ((!Array.isArray(variantKeysSource) || !variantKeysSource.length) && family) {
++    let variantKeysSource = USE_VARIANT_KEYS && Array.isArray(processedVariantKeys)
++      ? processedVariantKeys
++      : null;
++    if (USE_VARIANT_KEYS && (!Array.isArray(variantKeysSource) || !variantKeysSource.length) && family) {
+       try {
+         blueprint = await getBlueprint(family);
+         if (!Array.isArray(variantKeysSource) || !variantKeysSource.length) {
+           variantKeysSource = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+             ? blueprint.ingestOptions.variant_keys
+             : null;
+         }
+       } catch (err) {
+         console.warn('[persist] blueprint fetch failed for variant recovery:', err?.message || err);
+       }
+     }
+ 
+-    const variantKeys = Array.isArray(variantKeysSource)
++    const variantKeys = USE_VARIANT_KEYS && Array.isArray(variantKeysSource)
+       ? variantKeysSource.map((k) => String(k || '').trim()).filter(Boolean)
+       : [];
+ 
+     for (const r of records) {
+       if (!r || typeof r !== 'object') continue;
+       if (!Array.isArray(r.candidates) && Array.isArray(processed?.candidateCodes)) {
+         r.candidates = processed.candidateCodes;
+       }
+       const fixed = recoverCode(r, { pnTemplate, variantKeys });
+       if (fixed) {
+         if (!r.code) r.code = fixed;
+         if (!r.pn) r.pn = fixed;
+       }
+     }
+ 
+     records = records.filter((r) => isValidCode(r?.pn || r?.code));
+     if (!records.length) {
+       persistResult.skipped = [{ reason: 'missing_pn' }];
+     }
+ 
+     if (records.length) {
+       if (colTypes instanceof Map && colTypes.size) {
+         for (const rec of records) {
+           if (!rec || typeof rec !== 'object') continue;
+           for (const [k, v] of Object.entries(rec)) {

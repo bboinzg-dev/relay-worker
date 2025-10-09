@@ -755,6 +755,19 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
 });
 
+app.post('/api/worker/ingest', async (req, res) => {
+  try {
+    const payload = (req?.body && typeof req.body === 'object' && 'payload' in req.body)
+      ? (req.body.payload || {})
+      : (req.body || {});
+    const result = await getIngest().runAutoIngest(payload || {});
+    return res.status(202).json({ ok: true, run: result?.runId || null });
+  } catch (e) {
+    console.error('[api/worker/ingest] failed:', e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 function pickFirstString(...values) {
   for (const value of values) {
     if (typeof value === 'string' && value.trim()) {

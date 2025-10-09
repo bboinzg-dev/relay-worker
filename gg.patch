@@ -1,61 +1,68 @@
-diff --git a/src/utils/schema.js b/src/utils/schema.js
-index 6ae006717c568a642d093ed9d339eded85e64da3..055f7145139a0b37a2980c521cbbd0a5d2ed9a08 100644
---- a/src/utils/schema.js
-+++ b/src/utils/schema.js
-@@ -151,55 +151,51 @@ async function ensureSpecsTable(tableName, fields = {}) {
-     { name: 'pn', type: 'text' },
-     { name: 'series', type: 'text' },
-     { name: 'series_code', type: 'text' },
-     { name: 'datasheet_uri', type: 'text' },
-     { name: 'datasheet_url', type: 'text' },
-     { name: 'image_uri', type: 'text' },
-     { name: 'cover', type: 'text' },
-     { name: 'display_name', type: 'text' },
-     { name: 'displayname', type: 'text' },
-     { name: 'source_gcs_uri', type: 'text' },
-     { name: 'verified_in_doc', type: 'boolean' },
-     { name: 'raw_json', type: 'jsonb' },
-     { name: 'last_error', type: 'text' },
-     { name: 'created_at', type: 'timestamptz', defaultSql: 'now()' },
-     { name: 'updated_at', type: 'timestamptz', defaultSql: 'now()' },
-   ];
+diff --git a/server.js b/server.js
+index 0f37845c969d0f7bce524d84c999225ff8f76313..c3b18f039e967aa489f8a2b3355aa4af96e42b35 100644
+--- a/server.js
++++ b/server.js
+@@ -733,50 +733,63 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
+   } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'bulk ingest failed', detail:String(e?.message || e) }); }
+ });
  
-   for (const col of baseColumns) {
-     const defaultClause = col.defaultSql ? ` DEFAULT ${col.defaultSql}` : '';
-     await db.query(`ALTER TABLE ${qualified} ADD COLUMN IF NOT EXISTS "${col.name}" ${col.type}${defaultClause}`);
-     if (col.defaultSql) {
-       await db.query(`ALTER TABLE ${qualified} ALTER COLUMN "${col.name}" SET DEFAULT ${col.defaultSql}`);
+ app.post('/ingest/auto', requireSession, async (req, res) => {
+   try {
+     const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name, family_slug } = req.body || {};
+     const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
+     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
+     const overrides = {
+       brand: brand || null,
+       series: series || null,
+     };
+     const result = await getIngest().runAutoIngest({
+       gcsUri: uri,
+       family_slug,
+       brand,
+       code,
+       series,
+       display_name,
+       overrides,
+     });
+     res.json(result);
+   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
+ });
+ 
++app.post('/api/worker/ingest', async (req, res) => {
++  try {
++    const payload = (req?.body && typeof req.body === 'object' && 'payload' in req.body)
++      ? (req.body.payload || {})
++      : (req.body || {});
++    const result = await getIngest().runAutoIngest(payload || {});
++    return res.status(202).json({ ok: true, run: result?.runId || null });
++  } catch (e) {
++    console.error('[api/worker/ingest] failed:', e);
++    return res.status(500).json({ ok: false, error: String(e?.message || e) });
++  }
++});
++
+ function pickFirstString(...values) {
+   for (const value of values) {
+     if (typeof value === 'string' && value.trim()) {
+       return value.trim();
      }
    }
- 
--  const generatedColumns = [
--    { name: 'brand_norm', expression: 'lower(brand)' },
--    { name: 'code_norm', expression: 'lower(code)' },
--    { name: 'pn_norm', expression: 'lower(pn)' },
--  ];
-+  const generatedColumns = [{ name: 'brand_norm', expression: 'lower(brand)' }];
- 
-   for (const col of generatedColumns) {
-     await db.query(
-       `ALTER TABLE ${qualified} ADD COLUMN IF NOT EXISTS "${col.name}" text GENERATED ALWAYS AS (${col.expression}) STORED`
-     );
-   }
- 
-   const fieldEntries = normalizeFieldEntries(fields);
-   const reserved = new Set([
-     'id',
-     ...baseColumns.map((c) => c.name),
-     ...generatedColumns.map((c) => c.name),
-   ]);
- 
-   for (const [key, typeInput] of fieldEntries) {
-     if (!key || reserved.has(key)) continue;
-     const mapped = FIELD_TYPE_MAP[String(typeInput).toLowerCase()] || 'text';
-     await db.query(`ALTER TABLE ${qualified} ADD COLUMN IF NOT EXISTS "${key}" ${mapped}`);
-   }
- 
-   await db.query(
-     `CREATE UNIQUE INDEX IF NOT EXISTS ux_${table}_brandpn_expr ON ${qualified} (lower(brand), lower(pn))`
-   );
+   return null;
  }
  
+ function getTaskContext(req, phase) {
+   const headerName = req.get('X-CloudTasks-TaskName') || req.get('X-Cloud-Tasks-TaskName') || null;
+   const retryHeader = req.get('X-CloudTasks-TaskRetryCount') || req.get('X-Cloud-Tasks-TaskRetryCount');
+   const parsedRetry = Number(retryHeader);
+   return {
+     taskName: headerName || `phase:${phase}`,
+     retryCount: Number.isFinite(parsedRetry) ? parsedRetry : 0,
+   };
+ }
+ 
+ const ingestJobMeta = { inspectedAt: 0, columns: null };
+ 
+ async function getIngestJobColumns() {
+   const now = Date.now();
+   if (ingestJobMeta.inspectedAt && now - ingestJobMeta.inspectedAt < 60_000) {
+     return ingestJobMeta.columns;

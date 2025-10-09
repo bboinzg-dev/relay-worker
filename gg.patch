@@ -1,59 +1,121 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index cf5eb89db820619563b41a08588431bb0829a346..96e227cf454afd41e9274607a5bcca465cd37bb0 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -59,52 +59,52 @@ const META_KEYS = new Set([
-   'created_at',
-   'updated_at',
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 826d3787cbcaac7873fde47f8ea1198cad00e61d..65f8783b3236fdc938f68465773b1e9791e1d491 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -105,50 +105,51 @@ const SKIP_SPEC_KEYS = new Set([
+   'rawspecs',
+   'raw_table',
+   'raw_tables',
+   'ordering_info',
+   'doc_type',
  ]);
  
- const CONFLICT_KEYS = ['brand', 'pn'];
- const NEVER_INSERT = new Set(['id', 'brand_norm', 'code_norm', 'pn_norm', 'created_at', 'updated_at']);
- 
- const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
- const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
- const BANNED_PREFIX = /^(pdf|page|figure|table|sheet|rev|ver|draft)\b/i;
- const BANNED_EXACT = /^pdf-?1(\.\d+)?$/i;
- 
- const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
- const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
- const SCALE_MAP = {
-   k: 1e3,
-   m: 1e-3,
-   g: 1e9,
-   'µ': 1e-6,
-   u: 1e-6,
-   n: 1e-9,
-   p: 1e-12,
- };
- 
- const LLM_CONFIDENCE_THRESHOLD = (() => {
--  const raw = Number(process.env.SPEC_AI_CONFIDENCE_MIN ?? process.env.SPEC_NORMALIZE_CONFIDENCE ?? 0.6);
--  return Number.isFinite(raw) ? raw : 0.6;
-+  const raw = Number(process.env.SPEC_AI_CONFIDENCE_MIN ?? process.env.SPEC_NORMALIZE_CONFIDENCE ?? 0.5);
-+  return Number.isFinite(raw) ? raw : 0.5;
- })();
- 
- const llmNormalizationCache = new Map();
- 
- function buildBlueprintFieldMap(blueprint) {
-   const map = new Map();
-   if (!blueprint) return map;
- 
-   const raw =
-     (blueprint.fields && typeof blueprint.fields === 'object' && blueprint.fields) ||
-     blueprint.fields_json ||
-     blueprint;
- 
-   if (Array.isArray(raw)) {
-     for (const entry of raw) {
-       if (!entry || typeof entry !== 'object') continue;
-       const key = normKey(entry.name || entry.key || entry.field);
-       if (!key) continue;
-       map.set(key, entry);
+ function gatherRuntimeSpecKeys(rows) {
+   const set = new Set();
+   const list = Array.isArray(rows) ? rows : [];
+   for (const row of list) {
+     if (!row || typeof row !== 'object') continue;
+     for (const rawKey of Object.keys(row)) {
+       const trimmed = String(rawKey || '').trim();
+       if (!trimmed) continue;
+       const lower = trimmed.toLowerCase();
+       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
+       set.add(trimmed);
      }
-     return map;
    }
+   return set;
+ }
  
-   if (raw && typeof raw === 'object') {
-     for (const [name, meta] of Object.entries(raw)) {
+ const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
+ const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
++const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/]{1,62}[A-Z0-9)]$/i;
+ 
+ function sanitizeDatasheetUrl(url) {
+   if (url == null) return null;
+   const str = typeof url === 'string' ? url.trim() : String(url || '').trim();
+   if (!str) return null;
+   try {
+     const parsed = new URL(str);
+     const pathname = (parsed.pathname || '').trim();
+     if (!pathname) return null;
+     const lowerPath = pathname.toLowerCase();
+     if (!lowerPath.endsWith('.pdf')) return null;
+     return parsed.toString();
+   } catch {
+     return null;
+   }
+ }
+ 
+ function pickDatasheetUrl(rawUrl, fallbackUrl) {
+   const sanitized = sanitizeDatasheetUrl(rawUrl);
+   if (sanitized) return sanitized;
+   const fallback = typeof fallbackUrl === 'string' ? fallbackUrl.trim() : String(fallbackUrl || '').trim();
+   return fallback || null;
+ }
+ 
+ const RESERVED_SPEC_KEYS = new Set([
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 826d3787cbcaac7873fde47f8ea1198cad00e61d..65f8783b3236fdc938f68465773b1e9791e1d491 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -2402,50 +2403,60 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+           variantKeysSource = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+             ? blueprint.ingestOptions.variant_keys
+             : null;
+         }
+       } catch (err) {
+         console.warn('[persist] blueprint fetch failed for variant recovery:', err?.message || err);
+       }
+     }
+ 
+     const variantKeys = USE_VARIANT_KEYS && Array.isArray(variantKeysSource)
+       ? variantKeysSource.map((k) => String(k || '').trim()).filter(Boolean)
+       : [];
+ 
+     for (const r of records) {
+       if (!r || typeof r !== 'object') continue;
+       if (!Array.isArray(r.candidates) && Array.isArray(processed?.candidateCodes)) {
+         r.candidates = processed.candidateCodes;
+       }
+       const fixed = recoverCode(r, { pnTemplate, variantKeys });
+       if (fixed) {
+         if (!r.code) r.code = fixed;
+         if (!r.pn) r.pn = fixed;
+       }
+     }
+ 
++    // 저장 직전 PN 정합성 강화: 템플릿/가짜/링크 토큰 제거
++    records = records.filter((r) => {
++      const pn = String(r?.pn || r?.code || '').trim();
++      if (!pn) return false;
++      if (pn.startsWith('pdf:')) return false; // PDF 앵커 토큰 제거
++      if (pn.includes('{') || pn.includes('}')) return false; // 템플릿 잔재 제거
++      if (!PN_STRICT.test(pn)) return false; // 기초 포맷 체크
++      return true;
++    });
++
+     records = records.filter((r) => isValidCode(r?.pn || r?.code));
+     if (!records.length) {
+       persistResult.skipped = [{ reason: 'missing_pn' }];
+     }
+ 
+     if (records.length) {
+       if (colTypes instanceof Map && colTypes.size) {
+         for (const rec of records) {
+           if (!rec || typeof rec !== 'object') continue;
+           for (const [k, v] of Object.entries(rec)) {
+             const keyLower = String(k || '').toLowerCase();
+             const t = colTypes.get(keyLower) || colTypes.get(k);
+             if (!t) continue;
+             if (t === 'numeric')      rec[k] = coerceNumeric(v);
+             else if (t === 'int')     rec[k] = toInt(v);
+             else if (t === 'bool')    rec[k] = toBool(v);
+           }
+         }
+       }
+       console.log(
+         '[DIAG] persist start table=%s family=%s records=%d required=%d',
+         table,
+         family,
+         Array.isArray(records) ? records.length : -1,
+         Array.isArray(effectiveRequired) ? effectiveRequired.length : -1,

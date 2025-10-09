@@ -127,6 +127,7 @@ function gatherRuntimeSpecKeys(rows) {
 
 const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
 const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
+const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/]{1,62}[A-Z0-9)]$/i;
 
 function sanitizeDatasheetUrl(url) {
   if (url == null) return null;
@@ -2423,6 +2424,16 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         if (!r.pn) r.pn = fixed;
       }
     }
+
+    // 저장 직전 PN 정합성 강화: 템플릿/가짜/링크 토큰 제거
+    records = records.filter((r) => {
+      const pn = String(r?.pn || r?.code || '').trim();
+      if (!pn) return false;
+      if (pn.startsWith('pdf:')) return false; // PDF 앵커 토큰 제거
+      if (pn.includes('{') || pn.includes('}')) return false; // 템플릿 잔재 제거
+      if (!PN_STRICT.test(pn)) return false; // 기초 포맷 체크
+      return true;
+    });
 
     records = records.filter((r) => isValidCode(r?.pn || r?.code));
     if (!records.length) {

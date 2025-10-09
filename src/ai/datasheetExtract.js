@@ -20,6 +20,7 @@ try { pdfParse = require('pdf-parse'); } catch {}
 const db = require('../../db');
 const { parseGcsUri } = require('../utils/gcs');
 const { safeJsonParse } = require('../utils/safe-json');
+const { extractOrderingInfo } = require('../utils/ordering-sections');
 
 const MAX_PARTS = Number(process.env.MAX_ENUM_PARTS || 200);
 
@@ -314,6 +315,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   if (!fullText) fullText = await parseTextWithPdfParse(gcsUri);
 
   const brand = brandHint || (await detectBrandFromText(fullText)) || 'unknown';
+  const orderingInfo = extractOrderingInfo(fullText, MAX_PARTS);
 
   // 코드 후보
   let codes = [];
@@ -358,6 +360,16 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
 
   const tableList = Array.isArray(docai?.tables) ? docai.tables : [];
   const codeList = codes.slice(0, MAX_PARTS);
+  const uniqueRowCodes = new Set();
+  for (const row of out) {
+    if (!row || typeof row !== 'object') continue;
+    const code = String(row.code || row.pn || '').trim().toUpperCase();
+    if (code) uniqueRowCodes.add(code);
+  }
+  const uniqueCandidateCodes = new Set(codeList.map((c) => String(c || '').trim().toUpperCase()).filter(Boolean));
+  let docType = 'single';
+  if (orderingInfo) docType = 'ordering';
+  else if (uniqueRowCodes.size > 1 || uniqueCandidateCodes.size > 1) docType = 'catalog';
 
   return {
     brand,
@@ -366,6 +378,8 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     tables: tableList,
     codes: codeList,
     mpn_list: codeList,
+    ordering_info: orderingInfo || null,
+    doc_type: docType,
   };
 }
 

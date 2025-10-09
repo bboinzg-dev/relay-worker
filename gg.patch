@@ -1,213 +1,332 @@
-diff --git a/server.js b/server.js
-index 95802b8f589d558ddbadaa656d38e4fff34954ec..3595252338297876d9a288b7ca56b96354f23209 100644
---- a/server.js
-+++ b/server.js
-@@ -532,140 +532,135 @@ app.get('/catalog/registry', async (_req, res) => {
-       'SELECT family_slug, specs_table FROM public.component_registry ORDER BY family_slug'
-     );
-     res.json({ items: r.rows });
-   } catch (e) {
-     console.error(e); res.status(500).json({ ok:false, error:'registry failed' });
-   }
- });
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index fcc492783204886dca6364a0c3b8d17d62feb325..e897fc055784deabbfd83ee8151ab11e62fb1917 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -135,50 +135,173 @@ async function normalizeValueWithCache(params) {
+   llmNormalizationCache.set(cacheKey, task);
+   return task;
+ }
  
- app.get('/catalog/blueprint/:family', async (req, res) => {
-   try {
-     const r = await db.query(`
-       SELECT b.family_slug, r.specs_table, b.fields_json, b.prompt_template
-         FROM public.component_spec_blueprint b
-         JOIN public.component_registry r USING (family_slug)
-        WHERE b.family_slug = $1
-        LIMIT 1`, [req.params.family]);
-     if (!r.rows.length) return res.status(404).json({ ok:false, error:'blueprint not found' });
-     res.json(r.rows[0]);
-   } catch (e) {
-     console.error(e); res.status(500).json({ ok:false, error:'blueprint failed' });
-   }
- });
+ function normKey(key) {
+   return String(key || '')
+     .trim()
+     .toLowerCase();
+ }
  
- /* ---------------- Parts (compat: relay + generic) ---------------- */
- app.get('/parts/detail', async (req, res) => {
--  const brand  = (req.query.brand || '').toString();
--  const code   = (req.query.code  || '').toString();
--  const family = (req.query.family || '').toString().toLowerCase();
--  if (!brand || !code) return res.status(400).json({ ok:false, error:'brand & code required' });
-+  const brand = (req.query.brand || '').toString().trim();
-+  let pn = (req.query.pn || '').toString().trim();
-+  const legacyCode = (req.query.code || '').toString().trim();
-+  if (!pn && legacyCode) pn = legacyCode;
-+  if (!brand || !pn) return res.status(400).json({ ok:false, error:'brand & pn required' });
+ function sha1(input) {
+   return crypto.createHash('sha1').update(String(input || '')).digest('hex');
+ }
+ 
+ function isMinimalFallbackPn(value) {
+   return typeof value === 'string' && value.startsWith('pdf:');
+ }
+ 
+ function isValidCode(value) {
+   const trimmed = String(value || '').trim();
+   if (!trimmed) return false;
+   if (isMinimalFallbackPn(trimmed)) return true;
+   return PN_RE.test(trimmed);
+ }
+ 
++function pickFiniteNumber(...candidates) {
++  for (const candidate of candidates) {
++    if (candidate == null || candidate === '') continue;
++    const num = Number(candidate);
++    if (Number.isFinite(num)) return num;
++  }
++  return null;
++}
 +
-+  const sanitizeSpecsRow = (row) => {
-+    if (!row || typeof row !== 'object') return null;
-+    const omit = new Set(['brand_norm', 'code', 'code_norm', 'pn_norm', 'display_name', 'datasheet_uri', 'cover']);
-+    const out = {};
-+    for (const [key, value] of Object.entries(row)) {
-+      if (omit.has(key)) continue;
-+      out[key] = value;
++function normalizeDocType(value) {
++  if (value == null) return null;
++  const str = String(value).trim().toLowerCase();
++  if (!str) return null;
++  if (str.startsWith('order')) return 'ordering';
++  if (str.startsWith('catalog') || str.startsWith('multi')) return 'catalog';
++  if (str.startsWith('single') || str.startsWith('one')) return 'single';
++  return null;
++}
++
++function normalizeOrderingInfoPayload(raw) {
++  if (raw == null) return null;
++  let value = raw;
++  if (typeof value === 'string') {
++    const trimmed = value.trim();
++    if (!trimmed) return null;
++    try {
++      value = JSON.parse(trimmed);
++    } catch (_) {
++      return null;
 +    }
-+    return out;
++  }
++
++  if (Array.isArray(value)) {
++    const sections = value
++      .map((entry) => normalizeOrderingInfoPayload(entry))
++      .filter((entry) => entry && typeof entry === 'object');
++    if (!sections.length) return null;
++    if (sections.length === 1) return sections[0];
++    return { sections };
++  }
++
++  if (!value || typeof value !== 'object') return null;
++
++  const codes = [];
++  const seenCodes = new Set();
++  const collectCode = (input) => {
++    const str = typeof input === 'string' ? input : String(input ?? '');
++    const trimmed = str.trim();
++    if (!trimmed) return;
++    const normalized = trimmed.toUpperCase();
++    if (seenCodes.has(normalized)) return;
++    seenCodes.add(normalized);
++    codes.push(normalized);
 +  };
++
++  if (Array.isArray(value.codes)) {
++    for (const code of value.codes) collectCode(code);
++  }
++  if (!codes.length && Array.isArray(value.scored)) {
++    for (const entry of value.scored) {
++      if (!entry || typeof entry !== 'object') continue;
++      collectCode(entry.code);
++    }
++  }
++  if (!codes.length && Array.isArray(value.sections)) {
++    for (const section of value.sections) {
++      const normalized = normalizeOrderingInfoPayload(section);
++      if (!normalized) continue;
++      if (Array.isArray(normalized.codes)) {
++        for (const code of normalized.codes) collectCode(code);
++      }
++    }
++  }
++
++  if (!codes.length) return null;
++
++  const textSources = [
++    value.text,
++    value.window_text,
++    value.windowText,
++    value?.window?.text,
++  ];
++  let text = null;
++  for (const candidate of textSources) {
++    if (typeof candidate === 'string' && candidate.trim()) {
++      text = candidate;
++      break;
++    }
++  }
++
++  const start = pickFiniteNumber(value.start, value.window_start, value?.window?.start);
++  const end = pickFiniteNumber(value.end, value.window_end, value?.window?.end);
++  const anchorIndex = pickFiniteNumber(
++    value.anchor_index,
++    value.anchorIndex,
++    value?.window?.anchor_index,
++    value?.window?.anchorIndex,
++  );
++
++  const scored = Array.isArray(value.scored)
++    ? value.scored
++        .map((entry) => {
++          if (!entry || typeof entry !== 'object') return null;
++          const code = typeof entry.code === 'string' ? entry.code.trim().toUpperCase() : null;
++          if (!code) return null;
++          const score = Number(entry.score);
++          const normalized = { code };
++          if (Number.isFinite(score)) normalized.score = score;
++          return normalized;
++        })
++        .filter(Boolean)
++    : null;
++
++  const payload = { codes };
++  if (text) payload.text = text;
++  if (start != null) payload.start = start;
++  if (end != null) payload.end = end;
++  if (anchorIndex != null) payload.anchor_index = anchorIndex;
++  if (scored && scored.length) payload.scored = scored;
++
++  return payload;
++}
++
+ function repairPn(raw) {
+   if (!raw) return null;
+   let s = String(raw).trim();
+   if (!s) return null;
+   if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
+   s = s.replace(/[–—―]/g, '-');
+   s = s.replace(/\s+/g, '');
+   s = s.replace(/[^0-9A-Za-z\-_/().]/g, '');
+   if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
+   return s.length >= 3 ? s : null;
+ }
  
-   try {
--    if (family) {
--      const r = await db.query(
-+    const metaResult = await db.query(
-+      `SELECT id, family_slug, brand, pn,
-+              COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
-+              image_uri, datasheet_url, series, updated_at
-+         FROM public.component_specs
-+        WHERE lower(brand) = lower($1) AND lower(pn) = lower($2)
-+        LIMIT 1`,
-+      [brand, pn]
-+    );
-+
-+    const meta = metaResult.rows[0];
-+    if (!meta) return res.status(404).json({ ok:false, error:'NOT_FOUND' });
-+
-+    let specs = null;
-+    const metaFamilySlug = typeof meta.family_slug === 'string' ? meta.family_slug.trim().toLowerCase() : '';
-+    const requestFamilySlug = (req.query.family || '').toString().trim().toLowerCase();
-+    const familySlug = metaFamilySlug || requestFamilySlug || null;
-+    if (familySlug) {
-+      const registry = await db.query(
-         `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
--        [family]
-+        [familySlug]
-       );
--      const table = r.rows[0]?.specs_table;
--      if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
--      if (!/^[a-zA-Z0-9_]+$/.test(table)) {
--        console.error('[parts/detail] invalid table name', { table });
--        return res.status(500).json({ ok:false, error:'INVALID_TABLE' });
-+      const table = registry.rows[0]?.specs_table;
-+      if (table) {
-+        if (!/^[a-zA-Z0-9_]+$/.test(table)) {
-+          console.error('[parts/detail] invalid table name', { table });
-+          return res.status(500).json({ ok:false, error:'INVALID_TABLE' });
-+        }
-+        const detail = await db.query(
-+          `SELECT * FROM public.${table} WHERE lower(brand)=lower($1) AND lower(pn)=lower($2) LIMIT 1`,
-+          [brand, pn]
-+        );
-+        specs = sanitizeSpecsRow(detail.rows[0]) || null;
-       }
--      const row = await db.query(
--        `SELECT * FROM public.${table} WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
--        [brand, code]
--      );
--      return row.rows[0]
--        ? res.json({ ok:true, item: row.rows[0] })
--        : res.status(404).json({ ok:false, error:'NOT_FOUND' });
+ function isNumericType(type = '') {
+   const t = String(type || '').toLowerCase();
+   return (
+     t.includes('int') ||
+     t.includes('numeric') ||
+     t.includes('decimal') ||
+     t.includes('real') ||
+     t.includes('double')
+   );
+ }
+ 
+ function parseNumberToken(token, suffix) {
+   if (!token) return null;
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index fcc492783204886dca6364a0c3b8d17d62feb325..e897fc055784deabbfd83ee8151ab11e62fb1917 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -806,50 +929,52 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+   if (jobId) suffixParts.push(`job:${jobId}`);
+   const appNameSuffix = suffixParts.length ? ` ${suffixParts.join(' ')}` : '';
+ 
+   const guard = await ensureSchemaGuards(familySlug);
+   if (!guard.ok) {
+     result.skipped.push({ reason: guard.reason || 'schema_not_ready', detail: guard.detail || null });
+     return result;
+   }
+ 
+   const physicalCols = await getColumnsOf(targetTable);
+   if (!physicalCols.size) {
+     result.skipped.push({ reason: 'schema_not_ready' });
+     return result;
+   }
+ 
+   if (!physicalCols.has('pn') || !physicalCols.has('brand_norm') || !physicalCols.has('code_norm')) {
+     result.skipped.push({ reason: 'schema_not_ready' });
+     return result;
+   }
+ 
+   const columnTypes = await getColumnTypes(targetTable);
+   const blueprintMeta = options?.blueprint || null;
+   const blueprintFieldMap = buildBlueprintFieldMap(blueprintMeta);
+   const blueprintAllowedSet = buildAllowedKeySet(blueprintMeta);
+   const pnTemplate = typeof options.pnTemplate === 'string' && options.pnTemplate ? options.pnTemplate : null;
++  const sharedOrderingInfo = normalizeOrderingInfoPayload(options?.orderingInfo);
++  const sharedDocType = normalizeDocType(options?.docType);
+   const requiredKeys = Array.isArray(options.requiredKeys)
+     ? options.requiredKeys.map((k) => normKey(k)).filter(Boolean)
+     : [];
+   const explicitCoreKeys = Array.isArray(options.coreSpecKeys)
+     ? options.coreSpecKeys.map((k) => normKey(k)).filter(Boolean)
+     : [];
+   const guardKeys = explicitCoreKeys.length ? explicitCoreKeys : requiredKeys;
+   let candidateSpecKeys = [];
+ 
+   const allKeys = new Set();
+   for (const meta of META_KEYS) {
+     if (physicalCols.has(meta)) allKeys.add(meta);
+   }
+   for (const col of columnTypes.keys()) {
+     if (/_min(?:_[a-z0-9]+)?$/.test(col) || /_max(?:_[a-z0-9]+)?$/.test(col)) {
+       allKeys.add(col);
      }
- 
--    // fallback: unified view if present, else legacy relay view
--    try {
--      const row = await db.query(
--        `SELECT * FROM public.component_specs WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
--        [brand, code]
--      );
--      if (row.rows[0]) return res.json({ ok:true, item: row.rows[0] });
--    } catch {}
--    const row = await db.query(
--      `SELECT * FROM public.relay_specs WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
--      [brand, code]
--    );
--    return row.rows[0]
--      ? res.json({ ok:true, item: row.rows[0] })
--      : res.status(404).json({ ok:false, error:'NOT_FOUND' });
-+    return res.json({ ok:true, item: { ...meta, specs } });
-   } catch (e) {
-     console.error(e); res.status(500).json({ ok:false, error:'detail_failed' });
    }
- });
  
- app.get('/parts/search', async (req, res) => {
--  const q      = (req.query.q || '').toString().trim();
--  const limit  = Math.min(Number(req.query.limit || 20), 100);
--  const family = (req.query.family || '').toString().toLowerCase();
-+  const q = (req.query.q || '').toString().trim();
-+  const family = (req.query.family || '').toString().trim().toLowerCase();
-+  const rawLimit = Number(req.query.limit || 20);
-+  const rawOffset = Number(req.query.offset || 0);
-+  const limit = Math.min(Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 20, 100);
-+  const offset = Math.max(Number.isFinite(rawOffset) ? Math.floor(rawOffset) : 0, 0);
+   for (const row of rows) {
+     for (const key of Object.keys(row || {})) {
+       const normalized = normKey(key);
+       if (physicalCols.has(normalized)) allKeys.add(normalized);
+     }
+   }
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index fcc492783204886dca6364a0c3b8d17d62feb325..e897fc055784deabbfd83ee8151ab11e62fb1917 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -900,50 +1025,92 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+           row?._doc_text ??
+           row?.doc_text ??
+           (options?.docText || options?.doc_text) ??
+           '',
+       );
+       const docTextLower = docTextRaw.toLowerCase();
+       const brandCandidates = [options?.brand, rec.brand, rec.brand_norm];
+       let brandKey = null;
+       for (const candidate of brandCandidates) {
+         if (!candidate) continue;
+         const trimmed = String(candidate).trim();
+         if (!trimmed) continue;
+         brandKey = await normalizeBrand(trimmed, docTextLower);
+         if (brandKey) break;
+       }
+       if (brandKey) {
+         if (!rec.brand || !String(rec.brand).trim()) {
+           rec.brand = options?.brand || brandKey;
+         }
+         rec.brand_norm = brandKey;
+       } else if (physicalCols.has('brand_norm')) {
+         rec.brand_norm = null;
+       }
+       if (physicalCols.has('last_error')) rec.last_error = null;
  
-   try {
--    const text = q ? `%${q.toLowerCase()}%` : '%';
--
--    if (family) {
--      const r = await db.query(`SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]);
--      if (!r.rows[0]?.specs_table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
--      const rows = await db.query(
--        `SELECT id, family_slug, brand, code, display_name,
--                image_uri, datasheet_uri, updated_at
--           FROM public.component_specs
--          WHERE family_slug = $3
--            AND (brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(coalesce(display_name,'')) LIKE $1)
--          ORDER BY updated_at DESC
--          LIMIT $2`,
--        [text, limit, family]
--      );
--      return res.json({ ok:true, items: rows.rows });
--    }
--
--    // (fallback) unified view if present, else relay view
--    try {
--      const rows = await db.query(
--        `SELECT id, family_slug, brand, code, display_name,
--                width_mm, height_mm, length_mm, image_uri, datasheet_uri, updated_at
--           FROM public.component_specs
--          WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(coalesce(display_name,'')) LIKE $1
--          ORDER BY updated_at DESC
--          LIMIT $2`,
--        [text, limit]
--      );
--      return res.json({ ok:true, items: rows.rows });
--    } catch {}
-     const rows = await db.query(
--      `SELECT * FROM public.relay_specs
--        WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
--        ORDER BY updated_at DESC
--        LIMIT $2`,
--      [text, limit]
-+      `SELECT
-+         id, family_slug, brand, pn,
-+         COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
-+         image_uri, datasheet_url, series, updated_at
-+       FROM public.component_specs
-+      WHERE ($1::text IS NULL OR family_slug = $1::text)
-+        AND (
-+             unaccent(brand) ILIKE unaccent('%' || $2::text || '%')
-+          OR unaccent(pn)    ILIKE unaccent('%' || $2::text || '%')
-+        )
-+      ORDER BY updated_at DESC
-+      LIMIT $3 OFFSET $4`,
-+      [family || null, q, limit, offset]
-     );
++      let orderingPayload = sharedOrderingInfo;
++      if (Object.prototype.hasOwnProperty.call(rec, 'ordering_info') && rec.ordering_info != null) {
++        orderingPayload = normalizeOrderingInfoPayload(rec.ordering_info) || orderingPayload;
++      }
 +
-     return res.json({ ok:true, items: rows.rows });
-   } catch (e) {
-     console.error(e); res.status(500).json({ ok:false, error:'search_failed' });
-   }
- });
++      let docTypeValue = sharedDocType;
++      if (Object.prototype.hasOwnProperty.call(rec, 'doc_type')) {
++        const normalizedRowDocType = normalizeDocType(rec.doc_type);
++        if (normalizedRowDocType) docTypeValue = normalizedRowDocType;
++      }
++
++      if (orderingPayload || docTypeValue) {
++        let rawHolder = rec.raw_json;
++        if (typeof rawHolder === 'string') {
++          try {
++            rawHolder = JSON.parse(rawHolder);
++          } catch (_) {
++            rawHolder = {};
++          }
++        }
++        if (!rawHolder || typeof rawHolder !== 'object' || Array.isArray(rawHolder)) {
++          rawHolder = {};
++        }
++        if (orderingPayload && !rawHolder.ordering_info) {
++          let cloned = orderingPayload;
++          try {
++            cloned = JSON.parse(JSON.stringify(orderingPayload));
++          } catch (_) {}
++          rawHolder.ordering_info = cloned;
++        }
++        if (docTypeValue && !rawHolder.doc_type) {
++          rawHolder.doc_type = docTypeValue;
++        }
++        rec.raw_json = rawHolder;
++      }
++      if (Object.prototype.hasOwnProperty.call(rec, 'ordering_info')) {
++        delete rec.ordering_info;
++      }
++      if (Object.prototype.hasOwnProperty.call(rec, 'doc_type')) {
++        delete rec.doc_type;
++      }
++
+       const templateContext = { ...rec };
+       const ctxText = docTextRaw;
+       const pnWasTemplate = looksLikeTemplate(templateContext.pn);
+       const codeWasTemplate = looksLikeTemplate(templateContext.code);
  
- /* ---------------- Ingest: manual / bulk / auto ---------------- */
- app.post('/ingest', requireSession, async (req, res) => {
-   try {
-     const {
-       family_slug, specs_table, brand, code, series, display_name,
-       datasheet_uri, cover, source_gcs_uri, raw_json = null,
-       fields = {}, values = {}
-     } = req.body || {};
+       if (pnWasTemplate) {
+         const renderedPn = renderAnyTemplate(templateContext.pn, templateContext, ctxText);
+         rec.pn = renderedPn ?? null;
+       }
  
-     const table = (specs_table || `${family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
-     if (!brand || !code) return res.status(400).json({ ok:false, error:'brand & code required' });
+       if (codeWasTemplate) {
+         const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
+         const renderedCode = renderAnyTemplate(templateContext.code, contextForCode, ctxText);
+         rec.code = renderedCode ?? null;
+       }
  
-     await ensureSpecsTable(table, fields);
-     const row = await upsertByBrandCode(table, {
-       brand,
-       code,
-       pn: code,
-       series,
-       display_name: display_name || (brand ? `${brand} ${code}` : null),
+       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
+         rec.pn = rec.code;
+       }
+ 
+       if (!isValidCode(rec.pn) && allowMinimalStrict) {
+         const base = fallbackHash || sha1(`${targetTable || ''}:${familySlug || ''}`);
+         const fallbackPn = `pdf:${base}#${rowIndex + 1}`;
+         rec.pn = fallbackPn;
+         if (!rec.code || !isValidCode(rec.code)) {

@@ -157,6 +157,129 @@ function isValidCode(value) {
   return PN_RE.test(trimmed);
 }
 
+function pickFiniteNumber(...candidates) {
+  for (const candidate of candidates) {
+    if (candidate == null || candidate === '') continue;
+    const num = Number(candidate);
+    if (Number.isFinite(num)) return num;
+  }
+  return null;
+}
+
+function normalizeDocType(value) {
+  if (value == null) return null;
+  const str = String(value).trim().toLowerCase();
+  if (!str) return null;
+  if (str.startsWith('order')) return 'ordering';
+  if (str.startsWith('catalog') || str.startsWith('multi')) return 'catalog';
+  if (str.startsWith('single') || str.startsWith('one')) return 'single';
+  return null;
+}
+
+function normalizeOrderingInfoPayload(raw) {
+  if (raw == null) return null;
+  let value = raw;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      value = JSON.parse(trimmed);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  if (Array.isArray(value)) {
+    const sections = value
+      .map((entry) => normalizeOrderingInfoPayload(entry))
+      .filter((entry) => entry && typeof entry === 'object');
+    if (!sections.length) return null;
+    if (sections.length === 1) return sections[0];
+    return { sections };
+  }
+
+  if (!value || typeof value !== 'object') return null;
+
+  const codes = [];
+  const seenCodes = new Set();
+  const collectCode = (input) => {
+    const str = typeof input === 'string' ? input : String(input ?? '');
+    const trimmed = str.trim();
+    if (!trimmed) return;
+    const normalized = trimmed.toUpperCase();
+    if (seenCodes.has(normalized)) return;
+    seenCodes.add(normalized);
+    codes.push(normalized);
+  };
+
+  if (Array.isArray(value.codes)) {
+    for (const code of value.codes) collectCode(code);
+  }
+  if (!codes.length && Array.isArray(value.scored)) {
+    for (const entry of value.scored) {
+      if (!entry || typeof entry !== 'object') continue;
+      collectCode(entry.code);
+    }
+  }
+  if (!codes.length && Array.isArray(value.sections)) {
+    for (const section of value.sections) {
+      const normalized = normalizeOrderingInfoPayload(section);
+      if (!normalized) continue;
+      if (Array.isArray(normalized.codes)) {
+        for (const code of normalized.codes) collectCode(code);
+      }
+    }
+  }
+
+  if (!codes.length) return null;
+
+  const textSources = [
+    value.text,
+    value.window_text,
+    value.windowText,
+    value?.window?.text,
+  ];
+  let text = null;
+  for (const candidate of textSources) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      text = candidate;
+      break;
+    }
+  }
+
+  const start = pickFiniteNumber(value.start, value.window_start, value?.window?.start);
+  const end = pickFiniteNumber(value.end, value.window_end, value?.window?.end);
+  const anchorIndex = pickFiniteNumber(
+    value.anchor_index,
+    value.anchorIndex,
+    value?.window?.anchor_index,
+    value?.window?.anchorIndex,
+  );
+
+  const scored = Array.isArray(value.scored)
+    ? value.scored
+        .map((entry) => {
+          if (!entry || typeof entry !== 'object') return null;
+          const code = typeof entry.code === 'string' ? entry.code.trim().toUpperCase() : null;
+          if (!code) return null;
+          const score = Number(entry.score);
+          const normalized = { code };
+          if (Number.isFinite(score)) normalized.score = score;
+          return normalized;
+        })
+        .filter(Boolean)
+    : null;
+
+  const payload = { codes };
+  if (text) payload.text = text;
+  if (start != null) payload.start = start;
+  if (end != null) payload.end = end;
+  if (anchorIndex != null) payload.anchor_index = anchorIndex;
+  if (scored && scored.length) payload.scored = scored;
+
+  return payload;
+}
+
 function repairPn(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
@@ -828,6 +951,8 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   const blueprintFieldMap = buildBlueprintFieldMap(blueprintMeta);
   const blueprintAllowedSet = buildAllowedKeySet(blueprintMeta);
   const pnTemplate = typeof options.pnTemplate === 'string' && options.pnTemplate ? options.pnTemplate : null;
+  const sharedOrderingInfo = normalizeOrderingInfoPayload(options?.orderingInfo);
+  const sharedDocType = normalizeDocType(options?.docType);
   const requiredKeys = Array.isArray(options.requiredKeys)
     ? options.requiredKeys.map((k) => normKey(k)).filter(Boolean)
     : [];
@@ -921,6 +1046,48 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         rec.brand_norm = null;
       }
       if (physicalCols.has('last_error')) rec.last_error = null;
+
+      let orderingPayload = sharedOrderingInfo;
+      if (Object.prototype.hasOwnProperty.call(rec, 'ordering_info') && rec.ordering_info != null) {
+        orderingPayload = normalizeOrderingInfoPayload(rec.ordering_info) || orderingPayload;
+      }
+
+      let docTypeValue = sharedDocType;
+      if (Object.prototype.hasOwnProperty.call(rec, 'doc_type')) {
+        const normalizedRowDocType = normalizeDocType(rec.doc_type);
+        if (normalizedRowDocType) docTypeValue = normalizedRowDocType;
+      }
+
+      if (orderingPayload || docTypeValue) {
+        let rawHolder = rec.raw_json;
+        if (typeof rawHolder === 'string') {
+          try {
+            rawHolder = JSON.parse(rawHolder);
+          } catch (_) {
+            rawHolder = {};
+          }
+        }
+        if (!rawHolder || typeof rawHolder !== 'object' || Array.isArray(rawHolder)) {
+          rawHolder = {};
+        }
+        if (orderingPayload && !rawHolder.ordering_info) {
+          let cloned = orderingPayload;
+          try {
+            cloned = JSON.parse(JSON.stringify(orderingPayload));
+          } catch (_) {}
+          rawHolder.ordering_info = cloned;
+        }
+        if (docTypeValue && !rawHolder.doc_type) {
+          rawHolder.doc_type = docTypeValue;
+        }
+        rec.raw_json = rawHolder;
+      }
+      if (Object.prototype.hasOwnProperty.call(rec, 'ordering_info')) {
+        delete rec.ordering_info;
+      }
+      if (Object.prototype.hasOwnProperty.call(rec, 'doc_type')) {
+        delete rec.doc_type;
+      }
 
       const templateContext = { ...rec };
       const ctxText = docTextRaw;

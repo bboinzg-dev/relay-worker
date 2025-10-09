@@ -24,6 +24,7 @@ const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
 const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
 const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
 const { processDocument: processDocAi } = require('../services/docai');
+const { rankPartNumbersFromOrderingSections } = require('../utils/ordering-sections');
 
 const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
 
@@ -69,6 +70,8 @@ const SKIP_SPEC_KEYS = new Set([
   'rawspecs',
   'raw_table',
   'raw_tables',
+  'ordering_info',
+  'doc_type',
 ]);
 
 function gatherRuntimeSpecKeys(rows) {
@@ -745,63 +748,74 @@ function normalizeCode(str) {
     .toUpperCase();
 }
 
-// “Ordering Information / How to Order / 주문 정보” 인접영역에서 품번 후보를 뽑아 점수화
-function rankPartNumbersFromOrderingSections(full, limit = 50) {
-  const text = String(full || '');
-  if (!text) return [];
+// --- 문서 타입 감지: 단일 / 카탈로그 / 오더링 섹션 ---
+function resolveDocTypeFromExtraction(payload, text = '') {
+  if (!payload || typeof payload !== 'object') return null;
 
-  // 앵커: 다국어 포함 (영/한/중 기본)
-  const anchorRe = /(ORDER(?:ING)?\s+(INFO|INFORMATION|GUIDE|CODE|NUMBER)|HOW\s+TO\s+ORDER|주문\s*정보|주문\s*코드|订购信息|订货信息)/i;
-  let windowStart = 0, windowEnd = text.length;
-  const m = text.match(anchorRe);
-  if (m) {
-    // 앵커 앞뒤 약 8~12KB 윈도 선택(표와 주석이 보통 이 범위에 몰린다)
-    const idx = m.index || 0;
-    windowStart = Math.max(0, idx - 8000);
-    windowEnd   = Math.min(text.length, idx + 12000);
-  }
-  const windowTxt = text.slice(windowStart, windowEnd);
+  const existingRaw = typeof payload.doc_type === 'string' ? payload.doc_type.trim().toLowerCase() : '';
+  const orderingCodes = Array.isArray(payload?.ordering_info?.codes)
+    ? payload.ordering_info.codes.filter(Boolean).length
+    : 0;
 
-  // 일반적 품번 패턴: 영문+숫자 조합, 하이픈 허용. (너무 짧음/너무 김/순수숫자/순수영문은 제외)
-  const candRe = /[A-Z][A-Z0-9](?:[A-Z0-9\-\.]{1,18})/g;
-  const raw = windowTxt.match(candRe) || [];
-
-  // 노이즈 필터 (규격·단위·규정 키워드 제거)
-  const blacklist = /^(ISO|RoHS|UL|VDC|VAC|A|mA|mm|Ω|OHM|PDF|PAGE|NOTE|DATE|LOT|WWW|HTTP|HTTPS)$/i;
-  const stats = new Map();
-
-  for (const r of raw) {
-    const code = normalizeCode(r);
-    if (!/[0-9]/.test(code)) continue;          // 숫자 포함 필수
-    if (code.length < 4 || code.length > 20) continue;
-    if (blacklist.test(code)) continue;
-
-    // 근접 컨텍스트로 가중치 (코일 전압/폼/패키지 등 키워드 주변의 후보를 우대)
-    const pos = windowTxt.indexOf(r);
-    const ctx = windowTxt.slice(Math.max(0, pos - 80), Math.min(windowTxt.length, pos + 80));
-    let score = 1;
-    if (/(coil|voltage|vdc|form|contact|series|type|형식|전압|코일)/i.test(ctx)) score += 2;
-    if (/(model|part\s*no\.?|ordering|주문|订购)/i.test(ctx)) score += 2;
-
-    stats.set(code, (stats.get(code) || 0) + score);
+  const rowCodes = new Set();
+  if (Array.isArray(payload.rows)) {
+    for (const row of payload.rows) {
+      if (!row || typeof row !== 'object') continue;
+      const code = String(row.code || row.pn || '').trim().toUpperCase();
+      if (code) rowCodes.add(code);
+    }
   }
 
-  return [...stats.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, limit)
-    .map(([code, score]) => ({ code, score }));
-}
-
-
-
-// --- NEW: doc type detector (catalog vs. single datasheet) ---
-function detectDocType(full) {
-  const t = String(full || '').toLowerCase();
-  // HOW TO ORDER / ORDERING INFORMATION / 주문 정보 / 订购信息 / 订货信息 / TYPES / Part No.
-  if (/(how to order|ordering information|주문\s*정보|订购信息|订货信息|\btypes\b|\bpart\s*no\.?\b)/i.test(t)) {
-    return 'catalog';
+  let candidateList = [];
+  if (Array.isArray(payload.codes) && payload.codes.length) {
+    candidateList = payload.codes;
+  } else if (Array.isArray(payload.mpn_list) && payload.mpn_list.length) {
+    candidateList = payload.mpn_list;
   }
-  return 'single';
+  const candidateCodes = new Set(
+    candidateList.map((code) => String(code || '').trim().toUpperCase()).filter(Boolean)
+  );
+
+  let inferred = 'single';
+  if (orderingCodes > 0) inferred = 'ordering';
+  else if (rowCodes.size > 1 || candidateCodes.size > 1) inferred = 'catalog';
+
+  const haystack = String(text || '').toLowerCase();
+  if (inferred !== 'ordering' && orderingCodes === 0 && haystack) {
+    if (
+      haystack.includes('how to order') ||
+      haystack.includes('ordering information') ||
+      haystack.includes('ordering info') ||
+      haystack.includes('주문') ||
+      haystack.includes('订购') ||
+      haystack.includes('订货')
+    ) {
+      inferred = 'ordering';
+    }
+  }
+  if (inferred === 'single' && candidateCodes.size > 0 && haystack) {
+    if (
+      haystack.includes('catalog') ||
+      haystack.includes('product list') ||
+      haystack.includes('types') ||
+      haystack.includes('part no') ||
+      haystack.includes('part number')
+    ) {
+      inferred = 'catalog';
+    }
+  }
+
+  if (existingRaw === 'ordering') return 'ordering';
+  if (existingRaw === 'catalog') {
+    return inferred === 'ordering' ? 'ordering' : 'catalog';
+  }
+  if (existingRaw === 'single') {
+    if (inferred === 'ordering') return 'ordering';
+    if (inferred === 'catalog') return 'catalog';
+    return 'single';
+  }
+
+  return inferred;
 }
 
 // ---- NEW: "TYPES / Part No." 표에서 품번 열거 추출 ----
@@ -1214,6 +1228,9 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   if (vertexExtractValues && Object.keys(vertexExtractValues).length) {
     rawJsonPayload.vertex_extract = vertexExtractValues;
   }
+  if (typeof extracted?.doc_type === 'string' && extracted.doc_type) {
+    rawJsonPayload.doc_type = extracted.doc_type;
+  }
   if (Object.keys(rawJsonPayload).length) {
     if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
       extracted.rows = [{}];
@@ -1369,6 +1386,25 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
     // 분할 여부는 별도 판단. 여기서는 후보만 모아둠.
     // extracted.rows는 건드리지 않음.
+  }
+
+  const docTypeResolved = resolveDocTypeFromExtraction(
+    extracted,
+    extracted?.text || previewText || ''
+  );
+  if (docTypeResolved) {
+    extracted.doc_type = docTypeResolved;
+  }
+  if (typeof extracted?.doc_type === 'string' && extracted.doc_type) {
+    const normalizedDocType = extracted.doc_type.trim();
+    if (normalizedDocType && Array.isArray(extracted.rows)) {
+      for (const row of extracted.rows) {
+        if (!row || typeof row !== 'object') continue;
+        if (row.doc_type == null || row.doc_type === '') {
+          row.doc_type = normalizedDocType;
+        }
+      }
+    }
   }
 
   const extractedText = extracted?.text || previewText || '';
@@ -2296,6 +2332,8 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         jobId,
         job_id: jobId,
         gcsUri,
+        orderingInfo: extracted?.ordering_info,
+        docType: extracted?.doc_type,
       }) || persistResult;
     }
   } else if (!records.length) {
@@ -2372,6 +2410,9 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   }
 
   response.affected = affected;
+  if (typeof extracted?.doc_type === 'string' && extracted.doc_type) {
+    response.doc_type = extracted.doc_type;
+  }
   return response;
 }
 

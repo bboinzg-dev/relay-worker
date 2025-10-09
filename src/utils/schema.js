@@ -145,10 +145,16 @@ async function upsertByBrandCode(tableName, values = {}) {
     .filter((col) => !NO_UPDATE.has(col))
     .map((col) => `${col}=EXCLUDED.${col}`);
 
+  // Spec tables enforce uniqueness via the expression index (lower(brand), lower(pn)).
+  // Prefer targeting the named index when available, but fall back to the raw expression.
+  const conflictByExpr = `ON CONFLICT ((lower(brand)), (lower(pn)))`;
+  const conflictByName = `ON CONFLICT ON CONSTRAINT ux_${table}_brandpn_expr`;
+  const conflict = table ? conflictByName : conflictByExpr;
+
   const sql = `
     insert into ${qualified} (${insertCols.join(',')})
     values (${params.join(',')})
-    on conflict (brand_norm, pn)
+    ${conflict}
     do update set ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
     returning *`;
 

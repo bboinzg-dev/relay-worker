@@ -941,7 +941,12 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
     return result;
   }
 
-  if (!physicalCols.has('pn') || !physicalCols.has('brand_norm') || !physicalCols.has('code_norm')) {
+  if (
+    !physicalCols.has('pn') ||
+    !physicalCols.has('brand_norm') ||
+    !physicalCols.has('code_norm') ||
+    !physicalCols.has('pn_norm')
+  ) {
     result.skipped.push({ reason: 'schema_not_ready' });
     return result;
   }
@@ -995,10 +1000,20 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
     ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ') + `, "updated_at" = now()`
     : null;
 
+  // Spec tables enforce uniqueness via the expression index (lower(brand), lower(pn)).
+  // Prefer targeting the named index when available, but fall back to the raw expression.
+  const tableSegment = String(targetTable || '').split('.').pop() || '';
+  const normalizedTable = tableSegment.replace(/[^A-Za-z0-9_]/g, '').toLowerCase();
+  const conflictByExpr = 'ON CONFLICT ((lower(brand)), (lower(pn)))';
+  const conflictByName = normalizedTable
+    ? `ON CONFLICT ON CONSTRAINT ux_${normalizedTable}_brandpn_expr`
+    : conflictByExpr;
+  const conflict = conflictByName || conflictByExpr;
+
   const sql = [
     `INSERT INTO ${targetTable} (${insertCols.map((c) => `"${c}"`).join(',')})`,
     `VALUES (${placeholders})`,
-    'ON CONFLICT (brand_norm, pn)',
+    conflict,
     updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
     'RETURNING pn',
   ].join('\n');

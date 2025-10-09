@@ -81,8 +81,8 @@ const SCALE_MAP = {
 };
 
 const LLM_CONFIDENCE_THRESHOLD = (() => {
-  const raw = Number(process.env.SPEC_AI_CONFIDENCE_MIN ?? process.env.SPEC_NORMALIZE_CONFIDENCE ?? 0.6);
-  return Number.isFinite(raw) ? raw : 0.6;
+  const raw = Number(process.env.SPEC_AI_CONFIDENCE_MIN ?? process.env.SPEC_NORMALIZE_CONFIDENCE ?? 0.5);
+  return Number.isFinite(raw) ? raw : 0.5;
 })();
 
 const llmNormalizationCache = new Map();

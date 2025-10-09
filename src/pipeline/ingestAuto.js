@@ -1773,7 +1773,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
       if (process.env.AUTO_ADD_FIELDS === '1' && newCanonKeys.length) {
         const uniqueNew = Array.from(new Set(newCanonKeys.filter(Boolean)));
-        const limitRaw = Number(process.env.AUTO_ADD_FIELDS_LIMIT || '20');
+        const limitRaw = Number(process.env.AUTO_ADD_FIELDS_LIMIT || '50');
         const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : uniqueNew.length;
         const target = uniqueNew.slice(0, limit);
         if (target.length) {
@@ -2009,6 +2009,14 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     ordering_info: extracted?.ordering_info ?? null,
     doc_type: typeof extracted?.doc_type === 'string' ? extracted.doc_type : null,
   };
+
+  console.log(
+    '[DIAG] processedPayload recs=%d mpnList=%d docType=%s ordering=%s',
+    Array.isArray(records) ? records.length : -1,
+    Array.isArray(processedPayload.mpnList) ? processedPayload.mpnList.length : -1,
+    processedPayload.doc_type || null,
+    processedPayload.ordering_info ? 'yes' : 'no',
+  );
 
   if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
   if (display_name != null) processedPayload.display_name = display_name;
@@ -2435,20 +2443,36 @@ async function persistProcessedData(processed = {}, overrides = {}) {
           }
         }
       }
-      persistResult = await saveExtractedSpecs(qualified, family, records, {
-        brand: brandOverride,
-        pnTemplate,
-        requiredKeys: effectiveRequired,
-        coreSpecKeys: effectiveRequired,
-        blueprint,
-        runId,
-        run_id: runId,
-        jobId,
-        job_id: jobId,
-        gcsUri,
-        orderingInfo: processed?.ordering_info,
-        docType: processed?.doc_type,
-      }) || persistResult;
+      console.log(
+        '[DIAG] persist start table=%s family=%s records=%d required=%d',
+        table,
+        family,
+        Array.isArray(records) ? records.length : -1,
+        Array.isArray(effectiveRequired) ? effectiveRequired.length : -1,
+      );
+      try {
+        persistResult = await saveExtractedSpecs(qualified, family, records, {
+          brand: brandOverride,
+          pnTemplate,
+          requiredKeys: effectiveRequired,
+          coreSpecKeys: effectiveRequired,
+          blueprint,
+          runId,
+          run_id: runId,
+          jobId,
+          job_id: jobId,
+          gcsUri,
+          orderingInfo: processed?.ordering_info,
+          docType: processed?.doc_type,
+        }) || persistResult;
+      } catch (e) {
+        console.warn('[persist] saveExtractedSpecs failed:', e?.message || e);
+        if (!persistResult || typeof persistResult !== 'object') {
+          persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
+        }
+        if (!Array.isArray(persistResult.warnings)) persistResult.warnings = [];
+        persistResult.warnings.push(String(e?.message || e));
+      }
     }
   } else if (!records.length) {
     persistResult.skipped = [{ reason: 'missing_pn' }];

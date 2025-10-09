@@ -1,155 +1,59 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index aa5c4cc374e7790823020b822232f5f610246ffa..1d97d9ee95ee95cac40c5669ed01a60c58e7828f 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -1984,50 +1984,52 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
-   const processedPayload = {
-     started,
-     gcsUri,
-     family,
-     table,
-     qualified,
-     pnTemplate,
-     requiredFields,
-     coverUri,
-     records,
-     rows: records,
-     mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
-     extractedBrand: extracted?.brand || null,
-     brandName,
-     baseSeries,
-     runId,
-     run_id: runId,
-     jobId,
-     job_id: jobId,
-     text: extractedText,
-     brand: brandEffectiveResolved || extracted?.brand || null,
-     brand_detected: detectedBrand || null,
-     brand_effective: brandEffectiveResolved || null,
-     brand_source: brandSource || null,
-     variant_keys_runtime: runtimeVariantKeys,
-+    ordering_info: extracted?.ordering_info ?? null,
-+    doc_type: typeof extracted?.doc_type === 'string' ? extracted.doc_type : null,
-   };
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index cf5eb89db820619563b41a08588431bb0829a346..96e227cf454afd41e9274607a5bcca465cd37bb0 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -59,52 +59,52 @@ const META_KEYS = new Set([
+   'created_at',
+   'updated_at',
+ ]);
  
-   if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
-   if (display_name != null) processedPayload.display_name = display_name;
-   if (code != null) processedPayload.code = code;
-   if (series != null) processedPayload.series = series;
+ const CONFLICT_KEYS = ['brand', 'pn'];
+ const NEVER_INSERT = new Set(['id', 'brand_norm', 'code_norm', 'pn_norm', 'created_at', 'updated_at']);
  
-   if (input && typeof input === 'object' && input.skipPersist) {
-     return { ok: true, phase: 'process', processed: processedPayload };
-   }
+ const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
+ const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
+ const BANNED_PREFIX = /^(pdf|page|figure|table|sheet|rev|ver|draft)\b/i;
+ const BANNED_EXACT = /^pdf-?1(\.\d+)?$/i;
  
-   const persistBrand = pickBrandHint(brandEffectiveResolved, overridesBrand, effectiveBrand, detectedBrand, brand);
-   const persistOverrides = {
-     brand: persistBrand || null,
-     code,
-     series: overridesSeries ?? series,
-     display_name,
-     runId,
-     run_id: runId,
-     jobId,
-     job_id: jobId,
-   };
-   return withDeadline(
-     persistProcessedData(processedPayload, persistOverrides),
-     HARD_CAP_MS,
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index aa5c4cc374e7790823020b822232f5f610246ffa..1d97d9ee95ee95cac40c5669ed01a60c58e7828f 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -2422,52 +2424,52 @@ async function persistProcessedData(processed = {}, overrides = {}) {
-     if (records.length) {
-       if (colTypes instanceof Map && colTypes.size) {
-         for (const rec of records) {
-           if (!rec || typeof rec !== 'object') continue;
-           for (const [k, v] of Object.entries(rec)) {
-             const keyLower = String(k || '').toLowerCase();
-             const t = colTypes.get(keyLower) || colTypes.get(k);
-             if (!t) continue;
-             if (t === 'numeric')      rec[k] = coerceNumeric(v);
-             else if (t === 'int')     rec[k] = toInt(v);
-             else if (t === 'bool')    rec[k] = toBool(v);
-           }
-         }
-       }
-       persistResult = await saveExtractedSpecs(qualified, family, records, {
-         brand: brandOverride,
-         pnTemplate,
-         requiredKeys: effectiveRequired,
-         coreSpecKeys: effectiveRequired,
-         blueprint,
-         runId,
-         run_id: runId,
-         jobId,
-         job_id: jobId,
-         gcsUri,
--        orderingInfo: extracted?.ordering_info,
--        docType: extracted?.doc_type,
-+        orderingInfo: processed?.ordering_info,
-+        docType: processed?.doc_type,
-       }) || persistResult;
+ const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+ const SCALE_MAP = {
+   k: 1e3,
+   m: 1e-3,
+   g: 1e9,
+   'µ': 1e-6,
+   u: 1e-6,
+   n: 1e-9,
+   p: 1e-12,
+ };
+ 
+ const LLM_CONFIDENCE_THRESHOLD = (() => {
+-  const raw = Number(process.env.SPEC_AI_CONFIDENCE_MIN ?? process.env.SPEC_NORMALIZE_CONFIDENCE ?? 0.6);
+-  return Number.isFinite(raw) ? raw : 0.6;
++  const raw = Number(process.env.SPEC_AI_CONFIDENCE_MIN ?? process.env.SPEC_NORMALIZE_CONFIDENCE ?? 0.5);
++  return Number.isFinite(raw) ? raw : 0.5;
+ })();
+ 
+ const llmNormalizationCache = new Map();
+ 
+ function buildBlueprintFieldMap(blueprint) {
+   const map = new Map();
+   if (!blueprint) return map;
+ 
+   const raw =
+     (blueprint.fields && typeof blueprint.fields === 'object' && blueprint.fields) ||
+     blueprint.fields_json ||
+     blueprint;
+ 
+   if (Array.isArray(raw)) {
+     for (const entry of raw) {
+       if (!entry || typeof entry !== 'object') continue;
+       const key = normKey(entry.name || entry.key || entry.field);
+       if (!key) continue;
+       map.set(key, entry);
      }
-   } else if (!records.length) {
-     persistResult.skipped = [{ reason: 'missing_pn' }];
+     return map;
    }
  
-   const persistedCodes = new Set(
-     (persistResult.written || [])
-       .map((pn) => String(pn || '').trim())
-       .filter(Boolean)
-   );
- 
-   if (!persistedCodes.size && records.length) {
-     for (const rec of records) {
-       const pn = String(rec.pn || rec.code || '').trim();
-       if (pn) persistedCodes.add(pn);
-     }
-   }
- 
-   const persistedList = Array.from(persistedCodes);
-   const mpnListSafe = Array.isArray(mpnList) ? mpnList : [];
-   const mergedMpns = Array.from(new Set([...persistedList, ...mpnListSafe]));
- 
-   const rejectReasons = new Set(
-     (persistResult.skipped || [])
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index aa5c4cc374e7790823020b822232f5f610246ffa..1d97d9ee95ee95cac40c5669ed01a60c58e7828f 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -2500,32 +2502,32 @@ async function persistProcessedData(processed = {}, overrides = {}) {
-     final_table: table,
-     specs_table: table,
-     brand: finalBrand,
-     brand_effective: finalBrand,
-     brand_source: processedBrandSource || null,
-     code: finalCode,
-     datasheet_uri: gcsUri,
-     cover: coverUri || primaryRecord?.image_uri || null,
-     rows: affected,        // 실제 반영된 개수만 기록
-     codes: Array.from(persistedCodes),  // 표시는 그대로
-     mpn_list: mergedMpns,
-     variant_keys_runtime: runtimeMeta.variant_keys_runtime,
-     reject_reasons: Array.from(rejectReasons),
-     warnings: Array.from(warningReasons),
-   };
- 
-   if (response.code == null && Array.isArray(processed?.candidateCodes) && processed.candidateCodes.length) {
-     response.code = processed.candidateCodes[0];
-   }
- 
-   if (response.code == null && baseSeries != null) {
-     response.code = baseSeries;
-   }
- 
-   response.affected = affected;
--  if (typeof extracted?.doc_type === 'string' && extracted.doc_type) {
--    response.doc_type = extracted.doc_type;
-+  if (typeof processed?.doc_type === 'string' && processed.doc_type) {
-+    response.doc_type = processed.doc_type;
-   }
-   return response;
- }
- 
- module.exports = { runAutoIngest, persistProcessedData };
+   if (raw && typeof raw === 'object') {
+     for (const [name, meta] of Object.entries(raw)) {

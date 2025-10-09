@@ -1,49 +1,53 @@
-diff --git a/src/utils/schema.js b/src/utils/schema.js
-index 235f47f909d1999083952ed926f6cbab57cdfe08..8df51be71b6c4a4907e2e4801d954c9c1b472b4b 100644
---- a/src/utils/schema.js
-+++ b/src/utils/schema.js
-@@ -123,37 +123,43 @@ async function upsertByBrandCode(tableName, values = {}) {
-       where table_schema=$1 and table_name=$2`,
-     [schema, table],
-   );
-   const allowed = new Set(meta.rows.map((r) => String(r.column_name).toLowerCase()));
-   const generated = new Set(
-     meta.rows
-       .filter((r) => String(r.is_generated || '').toUpperCase() === 'ALWAYS')
-       .map((r) => String(r.column_name).toLowerCase()),
-   );
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 4c519a79c86dc67650069e7fc7059f2d9df455f0..fd0952d067b133382e454c84fbd6eb4c8e1a93f7 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1,47 +1,46 @@
+ 'use strict';
  
-   const insertCols = [];
-   const insertVals = [];
-   for (const col of cols) {
-     if (!allowed.has(col)) continue;
-     if (generated.has(col)) continue;
-     insertCols.push(col);
-     insertVals.push(payload[col]);
-   }
-   if (!insertCols.length) return null;
+ const path = require('node:path');
+ const fs = require('node:fs/promises');
+ const os = require('node:os');
+ const crypto = require('node:crypto');
+ const { execFile } = require('node:child_process');
+ const { promisify } = require('node:util');
+ const execFileP = promisify(execFile);
  
-   const params = insertCols.map((_, i) => `$${i + 1}`);
-   const updates = insertCols
-     .filter((col) => !NO_UPDATE.has(col))
-     .map((col) => `${col}=EXCLUDED.${col}`);
+ const db = require('../../db');
+ const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
+ const { extractText } = require('../utils/extract');
+ const { getBlueprint } = require('../utils/blueprint');
+ const { resolveBrand } = require('../utils/brand');
+ const { detectVariantKeys } = require('../utils/ordering');
+ const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
+ const { extractFields } = require('./extractByBlueprint');
+ const { aiCanonicalizeKeys } = require('./ai/canonKeys');
+ const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
+-const { explodeToRows } = require('../ingest/mpn-exploder');
+-const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
++const { explodeToRows, splitAndCarryPrefix } = require('../utils/mpn-exploder');
+ const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
+ const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
+ const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
+ const { processDocument: processDocAi } = require('../services/docai');
+ const { rankPartNumbersFromOrderingSections } = require('../utils/ordering-sections');
  
-+  // Spec tables enforce uniqueness via the expression index (lower(brand), lower(pn)).
-+  // Prefer targeting the named index when available, but fall back to the raw expression.
-+  const conflictByExpr = `ON CONFLICT ((lower(brand)), (lower(pn)))`;
-+  const conflictByName = `ON CONFLICT ON CONSTRAINT ux_${table}_brandpn_expr`;
-+  const conflict = table ? conflictByName : conflictByExpr;
-+
-   const sql = `
-     insert into ${qualified} (${insertCols.join(',')})
-     values (${params.join(',')})
--    on conflict (brand_norm, pn)
-+    ${conflict}
-     do update set ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
-     returning *`;
+ const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
  
-   const res = await db.query(sql, insertVals);
-   return res.rows?.[0] || null;
- }
+ const USE_CODE_RULES = /^(1|true|on)$/i.test(process.env.USE_CODE_RULES ?? '1');
+ const USE_PN_TEMPLATE = /^(1|true|on)$/i.test(process.env.USE_PN_TEMPLATE ?? '1');
+ const USE_VARIANT_KEYS = /^(1|true|on)$/i.test(
+   process.env.USE_VARIANT_KEYS ?? (process.env.USE_CODE_RULES ?? '1')
+ );
  
- module.exports = { upsertByBrandCode };
+ function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
+   const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
+   return new Promise((resolve, reject) => {
+     const timer = setTimeout(() => {
+       clearTimeout(timer);
+       reject(new Error(`${label}_TIMEOUT`));
+     }, timeout);
+     Promise.resolve(promise)
+       .then((value) => {
+         clearTimeout(timer);
+         resolve(value);

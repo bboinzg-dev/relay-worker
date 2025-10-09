@@ -52,6 +52,25 @@ process.on('unhandledRejection', (e) => {
 const path = require('node:path');
 const fs = require('node:fs');
 
+function tryRequire(paths) {
+  const errors = [];
+  for (const p of paths) {
+    try {
+      return require(p);
+    } catch (err) {
+      if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
+        errors.push(err);
+        continue;
+      }
+      throw err;
+    }
+  }
+  const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
+  error.code = 'MODULE_NOT_FOUND';
+  error.attempts = errors.map((e) => e?.message || String(e));
+  throw error;
+}
+
 
 // --- 3rd-party ---
 const express = require('express');
@@ -70,15 +89,24 @@ try {
   console.error('[BOOT] db load failed:', err?.message || err);
   db = { query: async () => { throw new Error('DB_UNAVAILABLE'); } };
 }
-const { getSignedUrl, canonicalDatasheetPath, canonicalCoverPath, moveObject, storage, parseGcsUri } = require('./src/utils/gcs');
-const { ensureSpecsTable, upsertByBrandCode } = require('./src/utils/schema');
+const {
+  getSignedUrl,
+  canonicalDatasheetPath,
+  canonicalCoverPath,
+  moveObject,
+  storage,
+  parseGcsUri,
+} = tryRequire(['./src/utils/gcs', './gcs']);
+const { ensureSpecsTable, upsertByBrandCode } = tryRequire(['./src/utils/schema', './schema']);
 // 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
 let __INGEST_MOD__ = null;
 function getIngest() {
   if (__INGEST_MOD__) return __INGEST_MOD__;
   try {
-    const modPath = path.join(__dirname, 'src', 'pipeline', 'ingestAuto.js');
-    __INGEST_MOD__ = require(modPath);
+    __INGEST_MOD__ = tryRequire([
+      './src/pipeline/ingestAuto.js',
+      './ingestAuto.js',
+    ]);
   } catch (e) {
     console.error('[INGEST] module load failed:', e?.message || e);
     if (e?.stack) console.error('[INGEST] stack:', e.stack);

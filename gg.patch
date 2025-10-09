@@ -1,53 +1,113 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 4c519a79c86dc67650069e7fc7059f2d9df455f0..fd0952d067b133382e454c84fbd6eb4c8e1a93f7 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -1,47 +1,46 @@
+diff --git a/src/pipeline/ensure-spec-columns.js b/src/pipeline/ensure-spec-columns.js
+index 5bccf0c66c717153df4ff3daa872fe4e2df143f1..a9d2ef1e4da879ff710a9b4df4062f2e8b67c55e 100644
+--- a/src/pipeline/ensure-spec-columns.js
++++ b/src/pipeline/ensure-spec-columns.js
+@@ -1,75 +1,105 @@
  'use strict';
  
- const path = require('node:path');
- const fs = require('node:fs/promises');
- const os = require('node:os');
- const crypto = require('node:crypto');
- const { execFile } = require('node:child_process');
- const { promisify } = require('node:util');
- const execFileP = promisify(execFile);
+-const db = require('../../db');
++const path = require('node:path');
++
++function tryRequire(paths) {
++  const errors = [];
++  for (const p of paths) {
++    try {
++      return require(p);
++    } catch (err) {
++      if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
++        errors.push(err);
++        continue;
++      }
++      throw err;
++    }
++  }
++  const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
++  error.code = 'MODULE_NOT_FOUND';
++  error.attempts = errors.map((e) => e?.message || String(e));
++  throw error;
++}
++
++const db = tryRequire([
++  path.join(__dirname, '../../db'),
++  path.join(__dirname, '../db'),
++  path.join(__dirname, './db'),
++  path.join(process.cwd(), 'db'),
++]);
  
- const db = require('../../db');
- const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
- const { extractText } = require('../utils/extract');
- const { getBlueprint } = require('../utils/blueprint');
- const { resolveBrand } = require('../utils/brand');
- const { detectVariantKeys } = require('../utils/ordering');
- const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
- const { extractFields } = require('./extractByBlueprint');
- const { aiCanonicalizeKeys } = require('./ai/canonKeys');
- const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
--const { explodeToRows } = require('../ingest/mpn-exploder');
--const { splitAndCarryPrefix } = require('../utils/mpn-exploder');
-+const { explodeToRows, splitAndCarryPrefix } = require('../utils/mpn-exploder');
- const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
- const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
- const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
- const { processDocument: processDocAi } = require('../services/docai');
- const { rankPartNumbersFromOrderingSections } = require('../utils/ordering-sections');
+ const TYPE_MAP = {
+   int: 'integer',
+   integer: 'integer',
+   numeric: 'numeric',
+   number: 'numeric',
++  float: 'double precision',
++  double: 'double precision',
++  'double precision': 'double precision',
++  decimal: 'numeric',
+   bool: 'boolean',
+   boolean: 'boolean',
+   text: 'text',
+   string: 'text',
+ };
  
- const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
+ function normKey(k) {
+   return String(k || '')
+     .trim()
+     .toLowerCase()
+     .replace(/[^a-z0-9_]/g, '');
+ }
  
- const USE_CODE_RULES = /^(1|true|on)$/i.test(process.env.USE_CODE_RULES ?? '1');
- const USE_PN_TEMPLATE = /^(1|true|on)$/i.test(process.env.USE_PN_TEMPLATE ?? '1');
- const USE_VARIANT_KEYS = /^(1|true|on)$/i.test(
-   process.env.USE_VARIANT_KEYS ?? (process.env.USE_CODE_RULES ?? '1')
- );
+ async function getColumnsOf(qualified) {
+   const [schema, table] = qualified.includes('.')
+     ? qualified.split('.', 2)
+     : ['public', qualified];
+   const { rows } = await db.query(
+     `SELECT lower(column_name) AS col
+        FROM information_schema.columns
+       WHERE table_schema = $1
+         AND table_name   = $2`,
+     [schema, table]
+   );
+   return new Set(rows.map((r) => r.col));
+ }
  
- function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
-   const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
-   return new Promise((resolve, reject) => {
-     const timer = setTimeout(() => {
-       clearTimeout(timer);
-       reject(new Error(`${label}_TIMEOUT`));
-     }, timeout);
-     Promise.resolve(promise)
-       .then((value) => {
-         clearTimeout(timer);
-         resolve(value);
+ async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
+   const have = await getColumnsOf(qualifiedTable);
+ 
+   const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
+   const variants = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+     ? blueprint.ingestOptions.variant_keys
+     : Array.isArray(blueprint?.variant_keys)
+       ? blueprint.variant_keys
+       : [];
+-        const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
++  const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
+   const fieldKeys = Object.keys(fieldMeta);
+ 
+   const wantedList = [
+     ...new Set(
+       [...allowed, ...variants, ...fieldKeys]
+         .map(normKey)
+         .filter(Boolean)
+     ),
+   ];
+ 
+   const toAdd = [];
+   for (const key of wantedList) {
+     if (have.has(key)) continue;
+     const rawType = fieldMeta[key]?.type ?? fieldMeta[key] ?? 'text';
+     const pgType = TYPE_MAP[String(rawType).toLowerCase()] || 'text';
+     toAdd.push({ key, pgType });
+   }
+ 
+   if (!toAdd.length) return { added: 0 };
+ 
+   for (const { key, pgType } of toAdd) {
+     await db.query(
+       `ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`
+     );
+   }
+   return { added: toAdd.length, columns: toAdd };
+ }
+ 
+-module.exports = { ensureSpecColumnsForBlueprint, getColumnsOf };
++module.exports = { ensureSpecColumnsForBlueprint, getColumnsOf };

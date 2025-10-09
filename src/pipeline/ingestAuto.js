@@ -2440,6 +2440,25 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     }
 
     if (records.length) {
+      for (const r of records) {
+        if (!r || typeof r !== 'object') continue;
+        r.brand =
+          safeBrand(r.brand) ||
+          safeBrand(brandOverride) ||
+          safeBrand(processedEffective) ||
+          safeBrand(brandName) ||
+          safeBrand(extractedBrand) ||
+          safeBrand(processedDetected) ||
+          null;
+
+        if (!r.pn && r.code) r.pn = r.code;
+        if (!r.code && r.pn) r.code = r.pn;
+
+        if (r.pn != null && String(r.pn).trim() === '') r.pn = null;
+        if (r.code != null && String(r.code).trim() === '') r.code = null;
+        if (r.brand != null && String(r.brand).trim() === '') r.brand = null;
+      }
+
       if (colTypes instanceof Map && colTypes.size) {
         for (const rec of records) {
           if (!rec || typeof rec !== 'object') continue;
@@ -2460,6 +2479,17 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         Array.isArray(records) ? records.length : -1,
         Array.isArray(effectiveRequired) ? effectiveRequired.length : -1,
       );
+      if (Array.isArray(records) && records.length) {
+        const r0 = records[0] || {};
+        console.log('[PERSIST.INPUT]', {
+          family,
+          table,
+          brand: r0.brand ?? null,
+          pn: r0.pn ?? null,
+          code: r0.code ?? null,
+          display_name: r0.display_name ?? null,
+        });
+      }
       try {
         persistResult = await saveExtractedSpecs(qualified, family, records, {
           brand: brandOverride,

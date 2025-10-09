@@ -1,62 +1,213 @@
-diff --git a/src/pipeline/ensure-spec-columns.js b/src/pipeline/ensure-spec-columns.js
-index 5df3db394c8b545575fd29744fcaa910493d159a..7412758ddf6dd6f110c7125803224fd1ed1f2a10 100644
---- a/src/pipeline/ensure-spec-columns.js
-+++ b/src/pipeline/ensure-spec-columns.js
-@@ -21,54 +21,55 @@ function normKey(k) {
- }
- 
- async function getColumnsOf(qualified) {
-   const [schema, table] = qualified.includes('.')
-     ? qualified.split('.', 2)
-     : ['public', qualified];
-   const { rows } = await db.query(
-     `SELECT lower(column_name) AS col
-        FROM information_schema.columns
-       WHERE table_schema = $1
-         AND table_name   = $2`,
-     [schema, table]
-   );
-   return new Set(rows.map((r) => r.col));
- }
- 
- async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
-   const have = await getColumnsOf(qualifiedTable);
- 
-   const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
-   const variants = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-     ? blueprint.ingestOptions.variant_keys
-     : Array.isArray(blueprint?.variant_keys)
-       ? blueprint.variant_keys
-       : [];
-+  const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
-+  const fieldKeys = Object.keys(fieldMeta);
- 
-   const wantedList = [
-     ...new Set(
--      [...allowed, ...variants]
-+      [...allowed, ...variants, ...fieldKeys]
-         .map(normKey)
-         .filter(Boolean)
-     ),
-   ];
- 
--  const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
-   const toAdd = [];
-   for (const key of wantedList) {
-     if (have.has(key)) continue;
-     const rawType = fieldMeta[key]?.type ?? fieldMeta[key] ?? 'text';
-     const pgType = TYPE_MAP[String(rawType).toLowerCase()] || 'text';
-     toAdd.push({ key, pgType });
-   }
- 
-   if (!toAdd.length) return { added: 0 };
- 
-   for (const { key, pgType } of toAdd) {
-     await db.query(
-       `ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`
+diff --git a/server.js b/server.js
+index 95802b8f589d558ddbadaa656d38e4fff34954ec..3595252338297876d9a288b7ca56b96354f23209 100644
+--- a/server.js
++++ b/server.js
+@@ -532,140 +532,135 @@ app.get('/catalog/registry', async (_req, res) => {
+       'SELECT family_slug, specs_table FROM public.component_registry ORDER BY family_slug'
      );
+     res.json({ items: r.rows });
+   } catch (e) {
+     console.error(e); res.status(500).json({ ok:false, error:'registry failed' });
    }
-   return { added: toAdd.length, columns: toAdd };
- }
+ });
  
- module.exports = { ensureSpecColumnsForBlueprint, getColumnsOf };
+ app.get('/catalog/blueprint/:family', async (req, res) => {
+   try {
+     const r = await db.query(`
+       SELECT b.family_slug, r.specs_table, b.fields_json, b.prompt_template
+         FROM public.component_spec_blueprint b
+         JOIN public.component_registry r USING (family_slug)
+        WHERE b.family_slug = $1
+        LIMIT 1`, [req.params.family]);
+     if (!r.rows.length) return res.status(404).json({ ok:false, error:'blueprint not found' });
+     res.json(r.rows[0]);
+   } catch (e) {
+     console.error(e); res.status(500).json({ ok:false, error:'blueprint failed' });
+   }
+ });
+ 
+ /* ---------------- Parts (compat: relay + generic) ---------------- */
+ app.get('/parts/detail', async (req, res) => {
+-  const brand  = (req.query.brand || '').toString();
+-  const code   = (req.query.code  || '').toString();
+-  const family = (req.query.family || '').toString().toLowerCase();
+-  if (!brand || !code) return res.status(400).json({ ok:false, error:'brand & code required' });
++  const brand = (req.query.brand || '').toString().trim();
++  let pn = (req.query.pn || '').toString().trim();
++  const legacyCode = (req.query.code || '').toString().trim();
++  if (!pn && legacyCode) pn = legacyCode;
++  if (!brand || !pn) return res.status(400).json({ ok:false, error:'brand & pn required' });
++
++  const sanitizeSpecsRow = (row) => {
++    if (!row || typeof row !== 'object') return null;
++    const omit = new Set(['brand_norm', 'code', 'code_norm', 'pn_norm', 'display_name', 'datasheet_uri', 'cover']);
++    const out = {};
++    for (const [key, value] of Object.entries(row)) {
++      if (omit.has(key)) continue;
++      out[key] = value;
++    }
++    return out;
++  };
+ 
+   try {
+-    if (family) {
+-      const r = await db.query(
++    const metaResult = await db.query(
++      `SELECT id, family_slug, brand, pn,
++              COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
++              image_uri, datasheet_url, series, updated_at
++         FROM public.component_specs
++        WHERE lower(brand) = lower($1) AND lower(pn) = lower($2)
++        LIMIT 1`,
++      [brand, pn]
++    );
++
++    const meta = metaResult.rows[0];
++    if (!meta) return res.status(404).json({ ok:false, error:'NOT_FOUND' });
++
++    let specs = null;
++    const metaFamilySlug = typeof meta.family_slug === 'string' ? meta.family_slug.trim().toLowerCase() : '';
++    const requestFamilySlug = (req.query.family || '').toString().trim().toLowerCase();
++    const familySlug = metaFamilySlug || requestFamilySlug || null;
++    if (familySlug) {
++      const registry = await db.query(
+         `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+-        [family]
++        [familySlug]
+       );
+-      const table = r.rows[0]?.specs_table;
+-      if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
+-      if (!/^[a-zA-Z0-9_]+$/.test(table)) {
+-        console.error('[parts/detail] invalid table name', { table });
+-        return res.status(500).json({ ok:false, error:'INVALID_TABLE' });
++      const table = registry.rows[0]?.specs_table;
++      if (table) {
++        if (!/^[a-zA-Z0-9_]+$/.test(table)) {
++          console.error('[parts/detail] invalid table name', { table });
++          return res.status(500).json({ ok:false, error:'INVALID_TABLE' });
++        }
++        const detail = await db.query(
++          `SELECT * FROM public.${table} WHERE lower(brand)=lower($1) AND lower(pn)=lower($2) LIMIT 1`,
++          [brand, pn]
++        );
++        specs = sanitizeSpecsRow(detail.rows[0]) || null;
+       }
+-      const row = await db.query(
+-        `SELECT * FROM public.${table} WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
+-        [brand, code]
+-      );
+-      return row.rows[0]
+-        ? res.json({ ok:true, item: row.rows[0] })
+-        : res.status(404).json({ ok:false, error:'NOT_FOUND' });
+     }
+ 
+-    // fallback: unified view if present, else legacy relay view
+-    try {
+-      const row = await db.query(
+-        `SELECT * FROM public.component_specs WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
+-        [brand, code]
+-      );
+-      if (row.rows[0]) return res.json({ ok:true, item: row.rows[0] });
+-    } catch {}
+-    const row = await db.query(
+-      `SELECT * FROM public.relay_specs WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
+-      [brand, code]
+-    );
+-    return row.rows[0]
+-      ? res.json({ ok:true, item: row.rows[0] })
+-      : res.status(404).json({ ok:false, error:'NOT_FOUND' });
++    return res.json({ ok:true, item: { ...meta, specs } });
+   } catch (e) {
+     console.error(e); res.status(500).json({ ok:false, error:'detail_failed' });
+   }
+ });
+ 
+ app.get('/parts/search', async (req, res) => {
+-  const q      = (req.query.q || '').toString().trim();
+-  const limit  = Math.min(Number(req.query.limit || 20), 100);
+-  const family = (req.query.family || '').toString().toLowerCase();
++  const q = (req.query.q || '').toString().trim();
++  const family = (req.query.family || '').toString().trim().toLowerCase();
++  const rawLimit = Number(req.query.limit || 20);
++  const rawOffset = Number(req.query.offset || 0);
++  const limit = Math.min(Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 20, 100);
++  const offset = Math.max(Number.isFinite(rawOffset) ? Math.floor(rawOffset) : 0, 0);
+ 
+   try {
+-    const text = q ? `%${q.toLowerCase()}%` : '%';
+-
+-    if (family) {
+-      const r = await db.query(`SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]);
+-      if (!r.rows[0]?.specs_table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
+-      const rows = await db.query(
+-        `SELECT id, family_slug, brand, code, display_name,
+-                image_uri, datasheet_uri, updated_at
+-           FROM public.component_specs
+-          WHERE family_slug = $3
+-            AND (brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(coalesce(display_name,'')) LIKE $1)
+-          ORDER BY updated_at DESC
+-          LIMIT $2`,
+-        [text, limit, family]
+-      );
+-      return res.json({ ok:true, items: rows.rows });
+-    }
+-
+-    // (fallback) unified view if present, else relay view
+-    try {
+-      const rows = await db.query(
+-        `SELECT id, family_slug, brand, code, display_name,
+-                width_mm, height_mm, length_mm, image_uri, datasheet_uri, updated_at
+-           FROM public.component_specs
+-          WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(coalesce(display_name,'')) LIKE $1
+-          ORDER BY updated_at DESC
+-          LIMIT $2`,
+-        [text, limit]
+-      );
+-      return res.json({ ok:true, items: rows.rows });
+-    } catch {}
+     const rows = await db.query(
+-      `SELECT * FROM public.relay_specs
+-        WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
+-        ORDER BY updated_at DESC
+-        LIMIT $2`,
+-      [text, limit]
++      `SELECT
++         id, family_slug, brand, pn,
++         COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
++         image_uri, datasheet_url, series, updated_at
++       FROM public.component_specs
++      WHERE ($1::text IS NULL OR family_slug = $1::text)
++        AND (
++             unaccent(brand) ILIKE unaccent('%' || $2::text || '%')
++          OR unaccent(pn)    ILIKE unaccent('%' || $2::text || '%')
++        )
++      ORDER BY updated_at DESC
++      LIMIT $3 OFFSET $4`,
++      [family || null, q, limit, offset]
+     );
++
+     return res.json({ ok:true, items: rows.rows });
+   } catch (e) {
+     console.error(e); res.status(500).json({ ok:false, error:'search_failed' });
+   }
+ });
+ 
+ /* ---------------- Ingest: manual / bulk / auto ---------------- */
+ app.post('/ingest', requireSession, async (req, res) => {
+   try {
+     const {
+       family_slug, specs_table, brand, code, series, display_name,
+       datasheet_uri, cover, source_gcs_uri, raw_json = null,
+       fields = {}, values = {}
+     } = req.body || {};
+ 
+     const table = (specs_table || `${family_slug}_specs`).replace(/[^a-zA-Z0-9_]/g, '');
+     if (!brand || !code) return res.status(400).json({ ok:false, error:'brand & code required' });
+ 
+     await ensureSpecsTable(table, fields);
+     const row = await upsertByBrandCode(table, {
+       brand,
+       code,
+       pn: code,
+       series,
+       display_name: display_name || (brand ? `${brand} ${code}` : null),

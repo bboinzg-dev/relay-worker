@@ -554,96 +554,91 @@ app.get('/catalog/blueprint/:family', async (req, res) => {
 
 /* ---------------- Parts (compat: relay + generic) ---------------- */
 app.get('/parts/detail', async (req, res) => {
-  const brand  = (req.query.brand || '').toString();
-  const code   = (req.query.code  || '').toString();
-  const family = (req.query.family || '').toString().toLowerCase();
-  if (!brand || !code) return res.status(400).json({ ok:false, error:'brand & code required' });
+  const brand = (req.query.brand || '').toString().trim();
+  let pn = (req.query.pn || '').toString().trim();
+  const legacyCode = (req.query.code || '').toString().trim();
+  if (!pn && legacyCode) pn = legacyCode;
+  if (!brand || !pn) return res.status(400).json({ ok:false, error:'brand & pn required' });
+
+  const sanitizeSpecsRow = (row) => {
+    if (!row || typeof row !== 'object') return null;
+    const omit = new Set(['brand_norm', 'code', 'code_norm', 'pn_norm', 'display_name', 'datasheet_uri', 'cover']);
+    const out = {};
+    for (const [key, value] of Object.entries(row)) {
+      if (omit.has(key)) continue;
+      out[key] = value;
+    }
+    return out;
+  };
 
   try {
-    if (family) {
-      const r = await db.query(
+    const metaResult = await db.query(
+      `SELECT id, family_slug, brand, pn,
+              COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
+              image_uri, datasheet_url, series, updated_at
+         FROM public.component_specs
+        WHERE lower(brand) = lower($1) AND lower(pn) = lower($2)
+        LIMIT 1`,
+      [brand, pn]
+    );
+
+    const meta = metaResult.rows[0];
+    if (!meta) return res.status(404).json({ ok:false, error:'NOT_FOUND' });
+
+    let specs = null;
+    const metaFamilySlug = typeof meta.family_slug === 'string' ? meta.family_slug.trim().toLowerCase() : '';
+    const requestFamilySlug = (req.query.family || '').toString().trim().toLowerCase();
+    const familySlug = metaFamilySlug || requestFamilySlug || null;
+    if (familySlug) {
+      const registry = await db.query(
         `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
-        [family]
+        [familySlug]
       );
-      const table = r.rows[0]?.specs_table;
-      if (!table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
-      if (!/^[a-zA-Z0-9_]+$/.test(table)) {
-        console.error('[parts/detail] invalid table name', { table });
-        return res.status(500).json({ ok:false, error:'INVALID_TABLE' });
+      const table = registry.rows[0]?.specs_table;
+      if (table) {
+        if (!/^[a-zA-Z0-9_]+$/.test(table)) {
+          console.error('[parts/detail] invalid table name', { table });
+          return res.status(500).json({ ok:false, error:'INVALID_TABLE' });
+        }
+        const detail = await db.query(
+          `SELECT * FROM public.${table} WHERE lower(brand)=lower($1) AND lower(pn)=lower($2) LIMIT 1`,
+          [brand, pn]
+        );
+        specs = sanitizeSpecsRow(detail.rows[0]) || null;
       }
-      const row = await db.query(
-        `SELECT * FROM public.${table} WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
-        [brand, code]
-      );
-      return row.rows[0]
-        ? res.json({ ok:true, item: row.rows[0] })
-        : res.status(404).json({ ok:false, error:'NOT_FOUND' });
     }
 
-    // fallback: unified view if present, else legacy relay view
-    try {
-      const row = await db.query(
-        `SELECT * FROM public.component_specs WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
-        [brand, code]
-      );
-      if (row.rows[0]) return res.json({ ok:true, item: row.rows[0] });
-    } catch {}
-    const row = await db.query(
-      `SELECT * FROM public.relay_specs WHERE brand_norm = lower($1) AND code_norm = lower($2) LIMIT 1`,
-      [brand, code]
-    );
-    return row.rows[0]
-      ? res.json({ ok:true, item: row.rows[0] })
-      : res.status(404).json({ ok:false, error:'NOT_FOUND' });
+    return res.json({ ok:true, item: { ...meta, specs } });
   } catch (e) {
     console.error(e); res.status(500).json({ ok:false, error:'detail_failed' });
   }
 });
 
 app.get('/parts/search', async (req, res) => {
-  const q      = (req.query.q || '').toString().trim();
-  const limit  = Math.min(Number(req.query.limit || 20), 100);
-  const family = (req.query.family || '').toString().toLowerCase();
+  const q = (req.query.q || '').toString().trim();
+  const family = (req.query.family || '').toString().trim().toLowerCase();
+  const rawLimit = Number(req.query.limit || 20);
+  const rawOffset = Number(req.query.offset || 0);
+  const limit = Math.min(Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 20, 100);
+  const offset = Math.max(Number.isFinite(rawOffset) ? Math.floor(rawOffset) : 0, 0);
 
   try {
-    const text = q ? `%${q.toLowerCase()}%` : '%';
-
-    if (family) {
-      const r = await db.query(`SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`, [family]);
-      if (!r.rows[0]?.specs_table) return res.status(400).json({ ok:false, error:'UNKNOWN_FAMILY' });
-      const rows = await db.query(
-        `SELECT id, family_slug, brand, code, display_name,
-                image_uri, datasheet_uri, updated_at
-           FROM public.component_specs
-          WHERE family_slug = $3
-            AND (brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(coalesce(display_name,'')) LIKE $1)
-          ORDER BY updated_at DESC
-          LIMIT $2`,
-        [text, limit, family]
-      );
-      return res.json({ ok:true, items: rows.rows });
-    }
-
-    // (fallback) unified view if present, else relay view
-    try {
-      const rows = await db.query(
-        `SELECT id, family_slug, brand, code, display_name,
-                width_mm, height_mm, length_mm, image_uri, datasheet_uri, updated_at
-           FROM public.component_specs
-          WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(coalesce(display_name,'')) LIKE $1
-          ORDER BY updated_at DESC
-          LIMIT $2`,
-        [text, limit]
-      );
-      return res.json({ ok:true, items: rows.rows });
-    } catch {}
     const rows = await db.query(
-      `SELECT * FROM public.relay_specs
-        WHERE brand_norm LIKE $1 OR code_norm LIKE $1 OR lower(series) LIKE $1 OR lower(display_name) LIKE $1
-        ORDER BY updated_at DESC
-        LIMIT $2`,
-      [text, limit]
+      `SELECT
+         id, family_slug, brand, pn,
+         COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
+         image_uri, datasheet_url, series, updated_at
+       FROM public.component_specs
+      WHERE ($1::text IS NULL OR family_slug = $1::text)
+        AND (
+             unaccent(brand) ILIKE unaccent('%' || $2::text || '%')
+          OR unaccent(pn)    ILIKE unaccent('%' || $2::text || '%')
+        )
+      ORDER BY updated_at DESC
+      LIMIT $3 OFFSET $4`,
+      [family || null, q, limit, offset]
     );
+
     return res.json({ ok:true, items: rows.rows });
   } catch (e) {
     console.error(e); res.status(500).json({ ok:false, error:'search_failed' });

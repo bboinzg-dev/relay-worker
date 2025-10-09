@@ -385,6 +385,18 @@ try {
   console.warn('[BOOT] fallback AI routes mounted at /api/ai/*');
 }
 
+/* ---------------- Worker ingest endpoint (Cloud Tasks target) ---------------- */
+app.post('/api/worker/ingest', async (req, res) => {
+  try {
+    const payload = (req.body?.payload) || req.body || {};
+    const out = await getIngest().runAutoIngest(payload);
+    return res.status(202).json({ ok: true, run: out?.runId || null });
+  } catch (e) {
+    console.error('[worker/ingest] error:', e?.message || e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 /* ---------------- Mount modular routers (after global middleware) ---------------- */
 try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
 try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}

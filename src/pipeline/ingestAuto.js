@@ -2006,6 +2006,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     brand_effective: brandEffectiveResolved || null,
     brand_source: brandSource || null,
     variant_keys_runtime: runtimeVariantKeys,
+    ordering_info: extracted?.ordering_info ?? null,
+    doc_type: typeof extracted?.doc_type === 'string' ? extracted.doc_type : null,
   };
 
   if (Array.isArray(extracted?.codes)) processedPayload.candidateCodes = extracted.codes;
@@ -2444,8 +2446,8 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         jobId,
         job_id: jobId,
         gcsUri,
-        orderingInfo: extracted?.ordering_info,
-        docType: extracted?.doc_type,
+        orderingInfo: processed?.ordering_info,
+        docType: processed?.doc_type,
       }) || persistResult;
     }
   } else if (!records.length) {
@@ -2522,8 +2524,8 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   }
 
   response.affected = affected;
-  if (typeof extracted?.doc_type === 'string' && extracted.doc_type) {
-    response.doc_type = extracted.doc_type;
+  if (typeof processed?.doc_type === 'string' && processed.doc_type) {
+    response.doc_type = processed.doc_type;
   }
   return response;
 }

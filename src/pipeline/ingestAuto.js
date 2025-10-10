@@ -72,6 +72,12 @@ const AUTO_ADD_FIELDS_LIMIT = Number.isFinite(AUTO_ADD_FIELDS_LIMIT_RAW)
   ? Math.max(0, AUTO_ADD_FIELDS_LIMIT_RAW)
   : 20;
 
+  // ── Auto-alias learning: unknown spec keys → extraction_recipe.key_alias ──
+const AUTO_ALIAS_LEARN = /^(1|true|on)$/i.test(process.env.AUTO_ALIAS_LEARN || '1');
+const AUTO_ALIAS_MIN_CONF = Math.max(0, Math.min(1, Number(process.env.AUTO_ALIAS_MIN_CONF || 0.8)));
+const AUTO_ALIAS_LIMIT_RAW = Number(process.env.AUTO_ALIAS_LIMIT || 20);
+const AUTO_ALIAS_LIMIT = Number.isFinite(AUTO_ALIAS_LIMIT_RAW) ? Math.max(0, AUTO_ALIAS_LIMIT_RAW) : 20;
+
 function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
   const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
   return new Promise((resolve, reject) => {
@@ -236,6 +242,117 @@ const ENUM_MAP = {
   form: { SPST: '1A', SPDT: '1C', DPDT: '2C' }
 };
 
+function normalizeKeyName(v) {
+  return String(v || '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '');
+}
+function normalizeAlias(v) {
+  return String(v || '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// extraction_recipe.recipe.key_alias { canonical_key: [ alias... ] } upsert
+async function upsertRecipeKeyAliases({ family, brand, series, additions }) {
+  if (!family || !additions || typeof additions !== 'object') return { updated: false };
+  const brandSlug = normalizeSlug(brand); // already imported from variant-keys
+  const seriesSlug = normalizeSlug(series);
+  const sel = await db.query(
+    `SELECT recipe FROM public.extraction_recipe
+      WHERE family_slug=$1 AND COALESCE(brand_slug,'')=COALESCE($2,'') AND COALESCE(series_slug,'')=COALESCE($3,'')
+      LIMIT 1`,
+    [family, brandSlug, seriesSlug]
+  ); /* uses the same table variant-keys reads from */ /* :contentReference[oaicite:5]{index=5} */
+  let recipe = sel.rows[0]?.recipe;
+  if (typeof recipe === 'string') {
+    try {
+      recipe = JSON.parse(recipe);
+    } catch {
+      recipe = {};
+    }
+  }
+  if (!recipe || typeof recipe !== 'object') recipe = {};
+  const keyAlias = recipe.key_alias && typeof recipe.key_alias === 'object' ? { ...recipe.key_alias } : {};
+  let changed = 0;
+  for (const [key, arr] of Object.entries(additions)) {
+    const k = normalizeKeyName(key);
+    if (!k) continue;
+    const exists = new Set(Array.isArray(keyAlias[k]) ? keyAlias[k].map(normalizeAlias) : []);
+    const incoming = (Array.isArray(arr) ? arr : [arr]).map(normalizeAlias).filter(Boolean);
+    const merged = [...new Set([...exists, ...incoming])];
+    if (!merged.length) continue;
+    keyAlias[k] = merged;
+    changed += merged.length - exists.size;
+  }
+  if (!changed) return { updated: false };
+  recipe.key_alias = keyAlias;
+  if (sel.rows.length) {
+    await db.query(
+      `UPDATE public.extraction_recipe
+         SET recipe=$4
+       WHERE family_slug=$1 AND COALESCE(brand_slug,'')=COALESCE($2,'') AND COALESCE(series_slug,'')=COALESCE($3,'')`,
+      [family, brandSlug, seriesSlug, JSON.stringify(recipe)]
+    );
+  } else {
+    await db.query(
+      `INSERT INTO public.extraction_recipe (family_slug, brand_slug, series_slug, recipe)
+       VALUES ($1,$2,$3,$4)`,
+      [family, brandSlug, seriesSlug, JSON.stringify(recipe)]
+    );
+  }
+  return { updated: true, added: changed };
+}
+
+function collectUnknownKeysFromExtraction(extracted, knownSet) {
+  const out = new Set();
+  const rows = Array.isArray(extracted?.rows) ? extracted.rows : [];
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    for (const raw of Object.keys(row)) {
+      const norm = normalizeKeyName(raw);
+      if (!norm) continue;
+      if (knownSet?.has?.(norm)) continue;
+      out.add(raw);
+    }
+  }
+  return Array.from(out);
+}
+
+async function learnAndPersistAliases({ family, brand, series, blueprint, extracted }) {
+  if (!AUTO_ALIAS_LEARN) return { added: 0 };
+  // blueprint.allowedKeys / variant_keys = known 키 집합
+  const known = new Set(
+    [].concat(
+      Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys.map(normalizeKeyName) : [],
+      Array.isArray(blueprint?.variant_keys) ? blueprint.variant_keys.map(normalizeKeyName) : []
+    )
+  );
+  const candidates = collectUnknownKeysFromExtraction(extracted, known).slice(0, AUTO_ALIAS_LIMIT * 2);
+  if (!candidates.length) return { added: 0 };
+  const { map } = await aiCanonicalizeKeys(family, candidates, Array.from(known)); /* :contentReference[oaicite:6]{index=6} */
+  const additions = {};
+  let added = 0;
+  for (const raw of candidates) {
+    const rec = map?.[raw];
+    if (!rec || rec.action !== 'map') continue;
+    if (!Number.isFinite(rec.conf) || rec.conf < AUTO_ALIAS_MIN_CONF) continue;
+    const canonical = normalizeKeyName(rec.canonical);
+    if (!canonical || !known.has(canonical)) continue;
+    (additions[canonical] ||= []).push(raw);
+    added += 1;
+    if (added >= AUTO_ALIAS_LIMIT) break;
+  }
+  if (!added) return { added: 0 };
+  await upsertRecipeKeyAliases({ family, brand, series, additions });
+  return { added };
+}
 function pickField(rec, aliases = []) {
   if (!rec || typeof rec !== 'object') return null;
   for (const key of aliases) {
@@ -1807,6 +1924,23 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
   const rawRows = Array.isArray(extracted?.rows) && extracted.rows.length ? extracted.rows : [];
   const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
+
+    if (family && extracted && AUTO_ALIAS_LEARN && AUTO_ALIAS_LIMIT) {
+    try {
+      const { added } = await learnAndPersistAliases({
+        family,
+        brand: brandName,
+        series: baseSeries,
+        blueprint,
+        extracted,
+      });
+      if (added > 0) {
+        console.log('[auto-alias] learned aliases', { family, brand: brandName, series: baseSeries, added });
+      }
+    } catch (err) {
+      console.warn('[auto-alias] failed:', err?.message || err);
+    }
+  }
 
   if (AUTO_ADD_FIELDS && AUTO_ADD_FIELDS_LIMIT && runtimeSpecKeys.size) {
     try {

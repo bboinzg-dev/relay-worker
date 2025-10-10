@@ -1,51 +1,146 @@
-diff --git a/src/utils/schema.js b/src/utils/schema.js
-index d6bb814cb56370f0381b51a6bb07220bd10f8803..16626dc49f257ac30b122776d8d1e133b53df8e3 100644
---- a/src/utils/schema.js
-+++ b/src/utils/schema.js
-@@ -1,43 +1,35 @@
- 'use strict';
- 
--const crypto = require('node:crypto');
- const db = require('../../db');
- 
- function isMinimalInsertEnabled() {
--  return /^(1|true|on)$/i.test(String(process.env.ALLOW_MINIMAL_INSERT || '').trim());
-+  return String(process.env.ALLOW_MINIMAL_INSERT || '').trim() === '1';
+diff --git a/src/pipeline/ensure-spec-columns.js b/src/pipeline/ensure-spec-columns.js
+index e29cb85d778a030e2b1818d387fa0b9a1a3c4a62..c360a13741774545bc0c46475dadd3cf4c0c2211 100644
+--- a/src/pipeline/ensure-spec-columns.js
++++ b/src/pipeline/ensure-spec-columns.js
+@@ -11,95 +11,131 @@ function tryRequire(paths) {
+       if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
+         errors.push(err);
+         continue;
+       }
+       throw err;
+     }
+   }
+   const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
+   error.code = 'MODULE_NOT_FOUND';
+   error.attempts = errors.map((e) => e?.message || String(e));
+   throw error;
  }
  
--function buildMinimalPnFallback(values = {}) {
--  const uri = values?.datasheet_uri || values?.datasheet_url || values?.gcs_uri || values?.gcsUri || '';
--  const brand = values?.brand || '';
--  const code = values?.code || '';
--  const series = values?.series || values?.series_code || '';
--  const seed = String(uri || `${brand}:${code}:${series}` || '').trim();
--  if (!seed) return null;
--  const hash = crypto.createHash('sha1').update(seed).digest('hex');
--  return `pdf:${hash.slice(0, 12)}`;
-+function buildMinimalPnFallback() {
-+  return null;
- }
+ const db = tryRequire([
+   path.join(__dirname, '../../db'),
+   path.join(__dirname, '../db'),
+   path.join(__dirname, './db'),
+   path.join(process.cwd(), 'db'),
+ ]);
  
- function normalizeIdentifier(name) {
-   return String(name || '')
+ const TYPE_MAP = {
+   int: 'integer',
+   integer: 'integer',
+   numeric: 'numeric',
+   number: 'numeric',
+-    float: 'double precision',
+-    double: 'double precision',
+-    'double precision': 'double precision',
+-    decimal: 'numeric',
++  float: 'double precision',
++  double: 'double precision',
++  'double precision': 'double precision',
++  decimal: 'numeric',
+   bool: 'boolean',
+   boolean: 'boolean',
+   text: 'text',
+   string: 'text',
+ };
+ 
+ function normKey(k) {
+   return String(k || '')
      .trim()
      .toLowerCase()
      .replace(/[^a-z0-9_]/g, '');
  }
  
- function parseTableName(tableName) {
-   const safe = String(tableName || '')
-     .trim()
-     .toLowerCase()
-     .replace(/[^a-z0-9_.]/g, '');
-   if (!safe) throw new Error('invalid table name');
+ async function getColumnsOf(qualified) {
+   const [schema, table] = qualified.includes('.')
+     ? qualified.split('.', 2)
+     : ['public', qualified];
+   const { rows } = await db.query(
+     `SELECT lower(column_name) AS col
+        FROM information_schema.columns
+       WHERE table_schema = $1
+         AND table_name   = $2`,
+     [schema, table]
+   );
+   return new Set(rows.map((r) => r.col));
+ }
  
-   let schema = 'public';
-   let table = safe;
-   if (safe.includes('.')) {
-     const parts = safe.split('.').filter(Boolean);
-     if (!parts.length) throw new Error('invalid table name');
-     if (parts.length === 1) {
-       table = parts[0];
-     } else {
-       schema = parts[0];
+ async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
+   const have = await getColumnsOf(qualifiedTable);
+ 
+   const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
+   const variants = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+     ? blueprint.ingestOptions.variant_keys
+-    : Array.isArray(blueprint?.variant_keys)
+-      ? blueprint.variant_keys
+-      : [];
+-      const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
+-      const fieldKeys = Object.keys(fieldMeta);
++      : Array.isArray(blueprint?.variant_keys)
++        ? blueprint.variant_keys
++        : [];
++  const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
++  const fieldKeys = Object.keys(fieldMeta);
+ 
+   const wantedList = [
+     ...new Set(
+       [...allowed, ...variants, ...fieldKeys]
+         .map(normKey)
+         .filter(Boolean)
+     ),
+   ];
+ 
+   const toAdd = [];
+   for (const key of wantedList) {
+     if (have.has(key)) continue;
+     const rawType = fieldMeta[key]?.type ?? fieldMeta[key] ?? 'text';
+     const pgType = TYPE_MAP[String(rawType).toLowerCase()] || 'text';
+     toAdd.push({ key, pgType });
+   }
+ 
+   if (!toAdd.length) return { added: 0 };
+ 
+   for (const { key, pgType } of toAdd) {
+     await db.query(
+       `ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`
+     );
+   }
+   return { added: toAdd.length, columns: toAdd };
+ }
+ 
+-module.exports = { ensureSpecColumnsForBlueprint, getColumnsOf };
++async function ensureSpecColumnsForKeys(qualifiedTable, keys = [], sample = {}) {
++  const have = await getColumnsOf(qualifiedTable);
++  const toAdd = [];
++
++  const list = Array.isArray(keys) ? keys : [];
++  for (const rawKey of list) {
++    const key = normKey(rawKey);
++    if (!key || have.has(key)) continue;
++
++    let value = null;
++    if (sample && typeof sample === 'object' && Object.prototype.hasOwnProperty.call(sample, rawKey)) {
++      value = sample[rawKey];
++    }
++
++    let pgType = 'text';
++    if (typeof value === 'number' && Number.isFinite(value)) {
++      pgType = 'double precision';
++    } else if (typeof value === 'boolean') {
++      pgType = 'boolean';
++    } else if (typeof value === 'string') {
++      const trimmed = value.trim();
++      if (trimmed && /-?\d+(?:\.\d+)?$/.test(trimmed)) {
++        pgType = 'double precision';
++      }
++    }
++
++    toAdd.push({ key, pgType });
++  }
++
++  for (const { key, pgType } of toAdd) {
++    await db.query(`ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`);
++  }
++
++  return { added: toAdd.length, columns: toAdd };
++}
++
++module.exports = { ensureSpecColumnsForBlueprint, ensureSpecColumnsForKeys, getColumnsOf };

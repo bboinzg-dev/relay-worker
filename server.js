@@ -98,6 +98,9 @@ const {
   parseGcsUri,
 } = tryRequire(['./src/utils/gcs', './gcs']);
 const { ensureSpecsTable, upsertByBrandCode } = tryRequire(['./src/utils/schema', './schema']);
+const authUtils = tryRequire(['./src/utils/auth', './auth']);
+const parseActor = typeof authUtils?.parseActor === 'function' ? authUtils.parseActor : () => ({ roles: [] });
+const hasRole = typeof authUtils?.hasRole === 'function' ? authUtils.hasRole : () => false;
 // 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
 let __INGEST_MOD__ = null;
 function getIngest() {
@@ -468,6 +471,20 @@ async function requireSession(req, res, next) {
   const claims = verifyJwtCookie(req.headers.cookie || '');
   if (claims) { req.user = claims; return next(); }
   return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+}
+
+function requireAdmin(req, res, next) {
+  let actor = null;
+  try {
+    actor = parseActor(req) || null;
+  } catch {
+    actor = null;
+  }
+  if (!actor || !hasRole(actor, 'admin')) {
+    return res.status(403).json({ ok: false, error: 'admin required' });
+  }
+  req.actor = actor;
+  return next();
 }
 
 /* ---------------- Files: upload / signed url / move ---------------- */
@@ -1303,6 +1320,54 @@ app.post([
 bodyParser.json({ limit: '25mb' }),
 requireSession,
 handleWorkerIngest);
+
+app.post(
+  '/admin/sync-variant-keys-to-blueprint',
+  bodyParser.json({ limit: '2mb' }),
+  requireSession,
+  requireAdmin,
+  async (req, res) => {
+    const family = String(req.query?.family || req.body?.family || '').trim();
+    if (!family) {
+      return res.status(400).json({ ok: false, error: 'family required' });
+    }
+    try {
+      const { rows } = await db.query(
+        `SELECT public.sync_variant_keys_from_recipes($1) AS ingest_options`,
+        [family],
+      );
+      const ingestOptions = rows?.[0]?.ingest_options ?? rows?.[0]?.sync_variant_keys_from_recipes ?? null;
+      return res.json({ ok: true, family, ingest_options: ingestOptions });
+    } catch (err) {
+      console.error('[admin] sync_variant_keys_to_blueprint failed:', err?.message || err);
+      return res.status(500).json({ ok: false, error: 'sync_failed', detail: err?.message || String(err) });
+    }
+  },
+);
+
+app.post(
+  '/admin/materialize-variant-columns',
+  bodyParser.json({ limit: '2mb' }),
+  requireSession,
+  requireAdmin,
+  async (req, res) => {
+    const family = String(req.query?.family || req.body?.family || '').trim();
+    if (!family) {
+      return res.status(400).json({ ok: false, error: 'family required' });
+    }
+    try {
+      const { rows } = await db.query(
+        `SELECT public.materialize_variant_columns($1) AS updated`,
+        [family],
+      );
+      const updated = Number(rows?.[0]?.updated ?? rows?.[0]?.materialize_variant_columns ?? 0);
+      return res.json({ ok: true, family, updated });
+    } catch (err) {
+      console.error('[admin] materialize_variant_columns failed:', err?.message || err);
+      return res.status(500).json({ ok: false, error: 'materialize_failed', detail: err?.message || String(err) });
+    }
+  },
+);
 
 async function seedManufacturerAliases() {
   try {

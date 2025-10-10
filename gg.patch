@@ -1,216 +1,534 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index bc5653e4cd23221e0b585bf9e012a99b97076d40..2d056e3259f6ffa05a4302a828cf1c12c7e2794c 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -21,69 +21,78 @@ function tryRequire(paths) {
-       throw err;
-     }
-   }
-   const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
-   error.code = 'MODULE_NOT_FOUND';
-   error.attempts = errors.map((e) => e?.message || String(e));
-   throw error;
+diff --git a/src/pipeline/variant-keys.js b/src/pipeline/variant-keys.js
+index bf79cddedd02e86353a59abf1320befceb5cf35c..fa995421c74e9688e7bbab3b1fb97bf53cc894c4 100644
+--- a/src/pipeline/variant-keys.js
++++ b/src/pipeline/variant-keys.js
+@@ -1,59 +1,248 @@
+ 'use strict';
+ 
+ const db = require('../../db');
+ 
+ const MIN_VARIATION_COUNT = 2;
+ 
++const VARIANT_DISCOVERY_ENABLED = /^(1|true|on)$/i.test(
++  process.env.VARIANT_DISCOVERY_ENABLED || '0'
++);
++
++function parseEnvNumber(name, defaultValue, parser = parseFloat) {
++  const raw = process.env[name];
++  if (raw == null || raw === '') return defaultValue;
++  const parsed = parser(raw);
++  if (!Number.isFinite(parsed)) {
++    console.warn(`[variant] invalid ${name}=${raw}, fallback=${defaultValue}`);
++    return defaultValue;
++  }
++  return parsed;
++}
++
++const VARIANT_MIN_COVERAGE = parseEnvNumber('VARIANT_MIN_COVERAGE', 0.4, parseFloat);
++const VARIANT_MAX_CARDINALITY = Math.max(
++  2,
++  parseEnvNumber('VARIANT_MAX_CARDINALITY', 20, (v) => parseInt(v, 10))
++);
++const VARIANT_MIN_MI = Math.max(0, parseEnvNumber('VARIANT_MIN_MI', 0.05, parseFloat));
++const VARIANT_DISCOVERY_SAMPLE_LIMIT = Math.max(
++  50,
++  parseEnvNumber('VARIANT_DISCOVERY_SAMPLE_LIMIT', 750, (v) => parseInt(v, 10))
++);
++const VARIANT_MIN_SAMPLE = 8;
++const VARIANT_MAX_VALUE_LENGTH = 80;
++
++const RESERVED_VARIANT_KEYS = new Set([
++  'id',
++  'created_at',
++  'updated_at',
++  'brand',
++  'brand_norm',
++  'pn',
++  'pn_norm',
++  'code',
++  'series',
++  'image_uri',
++  'datasheet_uri',
++  'datasheet_url',
++  'source_gcs_uri',
++  'raw_json',
++  'last_error',
++]);
++
++const PREFERRED_SEED_VARIANT_KEYS = new Set([
++  'coil_voltage_vdc',
++  'contact_form',
++  'mount_type',
++  'package',
++  'suffix',
++  'contact_arrangement',
++  'waterproof_rating',
++  'terminal_type',
++  'load_current_a',
++  'load_voltage_vac',
++  'load_voltage_vdc',
++  'poles',
++  'is_latching',
++  'insulation_rating',
++]);
++
+ function normalizeKeyName(value) {
+   return String(value || '')
+     .normalize('NFKC')
+     .toLowerCase()
+     .replace(/[^a-z0-9]+/g, '_')
+     .replace(/_+/g, '_')
+     .replace(/^_|_$/g, '');
  }
  
- const db = tryRequire([
-   path.join(__dirname, '../../db'),
-   path.join(__dirname, '../db'),
-   path.join(__dirname, './db'),
-   path.join(process.cwd(), 'db'),
- ]);
- const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
- const { extractText } = require('../utils/extract');
- const { getBlueprint } = require('../utils/blueprint');
- const { resolveBrand } = require('../utils/brand');
- const { detectVariantKeys } = require('../utils/ordering');
- const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
- const { extractFields } = require('./extractByBlueprint');
- const { aiCanonicalizeKeys } = require('./ai/canonKeys');
- const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
- const { explodeToRows, splitAndCarryPrefix } = require('../utils/mpn-exploder');
--const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
-+const {
-+  ensureSpecColumnsForBlueprint,
-+  ensureSpecColumnsForKeys,
-+  getColumnsOf,
-+} = require('./ensure-spec-columns');
- const { ensureSpecsTable } = tryRequire([
-   path.join(__dirname, '../utils/schema'),
-   path.join(__dirname, '../../utils/schema'),
-   path.join(__dirname, '../schema'),
-   path.join(process.cwd(), 'schema'),
- ]);
- const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
- const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
- const { processDocument: processDocAi } = require('../services/docai');
- const { rankPartNumbersFromOrderingSections } = require('../utils/ordering-sections');
- 
- const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
- 
- const USE_CODE_RULES = /^(1|true|on)$/i.test(process.env.USE_CODE_RULES ?? '1');
- const USE_PN_TEMPLATE = /^(1|true|on)$/i.test(process.env.USE_PN_TEMPLATE ?? '1');
- const USE_VARIANT_KEYS = /^(1|true|on)$/i.test(
-   process.env.USE_VARIANT_KEYS ?? (process.env.USE_CODE_RULES ?? '1')
- );
-+const AUTO_ADD_FIELDS = /^(1|true|on)$/i.test(process.env.AUTO_ADD_FIELDS ?? '1');
-+const AUTO_ADD_FIELDS_LIMIT_RAW = Number(process.env.AUTO_ADD_FIELDS_LIMIT ?? 20);
-+const AUTO_ADD_FIELDS_LIMIT = Number.isFinite(AUTO_ADD_FIELDS_LIMIT_RAW)
-+  ? Math.max(0, AUTO_ADD_FIELDS_LIMIT_RAW)
-+  : 20;
- 
- function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
-   const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
-   return new Promise((resolve, reject) => {
-     const timer = setTimeout(() => {
-       clearTimeout(timer);
-       reject(new Error(`${label}_TIMEOUT`));
-     }, timeout);
-     Promise.resolve(promise)
-       .then((value) => {
-         clearTimeout(timer);
-         resolve(value);
-       })
-       .catch((err) => {
-         clearTimeout(timer);
-         reject(err);
-       });
-   });
+ function normalizeAlias(value) {
+   return String(value || '')
+     .normalize('NFKC')
+     .toLowerCase()
+     .replace(/[^a-z0-9]+/g, ' ')
+     .replace(/\s+/g, ' ')
+     .trim();
  }
  
- const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
- const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
+ function normalizeSlug(value) {
+   const norm = String(value || '')
+     .normalize('NFKC')
+     .toLowerCase()
+     .replace(/[^a-z0-9]+/g, '-')
+     .replace(/-+/g, '-')
+     .replace(/^-|-$/g, '');
+   return norm || null;
+ }
  
- const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
- const BASE_KEYS = new Set([
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index bc5653e4cd23221e0b585bf9e012a99b97076d40..2d056e3259f6ffa05a4302a828cf1c12c7e2794c 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -1689,84 +1698,124 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
-           }
-         }
-       }
++function sanitizeQualifiedTable(name) {
++  if (!name) return null;
++  const safe = String(name)
++    .trim()
++    .replace(/[^a-zA-Z0-9_.]/g, '')
++    .replace(/\.\.+/g, '.');
++  if (!safe) return null;
++  const parts = safe.split('.').filter(Boolean);
++  if (!parts.length) return null;
++  if (parts.length === 1) return `public.${parts[0].toLowerCase()}`;
++  const schema = parts.slice(0, -1).join('.').toLowerCase();
++  const table = parts[parts.length - 1].toLowerCase();
++  return `${schema}.${table}`;
++}
++
++async function resolveSpecsTable(family) {
++  if (!family) return null;
++  try {
++    const { rows } = await db.query(
++      `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
++      [family]
++    );
++    const raw = rows?.[0]?.specs_table || null;
++    if (!raw) return null;
++    return sanitizeQualifiedTable(raw);
++  } catch (err) {
++    console.warn('[variant] resolve specs table failed:', err?.message || err);
++    return null;
++  }
++}
++
++function ensureObject(value) {
++  if (!value) return null;
++  if (typeof value === 'object' && !Array.isArray(value)) return value;
++  if (typeof value === 'string') {
++    try { return JSON.parse(value); } catch { return null; }
++  }
++  return null;
++}
++
++function normalizeVariantValue(value) {
++  if (value == null) return null;
++  let str = String(value)
++    .normalize('NFKC')
++    .replace(/[\u2013\u2014\u2212]/g, '-')
++    .replace(/\s+/g, ' ')
++    .trim();
++  if (!str) return null;
++  if (/^(?:n\/a|na|none|null|tbd|--|n\\.?d\.?|not\s+applicable)$/i.test(str)) return null;
++  if (str.length > VARIANT_MAX_VALUE_LENGTH) return null;
++  return str;
++}
++
++function canonicalValue(value) {
++  return normalizeVariantValue(value)?.toLowerCase() || null;
++}
++
++function tokenize(value) {
++  return String(value || '')
++    .toLowerCase()
++    .split(/[^a-z0-9]+/g)
++    .map((token) => token.trim())
++    .filter((token) => token.length >= 2);
++}
++
++function collapseAlphaNumeric(value) {
++  return String(value || '')
++    .toLowerCase()
++    .replace(/[^a-z0-9]+/g, '');
++}
++
++function buildPnContext(row) {
++  const sources = [row?.pn, row?.code, row?.series_code, row?.series]
++    .filter((item) => item != null && String(item).trim() !== '')
++    .map((item) => String(item).trim());
++  const joined = sources.join(' ');
++  return {
++    tokens: new Set(tokenize(joined)),
++    collapsed: collapseAlphaNumeric(joined),
++  };
++}
++
++function computePnMatch(value, context) {
++  if (!context) return false;
++  const normalized = normalizeVariantValue(value);
++  if (!normalized) return false;
++  const valueTokens = tokenize(normalized);
++  const collapsed = collapseAlphaNumeric(normalized);
++  for (const token of valueTokens) {
++    if (!token) continue;
++    if (context.tokens.has(token)) return true;
++    if (context.collapsed && token.length >= 3 && context.collapsed.includes(token)) return true;
++  }
++  if (collapsed && collapsed.length >= 3 && context.collapsed?.includes(collapsed)) return true;
++  return false;
++}
++
++async function loadSpecsRows({ family, brand, series }) {
++  const qualified = await resolveSpecsTable(family);
++  if (!qualified) return [];
++  const sql = `
++    SELECT brand, series, pn, code, series_code, raw_json
++      FROM ${qualified}
++     WHERE family_slug = $1
++     ORDER BY updated_at DESC NULLS LAST
++     LIMIT $2
++  `;
++  try {
++    const { rows } = await db.query(sql, [family, VARIANT_DISCOVERY_SAMPLE_LIMIT]);
++    const brandSlug = normalizeSlug(brand);
++    const seriesSlug = normalizeSlug(series);
++    const filtered = (rows || []).filter((row) => {
++      if (!row) return false;
++      const rowBrand = normalizeSlug(row.brand);
++      const rowSeries = normalizeSlug(row.series || row.series_code);
++      const brandOk = !brandSlug || !rowBrand ? !brandSlug : rowBrand === brandSlug;
++      const seriesOk = !seriesSlug || !rowSeries ? !seriesSlug : rowSeries === seriesSlug;
++      return brandOk && seriesOk;
++    });
++    return filtered;
++  } catch (err) {
++    console.warn('[variant] load specs rows failed:', err?.message || err);
++    return [];
++  }
++}
++
+ function addAlias(target, alias, key, weight = 0) {
+   const normalized = normalizeAlias(alias);
+   if (!normalized || normalized.length < 2) return;
+   target.push({ alias: normalized, key, weight: weight || normalized.replace(/\s+/g, '').length });
+ }
  
-       if (Array.isArray(freshKeys) && freshKeys.length) {
-         console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
+ function flattenValues(value) {
+   if (value == null) return [];
+   if (Array.isArray(value)) {
+     const out = [];
+     for (const item of value) out.push(...flattenValues(item));
+     return out;
+   }
+   if (typeof value === 'object') {
+     const candidates = [];
+     for (const prop of ['raw', 'text', 'value', 'display', 'label']) {
+       if (Object.prototype.hasOwnProperty.call(value, prop)) {
+         candidates.push(...flattenValues(value[prop]));
        }
-     } catch (err) {
-       console.warn('[variant] inferVariantKeys failed:', err?.message || err);
+     }
+     if (candidates.length) return candidates;
+     const str = String(value).trim();
+     return str ? [str] : [];
+   }
+   const str = String(value)
+diff --git a/src/pipeline/variant-keys.js b/src/pipeline/variant-keys.js
+index bf79cddedd02e86353a59abf1320befceb5cf35c..fa995421c74e9688e7bbab3b1fb97bf53cc894c4 100644
+--- a/src/pipeline/variant-keys.js
++++ b/src/pipeline/variant-keys.js
+@@ -147,50 +336,173 @@ function detectKeysFromRows(rows, aliasEntries, keySet) {
+   const map = new Map();
+   for (const row of rows || []) {
+     if (!row || typeof row !== 'object') continue;
+     for (const [rawKey, rawValue] of Object.entries(row)) {
+       if (rawKey == null) continue;
+       const key = findKeyForLabel(rawKey, aliasEntries, keySet);
+       if (!key) continue;
+       let set = map.get(key);
+       if (!set) {
+         set = new Set();
+         map.set(key, set);
+       }
+       for (const val of flattenValues(rawValue)) {
+         if (val) set.add(val);
+         if (set.size >= MIN_VARIATION_COUNT) break;
+       }
      }
    }
- 
-   if (!disableEnsure) {
-     await ensureSpecsTableByFamily(family, qualified);
-     if (!variantColumnsEnsured) {
-       try {
-         await ensureBlueprintVariantColumns(family);
-         variantColumnsEnsured = true;
-       } catch (err) {
-         console.warn('[variant] ensure_blueprint_variant_columns fallback failed:', err?.message || err);
-       }
-     }
+   const result = new Set();
+   for (const [key, set] of map.entries()) {
+     if (set.size >= MIN_VARIATION_COUNT) result.add(key);
    }
+   return result;
+ }
  
-   await ensureSpecColumnsForBlueprint(qualified, blueprint);
++function toNormalizedSet(input) {
++  if (!input) return new Set();
++  if (input instanceof Set) return new Set(input);
++  if (Array.isArray(input)) {
++    return new Set(input.map((item) => normalizeKeyName(item)).filter(Boolean));
++  }
++  if (typeof input === 'object') {
++    return new Set(
++      Object.keys(input)
++        .map((key) => normalizeKeyName(key))
++        .filter(Boolean)
++    );
++  }
++  return new Set();
++}
 +
-+  const rawRows = Array.isArray(extracted?.rows) && extracted.rows.length ? extracted.rows : [];
-+  const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
++async function discoverVariantKeys({ family, brand, series, existingKeys }) {
++  if (!VARIANT_DISCOVERY_ENABLED || !family) {
++    return { detected: [], newKeys: [], stats: [] };
++  }
 +
-+  if (AUTO_ADD_FIELDS && AUTO_ADD_FIELDS_LIMIT && runtimeSpecKeys.size) {
-+    try {
-+      const knownColumns = await getColumnsOf(qualified);
-+      const pending = [];
-+      const seen = new Set();
-+      for (const rawKey of runtimeSpecKeys) {
-+        const trimmed = String(rawKey || '').trim();
-+        if (!trimmed) continue;
-+        const lower = trimmed.toLowerCase();
-+        if (seen.has(lower)) continue;
-+        seen.add(lower);
-+        if (knownColumns.has(lower)) continue;
-+        if (RESERVED_SPEC_KEYS.has(lower)) continue;
-+        pending.push(trimmed);
-+        if (pending.length >= AUTO_ADD_FIELDS_LIMIT) break;
-+      }
++  const rows = await loadSpecsRows({ family, brand, series });
++  if (!rows.length) return { detected: [], newKeys: [], stats: [] };
 +
-+      if (pending.length) {
-+        const remaining = new Set(pending);
-+        const sample = {};
-+        for (const row of rawRows) {
-+          if (!row || typeof row !== 'object') continue;
-+          for (const key of pending) {
-+            if (!remaining.has(key)) continue;
-+            if (Object.prototype.hasOwnProperty.call(row, key)) {
-+              sample[key] = row[key];
-+              remaining.delete(key);
-+            }
-+          }
-+          if (!remaining.size) break;
++  const contexts = rows.map((row) => buildPnContext(row));
++  const candidateMap = new Map();
++  let considered = 0;
++
++  for (let idx = 0; idx < rows.length; idx += 1) {
++    const row = rows[idx];
++    const raw = ensureObject(row?.raw_json);
++    if (!raw || typeof raw !== 'object') continue;
++    const entries = Object.entries(raw);
++    if (!entries.length) continue;
++    considered += 1;
++    for (const [rawKey, rawValue] of entries) {
++      const normKey = normalizeKeyName(rawKey);
++      if (!normKey || RESERVED_VARIANT_KEYS.has(normKey)) continue;
++
++      const flattened = flattenValues(rawValue);
++      if (!flattened.length) continue;
++      let normalizedValue = null;
++      for (const candidate of flattened) {
++        const normValue = normalizeVariantValue(candidate);
++        if (normValue) {
++          normalizedValue = normValue;
++          break;
 +        }
-+
-+        await ensureSpecColumnsForKeys(qualified, pending, sample);
 +      }
-+    } catch (err) {
-+      console.warn('[schema] ensureSpecColumnsForKeys failed:', err?.message || err);
++      if (!normalizedValue) continue;
++
++      const canonical = canonicalValue(normalizedValue);
++      if (!canonical) continue;
++
++      let info = candidateMap.get(normKey);
++      if (!info) {
++        info = {
++          present: 0,
++          values: new Map(),
++          pnMatches: 0,
++          maxLength: 0,
++          totalLength: 0,
++          sampleCount: 0,
++        };
++        candidateMap.set(normKey, info);
++      }
++
++      info.present += 1;
++      info.maxLength = Math.max(info.maxLength, normalizedValue.length);
++      info.totalLength += normalizedValue.length;
++      info.sampleCount += 1;
++
++      let valueEntry = info.values.get(canonical);
++      if (!valueEntry) {
++        valueEntry = { count: 0, sample: normalizedValue };
++        info.values.set(canonical, valueEntry);
++      }
++      valueEntry.count += 1;
++      if (normalizedValue.length < valueEntry.sample.length) {
++        valueEntry.sample = normalizedValue;
++      }
++
++      if (computePnMatch(normalizedValue, contexts[idx])) {
++        info.pnMatches += 1;
++      }
 +    }
 +  }
 +
-   colTypes = await getColumnTypes(qualified);
++  if (considered < VARIANT_MIN_SAMPLE) {
++    return { detected: [], newKeys: [], stats: [] };
++  }
++
++  const totalRows = considered;
++  const stats = [];
++  for (const [key, info] of candidateMap.entries()) {
++    if (!info) continue;
++    if (info.present < 2) continue;
++    const coverage = info.present / totalRows;
++    if (coverage < VARIANT_MIN_COVERAGE) continue;
++    const cardinality = info.values.size;
++    if (cardinality < 2 || cardinality > VARIANT_MAX_CARDINALITY) continue;
++    if (info.maxLength > VARIANT_MAX_VALUE_LENGTH) continue;
++    const pnRatio = info.present ? info.pnMatches / info.present : 0;
++    const isSeed = PREFERRED_SEED_VARIANT_KEYS.has(key);
++    if (!isSeed && pnRatio < VARIANT_MIN_MI) continue;
++    stats.push({ key, coverage, cardinality, pnRatio });
++  }
++
++  if (!stats.length) return { detected: [], newKeys: [], stats: [] };
++
++  stats.sort((a, b) => {
++    if (b.coverage !== a.coverage) return b.coverage - a.coverage;
++    if (a.cardinality !== b.cardinality) return a.cardinality - b.cardinality;
++    return b.pnRatio - a.pnRatio;
++  });
++
++  const detected = stats.map((item) => item.key);
++  const known = toNormalizedSet(existingKeys);
++  const newKeys = detected.filter((key) => !known.has(key));
++
++  return { detected, newKeys, stats };
++}
++
+ async function loadRecipeRows(family) {
+   if (!family) return [];
+   try {
+     const { rows } = await db.query(
+       `SELECT family_slug, brand_slug, series_slug, recipe
+          FROM public.extraction_recipe
+         WHERE family_slug = $1`,
+       [family]
+     );
+     return rows || [];
+   } catch (err) {
+     console.warn('[variant] load recipe failed:', err?.message || err);
+     return [];
+   }
+ }
  
-   if (process.env.AUTO_FIX_BLUEPRINT_TYPES === '1' && colTypes instanceof Map && colTypes.size && family) {
-     const currentFields = blueprint?.fields && typeof blueprint.fields === 'object' ? blueprint.fields : {};
-     const patch = {};
-     for (const [col, t] of colTypes.entries()) {
-       if (t === 'numeric' || t === 'int' || t === 'bool') {
-         const now = currentFields[col];
-         if (!now || String(now).toLowerCase() === 'text') {
-           patch[col] = t === 'int' ? 'int' : t;
-         }
-       }
-     }
-     if (Object.keys(patch).length) {
-       await db.query(
-         `UPDATE public.component_spec_blueprint
-            SET fields_json = fields_json || $2::jsonb,
-                version = COALESCE(version,0)+1,
-                updated_at = now()
-          WHERE family_slug = $1`,
-         [family, JSON.stringify(patch)]
-       );
-       if (blueprint && typeof blueprint === 'object') {
-         if (!blueprint.fields || typeof blueprint.fields !== 'object') {
-           blueprint.fields = {};
-         }
-         Object.assign(blueprint.fields, patch);
-       }
-     }
+ function buildAliasEntries({ blueprint, recipes, brand, series }) {
+   const entries = [];
+   const keySet = new Set();
+ 
+   const pushKey = (key, weight = 0) => {
+     const norm = normalizeKeyName(key);
+     if (!norm) return;
+     keySet.add(norm);
+     addAlias(entries, key, norm, weight || norm.length + 4);
+diff --git a/src/pipeline/variant-keys.js b/src/pipeline/variant-keys.js
+index bf79cddedd02e86353a59abf1320befceb5cf35c..fa995421c74e9688e7bbab3b1fb97bf53cc894c4 100644
+--- a/src/pipeline/variant-keys.js
++++ b/src/pipeline/variant-keys.js
+@@ -237,66 +549,80 @@ function buildAliasEntries({ blueprint, recipes, brand, series }) {
+     if (seen.has(token)) continue;
+     seen.add(token);
+     deduped.push(entry);
    }
  
--  const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
--  const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
+   return { entries: deduped, keySet };
+ }
+ 
+ function filterRecipes(rows, brand, series) {
+   if (!Array.isArray(rows) || !rows.length) return [];
+   const brandNorm = normalizeSlug(brand);
+   const seriesNorm = normalizeSlug(series);
+   return rows.filter((row) => {
+     const rowBrand = normalizeSlug(row?.brand_slug ?? row?.brand);
+     const rowSeries = normalizeSlug(row?.series_slug ?? row?.series);
+     const brandMatch = !rowBrand || !brandNorm ? !rowBrand : rowBrand === brandNorm;
+     const seriesMatch = !rowSeries || !seriesNorm ? !rowSeries : rowSeries === seriesNorm;
+     return brandMatch && seriesMatch;
+   });
+ }
+ 
+ async function inferVariantKeys({ family, brand, series, blueprint, extracted }) {
+   const recipes = filterRecipes(await loadRecipeRows(family), brand, series);
+   const { entries, keySet } = buildAliasEntries({ blueprint, recipes, brand, series });
+ 
+-  if (!entries.length && !keySet.size) {
+-    return { detected: [], newKeys: [] };
+-  }
 -
-   const aiCanonicalMap = new Map();
-   const aiCanonicalMapLower = new Map();
-   if (process.env.AUTO_CANON_KEYS === '1' && runtimeSpecKeys.size) {
-     const specCols = colTypes ? Array.from(colTypes.keys()) : [];
-     const blueprintFieldKeys = blueprint?.fields && typeof blueprint.fields === 'object'
-       ? Object.keys(blueprint.fields).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+   const tables = Array.isArray(extracted?.tables) ? extracted.tables : [];
+   const rows = Array.isArray(extracted?.rows) ? extracted.rows : [];
+ 
+-  const tableKeys = detectKeysFromTables(tables, entries, keySet);
+-  const rowKeys = detectKeysFromRows(rows, entries, keySet);
+-
+   const detectedSet = new Set();
+-  for (const key of tableKeys) detectedSet.add(key);
+-  for (const key of rowKeys) detectedSet.add(key);
+ 
+-  if (!detectedSet.size) return { detected: [], newKeys: [] };
++  if (entries.length || keySet.size) {
++    const tableKeys = detectKeysFromTables(tables, entries, keySet);
++    const rowKeys = detectKeysFromRows(rows, entries, keySet);
++    for (const key of tableKeys) detectedSet.add(key);
++    for (const key of rowKeys) detectedSet.add(key);
++  }
+ 
+-  const existing = new Set();
++  const known = new Set();
+   const blueprintKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+     ? blueprint.ingestOptions.variant_keys
+     : Array.isArray(blueprint?.variant_keys)
+       ? blueprint.variant_keys
        : [];
-     const knownKeys = Array.from(new Set([
-       ...specCols,
-       ...blueprintFieldKeys,
-       ...(Array.isArray(variantKeys) ? variantKeys : []),
-     ]));
+   for (const key of blueprintKeys || []) {
+     const norm = normalizeKeyName(key);
+-    if (norm) existing.add(norm);
++    if (norm) known.add(norm);
++  }
++  for (const key of keySet || []) {
++    if (key) known.add(key);
+   }
  
-     try {
-       const { map, newKeys } = await aiCanonicalizeKeys(
-         family,
-         Array.from(runtimeSpecKeys),
-         knownKeys
-       );
+-  const detected = Array.from(detectedSet).map(normalizeKeyName).filter(Boolean);
+-  const seen = new Set();
++  const normalizedFromExtraction = Array.from(detectedSet)
++    .map(normalizeKeyName)
++    .filter(Boolean);
+   const deduped = [];
+-  for (const key of detected) {
++  const seen = new Set();
++  for (const key of normalizedFromExtraction) {
+     if (seen.has(key)) continue;
+     seen.add(key);
+     deduped.push(key);
+   }
  
-       const knownLower = new Set(knownKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
-       const newKeySet = new Set((Array.isArray(newKeys) ? newKeys : []).map((k) => String(k || '').trim()).filter(Boolean));
-       const newCanonKeys = [];
-       for (const [orig, info] of Object.entries(map || {})) {
-         const trimmedOrig = String(orig || '').trim();
+-  const newKeys = deduped.filter((key) => !existing.has(key));
+-  return { detected: deduped, newKeys };
++  const discovery = await discoverVariantKeys({
++    family,
++    brand,
++    series,
++    existingKeys: new Set([...known, ...deduped]),
++  });
++
++  const finalSet = new Set(deduped);
++  for (const key of discovery.detected || []) {
++    if (key) finalSet.add(key);
++  }
++
++  const newKeys = Array.from(finalSet).filter((key) => !known.has(key));
++
++  return { detected: Array.from(finalSet), newKeys, details: discovery.stats };
+ }
+ 
+-module.exports = { inferVariantKeys, normalizeSlug };
++module.exports = { inferVariantKeys, normalizeSlug };

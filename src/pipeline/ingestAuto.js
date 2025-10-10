@@ -1652,7 +1652,11 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   let variantColumnsEnsured = !USE_VARIANT_KEYS;
   if (USE_VARIANT_KEYS) {
     try {
-      const { detected: inferredKeys = [], newKeys: freshKeys = [] } = await inferVariantKeys({
+      const {
+        detected: inferredKeys = [],
+        newKeys: freshKeys = [],
+        details: discoveryDetails = [],
+      } = await inferVariantKeys({
         family,
         brand: brandName,
         series: baseSeries,
@@ -1663,6 +1667,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       if (Array.isArray(inferredKeys) && inferredKeys.length) {
         const brandSlug = normalizeSlug(brandName);
         const seriesSlug = normalizeSlug(baseSeries);
+        let syncedVariantKeys = null;
+        let syncEnsured = false;
         try {
           await db.query(
             `SELECT public.upsert_variant_keys($1,$2,$3,$4::jsonb)`,
@@ -1672,8 +1678,34 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           console.warn('[variant] upsert_variant_keys failed:', err?.message || err);
         }
 
+        try {
+          const { rows: syncRows } = await db.query(
+            `SELECT public.sync_variant_keys_from_recipes($1) AS ingest_options`,
+            [family],
+          );
+          const ingestOptions = syncRows?.[0]?.ingest_options ?? syncRows?.[0]?.sync_variant_keys_from_recipes ?? null;
+          if (ingestOptions && typeof ingestOptions === 'object') {
+            if (!blueprint.ingestOptions || typeof blueprint.ingestOptions !== 'object') {
+              blueprint.ingestOptions = {};
+            }
+            if (Array.isArray(ingestOptions.variant_keys)) {
+              syncedVariantKeys = ingestOptions.variant_keys
+                .map((key) => normalizeSpecKeyName(key) || (typeof key === 'string' ? key.trim() : null))
+                .filter((key) => typeof key === 'string' && key.length > 0);
+              blueprint.ingestOptions.variant_keys = [...syncedVariantKeys];
+              blueprint.variant_keys = [...syncedVariantKeys];
+            }
+          }
+          syncEnsured = true;
+        } catch (err) {
+          console.warn('[variant] sync_variant_keys_from_recipes failed:', err?.message || err);
+        }
+
         const mergedVariant = new Set(variantKeys);
         for (const key of inferredKeys) mergedVariant.add(key);
+        if (Array.isArray(syncedVariantKeys)) {
+          for (const key of syncedVariantKeys) mergedVariant.add(key);
+        }
         variantKeys = Array.from(mergedVariant);
 
         const mergedAllowed = new Set(allowedKeys);
@@ -1689,7 +1721,11 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           ? Array.from(new Set([...blueprint.allowedKeys, ...variantKeys]))
           : [...allowedKeys];
 
-        if (!disableEnsure) {
+        if (syncEnsured) {
+          variantColumnsEnsured = true;
+        }
+
+        if (!disableEnsure && !variantColumnsEnsured) {
           try {
             await ensureBlueprintVariantColumns(family);
             variantColumnsEnsured = true;
@@ -1697,10 +1733,56 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
             console.warn('[variant] ensure_blueprint_variant_columns failed:', err?.message || err);
           }
         }
+
+        if (Array.isArray(freshKeys) && freshKeys.length) {
+          try {
+            const { rows: materializedRows } = await db.query(
+              `SELECT public.materialize_variant_columns($1) AS updated`,
+              [family],
+            );
+            const updatedCount = Number(
+              materializedRows?.[0]?.updated ?? materializedRows?.[0]?.materialize_variant_columns ?? 0,
+            );
+            if (updatedCount > 0) {
+              console.log('[variant] materialized variant columns', {
+                family,
+                brand: brandName,
+                series: baseSeries,
+                updated: updatedCount,
+                keys: freshKeys,
+              });
+            }
+          } catch (err) {
+            console.warn('[variant] materialize_variant_columns failed:', err?.message || err);
+          }
+        }
       }
 
       if (Array.isArray(freshKeys) && freshKeys.length) {
         console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
+        if (Array.isArray(discoveryDetails) && discoveryDetails.length) {
+          const stats = discoveryDetails
+            .filter((item) => freshKeys.includes(item?.key))
+            .map((item) => {
+              const coverage = Number(item?.coverage ?? 0);
+              const pnRatio = Number(item?.pnRatio ?? 0);
+              return {
+                key: item?.key,
+                coverage: Number.isFinite(coverage) ? Number(coverage.toFixed(3)) : null,
+                cardinality: item?.cardinality ?? null,
+                pn_ratio: Number.isFinite(pnRatio) ? Number(pnRatio.toFixed(3)) : null,
+              };
+            })
+            .filter((item) => item.key);
+          if (stats.length) {
+            console.log('[variant] discovery stats', {
+              family,
+              brand: brandName,
+              series: baseSeries,
+              stats,
+            });
+          }
+        }
       }
     } catch (err) {
       console.warn('[variant] inferVariantKeys failed:', err?.message || err);

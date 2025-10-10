@@ -1,12 +1,8 @@
-diff --git a/src/pipeline/ensure-spec-columns.js b/src/pipeline/ensure-spec-columns.js
-index e29cb85d778a030e2b1818d387fa0b9a1a3c4a62..c360a13741774545bc0c46475dadd3cf4c0c2211 100644
---- a/src/pipeline/ensure-spec-columns.js
-+++ b/src/pipeline/ensure-spec-columns.js
-@@ -11,95 +11,131 @@ function tryRequire(paths) {
-       if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
-         errors.push(err);
-         continue;
-       }
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index bc5653e4cd23221e0b585bf9e012a99b97076d40..2d056e3259f6ffa05a4302a828cf1c12c7e2794c 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -21,69 +21,78 @@ function tryRequire(paths) {
        throw err;
      }
    }
@@ -22,125 +18,199 @@ index e29cb85d778a030e2b1818d387fa0b9a1a3c4a62..c360a13741774545bc0c46475dadd3cf
    path.join(__dirname, './db'),
    path.join(process.cwd(), 'db'),
  ]);
+ const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
+ const { extractText } = require('../utils/extract');
+ const { getBlueprint } = require('../utils/blueprint');
+ const { resolveBrand } = require('../utils/brand');
+ const { detectVariantKeys } = require('../utils/ordering');
+ const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
+ const { extractFields } = require('./extractByBlueprint');
+ const { aiCanonicalizeKeys } = require('./ai/canonKeys');
+ const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
+ const { explodeToRows, splitAndCarryPrefix } = require('../utils/mpn-exploder');
+-const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
++const {
++  ensureSpecColumnsForBlueprint,
++  ensureSpecColumnsForKeys,
++  getColumnsOf,
++} = require('./ensure-spec-columns');
+ const { ensureSpecsTable } = tryRequire([
+   path.join(__dirname, '../utils/schema'),
+   path.join(__dirname, '../../utils/schema'),
+   path.join(__dirname, '../schema'),
+   path.join(process.cwd(), 'schema'),
+ ]);
+ const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
+ const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
+ const { processDocument: processDocAi } = require('../services/docai');
+ const { rankPartNumbersFromOrderingSections } = require('../utils/ordering-sections');
  
- const TYPE_MAP = {
-   int: 'integer',
-   integer: 'integer',
-   numeric: 'numeric',
-   number: 'numeric',
--    float: 'double precision',
--    double: 'double precision',
--    'double precision': 'double precision',
--    decimal: 'numeric',
-+  float: 'double precision',
-+  double: 'double precision',
-+  'double precision': 'double precision',
-+  decimal: 'numeric',
-   bool: 'boolean',
-   boolean: 'boolean',
-   text: 'text',
-   string: 'text',
- };
+ const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
  
- function normKey(k) {
-   return String(k || '')
-     .trim()
-     .toLowerCase()
-     .replace(/[^a-z0-9_]/g, '');
+ const USE_CODE_RULES = /^(1|true|on)$/i.test(process.env.USE_CODE_RULES ?? '1');
+ const USE_PN_TEMPLATE = /^(1|true|on)$/i.test(process.env.USE_PN_TEMPLATE ?? '1');
+ const USE_VARIANT_KEYS = /^(1|true|on)$/i.test(
+   process.env.USE_VARIANT_KEYS ?? (process.env.USE_CODE_RULES ?? '1')
+ );
++const AUTO_ADD_FIELDS = /^(1|true|on)$/i.test(process.env.AUTO_ADD_FIELDS ?? '1');
++const AUTO_ADD_FIELDS_LIMIT_RAW = Number(process.env.AUTO_ADD_FIELDS_LIMIT ?? 20);
++const AUTO_ADD_FIELDS_LIMIT = Number.isFinite(AUTO_ADD_FIELDS_LIMIT_RAW)
++  ? Math.max(0, AUTO_ADD_FIELDS_LIMIT_RAW)
++  : 20;
+ 
+ function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
+   const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
+   return new Promise((resolve, reject) => {
+     const timer = setTimeout(() => {
+       clearTimeout(timer);
+       reject(new Error(`${label}_TIMEOUT`));
+     }, timeout);
+     Promise.resolve(promise)
+       .then((value) => {
+         clearTimeout(timer);
+         resolve(value);
+       })
+       .catch((err) => {
+         clearTimeout(timer);
+         reject(err);
+       });
+   });
  }
  
- async function getColumnsOf(qualified) {
-   const [schema, table] = qualified.includes('.')
-     ? qualified.split('.', 2)
-     : ['public', qualified];
-   const { rows } = await db.query(
-     `SELECT lower(column_name) AS col
-        FROM information_schema.columns
-       WHERE table_schema = $1
-         AND table_name   = $2`,
-     [schema, table]
-   );
-   return new Set(rows.map((r) => r.col));
- }
+ const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
+ const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
  
- async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
-   const have = await getColumnsOf(qualifiedTable);
+ const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
+ const BASE_KEYS = new Set([
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index bc5653e4cd23221e0b585bf9e012a99b97076d40..2d056e3259f6ffa05a4302a828cf1c12c7e2794c 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -1689,84 +1698,124 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+           }
+         }
+       }
  
-   const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
-   const variants = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-     ? blueprint.ingestOptions.variant_keys
--    : Array.isArray(blueprint?.variant_keys)
--      ? blueprint.variant_keys
--      : [];
--      const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
--      const fieldKeys = Object.keys(fieldMeta);
-+      : Array.isArray(blueprint?.variant_keys)
-+        ? blueprint.variant_keys
-+        : [];
-+  const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
-+  const fieldKeys = Object.keys(fieldMeta);
- 
-   const wantedList = [
-     ...new Set(
-       [...allowed, ...variants, ...fieldKeys]
-         .map(normKey)
-         .filter(Boolean)
-     ),
-   ];
- 
-   const toAdd = [];
-   for (const key of wantedList) {
-     if (have.has(key)) continue;
-     const rawType = fieldMeta[key]?.type ?? fieldMeta[key] ?? 'text';
-     const pgType = TYPE_MAP[String(rawType).toLowerCase()] || 'text';
-     toAdd.push({ key, pgType });
+       if (Array.isArray(freshKeys) && freshKeys.length) {
+         console.log('[variant] detected new keys', { family, brand: brandName, series: baseSeries, keys: freshKeys });
+       }
+     } catch (err) {
+       console.warn('[variant] inferVariantKeys failed:', err?.message || err);
+     }
    }
  
-   if (!toAdd.length) return { added: 0 };
- 
-   for (const { key, pgType } of toAdd) {
-     await db.query(
-       `ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`
-     );
+   if (!disableEnsure) {
+     await ensureSpecsTableByFamily(family, qualified);
+     if (!variantColumnsEnsured) {
+       try {
+         await ensureBlueprintVariantColumns(family);
+         variantColumnsEnsured = true;
+       } catch (err) {
+         console.warn('[variant] ensure_blueprint_variant_columns fallback failed:', err?.message || err);
+       }
+     }
    }
-   return { added: toAdd.length, columns: toAdd };
- }
  
--module.exports = { ensureSpecColumnsForBlueprint, getColumnsOf };
-+async function ensureSpecColumnsForKeys(qualifiedTable, keys = [], sample = {}) {
-+  const have = await getColumnsOf(qualifiedTable);
-+  const toAdd = [];
+   await ensureSpecColumnsForBlueprint(qualified, blueprint);
 +
-+  const list = Array.isArray(keys) ? keys : [];
-+  for (const rawKey of list) {
-+    const key = normKey(rawKey);
-+    if (!key || have.has(key)) continue;
++  const rawRows = Array.isArray(extracted?.rows) && extracted.rows.length ? extracted.rows : [];
++  const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
 +
-+    let value = null;
-+    if (sample && typeof sample === 'object' && Object.prototype.hasOwnProperty.call(sample, rawKey)) {
-+      value = sample[rawKey];
-+    }
-+
-+    let pgType = 'text';
-+    if (typeof value === 'number' && Number.isFinite(value)) {
-+      pgType = 'double precision';
-+    } else if (typeof value === 'boolean') {
-+      pgType = 'boolean';
-+    } else if (typeof value === 'string') {
-+      const trimmed = value.trim();
-+      if (trimmed && /-?\d+(?:\.\d+)?$/.test(trimmed)) {
-+        pgType = 'double precision';
++  if (AUTO_ADD_FIELDS && AUTO_ADD_FIELDS_LIMIT && runtimeSpecKeys.size) {
++    try {
++      const knownColumns = await getColumnsOf(qualified);
++      const pending = [];
++      const seen = new Set();
++      for (const rawKey of runtimeSpecKeys) {
++        const trimmed = String(rawKey || '').trim();
++        if (!trimmed) continue;
++        const lower = trimmed.toLowerCase();
++        if (seen.has(lower)) continue;
++        seen.add(lower);
++        if (knownColumns.has(lower)) continue;
++        if (RESERVED_SPEC_KEYS.has(lower)) continue;
++        pending.push(trimmed);
++        if (pending.length >= AUTO_ADD_FIELDS_LIMIT) break;
 +      }
++
++      if (pending.length) {
++        const remaining = new Set(pending);
++        const sample = {};
++        for (const row of rawRows) {
++          if (!row || typeof row !== 'object') continue;
++          for (const key of pending) {
++            if (!remaining.has(key)) continue;
++            if (Object.prototype.hasOwnProperty.call(row, key)) {
++              sample[key] = row[key];
++              remaining.delete(key);
++            }
++          }
++          if (!remaining.size) break;
++        }
++
++        await ensureSpecColumnsForKeys(qualified, pending, sample);
++      }
++    } catch (err) {
++      console.warn('[schema] ensureSpecColumnsForKeys failed:', err?.message || err);
 +    }
-+
-+    toAdd.push({ key, pgType });
 +  }
 +
-+  for (const { key, pgType } of toAdd) {
-+    await db.query(`ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`);
-+  }
-+
-+  return { added: toAdd.length, columns: toAdd };
-+}
-+
-+module.exports = { ensureSpecColumnsForBlueprint, ensureSpecColumnsForKeys, getColumnsOf };
+   colTypes = await getColumnTypes(qualified);
+ 
+   if (process.env.AUTO_FIX_BLUEPRINT_TYPES === '1' && colTypes instanceof Map && colTypes.size && family) {
+     const currentFields = blueprint?.fields && typeof blueprint.fields === 'object' ? blueprint.fields : {};
+     const patch = {};
+     for (const [col, t] of colTypes.entries()) {
+       if (t === 'numeric' || t === 'int' || t === 'bool') {
+         const now = currentFields[col];
+         if (!now || String(now).toLowerCase() === 'text') {
+           patch[col] = t === 'int' ? 'int' : t;
+         }
+       }
+     }
+     if (Object.keys(patch).length) {
+       await db.query(
+         `UPDATE public.component_spec_blueprint
+            SET fields_json = fields_json || $2::jsonb,
+                version = COALESCE(version,0)+1,
+                updated_at = now()
+          WHERE family_slug = $1`,
+         [family, JSON.stringify(patch)]
+       );
+       if (blueprint && typeof blueprint === 'object') {
+         if (!blueprint.fields || typeof blueprint.fields !== 'object') {
+           blueprint.fields = {};
+         }
+         Object.assign(blueprint.fields, patch);
+       }
+     }
+   }
+ 
+-  const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
+-  const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
+-
+   const aiCanonicalMap = new Map();
+   const aiCanonicalMapLower = new Map();
+   if (process.env.AUTO_CANON_KEYS === '1' && runtimeSpecKeys.size) {
+     const specCols = colTypes ? Array.from(colTypes.keys()) : [];
+     const blueprintFieldKeys = blueprint?.fields && typeof blueprint.fields === 'object'
+       ? Object.keys(blueprint.fields).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+       : [];
+     const knownKeys = Array.from(new Set([
+       ...specCols,
+       ...blueprintFieldKeys,
+       ...(Array.isArray(variantKeys) ? variantKeys : []),
+     ]));
+ 
+     try {
+       const { map, newKeys } = await aiCanonicalizeKeys(
+         family,
+         Array.from(runtimeSpecKeys),
+         knownKeys
+       );
+ 
+       const knownLower = new Set(knownKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
+       const newKeySet = new Set((Array.isArray(newKeys) ? newKeys : []).map((k) => String(k || '').trim()).filter(Boolean));
+       const newCanonKeys = [];
+       for (const [orig, info] of Object.entries(map || {})) {
+         const trimmedOrig = String(orig || '').trim();

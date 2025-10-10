@@ -43,7 +43,11 @@ const { extractFields } = require('./extractByBlueprint');
 const { aiCanonicalizeKeys } = require('./ai/canonKeys');
 const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
 const { explodeToRows, splitAndCarryPrefix } = require('../utils/mpn-exploder');
-const { ensureSpecColumnsForBlueprint } = require('./ensure-spec-columns');
+const {
+  ensureSpecColumnsForBlueprint,
+  ensureSpecColumnsForKeys,
+  getColumnsOf,
+} = require('./ensure-spec-columns');
 const { ensureSpecsTable } = tryRequire([
   path.join(__dirname, '../utils/schema'),
   path.join(__dirname, '../../utils/schema'),
@@ -62,6 +66,11 @@ const USE_PN_TEMPLATE = /^(1|true|on)$/i.test(process.env.USE_PN_TEMPLATE ?? '1'
 const USE_VARIANT_KEYS = /^(1|true|on)$/i.test(
   process.env.USE_VARIANT_KEYS ?? (process.env.USE_CODE_RULES ?? '1')
 );
+const AUTO_ADD_FIELDS = /^(1|true|on)$/i.test(process.env.AUTO_ADD_FIELDS ?? '1');
+const AUTO_ADD_FIELDS_LIMIT_RAW = Number(process.env.AUTO_ADD_FIELDS_LIMIT ?? 20);
+const AUTO_ADD_FIELDS_LIMIT = Number.isFinite(AUTO_ADD_FIELDS_LIMIT_RAW)
+  ? Math.max(0, AUTO_ADD_FIELDS_LIMIT_RAW)
+  : 20;
 
 function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
   const timeout = Number.isFinite(ms) && ms > 0 ? ms : HARD_CAP_MS;
@@ -1711,6 +1720,49 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
 
   await ensureSpecColumnsForBlueprint(qualified, blueprint);
+
+  const rawRows = Array.isArray(extracted?.rows) && extracted.rows.length ? extracted.rows : [];
+  const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
+
+  if (AUTO_ADD_FIELDS && AUTO_ADD_FIELDS_LIMIT && runtimeSpecKeys.size) {
+    try {
+      const knownColumns = await getColumnsOf(qualified);
+      const pending = [];
+      const seen = new Set();
+      for (const rawKey of runtimeSpecKeys) {
+        const trimmed = String(rawKey || '').trim();
+        if (!trimmed) continue;
+        const lower = trimmed.toLowerCase();
+        if (seen.has(lower)) continue;
+        seen.add(lower);
+        if (knownColumns.has(lower)) continue;
+        if (RESERVED_SPEC_KEYS.has(lower)) continue;
+        pending.push(trimmed);
+        if (pending.length >= AUTO_ADD_FIELDS_LIMIT) break;
+      }
+
+      if (pending.length) {
+        const remaining = new Set(pending);
+        const sample = {};
+        for (const row of rawRows) {
+          if (!row || typeof row !== 'object') continue;
+          for (const key of pending) {
+            if (!remaining.has(key)) continue;
+            if (Object.prototype.hasOwnProperty.call(row, key)) {
+              sample[key] = row[key];
+              remaining.delete(key);
+            }
+          }
+          if (!remaining.size) break;
+        }
+
+        await ensureSpecColumnsForKeys(qualified, pending, sample);
+      }
+    } catch (err) {
+      console.warn('[schema] ensureSpecColumnsForKeys failed:', err?.message || err);
+    }
+  }
+
   colTypes = await getColumnTypes(qualified);
 
   if (process.env.AUTO_FIX_BLUEPRINT_TYPES === '1' && colTypes instanceof Map && colTypes.size && family) {
@@ -1741,9 +1793,6 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
     }
   }
-
-  const rawRows = Array.isArray(extracted.rows) && extracted.rows.length ? extracted.rows : [];
-  const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
 
   const aiCanonicalMap = new Map();
   const aiCanonicalMapLower = new Map();

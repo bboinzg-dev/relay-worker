@@ -1,105 +1,50 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 65340b265b6cbc670a628d241e3d2a1104b9a744..feea14d407a332853f206dbfdc1632d8803a7acf 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -2418,70 +2418,100 @@ async function persistProcessedData(processed = {}, overrides = {}) {
-       if (!Array.isArray(r.candidates) && Array.isArray(processed?.candidateCodes)) {
-         r.candidates = processed.candidateCodes;
-       }
-       const fixed = recoverCode(r, { pnTemplate, variantKeys });
-       if (fixed) {
-         if (!r.code) r.code = fixed;
-         if (!r.pn) r.pn = fixed;
-       }
-     }
+diff --git a/src/utils/schema.js b/src/utils/schema.js
+index 055f7145139a0b37a2980c521cbbd0a5d2ed9a08..d6bb814cb56370f0381b51a6bb07220bd10f8803 100644
+--- a/src/utils/schema.js
++++ b/src/utils/schema.js
+@@ -255,42 +255,41 @@ async function upsertByBrandCode(tableName, values = {}) {
+     [schema, table],
+   );
+   const allowed = new Set(meta.rows.map((r) => String(r.column_name).toLowerCase()));
+   const generated = new Set(
+     meta.rows
+       .filter((r) => String(r.is_generated || '').toUpperCase() === 'ALWAYS')
+       .map((r) => String(r.column_name).toLowerCase()),
+   );
  
-     // 저장 직전 PN 정합성 강화
-     records = records.filter((r) => {
-       const pn = String(r?.pn || r?.code || '').trim();
-       if (!pn) return false;
-       if (pn.startsWith('pdf:')) return false; // PDF 앵커 토큰 컷
-       if (pn.includes('{') || pn.includes('}')) return false; // 템플릿 잔재 컷
-       return PN_STRICT.test(pn); // 기본 포맷 검증
-     });
+   const insertCols = [];
+   const insertVals = [];
+   for (const col of cols) {
+     if (!allowed.has(col)) continue;
+     if (generated.has(col)) continue;
+     insertCols.push(col);
+     insertVals.push(payload[col]);
+   }
+   if (!insertCols.length) return null;
  
-     records = records.filter((r) => isValidCode(r?.pn || r?.code));
-     if (!records.length) {
-       persistResult.skipped = [{ reason: 'missing_pn' }];
-     }
+   const params = insertCols.map((_, i) => `$${i + 1}`);
+   const updates = insertCols
+     .filter((col) => !NO_UPDATE.has(col))
+     .map((col) => `${col}=EXCLUDED.${col}`);
  
-     if (records.length) {
-+      for (const r of records) {
-+        if (!r || typeof r !== 'object') continue;
-+        r.brand =
-+          safeBrand(r.brand) ||
-+          safeBrand(brandOverride) ||
-+          safeBrand(processedEffective) ||
-+          safeBrand(brandName) ||
-+          safeBrand(extractedBrand) ||
-+          safeBrand(processedDetected) ||
-+          null;
-+
-+        if (!r.pn && r.code) r.pn = r.code;
-+        if (!r.code && r.pn) r.code = r.pn;
-+
-+        if (r.pn != null && String(r.pn).trim() === '') r.pn = null;
-+        if (r.code != null && String(r.code).trim() === '') r.code = null;
-+        if (r.brand != null && String(r.brand).trim() === '') r.brand = null;
-+      }
-+
-       if (colTypes instanceof Map && colTypes.size) {
-         for (const rec of records) {
-           if (!rec || typeof rec !== 'object') continue;
-           for (const [k, v] of Object.entries(rec)) {
-             const keyLower = String(k || '').toLowerCase();
-             const t = colTypes.get(keyLower) || colTypes.get(k);
-             if (!t) continue;
-             if (t === 'numeric')      rec[k] = coerceNumeric(v);
-             else if (t === 'int')     rec[k] = toInt(v);
-             else if (t === 'bool')    rec[k] = toBool(v);
-           }
-         }
-       }
-       console.log(
-         '[DIAG] persist start table=%s family=%s records=%d required=%d',
-         table,
-         family,
-         Array.isArray(records) ? records.length : -1,
-         Array.isArray(effectiveRequired) ? effectiveRequired.length : -1,
-       );
-+      if (Array.isArray(records) && records.length) {
-+        const r0 = records[0] || {};
-+        console.log('[PERSIST.INPUT]', {
-+          family,
-+          table,
-+          brand: r0.brand ?? null,
-+          pn: r0.pn ?? null,
-+          code: r0.code ?? null,
-+          display_name: r0.display_name ?? null,
-+        });
-+      }
-       try {
-         persistResult = await saveExtractedSpecs(qualified, family, records, {
-           brand: brandOverride,
-           pnTemplate,
-           requiredKeys: effectiveRequired,
-           coreSpecKeys: effectiveRequired,
-           blueprint,
-           runId,
-           run_id: runId,
-           jobId,
-           job_id: jobId,
-           gcsUri,
-           orderingInfo: processed?.ordering_info,
-           docType: processed?.doc_type,
-         }) || persistResult;
-       } catch (e) {
-         console.warn('[persist] saveExtractedSpecs failed:', e?.message || e);
-         if (!persistResult || typeof persistResult !== 'object') {
-           persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
-         }
-         if (!Array.isArray(persistResult.warnings)) persistResult.warnings = [];
-         persistResult.warnings.push(String(e?.message || e));
-       }
-     }
-   } else if (!records.length) {
+   // Spec tables enforce uniqueness via the expression index (lower(brand), lower(pn)).
+-  // Prefer targeting the named index when available, but fall back to the raw expression.
+-  const conflictByExpr = `ON CONFLICT ((lower(brand)), (lower(pn)))`;
+-  const conflictByName = `ON CONFLICT ON CONSTRAINT ux_${table}_brandpn_expr`;
+-  const conflict = table ? conflictByName : conflictByExpr;
++  // The backing database creates this as an expression index (not a constraint),
++  // therefore we must always target the raw expression in ON CONFLICT clauses.
++  const conflict = `ON CONFLICT ((lower(brand)), (lower(pn)))`;
+ 
+   const sql = `
+     insert into ${qualified} (${insertCols.join(',')})
+     values (${params.join(',')})
+     ${conflict}
+     do update set ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
+     returning *`;
+ 
+   const res = await db.query(sql, insertVals);
+   return res.rows?.[0] || null;
+ }
+ 
+ module.exports = { ensureSpecsTable, upsertByBrandCode };

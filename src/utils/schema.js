@@ -277,10 +277,9 @@ async function upsertByBrandCode(tableName, values = {}) {
     .map((col) => `${col}=EXCLUDED.${col}`);
 
   // Spec tables enforce uniqueness via the expression index (lower(brand), lower(pn)).
-  // Prefer targeting the named index when available, but fall back to the raw expression.
-  const conflictByExpr = `ON CONFLICT ((lower(brand)), (lower(pn)))`;
-  const conflictByName = `ON CONFLICT ON CONSTRAINT ux_${table}_brandpn_expr`;
-  const conflict = table ? conflictByName : conflictByExpr;
+  // The backing database creates this as an expression index (not a constraint),
+  // therefore we must always target the raw expression in ON CONFLICT clauses.
+  const conflict = `ON CONFLICT ((lower(brand)), (lower(pn)))`;
 
   const sql = `
     insert into ${qualified} (${insertCols.join(',')})

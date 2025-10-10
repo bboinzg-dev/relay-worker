@@ -1036,14 +1036,9 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
     : null;
 
   // Spec tables enforce uniqueness via the expression index (lower(brand), lower(pn)).
-  // Prefer targeting the named index when available, but fall back to the raw expression.
-  const tableSegment = String(targetTable || '').split('.').pop() || '';
-  const normalizedTable = tableSegment.replace(/[^A-Za-z0-9_]/g, '').toLowerCase();
-  const conflictByExpr = 'ON CONFLICT ((lower(brand)), (lower(pn)))';
-  const conflictByName = normalizedTable
-    ? `ON CONFLICT ON CONSTRAINT ux_${normalizedTable}_brandpn_expr`
-    : conflictByExpr;
-  const conflict = conflictByName || conflictByExpr;
+  // In production this exists only as an expression index, so we must always
+  // reference the raw expression instead of a constraint name.
+  const conflict = 'ON CONFLICT ((lower(brand)), (lower(pn)))';
 
   const sql = [
     `INSERT INTO ${targetTable} (${insertCols.map((c) => `"${c}"`).join(',')})`,

@@ -1,21 +1,13 @@
 'use strict';
 
-const crypto = require('node:crypto');
 const db = require('../../db');
 
 function isMinimalInsertEnabled() {
-  return /^(1|true|on)$/i.test(String(process.env.ALLOW_MINIMAL_INSERT || '').trim());
+  return String(process.env.ALLOW_MINIMAL_INSERT || '').trim() === '1';
 }
 
-function buildMinimalPnFallback(values = {}) {
-  const uri = values?.datasheet_uri || values?.datasheet_url || values?.gcs_uri || values?.gcsUri || '';
-  const brand = values?.brand || '';
-  const code = values?.code || '';
-  const series = values?.series || values?.series_code || '';
-  const seed = String(uri || `${brand}:${code}:${series}` || '').trim();
-  if (!seed) return null;
-  const hash = crypto.createHash('sha1').update(seed).digest('hex');
-  return `pdf:${hash.slice(0, 12)}`;
+function buildMinimalPnFallback() {
+  return null;
 }
 
 function normalizeIdentifier(name) {

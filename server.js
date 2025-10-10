@@ -476,6 +476,8 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
     if (!req.file) return res.status(400).json({ ok:false, error:'file required' });
 
     const buf = req.file.buffer;
+    const mime = (req.file.mimetype || '').toLowerCase();
+    const isPdfMagic = buf && buf.length >= 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46; // %PDF
     const sha = crypto.createHash('sha256').update(buf).digest('hex');
     const safe = (req.file.originalname || 'datasheet.pdf').replace(/\s+/g,'_');
     const object = `incoming/${sha}_${Date.now()}_${safe}`;
@@ -499,6 +501,11 @@ app.post(['/api/files/upload', '/files/upload'], upload.single('file'), async (r
     if (!ingestWanted) {
       // 평소처럼 업로드 결과만 반환
       return res.json({ ok:true, gcsUri });
+    }
+
+    // ★ ingest=1이면 반드시 PDF여야 함
+    if (!(mime === 'application/pdf' || isPdfMagic)) {
+      return res.status(400).json({ ok:false, error:'INGEST_PDF_ONLY' });
     }
 
     // 폼으로 넘어온 메타(있으면 사용, 없으면 추정)

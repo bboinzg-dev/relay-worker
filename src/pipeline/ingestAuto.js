@@ -1328,6 +1328,34 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
   ensureExtractedShape(extracted);
+  const mergeSkuCandidates = (...sources) => {
+    const skuMap = new Map();
+    const pushSku = (value) => {
+      if (value == null) return;
+      const raw = typeof value === 'string' ? value : String(value);
+      const trimmed = raw.trim();
+      if (!trimmed) return;
+      if (trimmed === '[object Object]') return;
+      const norm = normalizeCode(trimmed);
+      if (!norm) return;
+      if (!skuMap.has(norm)) skuMap.set(norm, trimmed);
+    };
+    for (const list of sources) {
+      if (!Array.isArray(list)) continue;
+      for (const item of list) pushSku(item);
+    }
+    return Array.from(skuMap.values()).slice(0, 200);
+  };
+  const docTextForSku = typeof extracted?.text === 'string' && extracted.text
+    ? extracted.text
+    : (previewText || '');
+  const skuFromTables = pickSkuListFromTables(extracted);
+  const skuFromSystem = expandFromCodeSystem(extracted, blueprint, docTextForSku);
+  const skuFromText = harvestMpnCandidates(docTextForSku, extracted?.series);
+  const baseCodes = Array.isArray(extracted?.codes) ? extracted.codes : [];
+  const mergedSkuList = mergeSkuCandidates(baseCodes, skuFromTables, skuFromSystem, skuFromText);
+  extracted.codes = mergedSkuList;
+  extracted.mpn_list = mergedSkuList;
   const rawJsonPayload = {};
   if (docAiResult && (docAiText || docAiTables.length)) rawJsonPayload.docai = docAiResult;
   if (vertexClassification) rawJsonPayload.vertex_classify = vertexClassification;
@@ -1452,8 +1480,9 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   // 🔹 “애초에 분석단계에서 여러 MPN을 리스트업” — 추출 결과에 명시적으로 부착
   if (extracted && typeof extracted === 'object') {
     const list = (Array.isArray(codes) ? codes : []).filter(Boolean);
-    extracted.codes = list;        // <- 최종 MPN 배열
-    extracted.mpn_list = list;     // <- 동의어(외부에서 쓰기 쉽도록)
+    const merged = mergeSkuCandidates(extracted.codes, list);
+    extracted.codes = merged;        // <- 최종 MPN 배열
+    extracted.mpn_list = merged;     // <- 동의어(외부에서 쓰기 쉽도록)
   }
 
   if (!code && !codes.length) {
@@ -1483,7 +1512,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
         candidates = merged;
         // 🔹 types/order/series 휴리스틱으로도 찾은 경우, 이것도 추출 결과에 반영
         if (extracted && typeof extracted === 'object') {
-          const uniq = Array.from(new Set([...(extracted.codes || []), ...merged]));
+          const uniq = mergeSkuCandidates(extracted.codes, merged);
           extracted.codes = uniq;
           extracted.mpn_list = uniq;
         }
@@ -2340,7 +2369,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
 
   let persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
   if (qualified && family && records.length) {
-    const allowMinimal = /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
+    const allowMinimal = String(process.env.ALLOW_MINIMAL_INSERT || '').trim() === '1';
     const requiredList = Array.isArray(requiredFields) ? requiredFields : [];
     const effectiveRequired = allowMinimal ? [] : requiredList;
 
@@ -2428,11 +2457,14 @@ async function persistProcessedData(processed = {}, overrides = {}) {
 
     // 저장 직전 PN 정합성 강화
     records = records.filter((r) => {
-      const pn = String(r?.pn || r?.code || '').trim();
-      if (!pn) return false;
-      if (pn.startsWith('pdf:')) return false; // PDF 앵커 토큰 컷
-      if (pn.includes('{') || pn.includes('}')) return false; // 템플릿 잔재 컷
-      return PN_STRICT.test(pn); // 기본 포맷 검증
+      const pnRaw = String(r?.pn ?? '').trim();
+      const codeRaw = String(r?.code ?? '').trim();
+      if (pnRaw && /\{[^}]*\}/.test(pnRaw)) return false; // 템플릿 PN 컷
+      if (codeRaw && /\{[^}]*\}/.test(codeRaw)) return false; // 템플릿 코드 컷
+      const candidate = pnRaw || codeRaw;
+      if (!candidate) return false;
+      if (candidate.startsWith('pdf:')) return false; // PDF 앵커 토큰 컷
+      return PN_STRICT.test(candidate); // 기본 포맷 검증
     });
 
     records = records.filter((r) => isValidCode(r?.pn || r?.code));

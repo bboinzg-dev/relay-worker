@@ -1,6 +1,5 @@
 'use strict';
 
-const crypto = require('crypto');
 const path = require('node:path');
 
 function tryRequire(paths) {
@@ -173,10 +172,6 @@ function normKey(key) {
     .toLowerCase();
 }
 
-function sha1(input) {
-  return crypto.createHash('sha1').update(String(input || '')).digest('hex');
-}
-
 function isMinimalFallbackPn(value) {
   return typeof value === 'string' && value.startsWith('pdf:');
 }
@@ -184,7 +179,8 @@ function isMinimalFallbackPn(value) {
 function isValidCode(value) {
   const trimmed = String(value || '').trim();
   if (!trimmed) return false;
-  if (isMinimalFallbackPn(trimmed)) return true;
+  if (isMinimalFallbackPn(trimmed)) return false;
+  if (/\{[^}]*\}/.test(trimmed)) return false;
   return PN_RE.test(trimmed);
 }
 
@@ -768,10 +764,6 @@ function hasCoreSpec(row, keys = [], candidateKeys = []) {
 }
 
 function isMinimalInsertEnabled() {
-  return /^(1|true|on)$/i.test(String(process.env.ALLOW_MINIMAL_INSERT || '').trim());
-}
-
-function isMinimalInsertStrict() {
   return String(process.env.ALLOW_MINIMAL_INSERT || '').trim() === '1';
 }
 
@@ -788,13 +780,12 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
 
   let pn = String(row.pn || row.code || '').trim();
   const allowMinimal = isMinimalInsertEnabled();
-  const relaxPnValidation = allowMinimal && !isMinimalInsertStrict();
-  const minimalFallback = allowMinimal && isMinimalFallbackPn(pn);
   if (!isValidCode(pn)) {
-    if (minimalFallback) {
-      row.last_error = row.last_error || 'invalid_code_fallback';
-      row.pn = pn;
-      return { ok: true };
+    const rawPn = String(row.pn || '').trim();
+    const rawCode = String(row.code || '').trim();
+    if ((rawPn && /\{[^}]*\}/.test(rawPn)) || (rawCode && /\{[^}]*\}/.test(rawCode))) {
+      row.last_error = 'invalid_code_template_placeholder';
+      return { ok: false, reason: 'invalid_code' };
     }
     const fixed = repairPn(pn);
     if (fixed && isValidCode(fixed)) {
@@ -807,14 +798,6 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
         console.warn('[persist] pn fallback applied', { original: pn, fallback: fallbackPn });
         pn = fallbackPn;
         row.last_error = row.last_error || 'invalid_code_fallback';
-      } else if (relaxPnValidation) {
-        const seed = [row.brand, row.code, row.series, pn]
-          .map((v) => String(v || '').trim())
-          .filter(Boolean)
-          .join(':');
-        const hash = sha1(seed || `relax:${Date.now()}`);
-        pn = `pdf:${hash.slice(0, 12)}`;
-        row.last_error = row.last_error || 'invalid_code_relaxed';
       } else {
         row.last_error = 'invalid_code';
         return { ok: false, reason: 'invalid_code' };
@@ -823,21 +806,13 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
       row.last_error = 'invalid_code';
       return { ok: false, reason: 'invalid_code' };
     }
-  } else if (!minimalFallback) {
+  } else {
     if (FORBIDDEN_RE.test(pn) || BANNED_PREFIX.test(pn) || BANNED_EXACT.test(pn)) {
       const fixed = repairPn(pn);
       if (fixed && isValidCode(fixed) && !FORBIDDEN_RE.test(fixed) && !BANNED_PREFIX.test(fixed) && !BANNED_EXACT.test(fixed)) {
         console.warn('[persist] pn repaired', { original: pn, fixed });
         row.last_error = row.last_error || 'invalid_code_fixed';
         pn = fixed;
-      } else if (relaxPnValidation) {
-        const seed = [row.brand, row.code, row.series, pn]
-          .map((v) => String(v || '').trim())
-          .filter(Boolean)
-          .join(':');
-        const hash = sha1(seed || `relax:${Date.now()}`);
-        pn = `pdf:${hash.slice(0, 12)}`;
-        row.last_error = row.last_error || 'invalid_code_relaxed';
       } else {
         row.last_error = 'invalid_code';
         return { ok: false, reason: 'invalid_code' };
@@ -958,9 +933,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
 
   console.log(`[PATH] persist family=${familySlug} rows=${rows.length} brand_override=${options?.brand || ''}`);
 
-  const allowMinimalStrict = isMinimalInsertStrict();
   const gcsUri = options?.gcsUri || options?.gcs_uri || null;
-  const fallbackHash = gcsUri ? sha1(gcsUri) : null;
 
   const runId = options?.runId ?? options?.run_id ?? null;
   const jobId = options?.jobId ?? options?.job_id ?? null;
@@ -1152,19 +1125,6 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
 
       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
         rec.pn = rec.code;
-      }
-
-      if (!isValidCode(rec.pn) && allowMinimalStrict) {
-        const base = fallbackHash || sha1(`${targetTable || ''}:${familySlug || ''}`);
-        const fallbackPn = `pdf:${base}#${rowIndex + 1}`;
-        rec.pn = fallbackPn;
-        if (!rec.code || !isValidCode(rec.code)) {
-          rec.code = fallbackPn;
-        }
-        if (physicalCols.has('last_error')) {
-          rec.last_error = rec.last_error || 'invalid_code_fallback';
-        }
-        warnings.add('minimal_pn_fallback');
       }
 
       if (!isValidCode(rec.pn)) {

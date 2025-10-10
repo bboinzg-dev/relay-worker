@@ -608,11 +608,16 @@ async function inferVariantKeys({ family, brand, series, blueprint, extracted })
     deduped.push(key);
   }
 
+    const existingKeys = new Set([
+    ...known,
+    ...deduped,
+  ]);
+
   const discovery = await discoverVariantKeys({
     family,
     brand,
     series,
-    existingKeys: new Set([...known, ...deduped]),
+   existingKeys,
   });
 
   const finalSet = new Set(deduped);

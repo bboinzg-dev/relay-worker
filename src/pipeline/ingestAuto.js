@@ -377,7 +377,8 @@ function renderFromTemplate(rec, pnTemplate, variantKeys = []) {
   if (!pnTemplate) return null;
   const ctxText = rec?._doc_text || rec?.doc_text || '';
   const advanced = renderTemplate(pnTemplate, rec, ctxText);
-  if (advanced != null && advanced !== '') return advanced;
+  // 텍스트 존재 검증: 문서 본문에 실제로 나타나는 코드만 허용
+  if (advanced && textContainsExact(ctxText, advanced)) return advanced;
 
   let out = pnTemplate;
   const dict = new Map(Object.entries(rec || {}));
@@ -386,7 +387,7 @@ function renderFromTemplate(rec, pnTemplate, variantKeys = []) {
   dict.set('series_code', rec?.series_code ?? rec?.series ?? '');
   out = out.replace(/\{([a-z0-9_]+)\}/ig, (_, k) => String(dict.get(k) ?? ''));
   out = out.replace(/\s+/g,'').trim();
-  return out || null;
+  return out && textContainsExact(ctxText, out) ? out : null;
 }
 
 function recoverCode(rec, { pnTemplate, variantKeys }) {
@@ -529,7 +530,8 @@ function harvestMpnCandidates(text, series){
     if (!raw) continue;
     if (PN_BLACKLIST_RE.test(raw)) continue;
     const norm = raw.toUpperCase();
-    if (ser && norm && !norm.startsWith(ser)) continue;
+    // 접두 '정확히 시작'만 허용 → '포함'까지 허용 (예: series=TQ, 코드=ATQ2S-5V-Z)
+    if (ser && norm && !(norm.startsWith(ser) || norm.includes(ser))) continue;
     if (seen.has(norm)) continue;
     seen.add(norm);
     out.push(raw.trim());

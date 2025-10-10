@@ -196,7 +196,8 @@ async function loadSpecsRows({ family, brand, series }) {
   const qualified = await resolveSpecsTable(family);
   if (!qualified) return [];
   const sql = `
-    SELECT brand, series, pn, code, series_code, raw_json
+    SELECT brand, series, pn, code, /* series_code 없음: 호환용 NULL */
+           NULL::text AS series_code, raw_json
       FROM ${qualified}
      WHERE family_slug = $1
      ORDER BY updated_at DESC NULLS LAST

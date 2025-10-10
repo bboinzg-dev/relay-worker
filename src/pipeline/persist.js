@@ -725,7 +725,9 @@ function buildPnIfMissing(record = {}, pnTemplate) {
   const existing = String(record.pn || '').trim();
   if (existing) return;
   const fromTemplate = renderPnTemplate(pnTemplate, record);
-  if (fromTemplate) {
+  // 본문 검증: 템플릿 결과가 실제 문서 텍스트에 존재할 때만 채택
+  const ctxText = String(record._doc_text || record.doc_text || '');
+  if (fromTemplate && ctxText && ctxText.includes(fromTemplate)) {
     record.pn = fromTemplate;
     if (!record.code) record.code = fromTemplate;
     return;

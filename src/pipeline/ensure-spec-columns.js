@@ -33,10 +33,10 @@ const TYPE_MAP = {
   integer: 'integer',
   numeric: 'numeric',
   number: 'numeric',
-    float: 'double precision',
-    double: 'double precision',
-    'double precision': 'double precision',
-    decimal: 'numeric',
+  float: 'double precision',
+  double: 'double precision',
+  'double precision': 'double precision',
+  decimal: 'numeric',
   bool: 'boolean',
   boolean: 'boolean',
   text: 'text',
@@ -70,11 +70,11 @@ async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
   const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
   const variants = Array.isArray(blueprint?.ingestOptions?.variant_keys)
     ? blueprint.ingestOptions.variant_keys
-    : Array.isArray(blueprint?.variant_keys)
-      ? blueprint.variant_keys
-      : [];
-      const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
-      const fieldKeys = Object.keys(fieldMeta);
+      : Array.isArray(blueprint?.variant_keys)
+        ? blueprint.variant_keys
+        : [];
+  const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
+  const fieldKeys = Object.keys(fieldMeta);
 
   const wantedList = [
     ...new Set(
@@ -102,4 +102,40 @@ async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
   return { added: toAdd.length, columns: toAdd };
 }
 
-module.exports = { ensureSpecColumnsForBlueprint, getColumnsOf };
+async function ensureSpecColumnsForKeys(qualifiedTable, keys = [], sample = {}) {
+  const have = await getColumnsOf(qualifiedTable);
+  const toAdd = [];
+
+  const list = Array.isArray(keys) ? keys : [];
+  for (const rawKey of list) {
+    const key = normKey(rawKey);
+    if (!key || have.has(key)) continue;
+
+    let value = null;
+    if (sample && typeof sample === 'object' && Object.prototype.hasOwnProperty.call(sample, rawKey)) {
+      value = sample[rawKey];
+    }
+
+    let pgType = 'text';
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      pgType = 'double precision';
+    } else if (typeof value === 'boolean') {
+      pgType = 'boolean';
+    } else if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed && /-?\d+(?:\.\d+)?$/.test(trimmed)) {
+        pgType = 'double precision';
+      }
+    }
+
+    toAdd.push({ key, pgType });
+  }
+
+  for (const { key, pgType } of toAdd) {
+    await db.query(`ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`);
+  }
+
+  return { added: toAdd.length, columns: toAdd };
+}
+
+module.exports = { ensureSpecColumnsForBlueprint, ensureSpecColumnsForKeys, getColumnsOf };

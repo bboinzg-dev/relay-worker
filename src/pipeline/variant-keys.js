@@ -4,6 +4,69 @@ const db = require('../../db');
 
 const MIN_VARIATION_COUNT = 2;
 
+const VARIANT_DISCOVERY_ENABLED = /^(1|true|on)$/i.test(
+  process.env.VARIANT_DISCOVERY_ENABLED || '0'
+);
+
+function parseEnvNumber(name, defaultValue, parser = parseFloat) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return defaultValue;
+  const parsed = parser(raw);
+  if (!Number.isFinite(parsed)) {
+    console.warn(`[variant] invalid ${name}=${raw}, fallback=${defaultValue}`);
+    return defaultValue;
+  }
+  return parsed;
+}
+
+const VARIANT_MIN_COVERAGE = parseEnvNumber('VARIANT_MIN_COVERAGE', 0.4, parseFloat);
+const VARIANT_MAX_CARDINALITY = Math.max(
+  2,
+  parseEnvNumber('VARIANT_MAX_CARDINALITY', 20, (v) => parseInt(v, 10))
+);
+const VARIANT_MIN_MI = Math.max(0, parseEnvNumber('VARIANT_MIN_MI', 0.05, parseFloat));
+const VARIANT_DISCOVERY_SAMPLE_LIMIT = Math.max(
+  50,
+  parseEnvNumber('VARIANT_DISCOVERY_SAMPLE_LIMIT', 750, (v) => parseInt(v, 10))
+);
+const VARIANT_MIN_SAMPLE = 8;
+const VARIANT_MAX_VALUE_LENGTH = 80;
+
+const RESERVED_VARIANT_KEYS = new Set([
+  'id',
+  'created_at',
+  'updated_at',
+  'brand',
+  'brand_norm',
+  'pn',
+  'pn_norm',
+  'code',
+  'series',
+  'image_uri',
+  'datasheet_uri',
+  'datasheet_url',
+  'source_gcs_uri',
+  'raw_json',
+  'last_error',
+]);
+
+const PREFERRED_SEED_VARIANT_KEYS = new Set([
+  'coil_voltage_vdc',
+  'contact_form',
+  'mount_type',
+  'package',
+  'suffix',
+  'contact_arrangement',
+  'waterproof_rating',
+  'terminal_type',
+  'load_current_a',
+  'load_voltage_vac',
+  'load_voltage_vdc',
+  'poles',
+  'is_latching',
+  'insulation_rating',
+]);
+
 function normalizeKeyName(value) {
   return String(value || '')
     .normalize('NFKC')
@@ -30,6 +93,132 @@ function normalizeSlug(value) {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
   return norm || null;
+}
+
+function sanitizeQualifiedTable(name) {
+  if (!name) return null;
+  const safe = String(name)
+    .trim()
+    .replace(/[^a-zA-Z0-9_.]/g, '')
+    .replace(/\.\.+/g, '.');
+  if (!safe) return null;
+  const parts = safe.split('.').filter(Boolean);
+  if (!parts.length) return null;
+  if (parts.length === 1) return `public.${parts[0].toLowerCase()}`;
+  const schema = parts.slice(0, -1).join('.').toLowerCase();
+  const table = parts[parts.length - 1].toLowerCase();
+  return `${schema}.${table}`;
+}
+
+async function resolveSpecsTable(family) {
+  if (!family) return null;
+  try {
+    const { rows } = await db.query(
+      `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+      [family]
+    );
+    const raw = rows?.[0]?.specs_table || null;
+    if (!raw) return null;
+    return sanitizeQualifiedTable(raw);
+  } catch (err) {
+    console.warn('[variant] resolve specs table failed:', err?.message || err);
+    return null;
+  }
+}
+
+function ensureObject(value) {
+  if (!value) return null;
+  if (typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try { return JSON.parse(value); } catch { return null; }
+  }
+  return null;
+}
+
+function normalizeVariantValue(value) {
+  if (value == null) return null;
+  let str = String(value)
+    .normalize('NFKC')
+    .replace(/[\u2013\u2014\u2212]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!str) return null;
+  if (/^(?:n\/a|na|none|null|tbd|--|n\\.?d\.?|not\s+applicable)$/i.test(str)) return null;
+  if (str.length > VARIANT_MAX_VALUE_LENGTH) return null;
+  return str;
+}
+
+function canonicalValue(value) {
+  return normalizeVariantValue(value)?.toLowerCase() || null;
+}
+
+function tokenize(value) {
+  return String(value || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2);
+}
+
+function collapseAlphaNumeric(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function buildPnContext(row) {
+  const sources = [row?.pn, row?.code, row?.series_code, row?.series]
+    .filter((item) => item != null && String(item).trim() !== '')
+    .map((item) => String(item).trim());
+  const joined = sources.join(' ');
+  return {
+    tokens: new Set(tokenize(joined)),
+    collapsed: collapseAlphaNumeric(joined),
+  };
+}
+
+function computePnMatch(value, context) {
+  if (!context) return false;
+  const normalized = normalizeVariantValue(value);
+  if (!normalized) return false;
+  const valueTokens = tokenize(normalized);
+  const collapsed = collapseAlphaNumeric(normalized);
+  for (const token of valueTokens) {
+    if (!token) continue;
+    if (context.tokens.has(token)) return true;
+    if (context.collapsed && token.length >= 3 && context.collapsed.includes(token)) return true;
+  }
+  if (collapsed && collapsed.length >= 3 && context.collapsed?.includes(collapsed)) return true;
+  return false;
+}
+
+async function loadSpecsRows({ family, brand, series }) {
+  const qualified = await resolveSpecsTable(family);
+  if (!qualified) return [];
+  const sql = `
+    SELECT brand, series, pn, code, series_code, raw_json
+      FROM ${qualified}
+     WHERE family_slug = $1
+     ORDER BY updated_at DESC NULLS LAST
+     LIMIT $2
+  `;
+  try {
+    const { rows } = await db.query(sql, [family, VARIANT_DISCOVERY_SAMPLE_LIMIT]);
+    const brandSlug = normalizeSlug(brand);
+    const seriesSlug = normalizeSlug(series);
+    const filtered = (rows || []).filter((row) => {
+      if (!row) return false;
+      const rowBrand = normalizeSlug(row.brand);
+      const rowSeries = normalizeSlug(row.series || row.series_code);
+      const brandOk = !brandSlug || !rowBrand ? !brandSlug : rowBrand === brandSlug;
+      const seriesOk = !seriesSlug || !rowSeries ? !seriesSlug : rowSeries === seriesSlug;
+      return brandOk && seriesOk;
+    });
+    return filtered;
+  } catch (err) {
+    console.warn('[variant] load specs rows failed:', err?.message || err);
+    return [];
+  }
 }
 
 function addAlias(target, alias, key, weight = 0) {
@@ -169,6 +358,129 @@ function detectKeysFromRows(rows, aliasEntries, keySet) {
   return result;
 }
 
+function toNormalizedSet(input) {
+  if (!input) return new Set();
+  if (input instanceof Set) return new Set(input);
+  if (Array.isArray(input)) {
+    return new Set(input.map((item) => normalizeKeyName(item)).filter(Boolean));
+  }
+  if (typeof input === 'object') {
+    return new Set(
+      Object.keys(input)
+        .map((key) => normalizeKeyName(key))
+        .filter(Boolean)
+    );
+  }
+  return new Set();
+}
+
+async function discoverVariantKeys({ family, brand, series, existingKeys }) {
+  if (!VARIANT_DISCOVERY_ENABLED || !family) {
+    return { detected: [], newKeys: [], stats: [] };
+  }
+
+  const rows = await loadSpecsRows({ family, brand, series });
+  if (!rows.length) return { detected: [], newKeys: [], stats: [] };
+
+  const contexts = rows.map((row) => buildPnContext(row));
+  const candidateMap = new Map();
+  let considered = 0;
+
+  for (let idx = 0; idx < rows.length; idx += 1) {
+    const row = rows[idx];
+    const raw = ensureObject(row?.raw_json);
+    if (!raw || typeof raw !== 'object') continue;
+    const entries = Object.entries(raw);
+    if (!entries.length) continue;
+    considered += 1;
+    for (const [rawKey, rawValue] of entries) {
+      const normKey = normalizeKeyName(rawKey);
+      if (!normKey || RESERVED_VARIANT_KEYS.has(normKey)) continue;
+
+      const flattened = flattenValues(rawValue);
+      if (!flattened.length) continue;
+      let normalizedValue = null;
+      for (const candidate of flattened) {
+        const normValue = normalizeVariantValue(candidate);
+        if (normValue) {
+          normalizedValue = normValue;
+          break;
+        }
+      }
+      if (!normalizedValue) continue;
+
+      const canonical = canonicalValue(normalizedValue);
+      if (!canonical) continue;
+
+      let info = candidateMap.get(normKey);
+      if (!info) {
+        info = {
+          present: 0,
+          values: new Map(),
+          pnMatches: 0,
+          maxLength: 0,
+          totalLength: 0,
+          sampleCount: 0,
+        };
+        candidateMap.set(normKey, info);
+      }
+
+      info.present += 1;
+      info.maxLength = Math.max(info.maxLength, normalizedValue.length);
+      info.totalLength += normalizedValue.length;
+      info.sampleCount += 1;
+
+      let valueEntry = info.values.get(canonical);
+      if (!valueEntry) {
+        valueEntry = { count: 0, sample: normalizedValue };
+        info.values.set(canonical, valueEntry);
+      }
+      valueEntry.count += 1;
+      if (normalizedValue.length < valueEntry.sample.length) {
+        valueEntry.sample = normalizedValue;
+      }
+
+      if (computePnMatch(normalizedValue, contexts[idx])) {
+        info.pnMatches += 1;
+      }
+    }
+  }
+
+  if (considered < VARIANT_MIN_SAMPLE) {
+    return { detected: [], newKeys: [], stats: [] };
+  }
+
+  const totalRows = considered;
+  const stats = [];
+  for (const [key, info] of candidateMap.entries()) {
+    if (!info) continue;
+    if (info.present < 2) continue;
+    const coverage = info.present / totalRows;
+    if (coverage < VARIANT_MIN_COVERAGE) continue;
+    const cardinality = info.values.size;
+    if (cardinality < 2 || cardinality > VARIANT_MAX_CARDINALITY) continue;
+    if (info.maxLength > VARIANT_MAX_VALUE_LENGTH) continue;
+    const pnRatio = info.present ? info.pnMatches / info.present : 0;
+    const isSeed = PREFERRED_SEED_VARIANT_KEYS.has(key);
+    if (!isSeed && pnRatio < VARIANT_MIN_MI) continue;
+    stats.push({ key, coverage, cardinality, pnRatio });
+  }
+
+  if (!stats.length) return { detected: [], newKeys: [], stats: [] };
+
+  stats.sort((a, b) => {
+    if (b.coverage !== a.coverage) return b.coverage - a.coverage;
+    if (a.cardinality !== b.cardinality) return a.cardinality - b.cardinality;
+    return b.pnRatio - a.pnRatio;
+  });
+
+  const detected = stats.map((item) => item.key);
+  const known = toNormalizedSet(existingKeys);
+  const newKeys = detected.filter((key) => !known.has(key));
+
+  return { detected, newKeys, stats };
+}
+
 async function loadRecipeRows(family) {
   if (!family) return [];
   try {
@@ -259,23 +571,19 @@ async function inferVariantKeys({ family, brand, series, blueprint, extracted })
   const recipes = filterRecipes(await loadRecipeRows(family), brand, series);
   const { entries, keySet } = buildAliasEntries({ blueprint, recipes, brand, series });
 
-  if (!entries.length && !keySet.size) {
-    return { detected: [], newKeys: [] };
-  }
-
   const tables = Array.isArray(extracted?.tables) ? extracted.tables : [];
   const rows = Array.isArray(extracted?.rows) ? extracted.rows : [];
 
-  const tableKeys = detectKeysFromTables(tables, entries, keySet);
-  const rowKeys = detectKeysFromRows(rows, entries, keySet);
-
   const detectedSet = new Set();
-  for (const key of tableKeys) detectedSet.add(key);
-  for (const key of rowKeys) detectedSet.add(key);
 
-  if (!detectedSet.size) return { detected: [], newKeys: [] };
+  if (entries.length || keySet.size) {
+    const tableKeys = detectKeysFromTables(tables, entries, keySet);
+    const rowKeys = detectKeysFromRows(rows, entries, keySet);
+    for (const key of tableKeys) detectedSet.add(key);
+    for (const key of rowKeys) detectedSet.add(key);
+  }
 
-  const existing = new Set();
+  const known = new Set();
   const blueprintKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
     ? blueprint.ingestOptions.variant_keys
     : Array.isArray(blueprint?.variant_keys)
@@ -283,20 +591,38 @@ async function inferVariantKeys({ family, brand, series, blueprint, extracted })
       : [];
   for (const key of blueprintKeys || []) {
     const norm = normalizeKeyName(key);
-    if (norm) existing.add(norm);
+    if (norm) known.add(norm);
+  }
+  for (const key of keySet || []) {
+    if (key) known.add(key);
   }
 
-  const detected = Array.from(detectedSet).map(normalizeKeyName).filter(Boolean);
-  const seen = new Set();
+  const normalizedFromExtraction = Array.from(detectedSet)
+    .map(normalizeKeyName)
+    .filter(Boolean);
   const deduped = [];
-  for (const key of detected) {
+  const seen = new Set();
+  for (const key of normalizedFromExtraction) {
     if (seen.has(key)) continue;
     seen.add(key);
     deduped.push(key);
   }
 
-  const newKeys = deduped.filter((key) => !existing.has(key));
-  return { detected: deduped, newKeys };
+  const discovery = await discoverVariantKeys({
+    family,
+    brand,
+    series,
+    existingKeys: new Set([...known, ...deduped]),
+  });
+
+  const finalSet = new Set(deduped);
+  for (const key of discovery.detected || []) {
+    if (key) finalSet.add(key);
+  }
+
+  const newKeys = Array.from(finalSet).filter((key) => !known.has(key));
+
+  return { detected: Array.from(finalSet), newKeys, details: discovery.stats };
 }
 
 module.exports = { inferVariantKeys, normalizeSlug };

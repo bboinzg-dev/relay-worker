@@ -1321,7 +1321,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       .filter(Boolean);
   }
 
-  const pnTemplate = USE_PN_TEMPLATE
+  let pnTemplate = USE_PN_TEMPLATE
     ? (blueprint?.ingestOptions?.pn_template || blueprint?.ingestOptions?.pnTemplate || null)
     : null;
   const requiredFields = [];
@@ -2278,6 +2278,26 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     recs: records.length,
     colsSanitized: colTypes?.size || 0,
   });
+
+  // 추출/가공 끝난 직후 시점에…
+  // 2-1) PN 템플릿이 없으면 문서에서 자동 유도 → recipe에 저장하고 이번 런에도 즉시 사용
+  try {
+    if (USE_PN_TEMPLATE && !pnTemplate) {
+      const fullText = await readText(gcsUri, 300 * 1024);
+      const { learnPnTemplate, upsertExtractionRecipe } = require('./pn-grammar');
+      const tpl = await learnPnTemplate({
+        family,
+        brand: brand || extracted.brand,
+        series,
+        docText: fullText,
+        rows: Array.isArray(records) && records.length ? records : extracted.rows,
+      });
+      if (tpl) {
+        await upsertExtractionRecipe({ family, brand: brand || extracted.brand, series, pnTemplate: tpl });
+        pnTemplate = tpl; // 이번 런에 바로 적용
+      }
+    }
+  } catch (e) { console.warn('[pn-learn] skipped:', e?.message || e); }
 
   const processedPayload = {
     started,

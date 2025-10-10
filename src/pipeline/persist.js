@@ -35,6 +35,37 @@ const { ensureSpecsTable } = tryRequire([
 ]);
 const { getColumnsOf } = require('./ensure-spec-columns');
 const { normalizeValueLLM } = require('../utils/ai');
+let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
+
+const STRICT_CODE_RULES = /^(1|true|on)$/i.test(process.env.STRICT_CODE_RULES || '1');
+
+function norm(s) {
+  return String(s || '')
+    .replace(/[\s\-_/()]/g, '')
+    .toUpperCase();
+}
+
+function codeForRelaySignal(spec) {
+  const parts = [];
+  const base = spec.pn || spec.series_code || spec.series || '';
+  if (base) parts.push(base);
+
+  const op = String(spec.operating_function || '').toLowerCase();
+  if (op.includes('latch')) parts.push('L');
+
+  const suf = (spec.suffix || '').trim();
+  if (suf) parts.push(suf.toUpperCase());
+
+  const cv = (spec.coil_voltage_vdc || spec.voltage || '')
+    .toString()
+    .replace(/\D/g, '');
+  if (cv) parts.push(`DC${cv}V`);
+
+  return parts
+    .filter(Boolean)
+    .join('-')
+    .replace(/--+/g, '-');
+}
 
 const META_KEYS = new Set([
   'family_slug',
@@ -717,9 +748,12 @@ function renderAnyTemplate(template, record = {}, ctxOrOptions = {}, maybeOption
   return cleaned || null;
 }
 
-function renderPnTemplate(template, record = {}) {
+function renderPnTemplateLocal(template, record = {}) {
   return renderAnyTemplate(template, record);
 }
+
+const renderPnTemplate =
+  typeof renderPnTemplateFromOrdering === 'function' ? renderPnTemplateFromOrdering : renderPnTemplateLocal;
 
 function buildPnIfMissing(record = {}, pnTemplate) {
   const existing = String(record.pn || '').trim();
@@ -734,6 +768,33 @@ function buildPnIfMissing(record = {}, pnTemplate) {
   }
   const code = String(record.code || '').trim();
   if (code) record.pn = code;
+}
+
+function buildBestIdentifiers(family, spec = {}, blueprint) {
+  if (!spec || typeof spec !== 'object') return spec;
+
+  let codeCandidate = null;
+  if (blueprint?.pn_template) {
+    try {
+      codeCandidate = renderPnTemplate(blueprint.pn_template, spec);
+    } catch (_) {}
+  }
+
+  if (!codeCandidate && family === 'relay_signal') {
+    codeCandidate = codeForRelaySignal(spec);
+  }
+
+  const docText = String(spec._doc_text || spec.doc_text || '');
+  if (codeCandidate && norm(docText).includes(norm(codeCandidate))) {
+    spec.pn = codeCandidate;
+    spec.code = codeCandidate;
+    spec.verified_in_doc = true;
+  } else {
+    spec.code = spec.pn;
+    if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
+  }
+
+  return spec;
 }
 
 function hasCoreSpecValue(value) {
@@ -1138,6 +1199,16 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       buildPnIfMissing(rec, pnTemplate);
+
+      buildBestIdentifiers(familySlug, rec, blueprintMeta);
+      if (!STRICT_CODE_RULES && rec._warn_invalid_code) {
+        console.warn(
+          '[WARN] invalid_code (soft) family=%s pn=%s code=%s',
+          familySlug,
+          rec.pn,
+          rec.code,
+        );
+      }
 
       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
         rec.pn = rec.code;

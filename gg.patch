@@ -1,54 +1,256 @@
-diff --git a/src/pipeline/variant-keys.js b/src/pipeline/variant-keys.js
-index 5927de202d5ed6452eab2456cfb0055db6fe4b7e..f4d5fcbf777420508f46ff7904535d1d7ff6c2ec 100644
---- a/src/pipeline/variant-keys.js
-+++ b/src/pipeline/variant-keys.js
-@@ -586,43 +586,48 @@ async function inferVariantKeys({ family, brand, series, blueprint, extracted })
-   const known = new Set();
-   const blueprintKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-     ? blueprint.ingestOptions.variant_keys
-     : Array.isArray(blueprint?.variant_keys)
-       ? blueprint.variant_keys
-       : [];
-   for (const key of blueprintKeys || []) {
-     const norm = normalizeKeyName(key);
-     if (norm) known.add(norm);
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 4029949b21db598a49cac35ace46aad64855cda8..f94a179831e011301569394443cc8b83ed302f9d 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -13,50 +13,81 @@ function tryRequire(paths) {
+         continue;
+       }
+       throw err;
+     }
    }
-   for (const key of keySet || []) {
-     if (key) known.add(key);
-   }
- 
-   const normalizedFromExtraction = Array.from(detectedSet)
-     .map(normalizeKeyName)
-     .filter(Boolean);
-   const deduped = [];
-   const seen = new Set();
-   for (const key of normalizedFromExtraction) {
-     if (seen.has(key)) continue;
-     seen.add(key);
-     deduped.push(key);
-   }
- 
-+  const existingKeys = new Set([
-+    ...known,
-+    ...deduped,
-+  ]);
-+
-   const discovery = await discoverVariantKeys({
-     family,
-     brand,
-     series,
--    existingKeys: new Set([...known, ...deduped]),
-+    existingKeys,
-   });
- 
-   const finalSet = new Set(deduped);
-   for (const key of discovery.detected || []) {
-     if (key) finalSet.add(key);
-   }
- 
-   const newKeys = Array.from(finalSet).filter((key) => !known.has(key));
- 
-   return { detected: Array.from(finalSet), newKeys, details: discovery.stats };
+   const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
+   error.code = 'MODULE_NOT_FOUND';
+   error.attempts = errors.map((e) => e?.message || String(e));
+   throw error;
  }
  
- module.exports = { inferVariantKeys, normalizeSlug };
+ const { pool } = tryRequire([
+   path.join(__dirname, '../../db'),
+   path.join(__dirname, '../db'),
+   path.join(__dirname, './db'),
+   path.join(process.cwd(), 'db'),
+ ]);
+ const { ensureSpecsTable } = tryRequire([
+   path.join(__dirname, '../utils/schema'),
+   path.join(__dirname, '../../utils/schema'),
+   path.join(__dirname, '../schema'),
+   path.join(process.cwd(), 'schema'),
+ ]);
+ const { getColumnsOf } = require('./ensure-spec-columns');
+ const { normalizeValueLLM } = require('../utils/ai');
++let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
++
++const STRICT_CODE_RULES = /^(1|true|on)$/i.test(process.env.STRICT_CODE_RULES || '1');
++
++function norm(s) {
++  return String(s || '')
++    .replace(/[\s\-_/()]/g, '')
++    .toUpperCase();
++}
++
++function codeForRelaySignal(spec) {
++  const parts = [];
++  const base = spec.pn || spec.series_code || spec.series || '';
++  if (base) parts.push(base);
++
++  const op = String(spec.operating_function || '').toLowerCase();
++  if (op.includes('latch')) parts.push('L');
++
++  const suf = (spec.suffix || '').trim();
++  if (suf) parts.push(suf.toUpperCase());
++
++  const cv = (spec.coil_voltage_vdc || spec.voltage || '')
++    .toString()
++    .replace(/\D/g, '');
++  if (cv) parts.push(`DC${cv}V`);
++
++  return parts
++    .filter(Boolean)
++    .join('-')
++    .replace(/--+/g, '-');
++}
+ 
+ const META_KEYS = new Set([
+   'family_slug',
+   'brand',
+   'brand_norm',
+   'pn',
+   'pn_norm',
+   'code',
+   'code_norm',
+   'mfr_full',
+   'datasheet_uri',
+   'verified_in_doc',
+   'display_name',
+   'displayname',
+   'image_uri',
+   'cover',
+   'series',
+   'series_code',
+   'raw_json',
+   'last_error',
+   'created_at',
+   'updated_at',
+ ]);
+ 
+ const CONFLICT_KEYS = ['brand', 'pn'];
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 4029949b21db598a49cac35ace46aad64855cda8..f94a179831e011301569394443cc8b83ed302f9d 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -695,69 +726,99 @@ function renderAnyTemplate(template, record = {}, ctxOrOptions = {}, maybeOption
+   }
+   const context = record && typeof record === 'object' ? { ...record } : {};
+   if (ctxText) {
+     if (context._doc_text == null) context._doc_text = ctxText;
+     if (context.doc_text == null) context.doc_text = ctxText;
+     if (context.__text == null) context.__text = ctxText;
+   }
+   let working = String(template);
+   let used = false;
+ 
+   const double = renderTemplateWithPattern(working, context, /\{\{\s*([^{}]+?)\s*\}\}/g);
+   working = double.rendered;
+   if (double.used) used = true;
+ 
+   const single = renderTemplateWithPattern(working, context, /\{\s*([^{}]+?)\s*\}/g);
+   working = single.rendered;
+   if (single.used) used = true;
+ 
+   if (!used) return null;
+   const collapseWhitespace = options?.collapseWhitespace !== false;
+   let cleaned = collapseWhitespace ? working.replace(/\s+/g, '') : working;
+   cleaned = cleaned.trim();
+   return cleaned || null;
+ }
+ 
+-function renderPnTemplate(template, record = {}) {
++function renderPnTemplateLocal(template, record = {}) {
+   return renderAnyTemplate(template, record);
+ }
+ 
++const renderPnTemplate =
++  typeof renderPnTemplateFromOrdering === 'function' ? renderPnTemplateFromOrdering : renderPnTemplateLocal;
++
+ function buildPnIfMissing(record = {}, pnTemplate) {
+   const existing = String(record.pn || '').trim();
+   if (existing) return;
+   const fromTemplate = renderPnTemplate(pnTemplate, record);
+   // 본문 검증: 템플릿 결과가 실제 문서 텍스트에 존재할 때만 채택
+   const ctxText = String(record._doc_text || record.doc_text || '');
+   if (fromTemplate && ctxText && ctxText.includes(fromTemplate)) {
+     record.pn = fromTemplate;
+     if (!record.code) record.code = fromTemplate;
+     return;
+   }
+   const code = String(record.code || '').trim();
+   if (code) record.pn = code;
+ }
+ 
++function buildBestIdentifiers(family, spec = {}, blueprint) {
++  if (!spec || typeof spec !== 'object') return spec;
++
++  let codeCandidate = null;
++  if (blueprint?.pn_template) {
++    try {
++      codeCandidate = renderPnTemplate(blueprint.pn_template, spec);
++    } catch (_) {}
++  }
++
++  if (!codeCandidate && family === 'relay_signal') {
++    codeCandidate = codeForRelaySignal(spec);
++  }
++
++  const docText = String(spec._doc_text || spec.doc_text || '');
++  if (codeCandidate && norm(docText).includes(norm(codeCandidate))) {
++    spec.pn = codeCandidate;
++    spec.code = codeCandidate;
++    spec.verified_in_doc = true;
++  } else {
++    spec.code = spec.pn;
++    if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
++  }
++
++  return spec;
++}
++
+ function hasCoreSpecValue(value) {
+   if (value == null) return false;
+   if (Array.isArray(value)) return value.some((v) => hasCoreSpecValue(v));
+   if (typeof value === 'boolean') return true;
+   if (typeof value === 'number') return Number.isFinite(value);
+   const str = String(value).trim();
+   return Boolean(str);
+ }
+ 
+ function hasCoreSpec(row, keys = [], candidateKeys = []) {
+   const primary = Array.isArray(keys) ? keys.filter(Boolean) : [];
+   const fallback = Array.isArray(candidateKeys) ? candidateKeys.filter(Boolean) : [];
+   const list = primary.length ? primary : fallback;
+   if (!list.length) {
+     for (const key of Object.keys(row || {})) {
+       const norm = normKey(key);
+       if (!norm || META_KEYS.has(norm)) continue;
+       if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
+     }
+     return false;
+   }
+   for (const key of list) {
+     const norm = normKey(key);
+     if (!norm) continue;
+     if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 4029949b21db598a49cac35ace46aad64855cda8..f94a179831e011301569394443cc8b83ed302f9d 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -1117,50 +1178,60 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+       if (pnWasTemplate) {
+         const renderedPn = renderAnyTemplate(templateContext.pn, templateContext, ctxText);
+         rec.pn = renderedPn ?? null;
+       }
+ 
+       if (codeWasTemplate) {
+         const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
+         const renderedCode = renderAnyTemplate(templateContext.code, contextForCode, ctxText);
+         rec.code = renderedCode ?? null;
+       }
+ 
+       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
+         rec.pn = rec.code;
+       }
+ 
+       if (!isValidCode(rec.pn)) {
+         rec.pn = null;
+       }
+ 
+       if (!rec.pn && rec.code) {
+         rec.pn = rec.code;
+       }
+ 
+       buildPnIfMissing(rec, pnTemplate);
+ 
++      buildBestIdentifiers(familySlug, rec, blueprintMeta);
++      if (!STRICT_CODE_RULES && rec._warn_invalid_code) {
++        console.warn(
++          '[WARN] invalid_code (soft) family=%s pn=%s code=%s',
++          familySlug,
++          rec.pn,
++          rec.code,
++        );
++      }
++
+       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
+         rec.pn = rec.code;
+       }
+ 
+       // 🔹 템플릿 미치환 차단: 아직 { } 가 남아있다면 유효 PN 아님
+       if (looksLikeTemplate(rec.pn) || looksLikeTemplate(rec.code)) {
+         if (physicalCols.has('last_error')) rec.last_error = 'template_unresolved';
+         result.skipped.push({ reason: 'invalid_code', detail: 'template_unresolved' });
+         continue;
+       }
+ 
+       const pnMissing = !isValidCode(rec.pn);
+       if (pnMissing && (pnWasTemplate || codeWasTemplate)) {
+         if (physicalCols.has('last_error')) rec.last_error = 'template_render_failed';
+         result.skipped.push({ reason: 'invalid_code', detail: 'template_render_failed' });
+         continue;
+       }
+ 
+       if (!isValidCode(rec.code) && isValidCode(rec.pn)) {
+         rec.code = rec.pn;
+       }
+ 
+       const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });
+       if (!guard.ok) {
+         const skip = { reason: guard.reason, detail: guard.detail || null };

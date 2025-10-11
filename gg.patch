@@ -1,84 +1,68 @@
 diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
-index 7d886540cdd3e91e143ba92bf29761f97879e8ef..846ae32b4d31388ca2fcccd3f00df8fc3479767a 100644
+index 17475595f07a6404f7c15e43f3170471e0d768b3..5904de387b21d8ca800187877fbc47f7bba14fda 100644
 --- a/src/utils/mpn-exploder.js
 +++ b/src/utils/mpn-exploder.js
-@@ -161,69 +161,72 @@ function __applyOps(val, ops = []) {
-   const first = Array.isArray(val) ? val[0] : val;
-   let s = first == null ? '' : String(first);
-   for (const rawOp of ops) {
-     if (!rawOp) continue;
-     const opToken = rawOp.includes('=') ? rawOp.replace('=', ':') : rawOp;
-     const op = opToken.trim();
-     if (!op) continue;
-     const lower = op.toLowerCase();
-     if (lower === 'upper') {
-       s = s.toUpperCase();
-       continue;
-     }
-     if (lower === 'lower') {
-       s = s.toLowerCase();
-       continue;
-     }
-     if (lower === 'first') {
-       s = s.split(',')[0].trim();
-       continue;
-     }
-     if (lower === 'alnum') {
-       s = s.replace(/[^0-9A-Z]/gi, '');
-       continue;
-     }
-     if (lower === 'digits') {
--      const digits = s.match(/\d+/g) || [''];
--      s = digits.join('');
-+      s = s.replace(/[^0-9]/g, '');
-       continue;
-     }
-     if (lower === 'num') {
-       const match = s.match(/-?\d+(?:\.\d+)?/);
-       s = match ? match[0] : '';
-       continue;
-     }
-     if (lower.startsWith('pad:')) {
--      const [, widthRaw] = op.split(':');
--      const width = Number(widthRaw) || 2;
--      s = s.padStart(width, '0');
-+      const parts = op.split(':');
-+      const width = Number(parts[1]) || 2;
-+      const fillRaw = parts.length > 2 ? parts[2] : '';
-+      const fill = fillRaw && fillRaw.trim() ? fillRaw.trim()[0] : '0';
-+      s = s.padStart(width, fill);
-       continue;
-     }
-     if (lower.startsWith('pad=')) {
--      const [, widthRaw] = op.split('=');
--      const width = Number(widthRaw) || 2;
--      s = s.padStart(width, '0');
-+      const parts = op.split('=');
-+      const width = Number(parts[1]) || 2;
-+      const fillRaw = parts.length > 2 ? parts[2] : '';
-+      const fill = fillRaw && fillRaw.trim() ? fillRaw.trim()[0] : '0';
-+      s = s.padStart(width, fill);
-       continue;
-     }
-     if (lower.startsWith('slice:')) {
-       const parts = op.split(':');
-       const start = Number(parts[1]) || 0;
-       const end = parts.length > 2 && parts[2] !== '' ? Number(parts[2]) : undefined;
-       s = s.slice(start, Number.isNaN(end) ? undefined : end);
-       continue;
-     }
-     if (lower.startsWith('map:')) {
-       const mapPairs = op.slice(4).split(',');
-       const mapping = Object.create(null);
-       for (const pair of mapPairs) {
-         const [from, to] = pair.split('>');
-         if (!from || to == null) continue;
-         mapping[String(from).trim().toUpperCase()] = String(to).trim();
-       }
-       const key = String(s).trim().toUpperCase();
-       s = mapping[key] ?? s;
-       continue;
-     }
+@@ -1,56 +1,57 @@
+ 'use strict';
+ 
+ const LIST_SEP = /[\s,;/|·•]+/;
+ // 패턴리스 정규화기: 1A/1B/1C/2A/2B/2C/1A1B/2AB 등 조합 처리
+ function normalizeContactForm(value) {
+   if (value == null) return null;
+   const raw = Array.isArray(value) ? value[0] : value;
+   if (raw == null) return null;
+   let s = String(raw).normalize('NFKC').toLowerCase();
+   if (!s.trim()) return null;
+-  s = s.replace(/[\s\-_]/g, '');
++  s = s.replace(/[\s\-_/]/g, '');
+   // 동의어 치환
+   s = s
+     .replace(/spstnc/g, '1b')
+     .replace(/spst(no)?/g, '1a')
+     .replace(/dpst(no)?/g, '2a')
+     .replace(/spdt/g, '1c')
+     .replace(/dpdt/g, '2c')
+     .replace(/form/g, '');
+   // (\d+)?[abc]+ 블록들을 누적 카운트
+   let a = 0;
+   let b = 0;
+   let c = 0;
+   const re = /(\d+)?([abc]+)/g;
+   let m;
+   while ((m = re.exec(s)) !== null) {
+-    const n = m[1] ? parseInt(m[1], 10) : 1;
+-    const letters = m[2];
+-    if (letters.includes('c')) c += n;
+-    if (letters.includes('a')) a += n;
+-    if (letters.includes('b')) b += n;
++    const rawCount = m[1] ? Number.parseInt(m[1], 10) : 1;
++    const n = Number.isFinite(rawCount) && rawCount > 0 ? rawCount : 1;
++    const letters = m[2] || '';
++    if (letters.includes('c')) c = Math.max(c, n);
++    if (letters.includes('a')) a = Math.max(a, n);
++    if (letters.includes('b')) b = Math.max(b, n);
    }
-   return s;
+   if (!a && !b && !c) return null;
+   if (c > 0) return `${c}C`;
+   if (a > 0 && b > 0) return `${a}A${b}B`;
+   if (a > 0) return `${a}A`;
+   return `${b}B`;
+ }
+ const SERIES_STRIP_WORDS = /\b(relays?|series|relay|power|signal)\b/gi;
+ const NON_MPN_WORDS = new Set([
+   'relay', 'relays', 'coil', 'vdc', 'vac', 'form', 'series', 'typ', 'max', 'min'
+ ]);
+ 
+ function normalizeSeriesCode(value) {
+   if (value == null) return null;
+   const raw = Array.isArray(value) ? value[0] : value;
+   if (raw == null) return null;
+   const str = String(raw).trim();
+   if (!str) return null;
+   const cleaned = str
+     .replace(SERIES_STRIP_WORDS, '')
+     .replace(/\s+/g, '')
+     .trim();
+   const upper = cleaned.toUpperCase();
+   return upper || null;
  }

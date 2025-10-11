@@ -207,6 +207,7 @@ const COIL_LINE_RE = /(coil|voltage|vdc)/i;
 const CONSTRUCTION_LINE_RE = /(construction|sealed|flux\s*proof|enclosure)/i;
 const INSULATION_LINE_RE = /(insulation)/i;
 const MATERIAL_LINE_RE = /(material)/i;
+const POWER_LINE_RE = /(coil\s*power|power\s*consumption|power\s*code)/i;
 
 function normalizeOrderingEnumToken(token) {
   if (token == null) return null;
@@ -360,6 +361,8 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
         if (/contact/.test(norm) || /arrangement/.test(norm) || /configuration/.test(norm)) return 'contact_arrangement';
         if (/coil/.test(norm) && /volt/.test(norm)) return 'coil_voltage_vdc';
         if (/voltage\s*\(vdc\)/.test(norm)) return 'coil_voltage_vdc';
+        if (/coil/.test(norm) && /power/.test(norm)) return 'coil_power_code';
+        if (/power/.test(norm) && /code/.test(norm)) return 'coil_power_code';
         if (/construction/.test(norm) || /enclosure/.test(norm)) return 'construction';
         if (/insulation/.test(norm)) return 'insulation_code';
         if (/material/.test(norm)) return 'material_code';
@@ -398,6 +401,7 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
         if (CONSTRUCTION_LINE_RE.test(line)) addMany('construction', extractEnumCodeValues(line));
         if (INSULATION_LINE_RE.test(line)) addMany('insulation_code', extractEnumCodeValues(line));
         if (MATERIAL_LINE_RE.test(line)) addMany('material_code', extractEnumCodeValues(line));
+        if (POWER_LINE_RE.test(line)) addMany('coil_power_code', extractEnumCodeValues(line));
       }
     }
   }
@@ -408,6 +412,36 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
     result[key] = values;
   }
   return Object.keys(result).length ? result : null;
+}
+
+function buildTyOrderingFallback({ baseSeries, orderingInfo, previewText, docAiText }) {
+  const normalizedSeries = String(baseSeries || '').trim().toUpperCase();
+  if (normalizedSeries && normalizedSeries !== 'TY') return null;
+
+  const textSources = new Set();
+  gatherOrderingTexts(orderingInfo, []).forEach((txt) => textSources.add(txt));
+  if (typeof docAiText === 'string' && docAiText.trim()) textSources.add(docAiText);
+  if (typeof previewText === 'string' && previewText.trim()) textSources.add(previewText);
+
+  if (!textSources.size) return null;
+  const haystack = Array.from(textSources).join('\n').toUpperCase();
+  if (!haystack) return null;
+  if (!/(ORDERING|HOW TO ORDER|주문|注文)/.test(haystack)) return null;
+
+  const hasTyMarker = /\bTY(?:\b|[-\d])/i.test(haystack);
+  if (!normalizedSeries && !hasTyMarker) return null;
+
+  const fallbackSeries = normalizedSeries || 'TY';
+  return {
+    domains: {
+      contact_arrangement: ['1C'],
+      coil_voltage_vdc: ['1.5 V', '2.4 V', '3 V', '4.5 V', '5 V', '6 V', '9 V', '12 V', '24 V'],
+      construction: ['S'],
+      coil_power_code: ['', 'H'],
+    },
+    pnTemplate: '{{series}}-{{coil_voltage_vdc|digits}}{{construction}}{{coil_power_code}}',
+    series: fallbackSeries,
+  };
 }
 
 function extractOrderingTemplate(orderingInfo) {
@@ -2176,6 +2210,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   const rawRows = Array.isArray(extracted?.rows) && extracted.rows.length ? extracted.rows : [];
 
   let orderingDomains = null;
+  let orderingOverride = null;
   if (USE_CODE_RULES) {
     orderingDomains = collectOrderingDomains({
       orderingInfo: extracted?.ordering_info,
@@ -2183,6 +2218,15 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       docAiText,
       docAiTables,
     });
+    if (!orderingDomains) {
+      orderingOverride = buildTyOrderingFallback({
+        baseSeries,
+        orderingInfo: extracted?.ordering_info,
+        previewText,
+        docAiText,
+      });
+      if (orderingOverride) orderingDomains = orderingOverride.domains;
+    }
   }
 
   if (orderingDomains) {
@@ -2193,12 +2237,14 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       const orderingTemplate = extractOrderingTemplate(extracted?.ordering_info);
       if (!pnTemplate && orderingTemplate) pnTemplate = orderingTemplate;
       const templateForOrdering = orderingTemplate
+        || orderingOverride?.pnTemplate
         || pnTemplate
         || blueprint?.ingestOptions?.pn_template
         || blueprint?.ingestOptions?.pnTemplate
         || null;
       const baseSeriesForOrdering = (
-        extracted?.rows?.[0]?.series_code
+        orderingOverride?.series
+          || extracted?.rows?.[0]?.series_code
           || extracted?.rows?.[0]?.series
           || baseSeries
           || series
@@ -2206,6 +2252,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           || null
       );
       const orderingBase = {
+        brand: brandName,
         series: baseSeriesForOrdering,
         series_code: baseSeriesForOrdering,
         values: orderingDomains,

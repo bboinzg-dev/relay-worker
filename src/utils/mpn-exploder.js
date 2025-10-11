@@ -8,7 +8,7 @@ function normalizeContactForm(value) {
   if (raw == null) return null;
   let s = String(raw).normalize('NFKC').toLowerCase();
   if (!s.trim()) return null;
-  s = s.replace(/[\s\-_]/g, '');
+  s = s.replace(/[\s\-_/]/g, '');
   // 동의어 치환
   s = s
     .replace(/spstnc/g, '1b')
@@ -24,11 +24,12 @@ function normalizeContactForm(value) {
   const re = /(\d+)?([abc]+)/g;
   let m;
   while ((m = re.exec(s)) !== null) {
-    const n = m[1] ? parseInt(m[1], 10) : 1;
-    const letters = m[2];
-    if (letters.includes('c')) c += n;
-    if (letters.includes('a')) a += n;
-    if (letters.includes('b')) b += n;
+    const rawCount = m[1] ? Number.parseInt(m[1], 10) : 1;
+    const n = Number.isFinite(rawCount) && rawCount > 0 ? rawCount : 1;
+    const letters = m[2] || '';
+    if (letters.includes('c')) c = Math.max(c, n);
+    if (letters.includes('a')) a = Math.max(a, n);
+    if (letters.includes('b')) b = Math.max(b, n);
   }
   if (!a && !b && !c) return null;
   if (c > 0) return `${c}C`;

@@ -278,7 +278,9 @@ function normalizeOrderingEnumToken(token) {
   const raw = String(token).trim();
   if (!raw) return null;
   if (/^(nil|blank|none|null|n\/a)$/i.test(raw)) return '';
+  // 문자 1~2자 또는 숫자 1~2자(예: Cover 1/2)
   if (/^[A-Za-z]{1,2}$/.test(raw)) return raw.toUpperCase();
+  if (/^\d{1,2}$/.test(raw)) return raw;
   return null;
 }
 
@@ -309,13 +311,20 @@ function extractContactValues(text) {
 function extractCoilVoltageValues(text) {
   if (!text) return [];
   const out = [];
-  const re = /\b(\d{1,3})\s*(?:V(?:DC)?|DC)\b/gi;
+  // DC12V / AC220V / 12V / 12 V / 12 VDC / 12 DC / AC 110 / DC 24
+  const re = /\b(?:AC|DC)?\s*(\d{1,3})\s*(?:V(?:DC)?|DC)?\b/gi;
   let m;
   while ((m = re.exec(text)) !== null) {
     const num = Number.parseInt(m[1], 10);
     if (!Number.isFinite(num)) continue;
-    const normalized = `${num} V`;
-    out.push(normalized);
+    out.push(`${num} V`);
+  }
+  // "AC: 6,12,24..." 같이 단위 없는 숫자 나열도 코일/볼티지 맥락이면 허용
+  if (!out.length && /(coil|volt|ac|dc)/i.test(text)) {
+    for (const match of text.matchAll(/\b(\d{1,3})\b/g)) {
+      const n = parseInt(match[1], 10);
+      if (Number.isFinite(n)) out.push(`${n} V`);
+    }
   }
   return out;
 }
@@ -466,6 +475,16 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
         if (INSULATION_LINE_RE.test(line)) addMany('insulation_code', extractEnumCodeValues(line));
         if (MATERIAL_LINE_RE.test(line)) addMany('material_code', extractEnumCodeValues(line));
         if (POWER_LINE_RE.test(line)) addMany('coil_power_code', extractEnumCodeValues(line));
+        // 자주 나오는 일반 패턴들
+        if (/led/i.test(line)) addMany('led_code', extractEnumCodeValues(line)); // "L: With LED, Nil: W/O LED"
+        if (/cover/i.test(line)) {
+          const modes = Array.from(line.matchAll(/\b([12])\b/g)).map((m) => m[1]);
+          if (modes.length) addMany('cover_mode', modes);
+        }
+        if (/(insert|pcb)/i.test(line)) {
+          const types = Array.from(line.matchAll(/\b([ab])\s*[:=]/gi)).map((m) => m[1].toLowerCase());
+          if (types.length) addMany('mount_type_code', types);
+        }
       }
     }
   }
@@ -582,6 +601,9 @@ const KEY_ALIASES = {
   form: ['form', 'contact_form', 'contact_arrangement', 'configuration', 'arrangement', 'poles_form'],
   voltage: ['voltage', 'coil_voltage_vdc', 'voltage_vdc', 'rated_voltage_vdc', 'vdc', 'coil_voltage'],
   case: ['case', 'case_code', 'package', 'pkg'],
+  led: ['led', 'led_code', 'indicator'],
+  cover: ['cover', 'cover_mode', 'cover_code'],
+  mount: ['mount', 'mount_type_code', 'insert_type', 'assembly'],
   capacitance: ['capacitance', 'capacitance_uF', 'capacitance_f', 'c'],
   resistance: ['resistance', 'resistance_ohm', 'r_ohm', 'r'],
   tolerance: ['tolerance', 'tolerance_pct'],
@@ -2408,13 +2430,6 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       .filter(Boolean);
     if (orderingKeys.length) {
       const orderingTemplate = extractOrderingTemplate(extracted?.ordering_info);
-      if (!pnTemplate && orderingTemplate) pnTemplate = orderingTemplate;
-      const templateForOrdering = orderingTemplate
-        || orderingOverride?.pnTemplate
-        || pnTemplate
-        || blueprint?.ingestOptions?.pn_template
-        || blueprint?.ingestOptions?.pnTemplate
-        || null;
       const baseSeriesForOrdering = (
         orderingOverride?.series
           || extracted?.rows?.[0]?.series_code
@@ -2424,6 +2439,38 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           || code
           || null
       );
+      if (!pnTemplate && orderingTemplate) pnTemplate = orderingTemplate;
+      // 템플릿이 여전히 없으면, 여기서 즉시 학습해 폭발 단계에 반영
+      if (USE_PN_TEMPLATE && !pnTemplate) {
+        try {
+          const fullText = await readText(gcsUri, 300 * 1024).catch(() => '');
+          if (fullText) {
+            const { learnPnTemplate, upsertExtractionRecipe } = require('./pn-grammar');
+            const tpl = await learnPnTemplate({
+              family,
+              brand: brandName,
+              series: baseSeriesForOrdering,
+              docText: fullText,
+              rows: Array.isArray(extracted?.rows) && extracted.rows.length ? extracted.rows : rawRows,
+            });
+            if (tpl) {
+              pnTemplate = tpl;
+              await upsertExtractionRecipe({
+                family,
+                brand: brandName,
+                series: baseSeriesForOrdering,
+                pnTemplate: tpl,
+              });
+            }
+          }
+        } catch (_) {}
+      }
+      const templateForOrdering = orderingTemplate
+        || orderingOverride?.pnTemplate
+        || pnTemplate
+        || blueprint?.ingestOptions?.pn_template
+        || blueprint?.ingestOptions?.pnTemplate
+        || null;
       const orderingBase = {
         brand: brandName,
         series: baseSeriesForOrdering,

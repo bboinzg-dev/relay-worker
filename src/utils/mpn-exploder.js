@@ -1,11 +1,41 @@
 'use strict';
 
 const LIST_SEP = /[\s,;/|·•]+/;
-const CONTACT_FORM_PATTERNS = [
-  { regex: /(1\s*form\s*a|1a|spst-?no)/i, value: '1A' },
-  { regex: /(2\s*form\s*a|2a|dpst-?no)/i, value: '2A' },
-];
-const CONTACT_FORM_ALLOWED = new Set(['1A', '2A']);
+// 패턴리스 정규화기: 1A/1B/1C/2A/2B/2C/1A1B/2AB 등 조합 처리
+function normalizeContactForm(value) {
+  if (value == null) return null;
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (raw == null) return null;
+  let s = String(raw).normalize('NFKC').toLowerCase();
+  if (!s.trim()) return null;
+  s = s.replace(/[\s\-_]/g, '');
+  // 동의어 치환
+  s = s
+    .replace(/spstnc/g, '1b')
+    .replace(/spst(no)?/g, '1a')
+    .replace(/dpst(no)?/g, '2a')
+    .replace(/spdt/g, '1c')
+    .replace(/dpdt/g, '2c')
+    .replace(/form/g, '');
+  // (\d+)?[abc]+ 블록들을 누적 카운트
+  let a = 0;
+  let b = 0;
+  let c = 0;
+  const re = /(\d+)?([abc]+)/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const n = m[1] ? parseInt(m[1], 10) : 1;
+    const letters = m[2];
+    if (letters.includes('c')) c += n;
+    if (letters.includes('a')) a += n;
+    if (letters.includes('b')) b += n;
+  }
+  if (!a && !b && !c) return null;
+  if (c > 0) return `${c}C`;
+  if (a > 0 && b > 0) return `${a}A${b}B`;
+  if (a > 0) return `${a}A`;
+  return `${b}B`;
+}
 const SERIES_STRIP_WORDS = /\b(relays?|series|relay|power|signal)\b/gi;
 const NON_MPN_WORDS = new Set([
   'relay', 'relays', 'coil', 'vdc', 'vac', 'form', 'series', 'typ', 'max', 'min'
@@ -25,21 +55,6 @@ function normalizeSeriesCode(value) {
   return upper || null;
 }
 
-function normalizeContactForm(value) {
-  if (value == null) return null;
-  const raw = Array.isArray(value) ? value[0] : value;
-  if (raw == null) return null;
-  const str = String(raw).trim();
-  if (!str) return null;
-  for (const { regex, value: mapped } of CONTACT_FORM_PATTERNS) {
-    if (regex.test(str)) return mapped;
-  }
-  const compact = str.replace(/\s+/g, '').toUpperCase();
-  if (CONTACT_FORM_ALLOWED.has(compact)) return compact;
-  if (compact === 'SPST' || compact === 'SPSTNO') return '1A';
-  if (compact === 'DPST' || compact === 'DPSTNO') return '2A';
-  return null;
-}
 
 function normalizeCoilVoltage(value) {
   if (value == null) return null;
@@ -250,7 +265,7 @@ function explodeToRows(base, options = {}) {
       assignValue(rowValues, key, val);
     });
 
-        const normalizedSeries = normalizeSeriesCode(
+    const normalizedSeries = normalizeSeriesCode(
       rowValues.series_code
         ?? rowValues.series
         ?? base?.series_code
@@ -281,18 +296,14 @@ function explodeToRows(base, options = {}) {
       delete rowValues.coil_voltagevdc;
     }
 
-    const canUseTemplate = pnTemplate
-      && normalizedSeries
-      && normalizedContactForm
-      && CONTACT_FORM_ALLOWED.has(normalizedContactForm)
-      && normalizedCoilVoltage;
+    const canUseTemplate = pnTemplate && normalizedSeries && normalizedCoilVoltage;
 
     let generatedByTemplate = false;
     let generatedByFallback = false;
     let code = null;
 
     if (pnTemplate) {
-            if (!canUseTemplate) return;
+  if (!canUseTemplate) return;
       code = renderTemplate(pnTemplate, {
         ...rowValues,
         series: normalizedSeries,
@@ -346,4 +357,5 @@ module.exports = {
   cartesian,
   renderTemplate,
   explodeToRows,
+  normalizeContactForm,
 };

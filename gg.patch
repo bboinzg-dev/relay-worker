@@ -1,66 +1,476 @@
-diff --git a/src/utils/vertex.js b/src/utils/vertex.js
-index 037b14e0aacafb157bf6648cbb68d409de6a7c2e..2bff4f97663fc96f5d1c868efbf91dcf18668bbe 100644
---- a/src/utils/vertex.js
-+++ b/src/utils/vertex.js
-@@ -24,26 +24,60 @@ function getModel(systemText, modelId = DEFAULT_MODEL_ID) {
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index b6068d61c9eac70be5cb466c9955af5e40f4753e..22910cef135138235ee1353b9e9d034457feda7e 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -119,50 +119,113 @@ const SKIP_SPEC_KEYS = new Set([
+   'raw_text',
+   'raw_specs',
+   'rawspecs',
+   'raw_table',
+   'raw_tables',
+   'ordering_info',
+   'doc_type',
+ ]);
+ 
+ function gatherRuntimeSpecKeys(rows) {
+   const set = new Set();
+   const list = Array.isArray(rows) ? rows : [];
+   for (const row of list) {
+     if (!row || typeof row !== 'object') continue;
+     for (const rawKey of Object.keys(row)) {
+       const trimmed = String(rawKey || '').trim();
+       if (!trimmed) continue;
+       const lower = trimmed.toLowerCase();
+       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
+       set.add(trimmed);
+     }
    }
-   return getVertex().getGenerativeModel(cfg);
+   return set;
  }
  
- async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
-   const model = getModel(systemText, modelId);
-   const req = {
-     contents: [{ role: 'user', parts: [{ text: String(userText || '') }]}],
-     generationConfig: {
-       responseMimeType: 'application/json',
-       temperature,
-       topP,
-       maxOutputTokens,
-     },
-   };
-   const resp = await model.generateContent(req);
-   const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-   try {
-     const parsed = safeJsonParse(txt);
-     return parsed ?? {};
-   } catch {
-     throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`);
-   }
- }
- 
--module.exports = { getVertex, getModel, callModelJson };
-+async function extractOrderingRecipe(gcsUriOrText) {
-+  const source = String(gcsUriOrText || '');
-+  if (!source) return { variant_domains: {}, pn_template: null };
++function expandRowsWithVariants(baseRows, options = {}) {
++  const list = Array.isArray(baseRows) ? baseRows : [];
++  const variantKeys = Array.isArray(options.variantKeys)
++    ? Array.from(
++        new Set(
++          options.variantKeys
++            .map((key) => String(key || '').trim())
++            .filter(Boolean),
++        ),
++      )
++    : [];
++  const pnTemplate = typeof options.pnTemplate === 'string' ? options.pnTemplate : null;
++  const defaultBrand = typeof options.defaultBrand === 'string' ? options.defaultBrand : null;
++  const defaultSeries = options.defaultSeries ?? null;
 +
-+  const sys = [
-+    'You analyze ORDERING INFORMATION / HOW TO ORDER sections from electronic component datasheets.',
-+    'Return strict JSON with shape: {"variant_domains": {"key": ["values"]}, "pn_template": "string or null"}.',
-+    'Keys must be concise machine-readable snake_case identifiers.',
-+    'If an option is blank/"Nil", represent it with an empty string "".',
-+    'Do not fabricate data. Leave arrays empty when unsure.',
-+  ].join('\n');
-+
-+  const payload = /^gs:\/\//i.test(source)
-+    ? { gcs_uri: source }
-+    : { text: source };
-+
-+  let out;
-+  try {
-+    out = await callModelJson(sys, JSON.stringify({ source: payload }), { maxOutputTokens: 2048 });
-+  } catch (err) {
-+    console.warn('[vertex] extractOrderingRecipe failed:', err?.message || err);
-+    return { variant_domains: {}, pn_template: null };
++  if (!variantKeys.length && !pnTemplate) {
++    return list;
 +  }
 +
-+  const domains = out && typeof out === 'object' && out.variant_domains && typeof out.variant_domains === 'object'
-+    ? out.variant_domains
-+    : {};
-+  const tpl = typeof out?.pn_template === 'string' && out.pn_template.trim()
-+    ? out.pn_template
-+    : null;
++  const expanded = [];
++  for (const rawRow of list) {
++    const baseRow = rawRow && typeof rawRow === 'object' ? { ...rawRow } : {};
++    if (defaultBrand) {
++      const brandCurrent = String(baseRow.brand || '').trim().toLowerCase();
++      if (!brandCurrent || brandCurrent === 'unknown') {
++        baseRow.brand = defaultBrand;
++      }
++    }
++    const seriesSeed =
++      baseRow.series_code ??
++      baseRow.series ??
++      (defaultSeries != null ? defaultSeries : null);
++    if (seriesSeed != null) {
++      if (baseRow.series == null) baseRow.series = seriesSeed;
++      if (baseRow.series_code == null) baseRow.series_code = seriesSeed;
++    }
 +
-+  return { variant_domains: domains, pn_template: tpl };
++    const explodeBase = {
++      brand: baseRow.brand ?? defaultBrand ?? null,
++      series: baseRow.series ?? seriesSeed ?? null,
++      series_code: baseRow.series_code ?? seriesSeed ?? null,
++      values: baseRow,
++    };
++
++    const exploded = explodeToRows(explodeBase, { variantKeys, pnTemplate }) || [];
++    if (Array.isArray(exploded) && exploded.length) {
++      for (const item of exploded) {
++        if (!item || typeof item !== 'object') continue;
++        const values = item.values && typeof item.values === 'object' ? item.values : {};
++        const merged = { ...baseRow, ...values };
++        if (item.code) merged.code = item.code;
++        if (item.code_norm) merged.code_norm = item.code_norm;
++        expanded.push(merged);
++      }
++      continue;
++    }
++
++    expanded.push(baseRow);
++  }
++
++  return expanded;
 +}
 +
-+module.exports = { getVertex, getModel, callModelJson, extractOrderingRecipe };
+ const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
+ const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
+ const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/]{1,62}[A-Z0-9)]$/i;
+ 
+ function sanitizeDatasheetUrl(url) {
+   if (url == null) return null;
+   const str = typeof url === 'string' ? url.trim() : String(url || '').trim();
+   if (!str) return null;
+   try {
+     const parsed = new URL(str);
+     const pathname = (parsed.pathname || '').trim();
+     if (!pathname) return null;
+     const lowerPath = pathname.toLowerCase();
+     if (!lowerPath.endsWith('.pdf')) return null;
+     return parsed.toString();
+   } catch {
+     return null;
+   }
+ }
+ 
+ function pickDatasheetUrl(rawUrl, fallbackUrl) {
+   const sanitized = sanitizeDatasheetUrl(rawUrl);
+   if (sanitized) return sanitized;
+   const fallback = typeof fallbackUrl === 'string' ? fallbackUrl.trim() : String(fallbackUrl || '').trim();
+   return fallback || null;
+@@ -1193,116 +1256,170 @@ function guessFamilySlug({ fileName = '', previewText = '', brand = '' }) {
+     }
+ 
+     const powerHints = /\b(power\s+relay|general\s+purpose\s+relay|high\s+power|power\s+load|heavy\s+duty)\b/;
+     if (powerHints.test(haystack)) {
+       return 'relay_power';
+     }
+   }
+ 
+   if (/\b(resistor|r-clamp|ohm)\b/.test(haystack)) return 'resistor_chip';
+   if (/\b(capacitor|mlcc|electrolytic|tantalum)\b/.test(haystack)) return 'capacitor_mlcc';
+   if (/\b(inductor|choke)\b/.test(haystack)) return 'inductor_power';
+   if (/\b(bridge|rectifier|diode)\b/.test(haystack)) return 'bridge_rectifier';
+ 
+   return null;
+ }
+ 
+ function normalizeCode(str) {
+   return String(str || '')
+     .replace(/[–—]/g, '-')      // 유니코드 대시 정규화
+     .replace(/\s+/g, '')        // 내부 공백 제거
+     .replace(/-+/g, '-')        // 대시 연속 정리
+     .toUpperCase();
+ }
+ 
+ // --- 문서 타입 감지: 단일 / 카탈로그 / 오더링 섹션 ---
+-function resolveDocTypeFromExtraction(payload, text = '') {
++function resolveDocTypeFromExtraction(payload, text = '', signals = {}) {
+   if (!payload || typeof payload !== 'object') return null;
+ 
+   const existingRaw = typeof payload.doc_type === 'string' ? payload.doc_type.trim().toLowerCase() : '';
+   const orderingCodes = Array.isArray(payload?.ordering_info?.codes)
+     ? payload.ordering_info.codes.filter(Boolean).length
+     : 0;
+ 
++  const vertexHintRaw = typeof signals?.vertexDocType === 'string'
++    ? signals.vertexDocType.trim().toLowerCase()
++    : '';
++  const docTypeHintRaw = typeof signals?.docTypeHint === 'string'
++    ? signals.docTypeHint.trim().toLowerCase()
++    : '';
++  const orderingHits = Array.isArray(signals?.orderingHits) ? signals.orderingHits : [];
++  const orderingHitCount = Number.isFinite(signals?.orderingHitCount)
++    ? Number(signals.orderingHitCount)
++    : orderingHits.length;
++  const orderingScore = Number.isFinite(signals?.orderingScore)
++    ? Number(signals.orderingScore)
++    : orderingHits.reduce((sum, item) => sum + Number(item?.score || 0), 0);
++  const orderingInfoCodes = Array.isArray(signals?.orderingInfo?.codes)
++    ? signals.orderingInfo.codes.filter(Boolean).length
++    : 0;
++  const orderingSignal = Math.max(orderingCodes, orderingInfoCodes, orderingHitCount);
++  const hasOrderingRecipe = Boolean(signals?.hasOrderingRecipe);
++
+   const rowCodes = new Set();
+   if (Array.isArray(payload.rows)) {
+     for (const row of payload.rows) {
+       if (!row || typeof row !== 'object') continue;
+       const code = String(row.code || row.pn || '').trim().toUpperCase();
+       if (code) rowCodes.add(code);
+     }
+   }
+ 
+   let candidateList = [];
+   if (Array.isArray(payload.codes) && payload.codes.length) {
+     candidateList = payload.codes;
+   } else if (Array.isArray(payload.mpn_list) && payload.mpn_list.length) {
+     candidateList = payload.mpn_list;
+   }
+   const candidateCodes = new Set(
+     candidateList.map((code) => String(code || '').trim().toUpperCase()).filter(Boolean)
+   );
+ 
+-  let inferred = 'single';
+-  if (orderingCodes > 0) inferred = 'ordering';
+-  else if (rowCodes.size > 1 || candidateCodes.size > 1) inferred = 'catalog';
+-
+   const haystack = String(text || '').toLowerCase();
+-  if (inferred !== 'ordering' && orderingCodes === 0 && haystack) {
+-    if (
++
++  const orderingKeywordHit = Boolean(
++    haystack && (
+       haystack.includes('how to order') ||
+       haystack.includes('ordering information') ||
+       haystack.includes('ordering info') ||
+       haystack.includes('주문') ||
+       haystack.includes('订购') ||
+       haystack.includes('订货')
+-    ) {
+-      inferred = 'ordering';
+-    }
+-  }
+-  if (inferred === 'single' && candidateCodes.size > 0 && haystack) {
+-    if (
++    )
++  );
++
++  const catalogKeywordHit = Boolean(
++    haystack && (
+       haystack.includes('catalog') ||
+       haystack.includes('product list') ||
+       haystack.includes('types') ||
+       haystack.includes('part no') ||
+       haystack.includes('part number')
+-    ) {
+-      inferred = 'catalog';
++    )
++  );
++
++  const baseHint = docTypeHintRaw || vertexHintRaw || '';
++
++  const strongOrdering =
++    orderingSignal > 0 ||
++    orderingKeywordHit ||
++    hasOrderingRecipe ||
++    orderingScore >= 6 ||
++    (orderingHitCount >= 2 && candidateCodes.size > 1);
++
++  let inferred = baseHint || 'single';
++  if (inferred !== 'ordering') {
++    if (strongOrdering) {
++      inferred = 'ordering';
++    } else if (inferred !== 'catalog') {
++      if (rowCodes.size > 1 || candidateCodes.size > 1 || catalogKeywordHit) {
++        inferred = 'catalog';
++      } else {
++        inferred = 'single';
++      }
+     }
+   }
+ 
++  if (inferred === 'catalog' && strongOrdering) {
++    inferred = 'ordering';
++  }
++
+   if (existingRaw === 'ordering') return 'ordering';
+   if (existingRaw === 'catalog') {
+-    return inferred === 'ordering' ? 'ordering' : 'catalog';
++    return strongOrdering ? 'ordering' : 'catalog';
+   }
+   if (existingRaw === 'single') {
+     if (inferred === 'ordering') return 'ordering';
+     if (inferred === 'catalog') return 'catalog';
+     return 'single';
+   }
+ 
++  if (strongOrdering) return 'ordering';
++  if (candidateCodes.size > 10 || rowCodes.size > 10) return 'catalog';
++  if (candidateCodes.size > 1) return 'catalog';
++  if (rowCodes.size > 1) return 'catalog';
++
++  if (orderingCodes > 0 || orderingInfoCodes > 0 || orderingHitCount > 0) return 'ordering';
++
++  if (orderingKeywordHit) return 'ordering';
++  if (catalogKeywordHit) return 'catalog';
++  if (haystack.includes('catalog')) return 'catalog';
++  if (haystack.includes('series information')) return 'catalog';
++  if (haystack.includes('ordering guide')) return 'ordering';
++  if (haystack.includes('ordering information')) return 'ordering';
++  if (haystack.includes('ordering info')) return 'ordering';
++
+   return inferred;
+ }
+ 
+ // ---- NEW: "TYPES / Part No." 표에서 품번 열거 추출 ----
+ function _expandAorS(code) {
+   return code.includes('*') ? [code.replace('*','A'), code.replace('*','S')] : [code];
+ }
+ function _looksLikePn(s) {
+   const c = s.toUpperCase();
+   if (!/[0-9]/.test(c)) return false;
+   if (c.length < 4 || c.length > 24) return false;
+   // 명백한 단위/잡토큰 제거
+   if (/^(ISO|ROHS|VDC|VAC|V|A|MA|MM|Ω|OHM|PDF|PAGE|NOTE|DATE|LOT|WWW|HTTP|HTTPS)$/i.test(c)) return false;
+   return true;
+ }
+ function extractPartNumbersFromTypesTables(full, limit = 200) {
+   const text = String(full || '');
+   if (!text) return [];
+   // TYPES, Part No. 주변 10~16KB 윈도우로 좁힌다
+   const idxTypes = text.search(/\bTYPES\b/i);
+   const idxPart  = text.search(/\bPart\s*No\.?\b/i);
+   const anchor   = (idxTypes >= 0 ? idxTypes : 0);
+   const start    = Math.max(0, Math.min(anchor, idxPart >= 0 ? idxPart : anchor) - 4000);
+   const end      = Math.min(text.length, (anchor || 0) + 16000);
+   const win      = text.slice(start, end);
+@@ -1877,91 +1994,102 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+   }
+ 
+   // 🔹 후보(candidates)가 아직 비었고, 방금 수집한 codes가 있으면 candidates로 승격
+   if (!candidates.length && codes.length) {
+     const merged = [];
+     const seen = new Set();
+     for (const raw of codes) {
+       const trimmed = typeof raw === 'string' ? raw.trim() : String(raw || '');
+       if (!trimmed) continue;
+       const norm = normalizeCode(trimmed);
+       if (seen.has(norm)) continue;
+       seen.add(norm);
+       merged.push(trimmed);
+     }
+     if (merged.length) candidates = merged;
+   }
+ 
+   // 🔹 “애초에 분석단계에서 여러 MPN을 리스트업” — 추출 결과에 명시적으로 부착
+   if (extracted && typeof extracted === 'object') {
+     const list = (Array.isArray(codes) ? codes : []).filter(Boolean);
+     const merged = mergeSkuCandidates(extracted.codes, list);
+     extracted.codes = merged;        // <- 최종 MPN 배열
+     extracted.mpn_list = merged;     // <- 동의어(외부에서 쓰기 쉽도록)
+   }
+ 
++  let orderingSectionRanks = [];
+   if (!code && !codes.length) {
+     let fullText = '';
+     try { fullText = await readText(gcsUri, 300 * 1024) || ''; } catch {}
+ 
+-    const fromTypes  = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
+-    const fromOrder  = rankPartNumbersFromOrderingSections(fullText, FIRST_PASS_CODES);
++    const fromTypes = extractPartNumbersFromTypesTables(fullText, FIRST_PASS_CODES * 4); // TYPES 표 우선
++    orderingSectionRanks = rankPartNumbersFromOrderingSections(fullText, FIRST_PASS_CODES);
+     const fromSeries = extractPartNumbersBySeriesHeuristic(fullText, FIRST_PASS_CODES * 4);
+-    console.log(`[PATH] pns={tables:${fromTypes.length}, body:${fromOrder.length}} combos=0`);
++    console.log(`[PATH] pns={tables:${fromTypes.length}, body:${orderingSectionRanks.length}} combos=0`);
+     // 가장 신뢰 높은 순서로 병합
+-    const picks = fromTypes.length ? fromTypes : (fromOrder.length ? fromOrder : fromSeries);
++    const picks = fromTypes.length ? fromTypes : (orderingSectionRanks.length ? orderingSectionRanks : fromSeries);
+ 
+     if (!candidates.length && picks.length) {
+       const merged = [];
+       const seen = new Set();
+       for (const p of picks) {
+         const raw = typeof p === 'string' ? p : p?.code;
+         const trimmed = typeof raw === 'string' ? raw.trim() : '';
+         if (!trimmed) continue;
+         const norm = normalizeCode(trimmed);
+         if (seen.has(norm)) continue;
+         seen.add(norm);
+         merged.push(trimmed);
+       }
+       if (merged.length) {
+         candidates = merged;
+         // 🔹 types/order/series 휴리스틱으로도 찾은 경우, 이것도 추출 결과에 반영
+         if (extracted && typeof extracted === 'object') {
+           const uniq = mergeSkuCandidates(extracted.codes, merged);
+           extracted.codes = uniq;
+           extracted.mpn_list = uniq;
+         }
+       }
+     }
+ 
+     // 분할 여부는 별도 판단. 여기서는 후보만 모아둠.
+     // extracted.rows는 건드리지 않음.
+   }
+ 
++  const orderingRankScore = Array.isArray(orderingSectionRanks)
++    ? orderingSectionRanks.reduce((sum, item) => sum + Number(item?.score || 0), 0)
++    : 0;
+   const docTypeResolved = resolveDocTypeFromExtraction(
+     extracted,
+-    extracted?.text || previewText || ''
++    extracted?.text || previewText || '',
++    {
++      vertexDocType: vertexClassification?.doc_type || vertexClassification?.docType || null,
++      orderingHits: orderingSectionRanks,
++      orderingHitCount: Array.isArray(orderingSectionRanks) ? orderingSectionRanks.length : 0,
++      orderingScore: orderingRankScore,
++      orderingInfo: extracted?.ordering_info,
++    },
+   );
+   if (docTypeResolved) {
+     extracted.doc_type = docTypeResolved;
+   }
+   if (typeof extracted?.doc_type === 'string' && extracted.doc_type) {
+     const normalizedDocType = extracted.doc_type.trim();
+     if (normalizedDocType && Array.isArray(extracted.rows)) {
+       for (const row of extracted.rows) {
+         if (!row || typeof row !== 'object') continue;
+         if (row.doc_type == null || row.doc_type === '') {
+           row.doc_type = normalizedDocType;
+         }
+       }
+     }
+   }
+ 
+   const extractedText = extracted?.text || previewText || '';
+   const brandHintSeed = pickBrandHint(
+     overridesBrand,
+     effectiveBrand,
+     brand,
+     extracted?.brand,
+     detectedBrand,
+     vertexClassification?.brand,
+   );
+@@ -2568,51 +2696,62 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+ 
+   const candidateMap = [];
+   const candidateNormSet = new Set();
+   for (const cand of candidates) {
+     const trimmed = typeof cand === 'string' ? cand.trim() : String(cand || '');
+     if (!trimmed) continue;
+     const norm = normalizeCode(trimmed);
+     if (!norm || candidateNormSet.has(norm)) continue;
+     candidateNormSet.add(norm);
+     candidateMap.push({ raw: trimmed, norm });
+   }
+ 
+   const baseRows = (rawRows.length ? rawRows : [{}]).map((row) => {
+     const obj = row && typeof row === 'object' ? { ...row } : {};
+     if (obj.brand == null) obj.brand = brandName;
+     const fallbackSeries = obj.series_code || obj.series || baseSeries || null;
+     if (fallbackSeries != null) {
+       if (obj.series == null) obj.series = fallbackSeries;
+       if (obj.series_code == null) obj.series_code = fallbackSeries;
+     }
+     if (obj.datasheet_uri == null) obj.datasheet_uri = gcsUri;
+     if (coverUri && obj.cover == null) obj.cover = coverUri;
+     return obj;
+   });
+ 
+-  const explodedRows = USE_CODE_RULES ? explodeToRows(blueprint, baseRows) : baseRows;
++  let explodedRows = baseRows;
++  if (USE_CODE_RULES) {
++    const expanded = expandRowsWithVariants(baseRows, {
++      variantKeys,
++      pnTemplate,
++      defaultBrand: brandName,
++      defaultSeries: baseSeries,
++    });
++    if (Array.isArray(expanded) && expanded.length) {
++      explodedRows = expanded;
++    }
++  }
+   const physicalCols = new Set(colTypes ? [...colTypes.keys()] : []);
+   const allowedSet = new Set((allowedKeys || []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
+   const variantSet = new Set(variantKeys);
+ 
+   const seenCodes = new Set();
+   for (const row of explodedRows) {
+     const seeds = [];
+     const seenSeed = new Set();
+     const pushSeed = (val) => {
+       if (val == null) return;
+       if (Array.isArray(val)) { val.forEach(pushSeed); return; }
+       const str = String(val).trim();
+       if (!str) return;
+       const parts = splitAndCarryPrefix(str);
+       if (parts.length > 1) { parts.forEach(pushSeed); return; }
+       const normed = str.toLowerCase();
+       if (seenSeed.has(normed)) return;
+       seenSeed.add(normed);
+       seeds.push(str);
+     };
+     pushSeed(row.code);
+     pushSeed(row.mpn);
+     pushSeed(row.part_number);
+     pushSeed(row.part_no);

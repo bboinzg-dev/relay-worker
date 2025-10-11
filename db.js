@@ -6,31 +6,6 @@ const fs = require('fs');
 const { URL } = require('url');
 
 let _pool;
-let _poolInitError = null;
-
-function createUnavailablePool(error) {
-  const makeError = () => {
-    const err = new Error('DB_UNAVAILABLE');
-    if (error) {
-      err.cause = error;
-      err.message = error?.message
-        ? `DB_UNAVAILABLE: ${error.message}`
-        : 'DB_UNAVAILABLE';
-    }
-    return err;
-  };
-
-  const reject = async () => {
-    throw makeError();
-  };
-
-  return {
-    query: reject,
-    connect: reject,
-    end: async () => {},
-    on: () => {},
-  };
-}
 
 function attachVerboseQueryLogging(pool) {
   if (process.env.VERBOSE_TRACE !== '1') return pool;
@@ -165,13 +140,7 @@ function buildPool() {
 
 function getPool() {
   if (_pool) return _pool;
-  try {
-    _pool = buildPool();
-  } catch (err) {
-    _poolInitError = err;
-    console.error('[db] buildPool failed:', err?.message || err);
-    _pool = createUnavailablePool(err);
-  }
+  _pool = buildPool();
   return _pool;
 }
 

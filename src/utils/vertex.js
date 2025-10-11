@@ -2,38 +2,16 @@
 
 const { VertexAI } = require('@google-cloud/vertexai');
 const { safeJsonParse } = require('./safe-json');
+const env = require('../config/env');
 
-let envConfig = null;
-let envLoadError = null;
-try {
-  envConfig = require('../config/env');
-} catch (err) {
-  envLoadError = err;
-  console.warn('[vertex] config env unavailable:', err?.message || err);
-}
+const DEFAULT_MODEL_ID = env.GEMINI_MODEL_EXTRACT || env.VERTEX_MODEL_ID;
 
-const PROJECT_ID = envConfig?.PROJECT_ID
-  || process.env.GCP_PROJECT_ID
-  || process.env.GOOGLE_CLOUD_PROJECT
-  || null;
-const LOCATION = envConfig?.VERTEX_LOCATION || process.env.VERTEX_LOCATION || 'asia-northeast3';
-const DEFAULT_MODEL_ID = envConfig?.GEMINI_MODEL_EXTRACT
-  || envConfig?.VERTEX_MODEL_ID
-  || process.env.GEMINI_MODEL_EXTRACT
-  || process.env.VERTEX_MODEL_ID
-  || 'gemini-2.5-flash';
 
 let vertexInstance;
 
 function getVertex() {
-    if (!PROJECT_ID) {
-    const err = new Error('VERTEX_PROJECT_ID_MISSING');
-    if (envLoadError) err.cause = envLoadError;
-    throw err;
-  }
   if (!vertexInstance) {
-    vertexInstance = new VertexAI({ project: PROJECT_ID, location: LOCATION });
-  return vertexInstance;
+    vertexInstance = new VertexAI({ project: env.PROJECT_ID, location: env.VERTEX_LOCATION });
 }
 
 // Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용

@@ -157,20 +157,84 @@ function cartesian(lists) {
   );
 }
 
+function __applyOps(val, ops = []) {
+  const first = Array.isArray(val) ? val[0] : val;
+  let s = first == null ? '' : String(first);
+  for (const rawOp of ops) {
+    if (!rawOp) continue;
+    const opToken = rawOp.includes('=') ? rawOp.replace('=', ':') : rawOp;
+    const op = opToken.trim();
+    if (!op) continue;
+    const lower = op.toLowerCase();
+    if (lower === 'upper') {
+      s = s.toUpperCase();
+      continue;
+    }
+    if (lower === 'lower') {
+      s = s.toLowerCase();
+      continue;
+    }
+    if (lower === 'first') {
+      s = s.split(',')[0].trim();
+      continue;
+    }
+    if (lower === 'alnum') {
+      s = s.replace(/[^0-9A-Z]/gi, '');
+      continue;
+    }
+    if (lower === 'digits') {
+      const digits = s.match(/\d+/g) || [''];
+      s = digits.join('');
+      continue;
+    }
+    if (lower === 'num') {
+      const match = s.match(/-?\d+(?:\.\d+)?/);
+      s = match ? match[0] : '';
+      continue;
+    }
+    if (lower.startsWith('pad:')) {
+      const [, widthRaw] = op.split(':');
+      const width = Number(widthRaw) || 2;
+      s = s.padStart(width, '0');
+      continue;
+    }
+    if (lower.startsWith('pad=')) {
+      const [, widthRaw] = op.split('=');
+      const width = Number(widthRaw) || 2;
+      s = s.padStart(width, '0');
+      continue;
+    }
+    if (lower.startsWith('slice:')) {
+      const parts = op.split(':');
+      const start = Number(parts[1]) || 0;
+      const end = parts.length > 2 && parts[2] !== '' ? Number(parts[2]) : undefined;
+      s = s.slice(start, Number.isNaN(end) ? undefined : end);
+      continue;
+    }
+    if (lower.startsWith('map:')) {
+      const mapPairs = op.slice(4).split(',');
+      const mapping = Object.create(null);
+      for (const pair of mapPairs) {
+        const [from, to] = pair.split('>');
+        if (!from || to == null) continue;
+        mapping[String(from).trim().toUpperCase()] = String(to).trim();
+      }
+      const key = String(s).trim().toUpperCase();
+      s = mapping[key] ?? s;
+      continue;
+    }
+  }
+  return s;
+}
+
 function renderTemplate(tpl, ctx) {
   if (!tpl) return '';
-  return tpl.replace(/\{\{([^}]+)\}\}/g, (_, expr) => {
-    const [head, ...pipes] = expr.split('|').map((s) => s.trim());
-    let val = ctx[head];
-    for (const pipe of pipes) {
-      if (pipe === 'upper') val = String(val ?? '').toUpperCase();
-      else if (pipe === 'lower') val = String(val ?? '').toLowerCase();
-      else if (pipe.startsWith('pad=')) {
-        const n = parseInt(pipe.slice(4), 10);
-        const str = String(val ?? '');
-        val = Number.isFinite(n) ? str.padStart(n, '0') : str;
-      }
-    }
+  return String(tpl).replace(/\{\{?([^{}]+)\}\}?/g, (_, expr) => {
+    const [head, ...pipes] = String(expr)
+      .split('|')
+      .map((s) => s.trim());
+    if (!head) return '';
+    const val = __applyOps(ctx[head], pipes);
     return val == null ? '' : String(val);
   });
 }
@@ -289,6 +353,7 @@ function explodeToRows(base, options = {}) {
       delete rowValues.contactform;
     }
 
+        assignValue(rowValues, 'coil_voltage_text', rowValues.coil_voltage_vdc);
     const normalizedCoilVoltage = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
     if (normalizedCoilVoltage) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltage);
     else {
@@ -358,4 +423,4 @@ module.exports = {
   renderTemplate,
   explodeToRows,
   normalizeContactForm,
-};
+};src/utils/mpn-exploder.js

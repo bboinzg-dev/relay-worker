@@ -201,6 +201,261 @@ function normalizeSpecKeyName(value) {
   return s;
 }
 
+const ORDERING_SECTION_RE = /(ordering information|ordering info|how to order|order information|ordering code|how-to-order|\b品番\b|\b型番\b|주문|注文)/i;
+const CONTACT_LINE_RE = /(contact|arrangement|configuration|form)/i;
+const COIL_LINE_RE = /(coil|voltage|vdc)/i;
+const CONSTRUCTION_LINE_RE = /(construction|sealed|flux\s*proof|enclosure)/i;
+const INSULATION_LINE_RE = /(insulation)/i;
+const MATERIAL_LINE_RE = /(material)/i;
+
+function normalizeOrderingEnumToken(token) {
+  if (token == null) return null;
+  const raw = String(token).trim();
+  if (!raw) return null;
+  if (/^(nil|blank|none|null|n\/a)$/i.test(raw)) return '';
+  if (/^[A-Za-z]{1,2}$/.test(raw)) return raw.toUpperCase();
+  return null;
+}
+
+function addOrderingDomainValue(domains, key, value) {
+  if (!key) return;
+  if (value == null) return;
+  const arr = domains.get(key) || [];
+  if (!arr.some((item) => item === value)) {
+    arr.push(value);
+    domains.set(key, arr);
+  }
+}
+
+function extractContactValues(text) {
+  if (!text) return [];
+  const out = [];
+  const re = /\b((?:\d{1,2}\s*[ABC])+)(?![A-Za-z])/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const token = m[1] ? m[1].replace(/\s+/g, '').toUpperCase() : '';
+    if (!token) continue;
+    if (!/[ABC]/.test(token)) continue;
+    out.push(token);
+  }
+  return out;
+}
+
+function extractCoilVoltageValues(text) {
+  if (!text) return [];
+  const out = [];
+  const re = /\b(\d{1,3})\s*(?:V(?:DC)?|DC)\b/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const num = Number.parseInt(m[1], 10);
+    if (!Number.isFinite(num)) continue;
+    const normalized = `${num} V`;
+    out.push(normalized);
+  }
+  return out;
+}
+
+function extractEnumCodeValues(text) {
+  if (!text) return [];
+  const out = [];
+  const directRe = /(Nil|Blank|None|[A-Za-z])\s*(?=[:=（(\-])/g;
+  let m;
+  while ((m = directRe.exec(text)) !== null) {
+    const normalized = normalizeOrderingEnumToken(m[1]);
+    if (normalized == null) continue;
+    out.push(normalized);
+  }
+  if (out.length) return out;
+
+  const fragments = String(text)
+    .split(/[\n,\/|•·]+/)
+    .map((part) => part.replace(/[()]/g, '').trim())
+    .filter(Boolean);
+  for (const frag of fragments) {
+    const normalized = normalizeOrderingEnumToken(frag);
+    if (normalized == null) continue;
+    out.push(normalized);
+  }
+  return out;
+}
+
+function gatherOrderingTexts(info, acc = []) {
+  if (!info) return acc;
+  if (typeof info === 'string') {
+    const trimmed = info.trim();
+    if (!trimmed) return acc;
+    try {
+      const parsed = JSON.parse(trimmed);
+      return gatherOrderingTexts(parsed, acc);
+    } catch (_) {
+      acc.push(trimmed);
+      return acc;
+    }
+  }
+  if (Array.isArray(info)) {
+    for (const entry of info) gatherOrderingTexts(entry, acc);
+    return acc;
+  }
+  if (typeof info !== 'object') return acc;
+
+  const candidates = [
+    info.text,
+    info.window_text,
+    info.windowText,
+    info.context,
+    info.snippet,
+    info.preview,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      acc.push(candidate.trim());
+    }
+  }
+  if (info.window && typeof info.window === 'object') {
+    gatherOrderingTexts(info.window, acc);
+  }
+  if (Array.isArray(info.sections)) {
+    for (const section of info.sections) gatherOrderingTexts(section, acc);
+  }
+  return acc;
+}
+
+function sliceOrderingSections(text) {
+  if (!text) return [];
+  const normalized = String(text).replace(/\r/g, '\n');
+  const sections = [];
+  const re = new RegExp(ORDERING_SECTION_RE.source, 'gi');
+  let match;
+  while ((match = re.exec(normalized)) !== null) {
+    const start = Math.max(0, match.index - 80);
+    const end = Math.min(normalized.length, match.index + 1200);
+    sections.push(normalized.slice(start, end));
+  }
+  if (!sections.length && normalized.trim()) {
+    sections.push(normalized.slice(0, 1200));
+  }
+  return sections;
+}
+
+function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTables }) {
+  const domains = new Map();
+
+  const addMany = (key, values) => {
+    if (!Array.isArray(values)) return;
+    for (const value of values) {
+      if (value == null) continue;
+      addOrderingDomainValue(domains, key, value);
+    }
+  };
+
+  if (Array.isArray(docAiTables)) {
+    for (const table of docAiTables) {
+      if (!table || typeof table !== 'object') continue;
+      const headers = Array.isArray(table.headers) ? table.headers : [];
+      const rows = Array.isArray(table.rows) ? table.rows : [];
+      if (!headers.length || !rows.length) continue;
+      const keyByIndex = headers.map((header) => {
+        const norm = String(header || '').trim().toLowerCase();
+        if (!norm) return null;
+        if (/contact/.test(norm) || /arrangement/.test(norm) || /configuration/.test(norm)) return 'contact_arrangement';
+        if (/coil/.test(norm) && /volt/.test(norm)) return 'coil_voltage_vdc';
+        if (/voltage\s*\(vdc\)/.test(norm)) return 'coil_voltage_vdc';
+        if (/construction/.test(norm) || /enclosure/.test(norm)) return 'construction';
+        if (/insulation/.test(norm)) return 'insulation_code';
+        if (/material/.test(norm)) return 'material_code';
+        return null;
+      });
+      if (!keyByIndex.some(Boolean)) continue;
+      for (const row of rows) {
+        if (!Array.isArray(row)) continue;
+        row.forEach((cell, idx) => {
+          const key = keyByIndex[idx];
+          if (!key) return;
+          const text = typeof cell === 'string' ? cell : String(cell ?? '');
+          if (!text.trim()) return;
+          if (key === 'contact_arrangement') addMany(key, extractContactValues(text));
+          else if (key === 'coil_voltage_vdc') addMany(key, extractCoilVoltageValues(text));
+          else addMany(key, extractEnumCodeValues(text));
+        });
+      }
+    }
+  }
+
+  const textSources = new Set();
+  gatherOrderingTexts(orderingInfo, []).forEach((txt) => textSources.add(txt));
+  if (typeof docAiText === 'string' && docAiText.trim()) textSources.add(docAiText);
+  if (typeof previewText === 'string' && previewText.trim()) textSources.add(previewText);
+
+  for (const rawText of textSources) {
+    const sections = sliceOrderingSections(rawText);
+    for (const section of sections) {
+      const lines = section.split(/\n+/);
+      for (const rawLine of lines) {
+        const line = rawLine.replace(/^[\s•·\-–—]+/, '').trim();
+        if (!line) continue;
+        if (CONTACT_LINE_RE.test(line)) addMany('contact_arrangement', extractContactValues(line));
+        if (COIL_LINE_RE.test(line)) addMany('coil_voltage_vdc', extractCoilVoltageValues(line));
+        if (CONSTRUCTION_LINE_RE.test(line)) addMany('construction', extractEnumCodeValues(line));
+        if (INSULATION_LINE_RE.test(line)) addMany('insulation_code', extractEnumCodeValues(line));
+        if (MATERIAL_LINE_RE.test(line)) addMany('material_code', extractEnumCodeValues(line));
+      }
+    }
+  }
+
+  const result = {};
+  for (const [key, values] of domains.entries()) {
+    if (!values || !values.length) continue;
+    result[key] = values;
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+function extractOrderingTemplate(orderingInfo) {
+  if (!orderingInfo) return null;
+  if (typeof orderingInfo === 'string') {
+    const trimmed = orderingInfo.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = JSON.parse(trimmed);
+      return extractOrderingTemplate(parsed);
+    } catch (_) {
+      return null;
+    }
+  }
+  if (Array.isArray(orderingInfo)) {
+    for (const entry of orderingInfo) {
+      const tpl = extractOrderingTemplate(entry);
+      if (tpl) return tpl;
+    }
+    return null;
+  }
+  if (typeof orderingInfo !== 'object') return null;
+
+  const candidates = [
+    orderingInfo.pn_template,
+    orderingInfo.pnTemplate,
+    orderingInfo.template,
+    orderingInfo.mpn_template,
+    orderingInfo.code_template,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  if (orderingInfo.window && typeof orderingInfo.window === 'object') {
+    const tpl = extractOrderingTemplate(orderingInfo.window);
+    if (tpl) return tpl;
+  }
+  if (Array.isArray(orderingInfo.sections)) {
+    for (const section of orderingInfo.sections) {
+      const tpl = extractOrderingTemplate(section);
+      if (tpl) return tpl;
+    }
+  }
+  return null;
+}
+
 function escapeRegex(str) {
   return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -1919,6 +2174,106 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   await ensureSpecColumnsForBlueprint(qualified, blueprint);
 
   const rawRows = Array.isArray(extracted?.rows) && extracted.rows.length ? extracted.rows : [];
+
+  let orderingDomains = null;
+  if (USE_CODE_RULES) {
+    orderingDomains = collectOrderingDomains({
+      orderingInfo: extracted?.ordering_info,
+      previewText,
+      docAiText,
+      docAiTables,
+    });
+  }
+
+  if (orderingDomains) {
+    const orderingKeys = Object.keys(orderingDomains)
+      .map((key) => String(key || '').trim())
+      .filter(Boolean);
+    if (orderingKeys.length) {
+      const orderingTemplate = extractOrderingTemplate(extracted?.ordering_info);
+      if (!pnTemplate && orderingTemplate) pnTemplate = orderingTemplate;
+      const templateForOrdering = orderingTemplate
+        || pnTemplate
+        || blueprint?.ingestOptions?.pn_template
+        || blueprint?.ingestOptions?.pnTemplate
+        || null;
+      const baseSeriesForOrdering = (
+        extracted?.rows?.[0]?.series_code
+          || extracted?.rows?.[0]?.series
+          || baseSeries
+          || series
+          || code
+          || null
+      );
+      const orderingBase = {
+        series: baseSeriesForOrdering,
+        series_code: baseSeriesForOrdering,
+        values: orderingDomains,
+      };
+      const explodedOrdering = explodeToRows(orderingBase, {
+        variantKeys: orderingKeys,
+        pnTemplate: templateForOrdering,
+      });
+      if (Array.isArray(explodedOrdering) && explodedOrdering.length) {
+        const existingCodes = new Set();
+        for (const row of rawRows) {
+          if (!row || typeof row !== 'object') continue;
+          const seed = row.code ?? row.pn ?? row.part_number;
+          if (!seed) continue;
+          const norm = String(seed).trim().toLowerCase();
+          if (norm) existingCodes.add(norm);
+        }
+        const appendedRows = [];
+        for (const generated of explodedOrdering) {
+          if (!generated || typeof generated !== 'object') continue;
+          const codeValue = typeof generated.code === 'string' ? generated.code.trim() : '';
+          if (!codeValue) continue;
+          const codeNorm = codeValue.toLowerCase();
+          if (existingCodes.has(codeNorm)) continue;
+          existingCodes.add(codeNorm);
+          const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
+          const normalizedSeries =
+            values.series_code
+              ?? values.series
+              ?? orderingBase.series_code
+              ?? orderingBase.series
+              ?? null;
+          const newRow = {
+            ...values,
+            code: codeValue,
+            code_norm: generated.code_norm || codeNorm,
+            verified_in_doc: true,
+          };
+          if (normalizedSeries && newRow.series == null) newRow.series = normalizedSeries;
+          if (normalizedSeries && newRow.series_code == null) newRow.series_code = normalizedSeries;
+          appendedRows.push(newRow);
+          rawRows.push(newRow);
+        }
+        if (appendedRows.length) {
+          if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
+            extracted.rows = rawRows;
+          }
+          const lowerOrderingKeys = orderingKeys
+            .map((k) => String(k).trim().toLowerCase())
+            .filter(Boolean);
+          const allowedLower = new Set(
+            (allowedKeys || []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+          );
+          for (const key of lowerOrderingKeys) {
+            if (!variantKeys.includes(key)) variantKeys.push(key);
+            if (!allowedLower.has(key)) {
+              allowedKeys.push(key);
+              allowedLower.add(key);
+            }
+            if (Array.isArray(runtimeVariantKeys) && !runtimeVariantKeys.includes(key)) {
+              runtimeVariantKeys.push(key);
+            }
+          }
+        }
+      }
+    }
+  }
+
   const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
 
     if (family && extracted && AUTO_ALIAS_LEARN && AUTO_ALIAS_LIMIT) {

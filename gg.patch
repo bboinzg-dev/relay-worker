@@ -1,46 +1,84 @@
-diff --git a/src/utils/vertex.js b/src/utils/vertex.js
-index ae74a94bbb9dbfae25a6ff927ebc2dfc04967a88..037b14e0aacafb157bf6648cbb68d409de6a7c2e 100644
---- a/src/utils/vertex.js
-+++ b/src/utils/vertex.js
-@@ -1,39 +1,41 @@
- 'use strict';
- 
- const { VertexAI } = require('@google-cloud/vertexai');
- const { safeJsonParse } = require('./safe-json');
- const env = require('../config/env');
- 
- const DEFAULT_MODEL_ID = env.GEMINI_MODEL_EXTRACT || env.VERTEX_MODEL_ID;
- 
- 
- let vertexInstance;
- 
- function getVertex() {
-   if (!vertexInstance) {
-     vertexInstance = new VertexAI({ project: env.PROJECT_ID, location: env.VERTEX_LOCATION });
-+  }
-+  return vertexInstance;
- }
- 
- // Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용
- function getModel(systemText, modelId = DEFAULT_MODEL_ID) {
-   const cfg = { model: modelId };
-   if (systemText && String(systemText).trim()) {
-     cfg.systemInstruction = { parts: [{ text: String(systemText) }] };
+diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
+index 7d886540cdd3e91e143ba92bf29761f97879e8ef..846ae32b4d31388ca2fcccd3f00df8fc3479767a 100644
+--- a/src/utils/mpn-exploder.js
++++ b/src/utils/mpn-exploder.js
+@@ -161,69 +161,72 @@ function __applyOps(val, ops = []) {
+   const first = Array.isArray(val) ? val[0] : val;
+   let s = first == null ? '' : String(first);
+   for (const rawOp of ops) {
+     if (!rawOp) continue;
+     const opToken = rawOp.includes('=') ? rawOp.replace('=', ':') : rawOp;
+     const op = opToken.trim();
+     if (!op) continue;
+     const lower = op.toLowerCase();
+     if (lower === 'upper') {
+       s = s.toUpperCase();
+       continue;
+     }
+     if (lower === 'lower') {
+       s = s.toLowerCase();
+       continue;
+     }
+     if (lower === 'first') {
+       s = s.split(',')[0].trim();
+       continue;
+     }
+     if (lower === 'alnum') {
+       s = s.replace(/[^0-9A-Z]/gi, '');
+       continue;
+     }
+     if (lower === 'digits') {
+-      const digits = s.match(/\d+/g) || [''];
+-      s = digits.join('');
++      s = s.replace(/[^0-9]/g, '');
+       continue;
+     }
+     if (lower === 'num') {
+       const match = s.match(/-?\d+(?:\.\d+)?/);
+       s = match ? match[0] : '';
+       continue;
+     }
+     if (lower.startsWith('pad:')) {
+-      const [, widthRaw] = op.split(':');
+-      const width = Number(widthRaw) || 2;
+-      s = s.padStart(width, '0');
++      const parts = op.split(':');
++      const width = Number(parts[1]) || 2;
++      const fillRaw = parts.length > 2 ? parts[2] : '';
++      const fill = fillRaw && fillRaw.trim() ? fillRaw.trim()[0] : '0';
++      s = s.padStart(width, fill);
+       continue;
+     }
+     if (lower.startsWith('pad=')) {
+-      const [, widthRaw] = op.split('=');
+-      const width = Number(widthRaw) || 2;
+-      s = s.padStart(width, '0');
++      const parts = op.split('=');
++      const width = Number(parts[1]) || 2;
++      const fillRaw = parts.length > 2 ? parts[2] : '';
++      const fill = fillRaw && fillRaw.trim() ? fillRaw.trim()[0] : '0';
++      s = s.padStart(width, fill);
+       continue;
+     }
+     if (lower.startsWith('slice:')) {
+       const parts = op.split(':');
+       const start = Number(parts[1]) || 0;
+       const end = parts.length > 2 && parts[2] !== '' ? Number(parts[2]) : undefined;
+       s = s.slice(start, Number.isNaN(end) ? undefined : end);
+       continue;
+     }
+     if (lower.startsWith('map:')) {
+       const mapPairs = op.slice(4).split(',');
+       const mapping = Object.create(null);
+       for (const pair of mapPairs) {
+         const [from, to] = pair.split('>');
+         if (!from || to == null) continue;
+         mapping[String(from).trim().toUpperCase()] = String(to).trim();
+       }
+       const key = String(s).trim().toUpperCase();
+       s = mapping[key] ?? s;
+       continue;
+     }
    }
-   return getVertex().getGenerativeModel(cfg);
+   return s;
  }
- 
- async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
-   const model = getModel(systemText, modelId);
-   const req = {
-     contents: [{ role: 'user', parts: [{ text: String(userText || '') }]}],
-     generationConfig: {
-       responseMimeType: 'application/json',
-       temperature,
-       topP,
-       maxOutputTokens,
-     },
-   };
-   const resp = await model.generateContent(req);
-   const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-   try {

@@ -72,6 +72,10 @@ const AUTO_ADD_FIELDS_LIMIT_RAW = Number(process.env.AUTO_ADD_FIELDS_LIMIT ?? 20
 const AUTO_ADD_FIELDS_LIMIT = Number.isFinite(AUTO_ADD_FIELDS_LIMIT_RAW)
   ? Math.max(0, AUTO_ADD_FIELDS_LIMIT_RAW)
   : 20;
+const VARIANT_MAX_CARDINALITY_INPUT = parseInt(process.env.VARIANT_MAX_CARDINALITY ?? '', 10);
+const VARIANT_MAX_CARDINALITY = Number.isFinite(VARIANT_MAX_CARDINALITY_INPUT)
+  ? Math.max(2, VARIANT_MAX_CARDINALITY_INPUT)
+  : 20;
 
   // ── Auto-alias learning: unknown spec keys → extraction_recipe.key_alias ──
 const AUTO_ALIAS_LEARN = /^(1|true|on)$/i.test(process.env.AUTO_ALIAS_LEARN || '1');
@@ -141,6 +145,32 @@ function gatherRuntimeSpecKeys(rows) {
   return set;
 }
 
+async function ensureDynamicColumnsForRows(qualifiedTable, rows) {
+  if (!AUTO_ADD_FIELDS || !AUTO_ADD_FIELDS_LIMIT) return;
+  const keys = Array.from(gatherRuntimeSpecKeys(rows)).slice(0, AUTO_ADD_FIELDS_LIMIT);
+  if (!keys.length) return;
+  const sample = {};
+  if (Array.isArray(rows)) {
+    const remaining = new Set(keys);
+    for (const row of rows) {
+      if (!row || typeof row !== 'object') continue;
+      for (const key of keys) {
+        if (!remaining.has(key)) continue;
+        if (Object.prototype.hasOwnProperty.call(row, key)) {
+          sample[key] = row[key];
+          remaining.delete(key);
+        }
+      }
+      if (!remaining.size) break;
+    }
+  }
+  try {
+    await ensureSpecColumnsForKeys(qualifiedTable, keys, sample);
+  } catch (err) {
+    console.warn('[schema] ensureDynamicColumnsForRows failed:', err?.message || err);
+  }
+}
+
 function expandRowsWithVariants(baseRows, options = {}) {
   const list = Array.isArray(baseRows) ? baseRows : [];
   const variantKeys = Array.isArray(options.variantKeys)
@@ -204,9 +234,9 @@ function expandRowsWithVariants(baseRows, options = {}) {
   return expanded;
 }
 
-const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]/gi;
+const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().#]{3,63}[0-9A-Z)#]/gi;
 const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
-const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/]{1,62}[A-Z0-9)]$/i;
+const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
 
 function sanitizeDatasheetUrl(url) {
   if (url == null) return null;
@@ -265,7 +295,8 @@ function normalizeSpecKeyName(value) {
   return s;
 }
 
-const ORDERING_SECTION_RE = /(ordering information|ordering info|how to order|order information|ordering code|how-to-order|\b品番\b|\b型番\b|주문|注文)/i;
+const ORDERING_SECTION_RE =
+  /(ordering information|ordering info|how to order|order information|ordering code|how-to-order|\b品番\b|\b型番\b|\b型号\b|\b型號\b|주문|형명|형번|품번|注文|订购信息|订购|订購|订货|型号)/i;
 const CONTACT_LINE_RE = /(contact|arrangement|configuration|form)/i;
 const COIL_LINE_RE = /(coil|voltage|vdc)/i;
 const CONSTRUCTION_LINE_RE = /(construction|sealed|flux\s*proof|enclosure)/i;
@@ -329,10 +360,28 @@ function extractCoilVoltageValues(text) {
   return out;
 }
 
+// D24/A24, D110/120 + 24D/110/120A 모두 인식
+function extractVoltageCodeTokens(text) {
+  if (!text) return [];
+  const s = String(text);
+  const set = new Set();
+  for (const m of s.matchAll(/\b([AD]\d{1,3}(?:\/\d{1,3})?)\b/gi)) set.add(m[1].toUpperCase()); // 접두
+  for (const m of s.matchAll(/\b(\d{1,3}(?:\/\d{1,3})?)([AD])\b/gi)) set.add((m[2] + m[1]).toUpperCase()); // 접미
+  return [...set];
+}
+
+// '1 Form C' → '1C'
+function extractContactFormsFromLine(text) {
+  if (!text) return [];
+  const out = [];
+  for (const m of String(text).matchAll(/(\d)\s*form\s*([ABC])/gi)) out.push(`${m[1]}${m[2].toUpperCase()}`);
+  return out;
+}
+
 function extractEnumCodeValues(text) {
   if (!text) return [];
   const out = [];
-  const directRe = /(Nil|Blank|None|[A-Za-z])\s*(?=[:=（(\-])/g;
+  const directRe = /(Nil|Blank|None|[A-Za-z]{1,3})\s*(?=[:=（(\-])/g;
   let m;
   while ((m = directRe.exec(text)) !== null) {
     const normalized = normalizeOrderingEnumToken(m[1]);
@@ -469,8 +518,14 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
       for (const rawLine of lines) {
         const line = rawLine.replace(/^[\s•·\-–—]+/, '').trim();
         if (!line) continue;
-        if (CONTACT_LINE_RE.test(line)) addMany('contact_arrangement', extractContactValues(line));
-        if (COIL_LINE_RE.test(line)) addMany('coil_voltage_vdc', extractCoilVoltageValues(line));
+        if (CONTACT_LINE_RE.test(line)) {
+          addMany('contact_arrangement', extractContactValues(line));
+          addMany('contact_arrangement', extractContactFormsFromLine(line));
+        }
+        if (COIL_LINE_RE.test(line)) {
+          addMany('coil_voltage_vdc', extractCoilVoltageValues(line));
+          addMany('coil_voltage_code', extractVoltageCodeTokens(section));
+        }
         if (CONSTRUCTION_LINE_RE.test(line)) addMany('construction', extractEnumCodeValues(line));
         if (INSULATION_LINE_RE.test(line)) addMany('insulation_code', extractEnumCodeValues(line));
         if (MATERIAL_LINE_RE.test(line)) addMany('material_code', extractEnumCodeValues(line));
@@ -494,7 +549,11 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
     if (!values || !values.length) continue;
     result[key] = values;
   }
-  return Object.keys(result).length ? result : null;
+  const normalizedDomains = Object.keys(result).length ? result : null;
+  return {
+    domains: normalizedDomains,
+    textSources: Array.from(textSources),
+  };
 }
 
 function buildTyOrderingFallback({ baseSeries, orderingInfo, previewText, docAiText }) {
@@ -599,7 +658,7 @@ function isValidCode(s) {
 
 const KEY_ALIASES = {
   form: ['form', 'contact_form', 'contact_arrangement', 'configuration', 'arrangement', 'poles_form'],
-  voltage: ['voltage', 'coil_voltage_vdc', 'voltage_vdc', 'rated_voltage_vdc', 'vdc', 'coil_voltage'],
+  voltage: ['voltage', 'coil_voltage_code', 'coil_voltage_vdc', 'voltage_vdc', 'rated_voltage_vdc', 'vdc', 'coil_voltage'],
   case: ['case', 'case_code', 'package', 'pkg'],
   led: ['led', 'led_code', 'indicator'],
   cover: ['cover', 'cover_mode', 'cover_code'],
@@ -610,7 +669,8 @@ const KEY_ALIASES = {
   length_mm: ['length_mm', 'dim_l_mm'],
   width_mm: ['width_mm', 'dim_w_mm'],
   height_mm: ['height_mm', 'dim_h_mm'],
-  series: ['series', 'series_code']
+  series: ['series', 'series_code'],
+  terminal: ['terminal', 'terminal_form', 'terminal_form_code', 'terminal_code'],
 };
 
 const ENUM_MAP = {
@@ -632,6 +692,24 @@ function normalizeAlias(v) {
     .replace(/[^a-z0-9]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function mergeVariantKeyLists(limit, ...lists) {
+  const max = Number.isFinite(limit) && limit > 0 ? limit : VARIANT_MAX_CARDINALITY;
+  const seen = new Set();
+  const out = [];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const rawKey of list) {
+      const norm = String(rawKey || '').trim().toLowerCase();
+      if (!norm) continue;
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      out.push(norm);
+      if (out.length >= max) return out;
+    }
+  }
+  return out;
 }
 
 // extraction_recipe.recipe.key_alias { canonical_key: [ alias... ] } upsert
@@ -2143,28 +2221,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     extracted.brand = brandEffectiveResolved;
   }
 
-  let runtimeVariantKeys = [];
-  if (USE_VARIANT_KEYS) {
-    try {
-      runtimeVariantKeys = await detectVariantKeys({
-        rawText: extractedText,
-        family,
-        blueprintVariantKeys: variantKeys,
-      });
-    } catch (err) {
-      console.warn('[variant] runtime detect failed:', err?.message || err);
-      runtimeVariantKeys = Array.isArray(variantKeys) ? [...variantKeys] : [];
-    }
-  }
-
-  console.log('[PATH] brand resolved', {
-    runId,
-    family,
-    hint: brandHintSeed || null,
-    effective: brandEffectiveResolved,
-    source: brandSource,
-    vkeys_runtime: runtimeVariantKeys,
-  });
+  let runtimeVariantKeys = Array.isArray(variantKeys) ? [...variantKeys] : [];
+  const blueprintVariantKeys = runtimeVariantKeys.slice();
 
 
   // 커버 추출 비활성(요청에 따라 완전 OFF)
@@ -2362,13 +2420,21 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
   let orderingDomains = null;
   let orderingOverride = null;
+  let orderingTextSources = [];
   if (USE_CODE_RULES) {
-    orderingDomains = collectOrderingDomains({
+    const orderingCollection = collectOrderingDomains({
       orderingInfo: extracted?.ordering_info,
       previewText,
       docAiText,
       docAiTables,
     });
+    orderingDomains = orderingCollection?.domains ?? null;
+    orderingTextSources = Array.isArray(orderingCollection?.textSources)
+      ? orderingCollection.textSources
+          .map((txt) => (typeof txt === 'string' ? txt : String(txt ?? '')))
+          .map((txt) => txt.trim())
+          .filter(Boolean)
+      : [];
     if (!orderingDomains) {
       orderingOverride = buildTyOrderingFallback({
         baseSeries,
@@ -2423,6 +2489,42 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
     }
   }
+
+  const orderingDomainKeys = Object.keys(orderingDomains || {});
+  if (USE_VARIANT_KEYS) {
+    let aiVariantKeys = [];
+    const rawOrderingText = orderingTextSources.length ? orderingTextSources.join('\n') : '';
+    const detectionInput = rawOrderingText || extractedText || '';
+    if (detectionInput.trim()) {
+      try {
+        aiVariantKeys = await detectVariantKeys({
+          rawText: detectionInput,
+          family,
+          blueprintVariantKeys: blueprint?.variant_keys,
+          allowedKeys: blueprint?.allowedKeys,
+        });
+      } catch (err) {
+        console.warn('[variant] runtime detect failed:', err?.message || err);
+      }
+    }
+    runtimeVariantKeys = mergeVariantKeyLists(
+      VARIANT_MAX_CARDINALITY,
+      Array.isArray(aiVariantKeys) ? aiVariantKeys : [],
+      orderingDomainKeys,
+      blueprintVariantKeys,
+    );
+  } else {
+    runtimeVariantKeys = [];
+  }
+
+  console.log('[PATH] brand resolved', {
+    runId,
+    family,
+    hint: brandHintSeed || null,
+    effective: brandEffectiveResolved,
+    source: brandSource,
+    vkeys_runtime: runtimeVariantKeys,
+  });
 
   if (orderingDomains) {
     const orderingKeys = Object.keys(orderingDomains)
@@ -3439,6 +3541,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
           display_name: r0.display_name ?? null,
         });
       }
+      await ensureDynamicColumnsForRows(qualified, records);
       try {
         persistResult = await saveExtractedSpecs(qualified, family, records, {
           brand: brandOverride,

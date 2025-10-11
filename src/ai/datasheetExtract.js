@@ -162,7 +162,7 @@ async function parseTextWithPdfParse(gcsUri) {
 /* -------------------- code extraction -------------------- */
 function looksLikeCode(x) {
   const s = String(x || '').trim();
-  if (!/^[A-Za-z0-9][A-Za-z0-9\-_/\.]{2,}$/.test(s)) return false;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/#-]{2,}$/.test(s)) return false;
   if (!/\d/.test(s)) return false;
   if (!/[A-Za-z]/.test(s) && !/[-_/]/.test(s)) return false;
   if (/\b(OHM|Ω|VDC|VAC|AMP|A|V|W|HZ|MS|SEC|UL|ROHS|REACH|DATE|PAGE)\b/i.test(s)) return false;
@@ -171,7 +171,7 @@ function looksLikeCode(x) {
 function mapHeaderToKey(h) {
   const s = String(h || '').trim().toLowerCase().replace(/\s+/g, ' ');
   if (/\b(part( no\.?| number)|model|type|pn|ordering( code| number)?|catalog( no\.?| number)|item code|product code)\b/.test(s)) return 'code';
-  if (/(부품|제품|주문|형명|品番|型番)/.test(s)) return 'code';
+  if (/(부품|제품|제품형명|주문|형명|형번|품번|品番|型番|型号|型號)/.test(s)) return 'code';
   return null;
 }
 function extractCodesFromCell(cell) {

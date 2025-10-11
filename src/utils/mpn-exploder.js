@@ -183,8 +183,7 @@ function __applyOps(val, ops = []) {
       continue;
     }
     if (lower === 'digits') {
-      const digits = s.match(/\d+/g) || [''];
-      s = digits.join('');
+    s = s.replace(/[^0-9]/g, '');
       continue;
     }
     if (lower === 'num') {
@@ -193,15 +192,19 @@ function __applyOps(val, ops = []) {
       continue;
     }
     if (lower.startsWith('pad:')) {
-      const [, widthRaw] = op.split(':');
-      const width = Number(widthRaw) || 2;
-      s = s.padStart(width, '0');
+      const parts = op.split(':');
+      const width = Number(parts[1]) || 2;
+      const fillRaw = parts.length > 2 ? parts[2] : '';
+      const fill = fillRaw && fillRaw.trim() ? fillRaw.trim()[0] : '0';
+      s = s.padStart(width, fill);
       continue;
     }
     if (lower.startsWith('pad=')) {
-      const [, widthRaw] = op.split('=');
-      const width = Number(widthRaw) || 2;
-      s = s.padStart(width, '0');
+      const parts = op.split('=');
+      const width = Number(parts[1]) || 2;
+      const fillRaw = parts.length > 2 ? parts[2] : '';
+      const fill = fillRaw && fillRaw.trim() ? fillRaw.trim()[0] : '0';
+      s = s.padStart(width, fill);
       continue;
     }
     if (lower.startsWith('slice:')) {

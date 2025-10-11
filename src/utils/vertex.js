@@ -12,6 +12,8 @@ let vertexInstance;
 function getVertex() {
   if (!vertexInstance) {
     vertexInstance = new VertexAI({ project: env.PROJECT_ID, location: env.VERTEX_LOCATION });
+  }
+  return vertexInstance;
 }
 
 // Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용

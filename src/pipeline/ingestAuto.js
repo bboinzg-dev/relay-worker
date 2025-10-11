@@ -42,7 +42,7 @@ const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
 const { aiCanonicalizeKeys } = require('./ai/canonKeys');
 const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
-const { explodeToRows, splitAndCarryPrefix } = require('../utils/mpn-exploder');
+const { explodeToRows, splitAndCarryPrefix, normalizeContactForm } = require('../utils/mpn-exploder');
 const {
   ensureSpecColumnsForBlueprint,
   ensureSpecColumnsForKeys,
@@ -444,19 +444,15 @@ function resolveToken(base, rec, ctxText = '') {
     }
 
     if (value) {
-      const match = String(value).match(/(\d)\s*form\s*([ABC])/i);
-      if (match) {
-        value = `${match[1]}${match[2].toUpperCase()}`;
-      }
+      const norm = normalizeContactForm(value);
+      if (norm) value = norm;
     }
 
     if (!value && ctxText) {
-      const match = ctxText.match(/(\d)\s*form\s*([ABC])/i);
-      if (match) {
-        value = `${match[1]}${match[2].toUpperCase()}`;
-      } else {
-        const poleMatch = ctxText.match(/\b(SPST|SPDT|DPDT)\b/i);
-        if (poleMatch) value = poleMatch[1].toUpperCase();
+      const m = ctxText.match(/(\d)\s*form\s*([ABC])/i) || ctxText.match(/\b(SPST|SPDT|DPDT)\b/i);
+      if (m) {
+        const norm = normalizeContactForm(m[0]);
+        if (norm) value = norm;
       }
     }
   }

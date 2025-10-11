@@ -43,6 +43,7 @@ const { extractFields } = require('./extractByBlueprint');
 const { aiCanonicalizeKeys } = require('./ai/canonKeys');
 const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
 const { explodeToRows, splitAndCarryPrefix, normalizeContactForm } = require('../utils/mpn-exploder');
+const { extractOrderingRecipe } = require('../utils/vertex');
 const {
   ensureSpecColumnsForBlueprint,
   ensureSpecColumnsForKeys,
@@ -2226,6 +2227,50 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
         docAiText,
       });
       if (orderingOverride) orderingDomains = orderingOverride.domains;
+    }
+    if (!orderingDomains) {
+      const orderingWindowText = typeof extracted?.ordering_info?.text === 'string'
+        ? extracted.ordering_info.text
+        : '';
+      const orderingHaystack = [orderingWindowText, previewText, docAiText]
+        .filter((chunk) => typeof chunk === 'string' && chunk.trim())
+        .join('\n');
+      if (orderingWindowText.trim() || (orderingHaystack && ORDERING_SECTION_RE.test(orderingHaystack))) {
+        try {
+          const recipeInput = orderingWindowText.trim().length >= 40
+            ? orderingWindowText
+            : (gcsUri || orderingWindowText);
+          const recipe = await extractOrderingRecipe(recipeInput);
+          const variantDomains = recipe?.variant_domains;
+          const normalizedDomains = {};
+          if (variantDomains && typeof variantDomains === 'object') {
+            for (const [rawKey, rawValue] of Object.entries(variantDomains)) {
+              const key = String(rawKey || '').trim();
+              if (!key) continue;
+              const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+              const seen = new Set();
+              const list = [];
+              for (const candidate of values) {
+                if (candidate == null) continue;
+                const str = String(candidate).trim();
+                const marker = str === '' ? '__EMPTY__' : str.toLowerCase();
+                if (seen.has(marker)) continue;
+                seen.add(marker);
+                list.push(str);
+              }
+              if (list.length) normalizedDomains[key] = list;
+            }
+          }
+          if (Object.keys(normalizedDomains).length) {
+            orderingDomains = normalizedDomains;
+            if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
+              pnTemplate = recipe.pn_template.trim();
+            }
+          }
+        } catch (err) {
+          console.warn('[ordering] recipe extract failed:', err?.message || err);
+        }
+      }
     }
   }
 

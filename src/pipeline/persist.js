@@ -93,17 +93,20 @@ const META_KEYS = new Set([
 const CONFLICT_KEYS = ['brand', 'pn'];
 const NEVER_INSERT = new Set(['id', 'brand_norm', 'code_norm', 'pn_norm', 'created_at', 'updated_at']);
 
-const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().]{3,63}[0-9A-Z)]\b/i;
+const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().#]{3,63}[0-9A-Z)#]\b/i;
 const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
 const BANNED_PREFIX = /^(pdf|page|figure|table|sheet|rev|ver|draft)\b/i;
 const BANNED_EXACT = /^pdf-?1(\.\d+)?$/i;
 
-const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
-const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgmunpµ]))?/i;
+const RANGE_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgKMGmunpµ]))?(?:\s*[a-z%°]*)?\s*(?:to|~|–|—|-)\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgKMGmunpµ]))?/i;
+const NUMBER_PATTERN = /(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*([kmgKMGmunpµ]))?/i;
 const SCALE_MAP = {
   k: 1e3,
+    K: 1e3,
   m: 1e-3,
+    M: 1e6,
   g: 1e9,
+    G: 1e9,
   'µ': 1e-6,
   u: 1e-6,
   n: 1e-9,
@@ -345,7 +348,7 @@ function repairPn(raw) {
   if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
   s = s.replace(/[–—―]/g, '-');
   s = s.replace(/\s+/g, '');
-  s = s.replace(/[^0-9A-Za-z\-_/().]/g, '');
+  s = s.replace(/[^0-9A-Za-z\-_/().#]/g, '');
   if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
   return s.length >= 3 ? s : null;
 }
@@ -367,7 +370,11 @@ function parseNumberToken(token, suffix) {
   const base = Number(cleaned);
   if (!Number.isFinite(base)) return null;
   if (!suffix) return base;
-  const scale = SCALE_MAP[suffix.toLowerCase()];
+  const trimmedSuffix = String(suffix).trim();
+  if (!trimmedSuffix) return base;
+  const direct = SCALE_MAP[trimmedSuffix];
+  if (direct != null) return base * direct;
+  const scale = SCALE_MAP[trimmedSuffix.toLowerCase()];
   return scale != null ? base * scale : base;
 }
 
@@ -761,10 +768,14 @@ function buildPnIfMissing(record = {}, pnTemplate) {
   const fromTemplate = renderPnTemplate(pnTemplate, record);
   // 본문 검증: 템플릿 결과가 실제 문서 텍스트에 존재할 때만 채택
   const ctxText = String(record._doc_text || record.doc_text || '');
-  if (fromTemplate && ctxText && ctxText.includes(fromTemplate)) {
-    record.pn = fromTemplate;
-    if (!record.code) record.code = fromTemplate;
-    return;
+  if (fromTemplate && ctxText) {
+    const normalizedContext = norm(ctxText);
+    const normalizedTemplate = norm(fromTemplate);
+    if (normalizedTemplate && normalizedContext.includes(normalizedTemplate)) {
+      record.pn = fromTemplate;
+      if (!record.code) record.code = fromTemplate;
+      return;
+    }
   }
   const code = String(record.code || '').trim();
   if (code) record.pn = code;

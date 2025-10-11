@@ -1,9 +1,12 @@
 'use strict';
-console.log(`[PATH] entered:${__filename}`);
+
 const { VertexAI } = require('@google-cloud/vertexai');
 const { safeJsonParse } = require('../utils/safe-json');
 
-const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
+const PROJECT_ID = process.env.GCP_PROJECT_ID
+  || process.env.GOOGLE_CLOUD_PROJECT
+  || process.env.GCLOUD_PROJECT
+  || null;
 const LOCATION   = process.env.VERTEX_LOCATION || 'asia-northeast3';
 const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash';
 
@@ -12,7 +15,17 @@ const MAX_OUT_TOKENS   = Number(process.env.BLUEPRINT_MAX_TOKENS || 512);     //
 const TEXT_LIMIT       = Number(process.env.BLUEPRINT_TEXT_LIMIT   || 32000); // 입력 텍스트 바이트/문자 상한(대략)
 const MIN_TEXT_FOR_LLM = Number(process.env.BLUEPRINT_MIN_TEXT     || 800);   // 이보다 짧으면 LLM 호출 생략
 
-const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+let vertexClient = null;
+
+function getVertexClient() {
+  if (!PROJECT_ID) {
+    throw new Error('VERTEX_PROJECT_ID_MISSING');
+  }
+  if (!vertexClient) {
+    vertexClient = new VertexAI({ project: PROJECT_ID, location: LOCATION });
+  }
+  return vertexClient;
+}
 
 // fieldsJson: {"coil_voltage_vdc":"numeric", "contact_form":"text", ...}
 function buildSchema(fieldsJson = {}) {
@@ -93,15 +106,23 @@ async function extractFields(rawText, code, fieldsJson) {
     `Fields schema: ${JSON.stringify(schema)}`
   ].join('\n');
 
-  const model = vertex.getGenerativeModel({
-    model: MODEL_ID,
-    generationConfig: {
-      temperature: 0.2,
-      topP: 0.8,
-      maxOutputTokens: MAX_OUT_TOKENS,
-      responseMimeType: 'application/json', // 구조화 출력 유지
-    },
-  });
+  let model;
+  try {
+    model = getVertexClient().getGenerativeModel({
+      model: MODEL_ID,
+      generationConfig: {
+        temperature: 0.2,
+        topP: 0.8,
+        maxOutputTokens: MAX_OUT_TOKENS,
+        responseMimeType: 'application/json', // 구조화 출력 유지
+      },
+    });
+  } catch (err) {
+    console.warn('[extractByBlueprint] Vertex init failed:', err?.message || err);
+    const empty = {};
+    for (const k of wantKeys) empty[k] = null;
+    return empty;
+  }
 
   const req = {
     contents: [{

@@ -1,122 +1,68 @@
-diff --git a/db.js b/db.js
-index 0d4bbff34fa61cfff8011c4e5d91d54efe506ca7..98ad8a6002d8bda6b3abff4adb442310b09e6b73 100644
---- a/db.js
-+++ b/db.js
-@@ -1,33 +1,58 @@
- // db.js — 워커 공용 PG 커넥터(싱글턴, 안전 TLS 지원)
+diff --git a/src/utils/vertex.js b/src/utils/vertex.js
+index f1c4e72868b52c1de96cc521e371d6fdd5d3d343..ff7c98878e9b55fcca15026fdf9862826ac77655 100644
+--- a/src/utils/vertex.js
++++ b/src/utils/vertex.js
+@@ -1,38 +1,60 @@
  'use strict';
  
- const { Pool } = require('pg');
- const fs = require('fs');
- const { URL } = require('url');
+ const { VertexAI } = require('@google-cloud/vertexai');
+ const { safeJsonParse } = require('./safe-json');
+-const env = require('../config/env');
  
- let _pool;
-+let _poolInitError = null;
-+
-+function createUnavailablePool(error) {
-+  const makeError = () => {
-+    const err = new Error('DB_UNAVAILABLE');
-+    if (error) {
-+      err.cause = error;
-+      err.message = error?.message
-+        ? `DB_UNAVAILABLE: ${error.message}`
-+        : 'DB_UNAVAILABLE';
-+    }
-+    return err;
-+  };
-+
-+  const reject = async () => {
-+    throw makeError();
-+  };
-+
-+  return {
-+    query: reject,
-+    connect: reject,
-+    end: async () => {},
-+    on: () => {},
-+  };
+-const DEFAULT_MODEL_ID = env.GEMINI_MODEL_EXTRACT || env.VERTEX_MODEL_ID;
++let envConfig = null;
++let envLoadError = null;
++try {
++  envConfig = require('../config/env');
++} catch (err) {
++  envLoadError = err;
++  console.warn('[vertex] config env unavailable:', err?.message || err);
 +}
++
++const PROJECT_ID = envConfig?.PROJECT_ID
++  || process.env.GCP_PROJECT_ID
++  || process.env.GOOGLE_CLOUD_PROJECT
++  || null;
++const LOCATION = envConfig?.VERTEX_LOCATION || process.env.VERTEX_LOCATION || 'asia-northeast3';
++const DEFAULT_MODEL_ID = envConfig?.GEMINI_MODEL_EXTRACT
++  || envConfig?.VERTEX_MODEL_ID
++  || process.env.GEMINI_MODEL_EXTRACT
++  || process.env.VERTEX_MODEL_ID
++  || 'gemini-2.5-flash';
  
- function attachVerboseQueryLogging(pool) {
-   if (process.env.VERBOSE_TRACE !== '1') return pool;
+ let vertexInstance;
  
-   const origQuery = pool.query.bind(pool);
-   pool.query = async (text, params) => {
-     try {
-       const caller = new Error().stack.split('\n')[2]?.trim();
-       const head = String(text).split('\n')[0].slice(0, 140);
-       console.log(`[SQL] ${head} :: caller=${caller}`);
-     } catch (_) {
-       // best-effort logging only
-     }
-     return origQuery(text, params);
-   };
-   return pool;
- }
- 
- /** 우선순위로 연결 문자열 선택 */
- function resolveConnectionString() {
-   const c =
-     process.env.POSTGRES_URL ||
-     process.env.DATABASE_URL ||
-     process.env.APP_DB_URL ||
-     process.env.PG_CONNECTION_STRING;
-@@ -118,51 +143,57 @@ function buildPool() {
-     console.log('[db] pool created', {
-       host: u.hostname,
-       port: u.port || 5432,
-       db: u.pathname.replace(/^\//, ''),
-       ssl:
-         ssl === false
-           ? 'off'
-           : ssl?.rejectUnauthorized === false
-           ? 'tls-insecure'
-           : 'tls-verify',
-       max,
-     });
-   } catch {
-     console.log('[db] pool created (sanitized)');
-   }
- 
-   pool.on('error', (err) => {
-     console.error('[db] unexpected error on idle client', err);
-   });
- 
-   return attachVerboseQueryLogging(pool);
- }
- 
- function getPool() {
-   if (_pool) return _pool;
--  _pool = buildPool();
-+  try {
-+    _pool = buildPool();
-+  } catch (err) {
-+    _poolInitError = err;
-+    console.error('[db] buildPool failed:', err?.message || err);
-+    _pool = createUnavailablePool(err);
+ function getVertex() {
++  if (!PROJECT_ID) {
++    const err = new Error('VERTEX_PROJECT_ID_MISSING');
++    if (envLoadError) err.cause = envLoadError;
++    throw err;
 +  }
-   return _pool;
- }
- 
- /** 단건 쿼리 */
- async function query(text, params) {
-   return getPool().query(text, params);
- }
- 
- /** 클라이언트 단위로 작업 */
- async function withClient(fn) {
-   const client = await getPool().connect();
-   try {
-     return await fn(client);
-   } finally {
-     client.release();
+   if (!vertexInstance) {
+-    vertexInstance = new VertexAI({ project: env.PROJECT_ID, location: env.VERTEX_LOCATION });
++    vertexInstance = new VertexAI({ project: PROJECT_ID, location: LOCATION });
    }
+   return vertexInstance;
  }
  
- /** 트랜잭션 유틸 */
- async function withTransaction(fn) {
-   return withClient(async (client) => {
-     await client.query('BEGIN');
-     try {
-       const res = await fn(client);
-       await client.query('COMMIT');
+ // Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용
+ function getModel(systemText, modelId = DEFAULT_MODEL_ID) {
+   const cfg = { model: modelId };
+   if (systemText && String(systemText).trim()) {
+     cfg.systemInstruction = { parts: [{ text: String(systemText) }] };
+   }
+   return getVertex().getGenerativeModel(cfg);
+ }
+ 
+ async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
+   const model = getModel(systemText, modelId);
+   const req = {
+     contents: [{ role: 'user', parts: [{ text: String(userText || '') }]}],
+     generationConfig: {
+       responseMimeType: 'application/json',
+       temperature,
+       topP,
+       maxOutputTokens,
+     },
+   };
+   const resp = await model.generateContent(req);

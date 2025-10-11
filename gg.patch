@@ -1,197 +1,122 @@
-diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
-index 40511479d13633a3ca1249c04ead71b93bcfb8dc..1f7643ab90cf31d9ce7c9c1d4971f6a34c37caf5 100644
---- a/src/utils/mpn-exploder.js
-+++ b/src/utils/mpn-exploder.js
-@@ -135,64 +135,128 @@ function splitAndCarryPrefix(raw) {
-     seen.add(norm);
-     deduped.push(token);
-   }
-   return deduped;
- }
+diff --git a/db.js b/db.js
+index 0d4bbff34fa61cfff8011c4e5d91d54efe506ca7..98ad8a6002d8bda6b3abff4adb442310b09e6b73 100644
+--- a/db.js
++++ b/db.js
+@@ -1,33 +1,58 @@
+ // db.js — 워커 공용 PG 커넥터(싱글턴, 안전 TLS 지원)
+ 'use strict';
  
- function normalizeList(value) {
-   if (value == null) return [];
-   if (Array.isArray(value)) return value.flatMap(normalizeList);
-   if (typeof value === 'string') {
-     return value
-       .split(LIST_SEP)
-       .map((s) => s.trim())
-       .filter(Boolean);
-   }
-   return [value];
- }
+ const { Pool } = require('pg');
+ const fs = require('fs');
+ const { URL } = require('url');
  
- function cartesian(lists) {
-   return lists.reduce(
-     (acc, list) => acc.flatMap((a) => list.map((b) => a.concat([b]))),
-     [[]]
-   );
- }
- 
--function renderTemplate(tpl, ctx) {
--  if (!tpl) return '';
--  return tpl.replace(/\{\{([^}]+)\}\}/g, (_, expr) => {
--    const [head, ...pipes] = expr.split('|').map((s) => s.trim());
--    let val = ctx[head];
--    for (const pipe of pipes) {
--      if (pipe === 'upper') val = String(val ?? '').toUpperCase();
--      else if (pipe === 'lower') val = String(val ?? '').toLowerCase();
--      else if (pipe.startsWith('pad=')) {
--        const n = parseInt(pipe.slice(4), 10);
--        const str = String(val ?? '');
--        val = Number.isFinite(n) ? str.padStart(n, '0') : str;
-+function __applyOps(val, ops = []) {
-+  const first = Array.isArray(val) ? val[0] : val;
-+  let s = first == null ? '' : String(first);
-+  for (const rawOp of ops) {
-+    if (!rawOp) continue;
-+    const opToken = rawOp.includes('=') ? rawOp.replace('=', ':') : rawOp;
-+    const op = opToken.trim();
-+    if (!op) continue;
-+    const lower = op.toLowerCase();
-+    if (lower === 'upper') {
-+      s = s.toUpperCase();
-+      continue;
-+    }
-+    if (lower === 'lower') {
-+      s = s.toLowerCase();
-+      continue;
-+    }
-+    if (lower === 'first') {
-+      s = s.split(',')[0].trim();
-+      continue;
-+    }
-+    if (lower === 'alnum') {
-+      s = s.replace(/[^0-9A-Z]/gi, '');
-+      continue;
-+    }
-+    if (lower === 'digits') {
-+      const digits = s.match(/\d+/g) || [''];
-+      s = digits.join('');
-+      continue;
-+    }
-+    if (lower === 'num') {
-+      const match = s.match(/-?\d+(?:\.\d+)?/);
-+      s = match ? match[0] : '';
-+      continue;
-+    }
-+    if (lower.startsWith('pad:')) {
-+      const [, widthRaw] = op.split(':');
-+      const width = Number(widthRaw) || 2;
-+      s = s.padStart(width, '0');
-+      continue;
-+    }
-+    if (lower.startsWith('pad=')) {
-+      const [, widthRaw] = op.split('=');
-+      const width = Number(widthRaw) || 2;
-+      s = s.padStart(width, '0');
-+      continue;
-+    }
-+    if (lower.startsWith('slice:')) {
-+      const parts = op.split(':');
-+      const start = Number(parts[1]) || 0;
-+      const end = parts.length > 2 && parts[2] !== '' ? Number(parts[2]) : undefined;
-+      s = s.slice(start, Number.isNaN(end) ? undefined : end);
-+      continue;
-+    }
-+    if (lower.startsWith('map:')) {
-+      const mapPairs = op.slice(4).split(',');
-+      const mapping = Object.create(null);
-+      for (const pair of mapPairs) {
-+        const [from, to] = pair.split('>');
-+        if (!from || to == null) continue;
-+        mapping[String(from).trim().toUpperCase()] = String(to).trim();
-       }
-+      const key = String(s).trim().toUpperCase();
-+      s = mapping[key] ?? s;
-+      continue;
-     }
-+  }
-+  return s;
-+}
+ let _pool;
++let _poolInitError = null;
 +
-+function renderTemplate(tpl, ctx) {
-+  if (!tpl) return '';
-+  return String(tpl).replace(/\{\{?([^{}]+)\}\}?/g, (_, expr) => {
-+    const [head, ...pipes] = String(expr)
-+      .split('|')
-+      .map((s) => s.trim());
-+    if (!head) return '';
-+    const val = __applyOps(ctx[head], pipes);
-     return val == null ? '' : String(val);
++function createUnavailablePool(error) {
++  const makeError = () => {
++    const err = new Error('DB_UNAVAILABLE');
++    if (error) {
++      err.cause = error;
++      err.message = error?.message
++        ? `DB_UNAVAILABLE: ${error.message}`
++        : 'DB_UNAVAILABLE';
++    }
++    return err;
++  };
++
++  const reject = async () => {
++    throw makeError();
++  };
++
++  return {
++    query: reject,
++    connect: reject,
++    end: async () => {},
++    on: () => {},
++  };
++}
+ 
+ function attachVerboseQueryLogging(pool) {
+   if (process.env.VERBOSE_TRACE !== '1') return pool;
+ 
+   const origQuery = pool.query.bind(pool);
+   pool.query = async (text, params) => {
+     try {
+       const caller = new Error().stack.split('\n')[2]?.trim();
+       const head = String(text).split('\n')[0].slice(0, 140);
+       console.log(`[SQL] ${head} :: caller=${caller}`);
+     } catch (_) {
+       // best-effort logging only
+     }
+     return origQuery(text, params);
+   };
+   return pool;
+ }
+ 
+ /** 우선순위로 연결 문자열 선택 */
+ function resolveConnectionString() {
+   const c =
+     process.env.POSTGRES_URL ||
+     process.env.DATABASE_URL ||
+     process.env.APP_DB_URL ||
+     process.env.PG_CONNECTION_STRING;
+@@ -118,51 +143,57 @@ function buildPool() {
+     console.log('[db] pool created', {
+       host: u.hostname,
+       port: u.port || 5432,
+       db: u.pathname.replace(/^\//, ''),
+       ssl:
+         ssl === false
+           ? 'off'
+           : ssl?.rejectUnauthorized === false
+           ? 'tls-insecure'
+           : 'tls-verify',
+       max,
+     });
+   } catch {
+     console.log('[db] pool created (sanitized)');
+   }
+ 
+   pool.on('error', (err) => {
+     console.error('[db] unexpected error on idle client', err);
    });
+ 
+   return attachVerboseQueryLogging(pool);
  }
  
- function assignValue(target, key, value) {
-   if (!key) return;
-   target[key] = value;
-   const lower = String(key).toLowerCase();
-   if (lower && lower !== key) target[lower] = value;
+ function getPool() {
+   if (_pool) return _pool;
+-  _pool = buildPool();
++  try {
++    _pool = buildPool();
++  } catch (err) {
++    _poolInitError = err;
++    console.error('[db] buildPool failed:', err?.message || err);
++    _pool = createUnavailablePool(err);
++  }
+   return _pool;
  }
  
- function collectMpnSeeds(base) {
-   const seeds = [];
-   const seen = new Set();
+ /** 단건 쿼리 */
+ async function query(text, params) {
+   return getPool().query(text, params);
+ }
  
-   const push = (val) => {
-     if (val == null) return;
-     if (Array.isArray(val)) {
-       for (const item of val) push(item);
-       return;
-     }
-     if (typeof val === 'string') {
-       const trimmed = val.trim();
-       if (!trimmed) return;
-       const parts = splitAndCarryPrefix(trimmed);
-@@ -267,50 +331,51 @@ function explodeToRows(base, options = {}) {
+ /** 클라이언트 단위로 작업 */
+ async function withClient(fn) {
+   const client = await getPool().connect();
+   try {
+     return await fn(client);
+   } finally {
+     client.release();
+   }
+ }
  
-     const normalizedSeries = normalizeSeriesCode(
-       rowValues.series_code
-         ?? rowValues.series
-         ?? base?.series_code
-         ?? base?.series
-         ?? null,
-     );
-     if (normalizedSeries) {
-       assignValue(rowValues, 'series_code', normalizedSeries);
-       if (rowValues.series == null) assignValue(rowValues, 'series', normalizedSeries);
-     }
- 
-     const normalizedContactForm = normalizeContactForm(
-       rowValues.contact_form
-         ?? rowValues.contact_arrangement
-         ?? rowValues.form
-         ?? null,
-     );
-     if (normalizedContactForm) assignValue(rowValues, 'contact_form', normalizedContactForm);
-     else {
-       delete rowValues.contact_form;
-       delete rowValues.contactform;
-     }
- 
-+    assignValue(rowValues, 'coil_voltage_text', rowValues.coil_voltage_vdc);
-     const normalizedCoilVoltage = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
-     if (normalizedCoilVoltage) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltage);
-     else {
-       delete rowValues.coil_voltage_vdc;
-       delete rowValues.coil_voltagevdc;
-     }
- 
-     const canUseTemplate = pnTemplate && normalizedSeries && normalizedCoilVoltage;
- 
-     let generatedByTemplate = false;
-     let generatedByFallback = false;
-     let code = null;
- 
-     if (pnTemplate) {
-   if (!canUseTemplate) return;
-       code = renderTemplate(pnTemplate, {
-         ...rowValues,
-         series: normalizedSeries,
-         series_code: normalizedSeries,
-         contact_form: normalizedContactForm,
-         coil_voltage_vdc: normalizedCoilVoltage,
-       });
-             generatedByTemplate = true;
-     } else if (mpnCandidates[idx]) {
-       code = mpnCandidates[idx];
+ /** 트랜잭션 유틸 */
+ async function withTransaction(fn) {
+   return withClient(async (client) => {
+     await client.query('BEGIN');
+     try {
+       const res = await fn(client);
+       await client.query('COMMIT');

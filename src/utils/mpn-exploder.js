@@ -357,7 +357,7 @@ function explodeToRows(base, options = {}) {
       delete rowValues.contactform;
     }
 
-        assignValue(rowValues, 'coil_voltage_text', rowValues.coil_voltage_vdc);
+    assignValue(rowValues, 'coil_voltage_text', rowValues.coil_voltage_vdc);
     const normalizedCoilVoltage = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
     if (normalizedCoilVoltage) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltage);
     else {
@@ -365,14 +365,13 @@ function explodeToRows(base, options = {}) {
       delete rowValues.coil_voltagevdc;
     }
 
-    const canUseTemplate = pnTemplate && normalizedSeries && normalizedCoilVoltage;
+    const canUseTemplate = pnTemplate && normalizedSeries;
 
     let generatedByTemplate = false;
     let generatedByFallback = false;
     let code = null;
 
-    if (pnTemplate) {
-  if (!canUseTemplate) return;
+    if (pnTemplate && canUseTemplate) {
       code = renderTemplate(pnTemplate, {
         ...rowValues,
         series: normalizedSeries,
@@ -380,7 +379,7 @@ function explodeToRows(base, options = {}) {
         contact_form: normalizedContactForm,
         coil_voltage_vdc: normalizedCoilVoltage,
       });
-            generatedByTemplate = true;
+      generatedByTemplate = true;
     } else if (mpnCandidates[idx]) {
       code = mpnCandidates[idx];
     } else if (mpnCandidates.length) {
@@ -397,13 +396,13 @@ function explodeToRows(base, options = {}) {
         .join('');
       if (suffix) parts.push(suffix);
       code = parts.join('');
-            generatedByFallback = true;
+      generatedByFallback = true;
     }
 
     code = String(code || '').trim();
     if (!code) return;
 
-        if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
+    if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
 
     const codeNorm = code.toLowerCase();
     if (rows.some((r) => r.code_norm === codeNorm)) return;

@@ -46,4 +46,38 @@ async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 
   }
 }
 
-module.exports = { getVertex, getModel, callModelJson };
+async function extractOrderingRecipe(gcsUriOrText) {
+  const source = String(gcsUriOrText || '');
+  if (!source) return { variant_domains: {}, pn_template: null };
+
+  const sys = [
+    'You analyze ORDERING INFORMATION / HOW TO ORDER sections from electronic component datasheets.',
+    'Return strict JSON with shape: {"variant_domains": {"key": ["values"]}, "pn_template": "string or null"}.',
+    'Keys must be concise machine-readable snake_case identifiers.',
+    'If an option is blank/"Nil", represent it with an empty string "".',
+    'Do not fabricate data. Leave arrays empty when unsure.',
+  ].join('\n');
+
+  const payload = /^gs:\/\//i.test(source)
+    ? { gcs_uri: source }
+    : { text: source };
+
+  let out;
+  try {
+    out = await callModelJson(sys, JSON.stringify({ source: payload }), { maxOutputTokens: 2048 });
+  } catch (err) {
+    console.warn('[vertex] extractOrderingRecipe failed:', err?.message || err);
+    return { variant_domains: {}, pn_template: null };
+  }
+
+  const domains = out && typeof out === 'object' && out.variant_domains && typeof out.variant_domains === 'object'
+    ? out.variant_domains
+    : {};
+  const tpl = typeof out?.pn_template === 'string' && out.pn_template.trim()
+    ? out.pn_template
+    : null;
+
+  return { variant_domains: domains, pn_template: tpl };
+}
+
+module.exports = { getVertex, getModel, callModelJson, extractOrderingRecipe };

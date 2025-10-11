@@ -1,108 +1,66 @@
-diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
-index 5904de387b21d8ca800187877fbc47f7bba14fda..392ab9786248bae3901a7e8f16ad0f7411ddea06 100644
---- a/src/utils/mpn-exploder.js
-+++ b/src/utils/mpn-exploder.js
-@@ -335,96 +335,95 @@ function explodeToRows(base, options = {}) {
- 
-     const normalizedSeries = normalizeSeriesCode(
-       rowValues.series_code
-         ?? rowValues.series
-         ?? base?.series_code
-         ?? base?.series
-         ?? null,
-     );
-     if (normalizedSeries) {
-       assignValue(rowValues, 'series_code', normalizedSeries);
-       if (rowValues.series == null) assignValue(rowValues, 'series', normalizedSeries);
-     }
- 
-     const normalizedContactForm = normalizeContactForm(
-       rowValues.contact_form
-         ?? rowValues.contact_arrangement
-         ?? rowValues.form
-         ?? null,
-     );
-     if (normalizedContactForm) assignValue(rowValues, 'contact_form', normalizedContactForm);
-     else {
-       delete rowValues.contact_form;
-       delete rowValues.contactform;
-     }
- 
--        assignValue(rowValues, 'coil_voltage_text', rowValues.coil_voltage_vdc);
-+    assignValue(rowValues, 'coil_voltage_text', rowValues.coil_voltage_vdc);
-     const normalizedCoilVoltage = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
-     if (normalizedCoilVoltage) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltage);
-     else {
-       delete rowValues.coil_voltage_vdc;
-       delete rowValues.coil_voltagevdc;
-     }
- 
--    const canUseTemplate = pnTemplate && normalizedSeries && normalizedCoilVoltage;
-+    const canUseTemplate = pnTemplate && normalizedSeries;
- 
-     let generatedByTemplate = false;
-     let generatedByFallback = false;
-     let code = null;
- 
--    if (pnTemplate) {
--  if (!canUseTemplate) return;
-+    if (pnTemplate && canUseTemplate) {
-       code = renderTemplate(pnTemplate, {
-         ...rowValues,
-         series: normalizedSeries,
-         series_code: normalizedSeries,
-         contact_form: normalizedContactForm,
-         coil_voltage_vdc: normalizedCoilVoltage,
-       });
--            generatedByTemplate = true;
-+      generatedByTemplate = true;
-     } else if (mpnCandidates[idx]) {
-       code = mpnCandidates[idx];
-     } else if (mpnCandidates.length) {
-       code = mpnCandidates[0];
-     } else {
-       const parts = [];
-       if (normalizedSeries) parts.push(normalizedSeries);
-       else if (base?.series) parts.push(base.series);
-       else if (base?.series_code) parts.push(base.series_code);
-       const suffix = variantKeys
-         .map((key) => rowValues[key] ?? rowValues[key?.toLowerCase()])
-         .filter((v) => v != null && v !== '')
-         .map((v) => String(v))
-         .join('');
-       if (suffix) parts.push(suffix);
-       code = parts.join('');
--            generatedByFallback = true;
-+      generatedByFallback = true;
-     }
- 
-     code = String(code || '').trim();
-     if (!code) return;
- 
--        if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
-+    if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
- 
-     const codeNorm = code.toLowerCase();
-     if (rows.some((r) => r.code_norm === codeNorm)) return;
- 
-     rows.push({
-       code,
-       code_norm: codeNorm,
-       values: rowValues,
-     });
-   });
- 
-   return rows;
+diff --git a/src/utils/vertex.js b/src/utils/vertex.js
+index 037b14e0aacafb157bf6648cbb68d409de6a7c2e..2bff4f97663fc96f5d1c868efbf91dcf18668bbe 100644
+--- a/src/utils/vertex.js
++++ b/src/utils/vertex.js
+@@ -24,26 +24,60 @@ function getModel(systemText, modelId = DEFAULT_MODEL_ID) {
+   }
+   return getVertex().getGenerativeModel(cfg);
  }
  
- module.exports = {
-   LIST_SEP,
-   NON_MPN_WORDS,
-   splitAndCarryPrefix,
-   normalizeList,
-   cartesian,
-   renderTemplate,
-   explodeToRows,
-   normalizeContactForm,
- };
-\ No newline at end of file
+ async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
+   const model = getModel(systemText, modelId);
+   const req = {
+     contents: [{ role: 'user', parts: [{ text: String(userText || '') }]}],
+     generationConfig: {
+       responseMimeType: 'application/json',
+       temperature,
+       topP,
+       maxOutputTokens,
+     },
+   };
+   const resp = await model.generateContent(req);
+   const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+   try {
+     const parsed = safeJsonParse(txt);
+     return parsed ?? {};
+   } catch {
+     throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`);
+   }
+ }
+ 
+-module.exports = { getVertex, getModel, callModelJson };
++async function extractOrderingRecipe(gcsUriOrText) {
++  const source = String(gcsUriOrText || '');
++  if (!source) return { variant_domains: {}, pn_template: null };
++
++  const sys = [
++    'You analyze ORDERING INFORMATION / HOW TO ORDER sections from electronic component datasheets.',
++    'Return strict JSON with shape: {"variant_domains": {"key": ["values"]}, "pn_template": "string or null"}.',
++    'Keys must be concise machine-readable snake_case identifiers.',
++    'If an option is blank/"Nil", represent it with an empty string "".',
++    'Do not fabricate data. Leave arrays empty when unsure.',
++  ].join('\n');
++
++  const payload = /^gs:\/\//i.test(source)
++    ? { gcs_uri: source }
++    : { text: source };
++
++  let out;
++  try {
++    out = await callModelJson(sys, JSON.stringify({ source: payload }), { maxOutputTokens: 2048 });
++  } catch (err) {
++    console.warn('[vertex] extractOrderingRecipe failed:', err?.message || err);
++    return { variant_domains: {}, pn_template: null };
++  }
++
++  const domains = out && typeof out === 'object' && out.variant_domains && typeof out.variant_domains === 'object'
++    ? out.variant_domains
++    : {};
++  const tpl = typeof out?.pn_template === 'string' && out.pn_template.trim()
++    ? out.pn_template
++    : null;
++
++  return { variant_domains: domains, pn_template: tpl };
++}
++
++module.exports = { getVertex, getModel, callModelJson, extractOrderingRecipe };

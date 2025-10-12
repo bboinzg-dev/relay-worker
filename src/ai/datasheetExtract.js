@@ -20,6 +20,8 @@ try { pdfParse = require('pdf-parse'); } catch {}
 const db = require('../../db');
 const { parseGcsUri } = require('../utils/gcs');
 const { safeJsonParse } = require('../utils/safe-json');
+const { explodeToRows } = require('../utils/mpn-exploder');
+const { extractOrderingRecipe } = require('../utils/vertex');
 const { extractOrderingInfo } = require('../utils/ordering-sections');
 
 const MAX_PARTS = Number(process.env.MAX_ENUM_PARTS || 200);
@@ -267,7 +269,7 @@ function codesFromFreeText(txt) {
 /* -------------------- Gemini mapping -------------------- */
 async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText, tablePreview }) {
   const { project, location, model } = resolveGemini();
-  if (!VertexAI || !project) return [];
+  if (!VertexAI || !project) return {};
 
   const vertex = new VertexAI({ project, location });
   const mdl = vertex.getGenerativeModel({
@@ -299,13 +301,64 @@ async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText,
     },
   });
 
-  let txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  let parsed = {};
   try {
-    const parsed = safeJsonParse(txt);
-    return Array.isArray(parsed?.parts) ? parsed.parts : [];
+    parsed = safeJsonParse(txt) || {};
   } catch {
-    return [];
+    parsed = {};
   }
+ 
+   const parts = Array.isArray(parsed?.parts) ? parsed.parts : [];
+   const tableHint = typeof parsed?.table_hint === 'string' ? parsed.table_hint : null;
+   const pnTemplate = typeof parsed?.pn_template === 'string' && parsed.pn_template.trim()
+     ? parsed.pn_template.trim()
+     : null;
+   const variantDomains = parsed?.variant_domains && typeof parsed.variant_domains === 'object'
+     ? parsed.variant_domains
+     : null;
+ 
+   return { parts, table_hint: tableHint, pn_template: pnTemplate, variant_domains: variantDomains };
+ }
+ 
+ function normalizeVariantDomainMap(raw) {
+   const normalized = {};
+   if (!raw || typeof raw !== 'object') return normalized;
+   for (const [rawKey, rawValue] of Object.entries(raw)) {
+     const key = String(rawKey || '').trim();
+     if (!key) continue;
+     const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+     const seen = new Set();
+     const list = [];
+     for (const candidate of values) {
+       if (candidate == null) continue;
+       const str = String(candidate).trim();
+       const marker = str.toLowerCase();
+       if (seen.has(marker)) continue;
+       seen.add(marker);
+       list.push(str);
+     }
+     if (list.length) normalized[key] = list;
+   }
+   return normalized;
+ }
+ 
+ function mergeVariantDomainMaps(primary, secondary) {
+   const out = { ...primary };
+   for (const [key, values] of Object.entries(secondary || {})) {
+     if (!out[key]) {
+       out[key] = [...values];
+       continue;
+     }
+     const seen = new Set(out[key].map((v) => v.toLowerCase()));
+     for (const value of values) {
+       const norm = value.toLowerCase();
+       if (seen.has(norm)) continue;
+       seen.add(norm);
+       out[key].push(value);
+     }
+   }
+   return out; 
 }
 
 /* -------------------- Public: main extractor -------------------- */
@@ -333,7 +386,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   }
 
   // Gemini로 values 매핑(블루프린트 키만)
-  const mapped = await geminiMapValues({
+  const mappedResult = await geminiMapValues({
     family,
     brandHint: brand,
     codes: codes.slice(0, MAX_PARTS),
@@ -342,24 +395,92 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     tablePreview
   });
 
-  // 병합
+  const mappedParts = Array.isArray(mappedResult?.parts) ? mappedResult.parts : [];
+  const tableHintRaw = String(mappedResult?.table_hint || '');
+
   const out = [];
-  const seen = new Set();
-  for (const m of mapped) {
-    const code = String(m?.code || '').trim().toUpperCase();
-    if (!code || seen.has(code)) continue;
-    seen.add(code);
-    const row = { code, verified_in_doc: true };
-    if (m?.brand) row.brand = m.brand;
-    const values = m?.values || {};
-    for (const k of allowedKeys) { if (values[k] != null) row[k] = values[k]; }
+  const seenRows = new Set();
+  const mergedCodes = [];
+  const seenCodes = new Set();
+  const seedCodes = codes.slice(0, MAX_PARTS);
+
+  const pushCode = (value) => {
+    const norm = String(value || '').trim().toUpperCase();
+    if (!norm || seenCodes.has(norm)) return;
+    seenCodes.add(norm);
+    mergedCodes.push(norm);
+  };
+
+  seedCodes.forEach(pushCode);
+
+  const pushRow = ({ code, values = {}, brand: rowBrand, verified }) => {
+    const norm = String(code || '').trim().toUpperCase();
+    if (!norm || seenRows.has(norm)) return;
+    seenRows.add(norm);
+    const row = { code: norm, verified_in_doc: Boolean(verified) };
+    const brandValue = rowBrand || brand;
+    if (brandValue) row.brand = brandValue;
+    if (values && typeof values === 'object') {
+      for (const key of allowedKeys) {
+        if (values[key] != null) row[key] = values[key];
+      }
+    }
     out.push(row);
+    pushCode(norm);
+  };
+
+  for (const part of mappedParts) {
+    const partValues = part?.values && typeof part.values === 'object' ? part.values : {};
+    pushRow({ code: part?.code, values: partValues, brand: part?.brand, verified: true });
   }
 
-  if (!out.length) for (const c of codes.slice(0, MAX_PARTS)) out.push({ code: c, verified_in_doc: true });
+  const shouldExpandOrdering = !mappedParts.length
+    || tableHintRaw.toUpperCase().includes('ORDERING');
+
+  if (shouldExpandOrdering) {
+    let orderingDomains = normalizeVariantDomainMap(mappedResult?.variant_domains);
+    let pnTemplate = typeof mappedResult?.pn_template === 'string' && mappedResult.pn_template.trim()
+      ? mappedResult.pn_template.trim()
+      : null;
+    try {
+      const recipe = await extractOrderingRecipe(gcsUri);
+      orderingDomains = mergeVariantDomainMaps(
+        orderingDomains,
+        normalizeVariantDomainMap(recipe?.variant_domains),
+      );
+      if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
+        pnTemplate = recipe.pn_template.trim();
+      }
+    } catch (err) {
+      console.warn('[ordering] extractOrderingRecipe failed:', err?.message || err);
+    }
+
+    const variantKeys = Object.keys(orderingDomains);
+    if (variantKeys.length) {
+      const baseSeries = orderingDomains.series_code?.[0] || orderingDomains.series?.[0] || null;
+      const orderingBase = {
+        brand,
+        series: baseSeries,
+        series_code: baseSeries,
+        values: orderingDomains,
+      };
+      const generatedRows = explodeToRows(orderingBase, { variantKeys, pnTemplate }) || [];
+      for (const generated of generatedRows) {
+        if (!generated || typeof generated !== 'object') continue;
+        const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
+        pushRow({ code: generated.code, values, brand, verified: false });
+      }
+    }
+  }
+
+  if (!out.length) {
+    for (const c of seedCodes) {
+      pushRow({ code: c, values: {}, brand, verified: true });
+    }
+  }
 
   const tableList = Array.isArray(docai?.tables) ? docai.tables : [];
-  const codeList = codes.slice(0, MAX_PARTS);
+  const codeList = mergedCodes.slice(0, MAX_PARTS);
   const uniqueRowCodes = new Set();
   for (const row of out) {
     if (!row || typeof row !== 'object') continue;
@@ -368,7 +489,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   }
   const uniqueCandidateCodes = new Set(codeList.map((c) => String(c || '').trim().toUpperCase()).filter(Boolean));
   let docType = 'single';
-  if (orderingInfo) docType = 'ordering';
+  if (orderingInfo || shouldExpandOrdering) docType = 'ordering';
   else if (uniqueRowCodes.size > 1 || uniqueCandidateCodes.size > 1) docType = 'catalog';
 
   return {

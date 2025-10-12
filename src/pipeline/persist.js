@@ -854,6 +854,8 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
 
   let pn = String(row.pn || row.code || '').trim();
   const allowMinimal = isMinimalInsertEnabled();
+  const docType = String(row.doc_type || '').trim().toLowerCase();
+  const allowForOrdering = docType === 'ordering' || Boolean(row.verified_in_doc);
   if (!isValidCode(pn)) {
     const rawPn = String(row.pn || '').trim();
     const rawCode = String(row.code || '').trim();
@@ -895,7 +897,7 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   }
   row.pn = pn;
   if (row.code == null || String(row.code).trim() === '') row.code = pn;
-  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !allowMinimal) {
+  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !(allowMinimal || allowForOrdering)) {
     return { ok: false, reason: 'missing_core_spec' };
   }
   return { ok: true };

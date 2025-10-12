@@ -105,7 +105,7 @@ function withDeadline(promise, ms = HARD_CAP_MS, label = 'op') {
 const FAST = String(process.env.INGEST_MODE || '').toUpperCase() === 'FAST' || process.env.FAST_INGEST === '1';
 const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지만
 
-const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
+const META_KEYS = new Set(['variant_keys','pn_template','ingest_options','_pn_template']);
 const BASE_KEYS = new Set([
   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
@@ -3810,6 +3810,48 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       const schemaEnsureRows = Array.isArray(processedRowsInput) && processedRowsInput.length
         ? (processedRowsInput === records ? records : [...records, ...processedRowsInput])
         : records;
+
+      if (family) {
+        if (!blueprint) {
+          try {
+            blueprint = await getBlueprint(family);
+          } catch (err) {
+            console.warn('[persist] blueprint fetch failed for key widening:', err?.message || err);
+          }
+        }
+        const knownList = Array.isArray(blueprint?.allowedKeys) ? [...blueprint.allowedKeys] : [];
+        const knownLower = new Set(
+          knownList.map((key) => String(key || '').trim().toLowerCase()).filter(Boolean),
+        );
+        const runtimeKeys = Array.from(gatherRuntimeSpecKeys(schemaEnsureRows));
+        const unknownKeys = Array.from(
+          new Set(
+            runtimeKeys
+              .map((key) => String(key || '').trim())
+              .filter((key) => key && !knownLower.has(key.toLowerCase())),
+          ),
+        );
+        if (unknownKeys.length) {
+          try {
+            const { map } = await aiCanonicalizeKeys(family, unknownKeys, knownList);
+            const widened = new Set(knownList);
+            for (const key of unknownKeys) {
+              const rec = map?.[key] || {};
+              let target = String(rec.canonical || '').trim();
+              if (!target || rec.action !== 'map') target = key;
+              const lower = target.toLowerCase();
+              if (!lower || knownLower.has(lower)) continue;
+              knownLower.add(lower);
+              widened.add(target);
+            }
+            blueprint = blueprint && typeof blueprint === 'object' ? blueprint : {};
+            blueprint.allowedKeys = Array.from(widened);
+          } catch (err) {
+            console.warn('[persist] aiCanonicalizeKeys failed:', err?.message || err);
+          }
+        }
+      }
+
       await ensureDynamicColumnsForRows(qualified, schemaEnsureRows);
       try {
         persistResult = await saveExtractedSpecs(qualified, family, records, {

@@ -743,6 +743,9 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
       if (!generated || typeof generated !== 'object') continue;
       const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
       const v = hasDocEvidence(normalizeCodeKey(generated.code)) || hasOrderingEvidence(generated.code);
+      if (values && typeof values === 'object' && !Object.prototype.hasOwnProperty.call(values, '_pn_template')) {
+        values._pn_template = pnTemplate || null;
+      }
       pushRow({ code: generated.code, values, brand, verified: v });
     }
     orderingExpanded = out.length > beforeCount;

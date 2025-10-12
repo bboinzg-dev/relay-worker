@@ -1,99 +1,73 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 35f261c5dc72dca5b9c3b0304c43d2afef1e432d..f1adf3509fd041b1a20713e241b22010142eac86 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -832,92 +832,94 @@ function hasCoreSpec(row, keys = [], candidateKeys = []) {
-   for (const key of list) {
-     const norm = normKey(key);
-     if (!norm) continue;
-     if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
-   }
-   return false;
- }
- 
- function isMinimalInsertEnabled() {
-   return String(process.env.ALLOW_MINIMAL_INSERT || '').trim() === '1';
- }
- 
- function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
-   if (!row || typeof row !== 'object') {
-     return { ok: false, reason: 'empty_row' };
-   }
- 
-   const brand = String(row.brand || '').trim().toLowerCase();
-   if (!brand || brand === 'unknown') {
-     row.last_error = 'missing_brand';
-     return { ok: false, reason: 'missing_brand' };
-   }
- 
-   let pn = String(row.pn || row.code || '').trim();
-   const allowMinimal = isMinimalInsertEnabled();
-+  const docType = String(row.doc_type || '').trim().toLowerCase();
-+  const allowForOrdering = docType === 'ordering' || Boolean(row.verified_in_doc);
-   if (!isValidCode(pn)) {
-     const rawPn = String(row.pn || '').trim();
-     const rawCode = String(row.code || '').trim();
-     if ((rawPn && /\{[^}]*\}/.test(rawPn)) || (rawCode && /\{[^}]*\}/.test(rawCode))) {
-       row.last_error = 'invalid_code_template_placeholder';
-       return { ok: false, reason: 'invalid_code' };
+diff --git a/src/utils/blueprint.js b/src/utils/blueprint.js
+index 5c8421acd5ecf89c346851ddc6240a705f1652cc..3ad9a3971603b3d26a6fc1bb9b802faf13dfbca0 100644
+--- a/src/utils/blueprint.js
++++ b/src/utils/blueprint.js
+@@ -68,51 +68,67 @@ function ensureFamilyOverrides(blueprint, registryRow) {
      }
-     const fixed = repairPn(pn);
-     if (fixed && isValidCode(fixed)) {
-       console.warn('[persist] pn repaired', { original: pn, fixed });
-       row.last_error = row.last_error || 'invalid_code_fixed';
-       pn = fixed;
-     } else if (allowMinimal) {
-       const fallbackPn = repairPn(String(row.series || row.code || ''));
-       if (fallbackPn && isValidCode(fallbackPn)) {
-         console.warn('[persist] pn fallback applied', { original: pn, fallback: fallbackPn });
-         pn = fallbackPn;
-         row.last_error = row.last_error || 'invalid_code_fallback';
-       } else {
-         row.last_error = 'invalid_code';
-         return { ok: false, reason: 'invalid_code' };
-       }
-     } else {
-       row.last_error = 'invalid_code';
-       return { ok: false, reason: 'invalid_code' };
+     if (!ingestOptions.pn_template && ingestOptions.pnTemplate) {
+       ingestOptions.pn_template = ingestOptions.pnTemplate;
      }
-   } else {
-     if (FORBIDDEN_RE.test(pn) || BANNED_PREFIX.test(pn) || BANNED_EXACT.test(pn)) {
-       const fixed = repairPn(pn);
-       if (fixed && isValidCode(fixed) && !FORBIDDEN_RE.test(fixed) && !BANNED_PREFIX.test(fixed) && !BANNED_EXACT.test(fixed)) {
-         console.warn('[persist] pn repaired', { original: pn, fixed });
-         row.last_error = row.last_error || 'invalid_code_fixed';
-         pn = fixed;
-       } else {
-         row.last_error = 'invalid_code';
-         return { ok: false, reason: 'invalid_code' };
-       }
+     if (!ingestOptions.pnTemplate && ingestOptions.pn_template) {
+       ingestOptions.pnTemplate = ingestOptions.pn_template;
      }
+   };
+ 
+   if (family === 'relay_power') {
+     addVariantKeys(['coil_voltage_vdc', 'contact_form', 'suffix']);
+     ensureTemplate('{{series_code}}{{contact_form}}{{coil_voltage_vdc|pad=2}}{{suffix}}');
    }
-   row.pn = pn;
-   if (row.code == null || String(row.code).trim() === '') row.code = pn;
--  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !allowMinimal) {
-+  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !(allowMinimal || allowForOrdering)) {
-     return { ok: false, reason: 'missing_core_spec' };
+ 
+   if (family === 'relay_signal') {
+     addVariantKeys(['coil_voltage_vdc', 'contact_arrangement', 'contact_form', 'suffix']);
+     ensureTemplate('{{series}}{{contact_arrangement|upper|alnum}}{{coil_voltage_vdc|digits|pad=2}}{{suffix|upper}}');
    }
-   return { ok: true };
+ 
+   const variantKeys = Array.from(forcedVariantKeys);
+   blueprint.variant_keys = variantKeys;
+   ingestOptions.variant_keys = variantKeys;
+   blueprint.ingestOptions = ingestOptions;
+ 
+   const allowed = Array.isArray(blueprint.allowedKeys) ? blueprint.allowedKeys : [];
+-  blueprint.allowedKeys = Array.from(new Set([...allowed, ...variantKeys]));
++  const generic = [
++    'pn_jp',
++    'pn_aliases',
++    'ordering_market',
++    'coil_voltage_vac',
++    'terminal_form',
++    'contact_rating_text',
++    'dielectric_strength_v',
++    'operate_time_ms',
++    'release_time_ms',
++    'coil_resistance_ohm',
++    'insulation_resistance_mohm',
++    'dim_l_mm',
++    'dim_w_mm',
++    'dim_h_mm',
++  ];
++  blueprint.allowedKeys = Array.from(new Set([...allowed, ...variantKeys, ...generic]));
+ 
+   if (registryRow?.specs_table && !blueprint.specsTable) {
+     blueprint.specsTable = registryRow.specs_table;
+   }
+ 
+   return blueprint;
  }
  
- async function getColumnTypes(targetTable) {
-   const [schema, table] = targetTable.includes('.')
-     ? targetTable.split('.', 2)
-     : ['public', targetTable];
+ function normalizeBlueprint(row, registryRow) {
+   if (!row) return null;
+   const fields = row.fields_json || row.fields || {};
+   const ingestOptionsRaw = row.ingest_options || row.ingestOptions || {};
+   const ingestOptions = ingestOptionsRaw && typeof ingestOptionsRaw === 'object'
+     ? { ...ingestOptionsRaw }
+     : {};
+   const codeRules = row.code_rules || row.codeRules || null;
+   const allowedKeys = deriveAllowedKeys(fields, ingestOptionsRaw);
+   let variantKeys = deriveVariantKeys(row);
+   const specsTable = registryRow?.specs_table || registryRow?.specsTable || `${row.family_slug}_specs`;
  
-   const { rows } = await pool.query(
-     `SELECT lower(column_name) AS column, data_type
-        FROM information_schema.columns
-       WHERE table_schema = $1
-         AND table_name   = $2`,
-     [schema, table],
-   );
- 
-   const map = new Map();
-   for (const row of rows) {
-     map.set(row.column, String(row.data_type || '').toLowerCase());
+   if (Array.isArray(ingestOptions.variant_keys)) {
+     ingestOptions.variant_keys = normalizeKeyList(ingestOptions.variant_keys);
    }
-   return map;
- }
+ 
+   variantKeys = Array.isArray(variantKeys) ? variantKeys : [];

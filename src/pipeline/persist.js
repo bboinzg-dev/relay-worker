@@ -417,7 +417,7 @@ async function applyAiNormalization({
   for (const key of keys) {
     if (!key) continue;
     if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
-    if (allowedKeySet?.size && !allowedKeySet.has(key)) continue;
+    if (allowedKeySet?.size && !allowedKeySet.has(key) && String(process.env.AUTO_ADD_FIELDS || '').trim() !== '1') continue;
 
     const original = record[key];
     if (original == null) continue;

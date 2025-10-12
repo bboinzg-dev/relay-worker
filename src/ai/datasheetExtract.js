@@ -339,6 +339,30 @@ function gatherPerCodeTablePreview(tables, codes, options = {}) {
   return previews;
 }
 
+function extractTypePartPairs(tables = []) {
+  const pairs = new Map();
+  for (const table of tables) {
+    const headers = Array.isArray(table?.headers)
+      ? table.headers.map((h) => String(h || '').toLowerCase())
+      : [];
+    const typeIdx = headers.findIndex((h) => /(^|\s)type(\s|$)|type no/.test(h));
+    const partIdx = headers.findIndex((h) => /(^|\s)part(\s|$)|part no|品番|型番/.test(h));
+    if (typeIdx < 0 || partIdx < 0) continue;
+    for (const row of table?.rows || []) {
+      if (!Array.isArray(row)) continue;
+      const type = String(row[typeIdx] || '').trim().toUpperCase();
+      const part = String(row[partIdx] || '').trim().toUpperCase();
+      if (!type || !part) continue;
+      if (!/[0-9]/.test(type) || !/[0-9]/.test(part)) continue;
+      if (!pairs.has(type)) pairs.set(type, new Set());
+      pairs.get(type).add(part);
+    }
+  }
+  const out = new Map();
+  for (const [key, valueSet] of pairs) out.set(key, Array.from(valueSet));
+  return out;
+}
+
 function gatherOrderingSectionEvidence(orderingInfo, code, options = {}) {
   const rawCode = String(code || '').trim();
   if (!rawCode) return null;
@@ -512,11 +536,18 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     }
   }
   const rowAllowedKeySet = new Set(seenAllowed);
-  const promptAllowedKeys = [...rowAllowedKeys];
+  const promptAllowedKeys = Array.from(new Set([
+    ...rowAllowedKeys,
+    'pn_jp',
+    'pn_aliases',
+    'ordering_market',
+  ]));
 
   let docai = await processWithDocAI(gcsUri);
   let fullText = docai?.fullText || '';
   if (!fullText) fullText = await parseTextWithPdfParse(gcsUri);
+
+  const typePartMap = extractTypePartPairs(docai?.tables || []);
 
   const brand = brandHint || (await detectBrandFromText(fullText)) || 'unknown';
   const orderingInfo = extractOrderingInfo(fullText, MAX_PARTS);
@@ -645,6 +676,14 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     const brandValue = rowBrand || brand;
     if (brandValue) row.brand = brandValue;
     if (values && typeof values === 'object') {
+      if (typePartMap.has(norm)) {
+        const jpList = typePartMap.get(norm);
+        values.pn_jp = Array.isArray(jpList) && jpList.length ? jpList[0] : null;
+        values.pn_aliases = jpList && jpList.length ? jpList : null;
+        values.ordering_market = 'GLOBAL';
+      } else if (!/^[A-Z]HE[0-9]/.test(norm) && /^AHE[0-9]/.test(norm)) {
+        values.ordering_market = 'JP';
+      }
       for (const key of rowAllowedKeys) {
         if (!key) continue;
         if (Object.prototype.hasOwnProperty.call(values, key) && values[key] != null) {

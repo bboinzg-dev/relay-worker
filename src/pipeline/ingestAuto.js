@@ -538,6 +538,7 @@ const CURRENT_LINE_RE = /(contact\s*current|current\s*\(?type\)?)/i;
 const COVER_LINE_RE = /\bcover\b/i;
 const TERMINAL_LINE_RE = /(terminal|shape|style)/i;
 const PACKING_LINE_RE = /(pack|tape|reel|emboss)/i;
+const MOUNT_LINE_RE = /(pc\s*board|surface-?mount|smd)/i;
 
 function normalizeOrderingEnumToken(token) {
   if (token == null) return null;
@@ -722,11 +723,12 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
         if (/voltage\s*\(vdc\)/.test(norm)) return 'coil_voltage_vdc';
         if (/coil/.test(norm) && /power/.test(norm)) return 'coil_power_code';
         if (/power/.test(norm) && /code/.test(norm)) return 'coil_power_code';
+        if (/(terminal|shape|style)/.test(norm)) return 'terminal_shape';
+        if (/(pack|tape|reel|emboss)/.test(norm)) return 'packing_style';
+        if (/(pc\s*board|surface-?mount|smd)/.test(norm)) return 'mount_type';
         if (/contact/.test(norm) && /current/.test(norm)) return 'contact_current_code';
         if (/cover/.test(norm)) return 'cover_code';
         if (/construction/.test(norm) || /enclosure/.test(norm)) return 'construction';
-        if (/terminal/.test(norm) || /shape/.test(norm)) return 'terminal_shape';
-        if (/(pack|tape|reel|emboss)/.test(norm)) return 'packing_style';
         if (/insulation/.test(norm)) return 'insulation_code';
         if (/material/.test(norm)) return 'material_code';
         return null;
@@ -774,6 +776,7 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
         if (CURRENT_LINE_RE.test(line)) addMany('contact_current_code', extractEnumCodeValues(line));
         if (TERMINAL_LINE_RE.test(line)) addMany('terminal_shape', extractEnumCodeValues(line));
         if (PACKING_LINE_RE.test(line)) addMany('packing_style', extractEnumCodeValues(line));
+        if (MOUNT_LINE_RE.test(line)) addMany('mount_type', extractEnumCodeValues(line));
         if (COVER_LINE_RE.test(line)) addMany('cover_code', extractEnumCodeValues(line));
         // 자주 나오는 일반 패턴들
         if (/led/i.test(line)) addMany('led_code', extractEnumCodeValues(line)); // "L: With LED, Nil: W/O LED"
@@ -907,7 +910,7 @@ const KEY_ALIASES = {
   case: ['case', 'case_code', 'package', 'pkg'],
   led: ['led', 'led_code', 'indicator'],
   cover: ['cover', 'cover_mode', 'cover_code'],
-  mount: ['mount', 'mount_type_code', 'insert_type', 'assembly'],
+  mount: ['mount', 'mount_type', 'mount_type_code', 'insert_type', 'assembly'],
   capacitance: ['capacitance', 'capacitance_uF', 'capacitance_f', 'c'],
   resistance: ['resistance', 'resistance_ohm', 'r_ohm', 'r'],
   tolerance: ['tolerance', 'tolerance_pct'],

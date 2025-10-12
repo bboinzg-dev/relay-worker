@@ -1,436 +1,56 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 6b86636d23c30743c87d6cf25ded126df141c1b2..b4812342191e473d1428e61a3ae020d30b6fdc24 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -107,92 +107,323 @@ const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지
+diff --git a/src/pipeline/variant-keys.js b/src/pipeline/variant-keys.js
+index 5d47068b8f47ff6d8a1ff0361d8a2f207d34bb79..a7e2179d7bd2ba7f89a1e25b94cc841bff734f84 100644
+--- a/src/pipeline/variant-keys.js
++++ b/src/pipeline/variant-keys.js
+@@ -1,50 +1,50 @@
+ 'use strict';
  
- const META_KEYS = new Set(['variant_keys','pn_template','ingest_options']);
- const BASE_KEYS = new Set([
-   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
-   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
-   'cover','verified_in_doc','updated_at'
- ]);
- const SKIP_SPEC_KEYS = new Set([
-   'raw_json',
-   'text',
-   'tables',
-   'mpn_list',
-   'mpn',
-   'codes',
+ const db = require('../../db');
+ 
+ const MIN_VARIATION_COUNT = 2;
+ 
+ const VARIANT_DISCOVERY_ENABLED = /^(1|true|on)$/i.test(
+   process.env.VARIANT_DISCOVERY_ENABLED || '0'
+ );
+ 
+ function parseEnvNumber(name, defaultValue, parser = parseFloat) {
+   const raw = process.env[name];
+   if (raw == null || raw === '') return defaultValue;
+   const parsed = parser(raw);
+   if (!Number.isFinite(parsed)) {
+     console.warn(`[variant] invalid ${name}=${raw}, fallback=${defaultValue}`);
+     return defaultValue;
+   }
+   return parsed;
+ }
+ 
+ const VARIANT_MIN_COVERAGE = parseEnvNumber('VARIANT_MIN_COVERAGE', 0.4, parseFloat);
+ const VARIANT_MAX_CARDINALITY = Math.max(
+   2,
+-  parseEnvNumber('VARIANT_MAX_CARDINALITY', 20, (v) => parseInt(v, 10))
++  parseEnvNumber('VARIANT_MAX_CARDINALITY', 120, (v) => parseInt(v, 10))
+ );
+ const VARIANT_MIN_MI = Math.max(0, parseEnvNumber('VARIANT_MIN_MI', 0.05, parseFloat));
+ const VARIANT_DISCOVERY_SAMPLE_LIMIT = Math.max(
+   50,
+   parseEnvNumber('VARIANT_DISCOVERY_SAMPLE_LIMIT', 750, (v) => parseInt(v, 10))
+ );
+ const VARIANT_MIN_SAMPLE = 8;
+ const VARIANT_MAX_VALUE_LENGTH = 80;
+ 
+ const RESERVED_VARIANT_KEYS = new Set([
+   'id',
+   'created_at',
+   'updated_at',
+   'brand',
+   'brand_norm',
+   'pn',
+   'pn_norm',
+   'code',
    'series',
-   'series_code',
-   'raw_text',
-   'raw_specs',
-   'rawspecs',
-   'raw_table',
-   'raw_tables',
-   'ordering_info',
-   'doc_type',
- ]);
- 
-+const MERGE_SKIP_KEYS = new Set([
-+  ...SKIP_SPEC_KEYS,
-+  'id',
-+  'created_at',
-+  'updated_at',
-+  'raw_json',
-+  'rawspecs',
-+  'raw_specs',
-+  'raw_table',
-+  'raw_tables',
-+  'raw_text',
-+  'doc_type',
-+  'ordering_info',
-+  'family_slug',
-+  'brand',
-+  'brand_norm',
-+  'pn',
-+  'pn_norm',
-+  'code',
-+  'code_norm',
-+  'display_name',
-+  'displayname',
-+  'image_uri',
-+  'datasheet_uri',
-+  'cover',
-+  'verified_in_doc',
-+  'candidates',
-+  '_doc_text',
-+  'mpn',
-+  'mpn_list',
-+  'codes',
-+  'last_error',
-+  'run_id',
-+  'job_id',
-+  'runid',
-+  'jobid',
-+]);
-+
- function gatherRuntimeSpecKeys(rows) {
-   const set = new Set();
-   const list = Array.isArray(rows) ? rows : [];
-   for (const row of list) {
-     if (!row || typeof row !== 'object') continue;
-     for (const rawKey of Object.keys(row)) {
-       const trimmed = String(rawKey || '').trim();
-       if (!trimmed) continue;
-       const lower = trimmed.toLowerCase();
-       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
-       set.add(trimmed);
-     }
-   }
-   return set;
- }
- 
- async function ensureDynamicColumnsForRows(qualifiedTable, rows) {
-   if (!AUTO_ADD_FIELDS || !AUTO_ADD_FIELDS_LIMIT) return;
-   const keys = Array.from(gatherRuntimeSpecKeys(rows)).slice(0, AUTO_ADD_FIELDS_LIMIT);
-   if (!keys.length) return;
-   const sample = {};
-   if (Array.isArray(rows)) {
-     const remaining = new Set(keys);
-     for (const row of rows) {
-       if (!row || typeof row !== 'object') continue;
-       for (const key of keys) {
-         if (!remaining.has(key)) continue;
-         if (Object.prototype.hasOwnProperty.call(row, key)) {
-           sample[key] = row[key];
-           remaining.delete(key);
-         }
-       }
-       if (!remaining.size) break;
-     }
-   }
-   try {
-     await ensureSpecColumnsForKeys(qualifiedTable, keys, sample);
-   } catch (err) {
-     console.warn('[schema] ensureDynamicColumnsForRows failed:', err?.message || err);
-   }
- }
- 
-+function quoteIdentifier(name) {
-+  const trimmed = String(name || '').trim();
-+  if (!trimmed) return '""';
-+  return `"${trimmed.replace(/"/g, '""')}"`;
-+}
-+
-+function normalizePnForMerge(value) {
-+  const raw = String(value || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
-+  if (raw.length < 4) return null;
-+  return raw;
-+}
-+
-+function getValueIgnoreCase(row, keyLower) {
-+  if (!row || typeof row !== 'object') return undefined;
-+  if (Object.prototype.hasOwnProperty.call(row, keyLower)) return row[keyLower];
-+  const target = String(keyLower || '').toLowerCase();
-+  for (const [k, v] of Object.entries(row)) {
-+    if (String(k || '').toLowerCase() === target) return v;
-+  }
-+  return undefined;
-+}
-+
-+function isEmptyValue(value) {
-+  if (value == null) return true;
-+  if (typeof value === 'string') return value.trim() === '';
-+  if (Array.isArray(value)) return value.length === 0;
-+  return false;
-+}
-+
-+function normalizeComparableValueForMerge(value) {
-+  if (value == null) return null;
-+  if (typeof value === 'number') {
-+    if (!Number.isFinite(value)) return null;
-+    return Number(value.toFixed(6));
-+  }
-+  if (typeof value === 'boolean') return value ? 1 : 0;
-+  if (value instanceof Date) return value.getTime();
-+  if (Array.isArray(value)) {
-+    const parts = value
-+      .map((item) => normalizeComparableValueForMerge(item))
-+      .filter((item) => item != null);
-+    return parts.length ? parts.join('|') : null;
-+  }
-+  const str = String(value).trim();
-+  if (!str) return null;
-+  const digitsOnly = str.replace(/,/g, '');
-+  if (/^-?\d+(?:\.\d+)?$/.test(digitsOnly)) {
-+    const num = Number(digitsOnly);
-+    if (Number.isFinite(num)) return Number(num.toFixed(6));
-+  }
-+  return str.toLowerCase().replace(/\s+/g, ' ');
-+}
-+
-+function valuesConflictForMerge(a, b) {
-+  const normA = normalizeComparableValueForMerge(a);
-+  const normB = normalizeComparableValueForMerge(b);
-+  if (normA == null || normB == null) return false;
-+  return normA !== normB;
-+}
-+
-+function isRecordCompatibleForMerge(record, existing, coreKeySet) {
-+  const keysToCheck = coreKeySet && coreKeySet.size
-+    ? Array.from(coreKeySet)
-+    : Object.keys(record || {}).map((k) => String(k || '').toLowerCase());
-+  for (const keyLower of keysToCheck) {
-+    if (!keyLower) continue;
-+    if (MERGE_SKIP_KEYS.has(keyLower)) continue;
-+    const recordValue = getValueIgnoreCase(record, keyLower);
-+    if (isEmptyValue(recordValue)) continue;
-+    const existingValue = getValueIgnoreCase(existing, keyLower);
-+    if (isEmptyValue(existingValue)) continue;
-+    if (valuesConflictForMerge(recordValue, existingValue)) return false;
-+  }
-+  return true;
-+}
-+
-+function backfillRecordFromExisting(record, existing) {
-+  if (!record || typeof record !== 'object') return;
-+  if (!existing || typeof existing !== 'object') return;
-+  for (const [key, value] of Object.entries(existing)) {
-+    const lower = String(key || '').toLowerCase();
-+    if (MERGE_SKIP_KEYS.has(lower)) continue;
-+    if (value == null) continue;
-+    if (typeof value === 'object' && !Array.isArray(value)) continue;
-+    const current = getValueIgnoreCase(record, lower);
-+    if (!isEmptyValue(current)) continue;
-+    if (Array.isArray(value) && !value.length) continue;
-+    record[key] = value;
-+  }
-+}
-+
-+async function mergeRecordsWithExisting({
-+  records,
-+  qualifiedTable,
-+  colTypes,
-+  brandFallback = null,
-+  family = null,
-+  coreKeys = [],
-+}) {
-+  if (!Array.isArray(records) || !records.length) return;
-+  if (!qualifiedTable) return;
-+  if (!(colTypes instanceof Map)) return;
-+
-+  const columnSet = new Set();
-+  for (const key of colTypes.keys()) {
-+    if (!key) continue;
-+    columnSet.add(String(key).trim().toLowerCase());
-+  }
-+
-+  const comparatorColumns = ['pn_norm', 'pn', 'code_norm', 'code'].filter((col) => columnSet.has(col));
-+  if (!comparatorColumns.length) return;
-+
-+  const brandColumn = columnSet.has('brand') ? 'brand' : null;
-+  if (!brandColumn) return;
-+
-+  const familyColumn = columnSet.has('family_slug') ? 'family_slug' : null;
-+  const familyValue = typeof family === 'string' ? family.trim() : '';
-+
-+  const coreKeySet = new Set(
-+    Array.isArray(coreKeys)
-+      ? coreKeys.map((key) => String(key || '').trim().toLowerCase()).filter(Boolean)
-+      : []
-+  );
-+
-+  const cache = new Map();
-+
-+  const fetchCandidates = async (brandValue, pnNorm) => {
-+    const cacheKey = `${brandValue.toLowerCase()}::${familyValue.toLowerCase()}::${pnNorm}`;
-+    if (cache.has(cacheKey)) return cache.get(cacheKey);
-+
-+    const whereClauses = [];
-+    const params = [];
-+    let paramIndex = 1;
-+
-+    whereClauses.push(`LOWER(${quoteIdentifier(brandColumn)}) = LOWER($${paramIndex})`);
-+    params.push(brandValue);
-+    paramIndex += 1;
-+
-+    if (familyColumn && familyValue) {
-+      whereClauses.push(`LOWER(${quoteIdentifier(familyColumn)}) = LOWER($${paramIndex})`);
-+      params.push(familyValue);
-+      paramIndex += 1;
-+    }
-+
-+    const normIndex = paramIndex;
-+    params.push(pnNorm);
-+
-+    const comparatorParts = comparatorColumns.map(
-+      (col) => `regexp_replace(coalesce(${quoteIdentifier(col)}, ''), '[^0-9A-Za-z]', '', 'g') = $${normIndex}`,
-+    );
-+    if (!comparatorParts.length) {
-+      cache.set(cacheKey, []);
-+      return [];
-+    }
-+
-+    whereClauses.push(`(${comparatorParts.join(' OR ')})`);
-+
-+    const sql = `
-+      SELECT *
-+        FROM ${qualifiedTable}
-+       WHERE ${whereClauses.join(' AND ')}
-+       ORDER BY updated_at DESC NULLS LAST
-+       LIMIT 5
-+    `;
-+
-+    let rows = [];
-+    try {
-+      const { rows: resultRows } = await db.query(sql, params);
-+      rows = Array.isArray(resultRows) ? resultRows : [];
-+    } catch (err) {
-+      console.warn('[merge] existing lookup failed:', err?.message || err);
-+      rows = [];
-+    }
-+
-+    cache.set(cacheKey, rows);
-+    return rows;
-+  };
-+
-+  for (const record of records) {
-+    if (!record || typeof record !== 'object') continue;
-+    const brandValue = String(record.brand || brandFallback || '').trim();
-+    if (!brandValue) continue;
-+    const pnCandidate = record.pn || record.code;
-+    const pnNorm = normalizePnForMerge(pnCandidate);
-+    if (!pnNorm) continue;
-+    const candidates = await fetchCandidates(brandValue, pnNorm);
-+    if (!Array.isArray(candidates) || !candidates.length) continue;
-+    const match = candidates.find((candidate) => isRecordCompatibleForMerge(record, candidate, coreKeySet));
-+    if (!match) continue;
-+    backfillRecordFromExisting(record, match);
-+  }
-+}
-+
- function expandRowsWithVariants(baseRows, options = {}) {
-   const list = Array.isArray(baseRows) ? baseRows : [];
-   const variantKeys = Array.isArray(options.variantKeys)
-     ? Array.from(
-         new Set(
-           options.variantKeys
-             .map((key) => String(key || '').trim())
-             .filter(Boolean),
-         ),
-       )
-     : [];
-   const pnTemplate = typeof options.pnTemplate === 'string' ? options.pnTemplate : null;
-   const defaultBrand = typeof options.defaultBrand === 'string' ? options.defaultBrand : null;
-   const defaultSeries = options.defaultSeries ?? null;
- 
-   if (!variantKeys.length && !pnTemplate) {
-     return list;
-   }
- 
-   const expanded = [];
-   for (const rawRow of list) {
-     const baseRow = rawRow && typeof rawRow === 'object' ? { ...rawRow } : {};
-     if (defaultBrand) {
-       const brandCurrent = String(baseRow.brand || '').trim().toLowerCase();
-       if (!brandCurrent || brandCurrent === 'unknown') {
-@@ -3488,82 +3719,106 @@ async function persistProcessedData(processed = {}, overrides = {}) {
-     records = records.filter((r) => isValidCode(r?.pn || r?.code));
-     if (!records.length) {
-       persistResult.skipped = [{ reason: 'missing_pn' }];
-     }
- 
-     if (records.length) {
-       for (const r of records) {
-         if (!r || typeof r !== 'object') continue;
-         r.brand =
-           safeBrand(r.brand) ||
-           safeBrand(brandOverride) ||
-           safeBrand(processedEffective) ||
-           safeBrand(brandName) ||
-           safeBrand(extractedBrand) ||
-           safeBrand(processedDetected) ||
-           null;
- 
-         if (!r.pn && r.code) r.pn = r.code;
-         if (!r.code && r.pn) r.code = r.pn;
- 
-         if (r.pn != null && String(r.pn).trim() === '') r.pn = null;
-         if (r.code != null && String(r.code).trim() === '') r.code = null;
-         if (r.brand != null && String(r.brand).trim() === '') r.brand = null;
-       }
- 
-+      const mergeBrandFallback =
-+        safeBrand(brandOverride) ||
-+        safeBrand(processedEffective) ||
-+        safeBrand(processedBrand) ||
-+        safeBrand(brandName) ||
-+        safeBrand(extractedBrand) ||
-+        safeBrand(processedDetected) ||
-+        null;
-+      try {
-+        await mergeRecordsWithExisting({
-+          records,
-+          qualifiedTable: qualified,
-+          colTypes,
-+          brandFallback: mergeBrandFallback,
-+          family,
-+          coreKeys: effectiveRequired,
-+        });
-+      } catch (err) {
-+        console.warn('[merge] mergeRecordsWithExisting failed:', err?.message || err);
-+      }
-+
-       if (colTypes instanceof Map && colTypes.size) {
-         for (const rec of records) {
-           if (!rec || typeof rec !== 'object') continue;
-           for (const [k, v] of Object.entries(rec)) {
-             const keyLower = String(k || '').toLowerCase();
-             const t = colTypes.get(keyLower) || colTypes.get(k);
-             if (!t) continue;
-             if (t === 'numeric')      rec[k] = coerceNumeric(v);
-             else if (t === 'int')     rec[k] = toInt(v);
-             else if (t === 'bool')    rec[k] = toBool(v);
-           }
-         }
-       }
-       console.log(
-         '[DIAG] persist start table=%s family=%s records=%d required=%d',
-         table,
-         family,
-         Array.isArray(records) ? records.length : -1,
-         Array.isArray(effectiveRequired) ? effectiveRequired.length : -1,
-       );
-       if (Array.isArray(records) && records.length) {
-         const r0 = records[0] || {};
-         console.log('[PERSIST.INPUT]', {
-           family,
-           table,
-           brand: r0.brand ?? null,
-           pn: r0.pn ?? null,
-           code: r0.code ?? null,
-           display_name: r0.display_name ?? null,
-         });
-       }
--      await ensureDynamicColumnsForRows(qualified, records);
-+      const schemaEnsureRows = Array.isArray(processedRowsInput) && processedRowsInput.length
-+        ? (processedRowsInput === records ? records : [...records, ...processedRowsInput])
-+        : records;
-+      await ensureDynamicColumnsForRows(qualified, schemaEnsureRows);
-       try {
-         persistResult = await saveExtractedSpecs(qualified, family, records, {
-           brand: brandOverride,
-           pnTemplate,
-           requiredKeys: effectiveRequired,
-           coreSpecKeys: effectiveRequired,
-           blueprint,
-           runId,
-           run_id: runId,
-           jobId,
-           job_id: jobId,
-           gcsUri,
-           orderingInfo: processed?.ordering_info,
-           docType: processed?.doc_type,
-         }) || persistResult;
-       } catch (e) {
-         console.warn('[persist] saveExtractedSpecs failed:', e?.message || e);
-         if (!persistResult || typeof persistResult !== 'object') {
-           persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
-         }
-         if (!Array.isArray(persistResult.warnings)) persistResult.warnings = [];
-         persistResult.warnings.push(String(e?.message || e));
-       }
-     }
-   } else if (!records.length) {
+   'image_uri',
+   'datasheet_uri',
+   'datasheet_url',
+   'source_gcs_uri',
+   'raw_json',
+   'last_error',

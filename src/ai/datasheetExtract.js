@@ -281,7 +281,7 @@ function formatTableRow(row) {
 function gatherPerCodeTablePreview(tables, codes, options = {}) {
   const context = Number.isFinite(options.contextRows)
     ? Math.max(0, options.contextRows)
-    : 1;
+    : 2;
   const maxMatchesPerCode = Number.isFinite(options.maxMatchesPerCode)
     ? Math.max(1, options.maxMatchesPerCode)
     : 1;
@@ -337,6 +337,62 @@ function gatherPerCodeTablePreview(tables, codes, options = {}) {
   }
 
   return previews;
+}
+
+function gatherOrderingSectionEvidence(orderingInfo, code, options = {}) {
+  const rawCode = String(code || '').trim();
+  if (!rawCode) return null;
+  const sectionText = orderingInfo?.text;
+  if (!sectionText) return null;
+
+  const context = Number.isFinite(options.contextLines)
+    ? Math.max(0, options.contextLines)
+    : 2;
+  const tokens = rawCode
+    .toUpperCase()
+    .split(/[^A-Z0-9]+/g)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2);
+  if (!tokens.length) return null;
+
+  const lines = sectionText
+    .split(/\r?\n/g)
+    .map((line) => String(line || '').trim())
+    .filter(Boolean);
+  if (!lines.length) return null;
+
+  let bestSnippet = null;
+  let bestScore = 0;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!line) continue;
+    const upperLine = line.toUpperCase();
+    let matches = 0;
+    for (const token of tokens) {
+      if (upperLine.includes(token)) matches += 1;
+    }
+    if (!matches) continue;
+
+    const start = Math.max(0, i - context);
+    const end = Math.min(lines.length - 1, i + context);
+    const snippetLines = lines.slice(start, end + 1).filter(Boolean);
+    if (!snippetLines.length) continue;
+    const snippet = snippetLines.join('\n');
+    if (matches > bestScore || (matches === bestScore && snippet.length < (bestSnippet?.length || Infinity))) {
+      bestSnippet = snippet;
+      bestScore = matches;
+    }
+  }
+
+  if (!bestSnippet && lines.length) {
+    const limited = lines.slice(0, Math.min(lines.length, Math.max(3, context * 2 + 1)));
+    const header = `TOKENS: ${tokens.join(' / ')}`;
+    bestSnippet = [header, ...limited].join('\n');
+  }
+
+  if (!bestSnippet) return null;
+  return `ORDERING SECTION:\n${bestSnippet}`;
 }
 
 /* -------------------- Gemini mapping -------------------- */
@@ -473,32 +529,46 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   // 표 프리뷰(LLM 컨텍스트)
   let tablePreview = '';
   let perCodePreviewMap = new Map();
+  const baseSegments = [];
   if (docai?.tables?.length) {
-    const baseSegments = docai.tables.slice(0, 6).map((t) => {
-      const head = (t.headers || []).join(' | ');
-      const rows = (t.rows || []).slice(0, 40).map((r) => r.join(' | ')).join('\n');
-      return `HEADER: ${head}\n${rows}`;
-    });
+    baseSegments.push(
+      ...docai.tables.slice(0, 6).map((t) => {
+        const head = (t.headers || []).join(' | ');
+        const rows = (t.rows || []).slice(0, 40).map((r) => r.join(' | ')).join('\n');
+        return `HEADER: ${head}\n${rows}`;
+      })
+    );
     perCodePreviewMap = gatherPerCodeTablePreview(docai.tables, codes.slice(0, MAX_PARTS), {
-      contextRows: 1,
+      contextRows: 2,
+      maxMatchesPerCode: 2,
     });
-    const perCodeSegments = [];
-    const seenPreviewCodes = new Set();
-    let appended = 0;
-    const previewOrder = codes.slice(0, MAX_PARTS);
-    for (const code of previewOrder) {
-      const norm = normalizeCodeKey(code);
-      if (!norm || seenPreviewCodes.has(norm)) continue;
-      const snippet = perCodePreviewMap.get(norm);
-      if (!snippet) continue;
-      seenPreviewCodes.add(norm);
-      perCodeSegments.push(`CODE: ${code}\n${snippet}`);
-      appended += 1;
-      if (appended >= 50) break;
+  }
+  const perCodeSegments = [];
+  const seenPreviewCodes = new Set();
+  let appended = 0;
+  const previewOrder = codes.slice(0, MAX_PARTS);
+  for (const code of previewOrder) {
+    const norm = normalizeCodeKey(code);
+    if (!norm || seenPreviewCodes.has(norm)) continue;
+    let snippet = perCodePreviewMap.get(norm);
+    if (!snippet) {
+      const orderingSnippet = gatherOrderingSectionEvidence(orderingInfo, code, { contextLines: 2 });
+      if (orderingSnippet) {
+        if (!(perCodePreviewMap instanceof Map)) perCodePreviewMap = new Map();
+        perCodePreviewMap.set(norm, orderingSnippet);
+        snippet = orderingSnippet;
+      }
     }
-    const combinedSegments = [];
-    if (baseSegments.length) combinedSegments.push(...baseSegments);
-    if (perCodeSegments.length) combinedSegments.push(...perCodeSegments);
+    if (!snippet) continue;
+    seenPreviewCodes.add(norm);
+    perCodeSegments.push(`CODE: ${code}\n${snippet}`);
+    appended += 1;
+    if (appended >= 50) break;
+  }
+  const combinedSegments = [];
+  if (baseSegments.length) combinedSegments.push(...baseSegments);
+  if (perCodeSegments.length) combinedSegments.push(...perCodeSegments);
+  if (combinedSegments.length) {
     tablePreview = combinedSegments.join('\n---\n');
   }
 
@@ -571,8 +641,9 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   let pnTemplate = typeof mappedResult?.pn_template === 'string' && mappedResult.pn_template.trim()
     ? mappedResult.pn_template.trim()
     : null;
+  const recipeInput = gcsUri || orderingInfo?.text || tablePreview || (fullText ? String(fullText).slice(0, 6000) : '');
   try {
-    const recipe = await extractOrderingRecipe(gcsUri);
+    const recipe = await extractOrderingRecipe(recipeInput);
     orderingDomains = mergeVariantDomainMaps(
       orderingDomains,
       normalizeVariantDomainMap(recipe?.variant_domains),

@@ -75,7 +75,7 @@ const AUTO_ADD_FIELDS_LIMIT = Number.isFinite(AUTO_ADD_FIELDS_LIMIT_RAW)
 const VARIANT_MAX_CARDINALITY_INPUT = parseInt(process.env.VARIANT_MAX_CARDINALITY ?? '', 10);
 const VARIANT_MAX_CARDINALITY = Number.isFinite(VARIANT_MAX_CARDINALITY_INPUT)
   ? Math.max(2, VARIANT_MAX_CARDINALITY_INPUT)
-  : 20;
+  : 120;
 
   // ── Auto-alias learning: unknown spec keys → extraction_recipe.key_alias ──
 const AUTO_ALIAS_LEARN = /^(1|true|on)$/i.test(process.env.AUTO_ALIAS_LEARN || '1');
@@ -534,6 +534,8 @@ const CONSTRUCTION_LINE_RE = /(construction|sealed|flux\s*proof|enclosure)/i;
 const INSULATION_LINE_RE = /(insulation)/i;
 const MATERIAL_LINE_RE = /(material)/i;
 const POWER_LINE_RE = /(coil\s*power|power\s*consumption|power\s*code)/i;
+const TERMINAL_LINE_RE = /(terminal|shape|style)/i;
+const PACKING_LINE_RE = /(pack|tape|reel|emboss)/i;
 
 function normalizeOrderingEnumToken(token) {
   if (token == null) return null;
@@ -543,6 +545,7 @@ function normalizeOrderingEnumToken(token) {
   // 문자 1~2자 또는 숫자 1~2자(예: Cover 1/2)
   if (/^[A-Za-z]{1,2}$/.test(raw)) return raw.toUpperCase();
   if (/^\d{1,2}$/.test(raw)) return raw;
+  if (/^(?:[A-Za-z]\d|\d[A-Za-z])$/.test(raw)) return raw.toUpperCase();
   return null;
 }
 
@@ -591,13 +594,14 @@ function extractCoilVoltageValues(text) {
   return out;
 }
 
-// D24/A24, D110/120 + 24D/110/120A 모두 인식
+// D24/A24, D110/120 + 24D/110/120A + 1H/4H 같은 혼합형도 인식
 function extractVoltageCodeTokens(text) {
   if (!text) return [];
   const s = String(text);
   const set = new Set();
   for (const m of s.matchAll(/\b([AD]\d{1,3}(?:\/\d{1,3})?)\b/gi)) set.add(m[1].toUpperCase()); // 접두
   for (const m of s.matchAll(/\b(\d{1,3}(?:\/\d{1,3})?)([AD])\b/gi)) set.add((m[2] + m[1]).toUpperCase()); // 접미
+  for (const m of s.matchAll(/\b(\d{1,2}[Hh])\b/g)) set.add(m[1].toUpperCase());
   return [...set];
 }
 
@@ -717,6 +721,8 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
         if (/coil/.test(norm) && /power/.test(norm)) return 'coil_power_code';
         if (/power/.test(norm) && /code/.test(norm)) return 'coil_power_code';
         if (/construction/.test(norm) || /enclosure/.test(norm)) return 'construction';
+        if (/terminal/.test(norm) || /shape/.test(norm)) return 'terminal_shape';
+        if (/(pack|tape|reel|emboss)/.test(norm)) return 'packing_style';
         if (/insulation/.test(norm)) return 'insulation_code';
         if (/material/.test(norm)) return 'material_code';
         return null;
@@ -761,6 +767,8 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
         if (INSULATION_LINE_RE.test(line)) addMany('insulation_code', extractEnumCodeValues(line));
         if (MATERIAL_LINE_RE.test(line)) addMany('material_code', extractEnumCodeValues(line));
         if (POWER_LINE_RE.test(line)) addMany('coil_power_code', extractEnumCodeValues(line));
+        if (TERMINAL_LINE_RE.test(line)) addMany('terminal_shape', extractEnumCodeValues(line));
+        if (PACKING_LINE_RE.test(line)) addMany('packing_style', extractEnumCodeValues(line));
         // 자주 나오는 일반 패턴들
         if (/led/i.test(line)) addMany('led_code', extractEnumCodeValues(line)); // "L: With LED, Nil: W/O LED"
         if (/cover/i.test(line)) {

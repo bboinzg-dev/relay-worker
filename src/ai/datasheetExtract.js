@@ -262,6 +262,254 @@ function escapeRegex(value) {
   return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function escapeRegexWithWildcards(value) {
+  const str = String(value || '').toUpperCase();
+  let out = '';
+  for (const ch of str) {
+    if (ch === '*') {
+      out += '[A-Z0-9]*';
+      continue;
+    }
+    if (ch === '?') {
+      out += '[A-Z0-9]';
+      continue;
+    }
+    if (ch === '#') {
+      out += '\\d';
+      continue;
+    }
+    out += escapeRegex(ch);
+  }
+  return out;
+}
+
+function applyTemplateOpsForRegex(value, options = []) {
+  const arr = Array.isArray(options) ? options : [];
+  const first = Array.isArray(value) ? value[0] : value;
+  let current = first == null ? '' : String(first);
+  for (const rawOption of arr) {
+    if (!rawOption) continue;
+    const token = String(rawOption).trim();
+    if (!token) continue;
+    const normalized = token.includes('=') ? token.replace('=', ':') : token;
+    const lower = normalized.toLowerCase();
+    if (lower === 'upper' || lower === 'uppercase' || lower === 'upcase') {
+      current = current.toUpperCase();
+      continue;
+    }
+    if (lower === 'lower' || lower === 'downcase' || lower === 'lowercase') {
+      current = current.toLowerCase();
+      continue;
+    }
+    if (lower === 'first') {
+      current = current.split(',')[0].trim();
+      continue;
+    }
+    if (lower === 'alnum') {
+      current = current.replace(/[^0-9A-Z]/gi, '');
+      continue;
+    }
+    if (lower === 'digits') {
+      current = current.replace(/[^0-9]/g, '');
+      continue;
+    }
+    if (lower === 'num') {
+      const match = current.match(/-?\d+(?:\.\d+)?/);
+      current = match ? match[0] : '';
+      continue;
+    }
+    if (lower.startsWith('pad:')) {
+      const parts = normalized.split(':');
+      const width = Number(parts[1]) || 0;
+      const fillRaw = parts.length > 2 ? parts[2] : '';
+      const fill = fillRaw && fillRaw.trim() ? fillRaw.trim()[0] : '0';
+      if (width > 0) current = current.padStart(width, fill);
+      continue;
+    }
+    if (lower.startsWith('slice:')) {
+      const parts = normalized.split(':');
+      const start = Number(parts[1]) || 0;
+      const end = parts.length > 2 && parts[2] !== '' ? Number(parts[2]) : undefined;
+      current = current.slice(start, Number.isNaN(end) ? undefined : end);
+      continue;
+    }
+    if (lower.startsWith('map:')) {
+      const entries = normalized.slice(4).split(',');
+      const mapping = Object.create(null);
+      for (const entry of entries) {
+        const [from, to] = entry.split('>');
+        if (!from || to == null) continue;
+        mapping[String(from).trim().toUpperCase()] = String(to).trim();
+      }
+      const key = String(current).trim().toUpperCase();
+      if (Object.prototype.hasOwnProperty.call(mapping, key)) {
+        current = mapping[key];
+      }
+      continue;
+    }
+    if (lower.startsWith('prefix:')) {
+      const [, rawPrefix = ''] = normalized.split(':');
+      current = `${rawPrefix}${current}`;
+      continue;
+    }
+    if (lower.startsWith('suffix:')) {
+      const [, rawSuffix = ''] = normalized.split(':');
+      current = `${current}${rawSuffix}`;
+      continue;
+    }
+    if (lower.startsWith('replace:')) {
+      const [, rawArgs = ''] = normalized.split(':');
+      const [search, replacement = ''] = rawArgs.split('>');
+      if (search != null) {
+        const matcher = new RegExp(escapeRegex(search), 'g');
+        current = current.replace(matcher, replacement);
+      }
+      continue;
+    }
+  }
+  return current.trim();
+}
+
+function parseMapOutputs(options = []) {
+  const outputs = [];
+  for (const rawOption of options) {
+    if (!rawOption) continue;
+    const token = String(rawOption).trim();
+    if (!token) continue;
+    const normalized = token.includes('=') ? token.replace('=', ':') : token;
+    const lower = normalized.toLowerCase();
+    if (!lower.startsWith('map:')) continue;
+    const entries = normalized.slice(4).split(',');
+    for (const entry of entries) {
+      const [, to] = entry.split('>');
+      if (to == null) continue;
+      const clean = String(to).trim();
+      if (clean) outputs.push(clean);
+    }
+  }
+  return outputs;
+}
+
+function findVariantDomainValues(key, variantDomains = {}) {
+  const raw = String(key || '').trim();
+  if (!raw) return [];
+  const lower = raw.toLowerCase();
+  const normalized = lower.replace(/[^a-z0-9]/g, '');
+  const results = [];
+  for (const [domainKey, domainValues] of Object.entries(variantDomains || {})) {
+    const domainStr = String(domainKey || '').trim();
+    if (!domainStr) continue;
+    const domainLower = domainStr.toLowerCase();
+    const domainNormalized = domainLower.replace(/[^a-z0-9]/g, '');
+    if (domainStr === raw || domainLower === lower || domainNormalized === normalized) {
+      const list = Array.isArray(domainValues) ? domainValues : [domainValues];
+      for (const value of list) {
+        const str = value == null ? '' : String(value).trim();
+        if (!str) continue;
+        results.push(str);
+      }
+    }
+  }
+  return results;
+}
+
+function buildPlaceholderRegex(body, variantDomains) {
+  const tokens = String(body || '')
+    .split('|')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (!tokens.length) return '';
+  const baseKey = tokens.shift();
+  const options = tokens;
+  const domainValues = findVariantDomainValues(baseKey, variantDomains);
+  const processed = [];
+  let hasEmpty = false;
+  if (domainValues.length) {
+    for (const value of domainValues) {
+      const applied = applyTemplateOpsForRegex(value, options);
+      if (applied == null) continue;
+      const trimmed = String(applied).trim();
+      if (!trimmed) {
+        hasEmpty = true;
+        continue;
+      }
+      processed.push(trimmed.toUpperCase());
+    }
+  }
+  if (!processed.length) {
+    const mapOutputs = parseMapOutputs(options);
+    if (mapOutputs.length) {
+      for (const output of mapOutputs) {
+        const trimmed = String(output).trim();
+        if (!trimmed) {
+          hasEmpty = true;
+          continue;
+        }
+        processed.push(trimmed.toUpperCase());
+      }
+    }
+  }
+  const unique = Array.from(new Set(processed));
+  if (!unique.length) {
+    if (hasEmpty) return '';
+    if (options.some((op) => String(op).toLowerCase().includes('digit'))) {
+      const padOption = options.find((op) => /^pad[:=]/i.test(String(op)));
+      if (padOption) {
+        const normalizedPad = String(padOption).replace('=', ':');
+        const [, widthRaw = ''] = normalizedPad.split(':');
+        const width = Number(widthRaw) || 0;
+        if (width > 0) return `\\d{${width}}`;
+      }
+      return '\\d+';
+    }
+    if (options.some((op) => String(op).toLowerCase().includes('alnum'))) {
+      return '[A-Z0-9]+';
+    }
+    return '[A-Z0-9]+';
+  }
+  const patterns = unique.map((value) => escapeRegexWithWildcards(value)).filter(Boolean);
+  if (!patterns.length) {
+    if (hasEmpty) return '';
+    return '[A-Z0-9]+';
+  }
+  let combined;
+  if (patterns.length === 1) combined = patterns[0];
+  else combined = `(?:${patterns.join('|')})`;
+  if (hasEmpty) combined = `(?:${combined})?`;
+  return combined;
+}
+
+function buildPnRegexFromTemplate(template, variantDomains = {}) {
+  const tpl = typeof template === 'string' ? template.trim() : '';
+  if (!tpl) return null;
+  const parts = [];
+  const pattern = /\{\{?\s*([^{}]+?)\s*\}\}?/g;
+  let lastIndex = 0;
+  let match;
+  while ((match = pattern.exec(tpl)) !== null) {
+    if (match.index > lastIndex) {
+      const literal = tpl.slice(lastIndex, match.index);
+      if (literal) parts.push(escapeRegex(literal));
+    }
+    const placeholder = buildPlaceholderRegex(match[1], variantDomains);
+    if (placeholder) parts.push(placeholder);
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < tpl.length) {
+    const tail = tpl.slice(lastIndex);
+    if (tail) parts.push(escapeRegex(tail));
+  }
+  if (!parts.length) return null;
+  const combined = parts.join('');
+  if (!combined) return null;
+  try {
+    return new RegExp(`^(?:${combined})$`, 'i');
+  } catch (err) {
+    console.warn('[pn-regex] failed to build regex from template:', err?.message || err);
+    return null;
+  }
+}
+
 function tokenizeForPn(code) {
   if (!code) return [];
   const tokens = [];
@@ -713,7 +961,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   let codes = [];
   if (tableList.length) codes = codesFromDocAiTables(tableList);
   if (!codes.length && fullText) codes = codesFromFreeText(fullText);
-  const pnRegex = buildPnRegexFromExamples(codes.slice(0, MAX_PARTS));
+  let pnRegex = buildPnRegexFromExamples(codes.slice(0, MAX_PARTS));
 
   // 표 프리뷰(LLM 컨텍스트)
   let tablePreview = '';
@@ -940,6 +1188,11 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     }
   } catch (err) {
     console.warn('[ordering] extractOrderingRecipe failed:', err?.message || err);
+  }
+
+    if (!pnRegex && pnTemplate) {
+    const templateRegex = buildPnRegexFromTemplate(pnTemplate, orderingDomains);
+    if (templateRegex) pnRegex = templateRegex;
   }
 
   const variantKeys = Object.keys(orderingDomains)

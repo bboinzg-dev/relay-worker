@@ -785,9 +785,10 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
   if (!spec || typeof spec !== 'object') return spec;
 
   let codeCandidate = null;
-  if (blueprint?.pn_template) {
+  const localTemplate = blueprint?.pn_template || spec?._pn_template || null;
+  if (localTemplate) {
     try {
-      codeCandidate = renderPnTemplate(blueprint.pn_template, spec);
+      codeCandidate = renderPnTemplate(localTemplate, spec);
     } catch (_) {}
   }
 
@@ -803,6 +804,10 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
   } else {
     spec.code = spec.pn;
     if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
+  }
+
+    if (Object.prototype.hasOwnProperty.call(spec, '_pn_template')) {
+    delete spec._pn_template;
   }
 
   return spec;

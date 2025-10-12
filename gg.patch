@@ -1,216 +1,126 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index bc1b4966843d35c1df32429749520d01af42ea0c..2f3be9defd5e3b54067a87ea01cce869f52caebc 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -516,50 +516,51 @@ function normalizeSpecKeyName(value) {
-   let s = String(value).trim().toLowerCase();
-   if (!s) return null;
-   s = s.replace(/[–—―]/g, '-');
-   s = s.replace(/\s+/g, '_');
-   s = s.replace(/[^0-9a-z_]+/g, '_');
-   s = s.replace(/_+/g, '_');
-   s = s.replace(/^_|_$/g, '');
-   if (!s) return null;
-   if (s.length > 63) s = s.slice(0, 63);
-   if (RESERVED_SPEC_KEYS.has(s)) return null;
-   return s;
+diff --git a/src/ai/datasheetExtract.js b/src/ai/datasheetExtract.js
+index 0e0fac3c8ae38f4fc1c5d7fbdb899e3878206dc7..b6dfe836d7b8e82e6ef439dde15548426c62bb77 100644
+--- a/src/ai/datasheetExtract.js
++++ b/src/ai/datasheetExtract.js
+@@ -637,50 +637,66 @@ async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText,
+    }
+    return out; 
  }
  
- const ORDERING_SECTION_RE =
-   /(ordering information|ordering info|how to order|order information|ordering code|how-to-order|\b品番\b|\b型番\b|\b型号\b|\b型號\b|주문|형명|형번|품번|注文|订购信息|订购|订購|订货|型号)/i;
- const CONTACT_LINE_RE = /(contact|arrangement|configuration|form)/i;
- const COIL_LINE_RE = /(coil|voltage|vdc)/i;
- const CONSTRUCTION_LINE_RE = /(construction|sealed|flux\s*proof|enclosure)/i;
- const INSULATION_LINE_RE = /(insulation)/i;
- const MATERIAL_LINE_RE = /(material)/i;
- const POWER_LINE_RE = /(coil\s*power|power\s*consumption|power\s*code)/i;
- const CURRENT_LINE_RE = /(contact\s*current|current\s*\(?type\)?)/i;
- const COVER_LINE_RE = /\bcover\b/i;
- const TERMINAL_LINE_RE = /(terminal|shape|style)/i;
- const PACKING_LINE_RE = /(pack|tape|reel|emboss)/i;
-+const MOUNT_LINE_RE = /(pc\s*board|surface-?mount|smd)/i;
- 
- function normalizeOrderingEnumToken(token) {
-   if (token == null) return null;
-   const raw = String(token).trim();
-   if (!raw) return null;
-   if (/^(nil|blank|none|null|n\/a)$/i.test(raw)) return '';
-   // 문자 1~2자 또는 숫자 1~2자(예: Cover 1/2)
-   if (/^[A-Za-z]{1,2}$/.test(raw)) return raw.toUpperCase();
-   if (/^\d{1,2}$/.test(raw)) return raw;
-   if (/^(?:[A-Za-z]\d|\d[A-Za-z])$/.test(raw)) return raw.toUpperCase();
-   return null;
- }
- 
- function addOrderingDomainValue(domains, key, value) {
-   if (!key) return;
-   if (value == null) return;
-   const arr = domains.get(key) || [];
-   if (!arr.some((item) => item === value)) {
-     arr.push(value);
-     domains.set(key, arr);
-   }
- }
- 
- function extractContactValues(text) {
-   if (!text) return [];
-@@ -700,102 +701,104 @@ function sliceOrderingSections(text) {
- function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTables }) {
-   const domains = new Map();
- 
-   const addMany = (key, values) => {
-     if (!Array.isArray(values)) return;
-     for (const value of values) {
-       if (value == null) continue;
-       addOrderingDomainValue(domains, key, value);
-     }
+ /* -------------------- Public: main extractor -------------------- */
+ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null, brandHint = null }) {
+   const rowAllowedKeySet = new Set();
+   const rowAllowedKeys = [];
+   const ensureAllowedKey = (value) => {
+     const str = value == null ? '' : String(value).trim();
+     if (!str) return;
+     const lower = str.toLowerCase();
+     if (rowAllowedKeySet.has(lower)) return;
+     rowAllowedKeySet.add(lower);
+     rowAllowedKeys.push(str);
    };
  
-   if (Array.isArray(docAiTables)) {
-     for (const table of docAiTables) {
-       if (!table || typeof table !== 'object') continue;
-       const headers = Array.isArray(table.headers) ? table.headers : [];
-       const rows = Array.isArray(table.rows) ? table.rows : [];
-       if (!headers.length || !rows.length) continue;
-       const keyByIndex = headers.map((header) => {
-         const norm = String(header || '').trim().toLowerCase();
-         if (!norm) return null;
-         if (/contact/.test(norm) || /arrangement/.test(norm) || /configuration/.test(norm)) return 'contact_arrangement';
-         if (/coil/.test(norm) && /volt/.test(norm)) return 'coil_voltage_vdc';
-         if (/voltage\s*\(vdc\)/.test(norm)) return 'coil_voltage_vdc';
-         if (/coil/.test(norm) && /power/.test(norm)) return 'coil_power_code';
-         if (/power/.test(norm) && /code/.test(norm)) return 'coil_power_code';
-+        if (/(terminal|shape|style)/.test(norm)) return 'terminal_shape';
-+        if (/(pack|tape|reel|emboss)/.test(norm)) return 'packing_style';
-+        if (/(pc\s*board|surface-?mount|smd)/.test(norm)) return 'mount_type';
-         if (/contact/.test(norm) && /current/.test(norm)) return 'contact_current_code';
-         if (/cover/.test(norm)) return 'cover_code';
-         if (/construction/.test(norm) || /enclosure/.test(norm)) return 'construction';
--        if (/terminal/.test(norm) || /shape/.test(norm)) return 'terminal_shape';
--        if (/(pack|tape|reel|emboss)/.test(norm)) return 'packing_style';
-         if (/insulation/.test(norm)) return 'insulation_code';
-         if (/material/.test(norm)) return 'material_code';
-         return null;
-       });
-       if (!keyByIndex.some(Boolean)) continue;
-       for (const row of rows) {
-         if (!Array.isArray(row)) continue;
-         row.forEach((cell, idx) => {
-           const key = keyByIndex[idx];
-           if (!key) return;
-           const text = typeof cell === 'string' ? cell : String(cell ?? '');
-           if (!text.trim()) return;
-           if (key === 'contact_arrangement') addMany(key, extractContactValues(text));
-           else if (key === 'coil_voltage_vdc') addMany(key, extractCoilVoltageValues(text));
-           else addMany(key, extractEnumCodeValues(text));
-         });
+   if (Array.isArray(allowedKeys)) {
+     for (const key of allowedKeys) ensureAllowedKey(key);
+   }
+   ensureAllowedKey('series');
+   ensureAllowedKey('series_code');
+   ensureAllowedKey('pn_jp');
+   ensureAllowedKey('pn_aliases');
+   ensureAllowedKey('ordering_market');
++  if ((family || '').toLowerCase().includes('capacitor')) {
++    [
++      'capacitance_uf',
++      'rated_voltage_v',
++      'esr_mohm',
++      'df_percent',
++      'dcl_ua',
++      'case_size_code',
++      'product_category',
++      'msl',
++      'rms_current_100khz_45c',
++      'rms_current_100khz_85c',
++      'rms_current_100khz_105c',
++      'rms_current_100khz_125c',
++    ].forEach(ensureAllowedKey);
++  }
+ 
+   const promptAllowedKeys = Array.from(new Set([
+     ...rowAllowedKeys,
+   ]));
+ 
+   let docai = await processWithDocAI(gcsUri);
+   let fullText = docai?.fullText || '';
+   if (!fullText) fullText = await parseTextWithPdfParse(gcsUri);
+ 
+   const tableList = Array.isArray(docai?.tables) ? docai.tables : [];
+   const typePartMap = extractTypePartPairs(tableList);
+ 
+   const brand = brandHint || (await detectBrandFromText(fullText)) || 'unknown';
+   const orderingInfo = extractOrderingInfo(fullText, MAX_PARTS);
+ 
+   // 코드 후보
+   let codes = [];
+   if (tableList.length) codes = codesFromDocAiTables(tableList);
+   if (!codes.length && fullText) codes = codesFromFreeText(fullText);
+   const pnRegex = buildPnRegexFromExamples(codes.slice(0, MAX_PARTS));
+ 
+   // 표 프리뷰(LLM 컨텍스트)
+   let tablePreview = '';
+   let perCodePreviewMap = new Map();
+   const baseSegments = [];
+@@ -901,52 +917,53 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
+       normalizeVariantDomainMap(recipe?.variant_domains),
+     );
+     if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
+       pnTemplate = recipe.pn_template.trim();
+     }
+   } catch (err) {
+     console.warn('[ordering] extractOrderingRecipe failed:', err?.message || err);
+   }
+ 
+   const variantKeys = Object.keys(orderingDomains)
+     .map((key) => String(key || '').trim())
+     .filter(Boolean);
+   if (variantKeys.length) {
+     for (const key of variantKeys) ensureAllowedKey(key);
+     const baseSeries = orderingDomains.series_code?.[0] || orderingDomains.series?.[0] || null;
+     const orderingBase = {
+       brand,
+       series: baseSeries,
+       series_code: baseSeries,
+       values: orderingDomains,
+     };
+     const generatedRows = explodeToRows(orderingBase, { variantKeys, pnTemplate }) || [];
+     const beforeCount = out.length;
+     for (const generated of generatedRows) {
+       if (!generated || typeof generated !== 'object') continue;
++      // 테이블 예시로 학습한 PN-정규식에 안 맞으면 버림
++      if (pnRegex && !pnRegex.test(String(generated.code || ''))) continue;
+       const codeNorm = String(generated.code || '').trim().toUpperCase();
+-      if (pnRegex && codeNorm && !pnRegex.test(codeNorm)) continue;
+       const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
+       const v = hasDocEvidence(normalizeCodeKey(generated.code)) || hasOrderingEvidence(generated.code);
+       if (values && typeof values === 'object' && !Object.prototype.hasOwnProperty.call(values, '_pn_template')) {
+         values._pn_template = pnTemplate || null;
        }
+       pushRow({ code: generated.code, values, brand, verified: v });
+     }
+     orderingExpanded = out.length > beforeCount;
+   }
+ 
+   if (!out.length) {
+     for (const c of seedCodes) {
+       pushRow({ code: c, values: {}, brand, verified: hasDocEvidenceValue(c) });
      }
    }
  
-   const textSources = new Set();
-   gatherOrderingTexts(orderingInfo, []).forEach((txt) => textSources.add(txt));
-   if (typeof docAiText === 'string' && docAiText.trim()) textSources.add(docAiText);
-   if (typeof previewText === 'string' && previewText.trim()) textSources.add(previewText);
- 
-   for (const rawText of textSources) {
-     const sections = sliceOrderingSections(rawText);
-     for (const section of sections) {
-       const lines = section.split(/\n+/);
-       for (const rawLine of lines) {
-         const line = rawLine.replace(/^[\s•·\-–—]+/, '').trim();
-         if (!line) continue;
-         if (CONTACT_LINE_RE.test(line)) {
-           addMany('contact_arrangement', extractContactValues(line));
-           addMany('contact_arrangement', extractContactFormsFromLine(line));
-         }
-         if (COIL_LINE_RE.test(line)) {
-           addMany('coil_voltage_vdc', extractCoilVoltageValues(line));
-           addMany('coil_voltage_code', extractVoltageCodeTokens(section));
-         }
-         if (CONSTRUCTION_LINE_RE.test(line)) addMany('construction', extractEnumCodeValues(line));
-         if (INSULATION_LINE_RE.test(line)) addMany('insulation_code', extractEnumCodeValues(line));
-         if (MATERIAL_LINE_RE.test(line)) addMany('material_code', extractEnumCodeValues(line));
-         if (POWER_LINE_RE.test(line)) addMany('coil_power_code', extractEnumCodeValues(line));
-         if (CURRENT_LINE_RE.test(line)) addMany('contact_current_code', extractEnumCodeValues(line));
-         if (TERMINAL_LINE_RE.test(line)) addMany('terminal_shape', extractEnumCodeValues(line));
-         if (PACKING_LINE_RE.test(line)) addMany('packing_style', extractEnumCodeValues(line));
-+        if (MOUNT_LINE_RE.test(line)) addMany('mount_type', extractEnumCodeValues(line));
-         if (COVER_LINE_RE.test(line)) addMany('cover_code', extractEnumCodeValues(line));
-         // 자주 나오는 일반 패턴들
-         if (/led/i.test(line)) addMany('led_code', extractEnumCodeValues(line)); // "L: With LED, Nil: W/O LED"
-         if (/cover/i.test(line)) {
-           const modes = Array.from(line.matchAll(/\b([12])\b/g)).map((m) => m[1]);
-           if (modes.length) addMany('cover_mode', modes);
-         }
-         if (/(insert|pcb)/i.test(line)) {
-           const types = Array.from(line.matchAll(/\b([ab])\s*[:=]/gi)).map((m) => m[1].toLowerCase());
-           if (types.length) addMany('mount_type_code', types);
-         }
-       }
-     }
+   const codeList = mergedCodes.slice(0, MAX_PARTS);
+   const uniqueRowCodes = new Set();
+   for (const row of out) {
+     if (!row || typeof row !== 'object') continue;
+     const code = String(row.code || row.pn || '').trim().toUpperCase();
+     if (code) uniqueRowCodes.add(code);
    }
- 
-   const result = {};
-   for (const [key, values] of domains.entries()) {
-     if (!values || !values.length) continue;
-     result[key] = values;
-   }
-   const normalizedDomains = Object.keys(result).length ? result : null;
-   return {
-     domains: normalizedDomains,
-     textSources: Array.from(textSources),
-   };
-@@ -885,51 +888,51 @@ function textContainsExact(text, pn) {
-   if (!text || !pn) return false;
-   const pattern = escapeRegex(String(pn).trim());
-   if (!pattern) return false;
-   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
-   return re.test(String(text));
- }
- 
- function normLower(s){ return String(s||'').trim().toLowerCase(); }
- 
- function isValidCode(s) {
-   const v = String(s || '').trim();
-   if (!v) return false;
-   if (v.length < 2 || v.length > 64) return false;
-   if (!/[0-9A-Za-z]/.test(v)) return false;
-   if (/\s{2,}/.test(v)) return false;
-   if (/^pdf-?1(\.\d+)?$/i.test(v)) return false;
-   return true;
- }
- 
- const KEY_ALIASES = {
-   form: ['form', 'contact_form', 'contact_arrangement', 'configuration', 'arrangement', 'poles_form'],
-   voltage: ['voltage', 'coil_voltage_code', 'coil_voltage_vdc', 'voltage_vdc', 'rated_voltage_vdc', 'vdc', 'coil_voltage'],
-   case: ['case', 'case_code', 'package', 'pkg'],
-   led: ['led', 'led_code', 'indicator'],
-   cover: ['cover', 'cover_mode', 'cover_code'],
--  mount: ['mount', 'mount_type_code', 'insert_type', 'assembly'],
-+  mount: ['mount', 'mount_type', 'mount_type_code', 'insert_type', 'assembly'],
-   capacitance: ['capacitance', 'capacitance_uF', 'capacitance_f', 'c'],
-   resistance: ['resistance', 'resistance_ohm', 'r_ohm', 'r'],
-   tolerance: ['tolerance', 'tolerance_pct'],
-   length_mm: ['length_mm', 'dim_l_mm'],
-   width_mm: ['width_mm', 'dim_w_mm'],
-   height_mm: ['height_mm', 'dim_h_mm'],
-   series: ['series', 'series_code'],
-   terminal: ['terminal', 'terminal_form', 'terminal_form_code', 'terminal_code'],
- };
- 
- const ENUM_MAP = {
-   form: { SPST: '1A', SPDT: '1C', DPDT: '2C' }
- };
- 
- function normalizeKeyName(v) {
-   return String(v || '')
-     .normalize('NFKC')
-     .toLowerCase()
-     .replace(/[^a-z0-9]+/g, '_')
-     .replace(/_+/g, '_')
-     .replace(/^_|_$/g, '');
- }
- function normalizeAlias(v) {
-   return String(v || '')
-     .normalize('NFKC')
+   const uniqueCandidateCodes = new Set(codeList.map((c) => String(c || '').trim().toUpperCase()).filter(Boolean));
+   let docType = 'single';

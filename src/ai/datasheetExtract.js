@@ -266,6 +266,79 @@ function codesFromFreeText(txt) {
   return Array.from(set);
 }
 
+function normalizeCodeKey(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function formatTableRow(row) {
+  if (!Array.isArray(row)) return '';
+  return row
+    .map((cell) => (cell == null ? '' : String(cell).trim()))
+    .join(' | ')
+    .trim();
+}
+
+function gatherPerCodeTablePreview(tables, codes, options = {}) {
+  const context = Number.isFinite(options.contextRows)
+    ? Math.max(0, options.contextRows)
+    : 1;
+  const maxMatchesPerCode = Number.isFinite(options.maxMatchesPerCode)
+    ? Math.max(1, options.maxMatchesPerCode)
+    : 1;
+  const normalizedCodes = Array.isArray(codes)
+    ? codes
+        .map((code) => normalizeCodeKey(code))
+        .filter(Boolean)
+    : [];
+  if (!normalizedCodes.length || !Array.isArray(tables) || !tables.length) {
+    return new Map();
+  }
+
+  const pending = new Map();
+  for (const code of normalizedCodes) {
+    if (!pending.has(code)) pending.set(code, 0);
+  }
+
+  const previews = new Map();
+
+  for (const table of tables) {
+    if (!pending.size) break;
+    const headers = Array.isArray(table?.headers) ? table.headers : [];
+    const headerLine = formatTableRow(headers);
+    const rows = Array.isArray(table?.rows) ? table.rows : [];
+    for (let i = 0; i < rows.length && pending.size; i += 1) {
+      const row = rows[i];
+      const rowText = normalizeCodeKey(Array.isArray(row) ? row.join(' ') : '');
+      if (!rowText) continue;
+      for (const code of pending.keys()) {
+        if (!rowText.includes(code)) continue;
+        const start = Math.max(0, i - context);
+        const end = Math.min(rows.length - 1, i + context);
+        const snippetRows = [];
+        for (let idx = start; idx <= end; idx += 1) {
+          const formatted = formatTableRow(rows[idx]);
+          if (formatted) snippetRows.push(formatted);
+        }
+        const snippet = [
+          headerLine ? `HEADER: ${headerLine}` : null,
+          snippetRows.join('\n'),
+        ]
+          .filter(Boolean)
+          .join('\n');
+        if (!previews.has(code)) previews.set(code, snippet);
+        const hits = pending.get(code) || 0;
+        if (hits + 1 >= maxMatchesPerCode) {
+          pending.delete(code);
+        } else {
+          pending.set(code, hits + 1);
+        }
+      }
+    }
+  }
+
+  return previews;
+}
+
 /* -------------------- Gemini mapping -------------------- */
 async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText, tablePreview }) {
   const { project, location, model } = resolveGemini();
@@ -363,6 +436,28 @@ async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText,
 
 /* -------------------- Public: main extractor -------------------- */
 async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null, brandHint = null }) {
+  let rowAllowedKeys = Array.isArray(allowedKeys) ? allowedKeys : [];
+  rowAllowedKeys = rowAllowedKeys
+    .map((key) => (key == null ? '' : String(key).trim()))
+    .filter(Boolean);
+  const seenAllowed = new Set();
+  const dedupedAllowed = [];
+  for (const key of rowAllowedKeys) {
+    const lower = key.toLowerCase();
+    if (seenAllowed.has(lower)) continue;
+    seenAllowed.add(lower);
+    dedupedAllowed.push(key);
+  }
+  rowAllowedKeys = dedupedAllowed;
+  for (const baseKey of ['series', 'series_code']) {
+    if (!seenAllowed.has(baseKey)) {
+      seenAllowed.add(baseKey);
+      rowAllowedKeys.push(baseKey);
+    }
+  }
+  const rowAllowedKeySet = new Set(seenAllowed);
+  const promptAllowedKeys = [...rowAllowedKeys];
+
   let docai = await processWithDocAI(gcsUri);
   let fullText = docai?.fullText || '';
   if (!fullText) fullText = await parseTextWithPdfParse(gcsUri);
@@ -377,12 +472,34 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
 
   // 표 프리뷰(LLM 컨텍스트)
   let tablePreview = '';
+  let perCodePreviewMap = new Map();
   if (docai?.tables?.length) {
-    tablePreview = docai.tables.slice(0, 6).map(t => {
+    const baseSegments = docai.tables.slice(0, 6).map((t) => {
       const head = (t.headers || []).join(' | ');
-      const rows = (t.rows || []).slice(0, 40).map(r => r.join(' | ')).join('\n');
+      const rows = (t.rows || []).slice(0, 40).map((r) => r.join(' | ')).join('\n');
       return `HEADER: ${head}\n${rows}`;
-    }).join('\n---\n');
+    });
+    perCodePreviewMap = gatherPerCodeTablePreview(docai.tables, codes.slice(0, MAX_PARTS), {
+      contextRows: 1,
+    });
+    const perCodeSegments = [];
+    const seenPreviewCodes = new Set();
+    let appended = 0;
+    const previewOrder = codes.slice(0, MAX_PARTS);
+    for (const code of previewOrder) {
+      const norm = normalizeCodeKey(code);
+      if (!norm || seenPreviewCodes.has(norm)) continue;
+      const snippet = perCodePreviewMap.get(norm);
+      if (!snippet) continue;
+      seenPreviewCodes.add(norm);
+      perCodeSegments.push(`CODE: ${code}\n${snippet}`);
+      appended += 1;
+      if (appended >= 50) break;
+    }
+    const combinedSegments = [];
+    if (baseSegments.length) combinedSegments.push(...baseSegments);
+    if (perCodeSegments.length) combinedSegments.push(...perCodeSegments);
+    tablePreview = combinedSegments.join('\n---\n');
   }
 
   // Gemini로 values 매핑(블루프린트 키만)
@@ -390,19 +507,31 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     family,
     brandHint: brand,
     codes: codes.slice(0, MAX_PARTS),
-    allowedKeys,
+    allowedKeys: promptAllowedKeys,
     docText: fullText,
     tablePreview
   });
 
   const mappedParts = Array.isArray(mappedResult?.parts) ? mappedResult.parts : [];
   const tableHintRaw = String(mappedResult?.table_hint || '');
+  const orderingHint = tableHintRaw.toUpperCase().includes('ORDERING');
 
   const out = [];
   const seenRows = new Set();
   const mergedCodes = [];
   const seenCodes = new Set();
   const seedCodes = codes.slice(0, MAX_PARTS);
+
+  const perCodeEvidence = new Set(perCodePreviewMap instanceof Map ? perCodePreviewMap.keys() : []);
+  const docTextHaystack = typeof fullText === 'string' ? fullText.toUpperCase() : '';
+  const hasDocEvidence = (norm) => {
+    if (!norm) return false;
+    if (perCodeEvidence.has(norm)) return true;
+    if (docTextHaystack && docTextHaystack.includes(norm)) return true;
+    return false;
+  };
+
+  const hasDocEvidenceValue = (value) => hasDocEvidence(normalizeCodeKey(value));
 
   const pushCode = (value) => {
     const norm = String(value || '').trim().toUpperCase();
@@ -417,12 +546,15 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     const norm = String(code || '').trim().toUpperCase();
     if (!norm || seenRows.has(norm)) return;
     seenRows.add(norm);
-    const row = { code: norm, verified_in_doc: Boolean(verified) };
+    const row = { code: norm, verified_in_doc: Boolean(verified || hasDocEvidence(norm)) };
     const brandValue = rowBrand || brand;
     if (brandValue) row.brand = brandValue;
     if (values && typeof values === 'object') {
-      for (const key of allowedKeys) {
-        if (values[key] != null) row[key] = values[key];
+      for (const key of rowAllowedKeys) {
+        if (!key) continue;
+        if (Object.prototype.hasOwnProperty.call(values, key) && values[key] != null) {
+          row[key] = values[key];
+        }
       }
     }
     out.push(row);
@@ -434,48 +566,55 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     pushRow({ code: part?.code, values: partValues, brand: part?.brand, verified: true });
   }
 
-  const shouldExpandOrdering = !mappedParts.length
-    || tableHintRaw.toUpperCase().includes('ORDERING');
-
-  if (shouldExpandOrdering) {
-    let orderingDomains = normalizeVariantDomainMap(mappedResult?.variant_domains);
-    let pnTemplate = typeof mappedResult?.pn_template === 'string' && mappedResult.pn_template.trim()
-      ? mappedResult.pn_template.trim()
-      : null;
-    try {
-      const recipe = await extractOrderingRecipe(gcsUri);
-      orderingDomains = mergeVariantDomainMaps(
-        orderingDomains,
-        normalizeVariantDomainMap(recipe?.variant_domains),
-      );
-      if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
-        pnTemplate = recipe.pn_template.trim();
-      }
-    } catch (err) {
-      console.warn('[ordering] extractOrderingRecipe failed:', err?.message || err);
+  let orderingExpanded = false;
+  let orderingDomains = normalizeVariantDomainMap(mappedResult?.variant_domains);
+  let pnTemplate = typeof mappedResult?.pn_template === 'string' && mappedResult.pn_template.trim()
+    ? mappedResult.pn_template.trim()
+    : null;
+  try {
+    const recipe = await extractOrderingRecipe(gcsUri);
+    orderingDomains = mergeVariantDomainMaps(
+      orderingDomains,
+      normalizeVariantDomainMap(recipe?.variant_domains),
+    );
+    if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
+      pnTemplate = recipe.pn_template.trim();
     }
+  } catch (err) {
+    console.warn('[ordering] extractOrderingRecipe failed:', err?.message || err);
+  }
 
-    const variantKeys = Object.keys(orderingDomains);
-    if (variantKeys.length) {
-      const baseSeries = orderingDomains.series_code?.[0] || orderingDomains.series?.[0] || null;
-      const orderingBase = {
-        brand,
-        series: baseSeries,
-        series_code: baseSeries,
-        values: orderingDomains,
-      };
-      const generatedRows = explodeToRows(orderingBase, { variantKeys, pnTemplate }) || [];
-      for (const generated of generatedRows) {
-        if (!generated || typeof generated !== 'object') continue;
-        const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
-        pushRow({ code: generated.code, values, brand, verified: false });
+  const variantKeys = Object.keys(orderingDomains)
+    .map((key) => String(key || '').trim())
+    .filter(Boolean);
+  if (variantKeys.length) {
+    for (const key of variantKeys) {
+      const lower = key.toLowerCase();
+      if (!rowAllowedKeySet.has(lower)) {
+        rowAllowedKeySet.add(lower);
+        rowAllowedKeys.push(key);
       }
     }
+    const baseSeries = orderingDomains.series_code?.[0] || orderingDomains.series?.[0] || null;
+    const orderingBase = {
+      brand,
+      series: baseSeries,
+      series_code: baseSeries,
+      values: orderingDomains,
+    };
+    const generatedRows = explodeToRows(orderingBase, { variantKeys, pnTemplate }) || [];
+    const beforeCount = out.length;
+    for (const generated of generatedRows) {
+      if (!generated || typeof generated !== 'object') continue;
+      const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
+      pushRow({ code: generated.code, values, brand, verified: false });
+    }
+    orderingExpanded = out.length > beforeCount;
   }
 
   if (!out.length) {
     for (const c of seedCodes) {
-      pushRow({ code: c, values: {}, brand, verified: true });
+      pushRow({ code: c, values: {}, brand, verified: hasDocEvidenceValue(c) });
     }
   }
 
@@ -489,7 +628,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   }
   const uniqueCandidateCodes = new Set(codeList.map((c) => String(c || '').trim().toUpperCase()).filter(Boolean));
   let docType = 'single';
-  if (orderingInfo || shouldExpandOrdering) docType = 'ordering';
+  if (orderingInfo || orderingExpanded || orderingHint) docType = 'ordering';
   else if (uniqueRowCodes.size > 1 || uniqueCandidateCodes.size > 1) docType = 'catalog';
 
   return {

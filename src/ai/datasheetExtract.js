@@ -601,6 +601,11 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     return false;
   };
 
+  const hasOrderingEvidence = (code) => {
+    const snip = gatherOrderingSectionEvidence(orderingInfo, code, { contextLines: 2 });
+    return Boolean(snip && snip.length >= 20);
+  };
+
   const hasDocEvidenceValue = (value) => hasDocEvidence(normalizeCodeKey(value));
 
   const pushCode = (value) => {
@@ -678,7 +683,8 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     for (const generated of generatedRows) {
       if (!generated || typeof generated !== 'object') continue;
       const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
-      pushRow({ code: generated.code, values, brand, verified: false });
+      const v = hasDocEvidence(normalizeCodeKey(generated.code)) || hasOrderingEvidence(generated.code);
+      pushRow({ code: generated.code, values, brand, verified: v });
     }
     orderingExpanded = out.length > beforeCount;
   }

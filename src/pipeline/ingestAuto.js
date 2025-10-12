@@ -130,6 +130,44 @@ const SKIP_SPEC_KEYS = new Set([
 ]);
 
 function gatherRuntimeSpecKeys(rows) {
+const MERGE_SKIP_KEYS = new Set([
+  ...SKIP_SPEC_KEYS,
+  'id',
+  'created_at',
+  'updated_at',
+  'raw_json',
+  'rawspecs',
+  'raw_specs',
+  'raw_table',
+  'raw_tables',
+  'raw_text',
+  'doc_type',
+  'ordering_info',
+  'family_slug',
+  'brand',
+  'brand_norm',
+  'pn',
+  'pn_norm',
+  'code',
+  'code_norm',
+  'display_name',
+  'displayname',
+  'image_uri',
+  'datasheet_uri',
+  'cover',
+  'verified_in_doc',
+  'candidates',
+  '_doc_text',
+  'mpn',
+  'mpn_list',
+  'codes',
+  'last_error',
+  'run_id',
+  'job_id',
+  'runid',
+  'jobid',
+]);
+
   const set = new Set();
   const list = Array.isArray(rows) ? rows : [];
   for (const row of list) {
@@ -168,6 +206,199 @@ async function ensureDynamicColumnsForRows(qualifiedTable, rows) {
     await ensureSpecColumnsForKeys(qualifiedTable, keys, sample);
   } catch (err) {
     console.warn('[schema] ensureDynamicColumnsForRows failed:', err?.message || err);
+  }
+}
+
+function quoteIdentifier(name) {
+  const trimmed = String(name || '').trim();
+  if (!trimmed) return '""';
+  return `"${trimmed.replace(/"/g, '""')}"`;
+}
+
+function normalizePnForMerge(value) {
+  const raw = String(value || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+  if (raw.length < 4) return null;
+  return raw;
+}
+
+function getValueIgnoreCase(row, keyLower) {
+  if (!row || typeof row !== 'object') return undefined;
+  if (Object.prototype.hasOwnProperty.call(row, keyLower)) return row[keyLower];
+  const target = String(keyLower || '').toLowerCase();
+  for (const [k, v] of Object.entries(row)) {
+    if (String(k || '').toLowerCase() === target) return v;
+  }
+  return undefined;
+}
+
+function isEmptyValue(value) {
+  if (value == null) return true;
+  if (typeof value === 'string') return value.trim() === '';
+  if (Array.isArray(value)) return value.length === 0;
+  return false;
+}
+
+function normalizeComparableValueForMerge(value) {
+  if (value == null) return null;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null;
+    return Number(value.toFixed(6));
+  }
+  if (typeof value === 'boolean') return value ? 1 : 0;
+  if (value instanceof Date) return value.getTime();
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((item) => normalizeComparableValueForMerge(item))
+      .filter((item) => item != null);
+    return parts.length ? parts.join('|') : null;
+  }
+  const str = String(value).trim();
+  if (!str) return null;
+  const digitsOnly = str.replace(/,/g, '');
+  if (/^-?\d+(?:\.\d+)?$/.test(digitsOnly)) {
+    const num = Number(digitsOnly);
+    if (Number.isFinite(num)) return Number(num.toFixed(6));
+  }
+  return str.toLowerCase().replace(/\s+/g, ' ');
+}
+
+function valuesConflictForMerge(a, b) {
+  const normA = normalizeComparableValueForMerge(a);
+  const normB = normalizeComparableValueForMerge(b);
+  if (normA == null || normB == null) return false;
+  return normA !== normB;
+}
+
+function isRecordCompatibleForMerge(record, existing, coreKeySet) {
+  const keysToCheck = coreKeySet && coreKeySet.size
+    ? Array.from(coreKeySet)
+    : Object.keys(record || {}).map((k) => String(k || '').toLowerCase());
+  for (const keyLower of keysToCheck) {
+    if (!keyLower) continue;
+    if (MERGE_SKIP_KEYS.has(keyLower)) continue;
+    const recordValue = getValueIgnoreCase(record, keyLower);
+    if (isEmptyValue(recordValue)) continue;
+    const existingValue = getValueIgnoreCase(existing, keyLower);
+    if (isEmptyValue(existingValue)) continue;
+    if (valuesConflictForMerge(recordValue, existingValue)) return false;
+  }
+  return true;
+}
+
+function backfillRecordFromExisting(record, existing) {
+  if (!record || typeof record !== 'object') return;
+  if (!existing || typeof existing !== 'object') return;
+  for (const [key, value] of Object.entries(existing)) {
+    const lower = String(key || '').toLowerCase();
+    if (MERGE_SKIP_KEYS.has(lower)) continue;
+    if (value == null) continue;
+    if (typeof value === 'object' && !Array.isArray(value)) continue;
+    const current = getValueIgnoreCase(record, lower);
+    if (!isEmptyValue(current)) continue;
+    if (Array.isArray(value) && !value.length) continue;
+    record[key] = value;
+  }
+}
+
+async function mergeRecordsWithExisting({
+  records,
+  qualifiedTable,
+  colTypes,
+  brandFallback = null,
+  family = null,
+  coreKeys = [],
+}) {
+  if (!Array.isArray(records) || !records.length) return;
+  if (!qualifiedTable) return;
+  if (!(colTypes instanceof Map)) return;
+
+  const columnSet = new Set();
+  for (const key of colTypes.keys()) {
+    if (!key) continue;
+    columnSet.add(String(key).trim().toLowerCase());
+  }
+
+  const comparatorColumns = ['pn_norm', 'pn', 'code_norm', 'code'].filter((col) => columnSet.has(col));
+  if (!comparatorColumns.length) return;
+
+  const brandColumn = columnSet.has('brand') ? 'brand' : null;
+  if (!brandColumn) return;
+
+  const familyColumn = columnSet.has('family_slug') ? 'family_slug' : null;
+  const familyValue = typeof family === 'string' ? family.trim() : '';
+
+  const coreKeySet = new Set(
+    Array.isArray(coreKeys)
+      ? coreKeys.map((key) => String(key || '').trim().toLowerCase()).filter(Boolean)
+      : []
+  );
+
+  const cache = new Map();
+
+  const fetchCandidates = async (brandValue, pnNorm) => {
+    const cacheKey = `${brandValue.toLowerCase()}::${familyValue.toLowerCase()}::${pnNorm}`;
+    if (cache.has(cacheKey)) return cache.get(cacheKey);
+
+    const whereClauses = [];
+    const params = [];
+    let paramIndex = 1;
+
+    whereClauses.push(`LOWER(${quoteIdentifier(brandColumn)}) = LOWER($${paramIndex})`);
+    params.push(brandValue);
+    paramIndex += 1;
+
+    if (familyColumn && familyValue) {
+      whereClauses.push(`LOWER(${quoteIdentifier(familyColumn)}) = LOWER($${paramIndex})`);
+      params.push(familyValue);
+      paramIndex += 1;
+    }
+
+    const normIndex = paramIndex;
+    params.push(pnNorm);
+
+    const comparatorParts = comparatorColumns.map(
+      (col) => `regexp_replace(coalesce(${quoteIdentifier(col)}, ''), '[^0-9A-Za-z]', '', 'g') = $${normIndex}`,
+    );
+    if (!comparatorParts.length) {
+      cache.set(cacheKey, []);
+      return [];
+    }
+
+    whereClauses.push(`(${comparatorParts.join(' OR ')})`);
+
+    const sql = `
+      SELECT *
+        FROM ${qualifiedTable}
+       WHERE ${whereClauses.join(' AND ')}
+       ORDER BY updated_at DESC NULLS LAST
+       LIMIT 5
+    `;
+
+    let rows = [];
+    try {
+      const { rows: resultRows } = await db.query(sql, params);
+      rows = Array.isArray(resultRows) ? resultRows : [];
+    } catch (err) {
+      console.warn('[merge] existing lookup failed:', err?.message || err);
+      rows = [];
+    }
+
+    cache.set(cacheKey, rows);
+    return rows;
+  };
+
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    const brandValue = String(record.brand || brandFallback || '').trim();
+    if (!brandValue) continue;
+    const pnCandidate = record.pn || record.code;
+    const pnNorm = normalizePnForMerge(pnCandidate);
+    if (!pnNorm) continue;
+    const candidates = await fetchCandidates(brandValue, pnNorm);
+    if (!Array.isArray(candidates) || !candidates.length) continue;
+    const match = candidates.find((candidate) => isRecordCompatibleForMerge(record, candidate, coreKeySet));
+    if (!match) continue;
+    backfillRecordFromExisting(record, match);
   }
 }
 
@@ -3510,6 +3741,27 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         if (r.brand != null && String(r.brand).trim() === '') r.brand = null;
       }
 
+      const mergeBrandFallback =
+        safeBrand(brandOverride) ||
+        safeBrand(processedEffective) ||
+        safeBrand(processedBrand) ||
+        safeBrand(brandName) ||
+        safeBrand(extractedBrand) ||
+        safeBrand(processedDetected) ||
+        null;
+      try {
+        await mergeRecordsWithExisting({
+          records,
+          qualifiedTable: qualified,
+          colTypes,
+          brandFallback: mergeBrandFallback,
+          family,
+          coreKeys: effectiveRequired,
+        });
+      } catch (err) {
+        console.warn('[merge] mergeRecordsWithExisting failed:', err?.message || err);
+      }
+
       if (colTypes instanceof Map && colTypes.size) {
         for (const rec of records) {
           if (!rec || typeof rec !== 'object') continue;
@@ -3541,7 +3793,10 @@ async function persistProcessedData(processed = {}, overrides = {}) {
           display_name: r0.display_name ?? null,
         });
       }
-      await ensureDynamicColumnsForRows(qualified, records);
+      const schemaEnsureRows = Array.isArray(processedRowsInput) && processedRowsInput.length
+        ? (processedRowsInput === records ? records : [...records, ...processedRowsInput])
+        : records;
+      await ensureDynamicColumnsForRows(qualified, schemaEnsureRows);
       try {
         persistResult = await saveExtractedSpecs(qualified, family, records, {
           brand: brandOverride,

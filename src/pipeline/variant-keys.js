@@ -22,7 +22,7 @@ function parseEnvNumber(name, defaultValue, parser = parseFloat) {
 const VARIANT_MIN_COVERAGE = parseEnvNumber('VARIANT_MIN_COVERAGE', 0.4, parseFloat);
 const VARIANT_MAX_CARDINALITY = Math.max(
   2,
-  parseEnvNumber('VARIANT_MAX_CARDINALITY', 20, (v) => parseInt(v, 10))
+  parseEnvNumber('VARIANT_MAX_CARDINALITY', 120, (v) => parseInt(v, 10))
 );
 const VARIANT_MIN_MI = Math.max(0, parseEnvNumber('VARIANT_MIN_MI', 0.05, parseFloat));
 const VARIANT_DISCOVERY_SAMPLE_LIMIT = Math.max(

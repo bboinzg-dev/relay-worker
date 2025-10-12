@@ -659,6 +659,22 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   ensureAllowedKey('pn_jp');
   ensureAllowedKey('pn_aliases');
   ensureAllowedKey('ordering_market');
+    if ((family || '').toLowerCase().includes('capacitor')) {
+    [
+      'capacitance_uf',
+      'rated_voltage_v',
+      'esr_mohm',
+      'df_percent',
+      'dcl_ua',
+      'case_size_code',
+      'product_category',
+      'msl',
+      'rms_current_100khz_45c',
+      'rms_current_100khz_85c',
+      'rms_current_100khz_105c',
+      'rms_current_100khz_125c',
+    ].forEach(ensureAllowedKey);
+  }
 
   const promptAllowedKeys = Array.from(new Set([
     ...rowAllowedKeys,
@@ -923,8 +939,9 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     const beforeCount = out.length;
     for (const generated of generatedRows) {
       if (!generated || typeof generated !== 'object') continue;
+      // 테이블 예시로 학습한 PN-정규식에 안 맞으면 버림
+      if (pnRegex && !pnRegex.test(String(generated.code || ''))) continue;
       const codeNorm = String(generated.code || '').trim().toUpperCase();
-      if (pnRegex && codeNorm && !pnRegex.test(codeNorm)) continue;
       const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
       const v = hasDocEvidence(normalizeCodeKey(generated.code)) || hasOrderingEvidence(generated.code);
       if (values && typeof values === 'object' && !Object.prototype.hasOwnProperty.call(values, '_pn_template')) {

@@ -90,7 +90,23 @@ function ensureFamilyOverrides(blueprint, registryRow) {
   blueprint.ingestOptions = ingestOptions;
 
   const allowed = Array.isArray(blueprint.allowedKeys) ? blueprint.allowedKeys : [];
-  blueprint.allowedKeys = Array.from(new Set([...allowed, ...variantKeys]));
+  const generic = [
+    'pn_jp',
+    'pn_aliases',
+    'ordering_market',
+    'coil_voltage_vac',
+    'terminal_form',
+    'contact_rating_text',
+    'dielectric_strength_v',
+    'operate_time_ms',
+    'release_time_ms',
+    'coil_resistance_ohm',
+    'insulation_resistance_mohm',
+    'dim_l_mm',
+    'dim_w_mm',
+    'dim_h_mm',
+  ];
+  blueprint.allowedKeys = Array.from(new Set([...allowed, ...variantKeys, ...generic]));
 
   if (registryRow?.specs_table && !blueprint.specsTable) {
     blueprint.specsTable = registryRow.specs_table;

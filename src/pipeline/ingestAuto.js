@@ -534,6 +534,8 @@ const CONSTRUCTION_LINE_RE = /(construction|sealed|flux\s*proof|enclosure)/i;
 const INSULATION_LINE_RE = /(insulation)/i;
 const MATERIAL_LINE_RE = /(material)/i;
 const POWER_LINE_RE = /(coil\s*power|power\s*consumption|power\s*code)/i;
+const CURRENT_LINE_RE = /(contact\s*current|current\s*\(?type\)?)/i;
+const COVER_LINE_RE = /\bcover\b/i;
 const TERMINAL_LINE_RE = /(terminal|shape|style)/i;
 const PACKING_LINE_RE = /(pack|tape|reel|emboss)/i;
 
@@ -720,6 +722,8 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
         if (/voltage\s*\(vdc\)/.test(norm)) return 'coil_voltage_vdc';
         if (/coil/.test(norm) && /power/.test(norm)) return 'coil_power_code';
         if (/power/.test(norm) && /code/.test(norm)) return 'coil_power_code';
+        if (/contact/.test(norm) && /current/.test(norm)) return 'contact_current_code';
+        if (/cover/.test(norm)) return 'cover_code';
         if (/construction/.test(norm) || /enclosure/.test(norm)) return 'construction';
         if (/terminal/.test(norm) || /shape/.test(norm)) return 'terminal_shape';
         if (/(pack|tape|reel|emboss)/.test(norm)) return 'packing_style';
@@ -767,8 +771,10 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
         if (INSULATION_LINE_RE.test(line)) addMany('insulation_code', extractEnumCodeValues(line));
         if (MATERIAL_LINE_RE.test(line)) addMany('material_code', extractEnumCodeValues(line));
         if (POWER_LINE_RE.test(line)) addMany('coil_power_code', extractEnumCodeValues(line));
+        if (CURRENT_LINE_RE.test(line)) addMany('contact_current_code', extractEnumCodeValues(line));
         if (TERMINAL_LINE_RE.test(line)) addMany('terminal_shape', extractEnumCodeValues(line));
         if (PACKING_LINE_RE.test(line)) addMany('packing_style', extractEnumCodeValues(line));
+        if (COVER_LINE_RE.test(line)) addMany('cover_code', extractEnumCodeValues(line));
         // 자주 나오는 일반 패턴들
         if (/led/i.test(line)) addMany('led_code', extractEnumCodeValues(line)); // "L: With LED, Nil: W/O LED"
         if (/cover/i.test(line)) {

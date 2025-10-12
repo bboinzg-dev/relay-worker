@@ -602,8 +602,28 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   };
 
   const hasOrderingEvidence = (code) => {
+    // 주문 섹션에서 코드 토큰들이 같은 라인/인접 라인에 함께 나오면 true
+    if (!code) return false;
     const snip = gatherOrderingSectionEvidence(orderingInfo, code, { contextLines: 2 });
-    return Boolean(snip && snip.length >= 20);
+    if (!snip || snip.length < 20) return false;
+    const tokens = String(code)
+      .toUpperCase()
+      .split(/[^A-Z0-9]+/)
+      .map((part) => part.trim())
+      .filter((part) => part && (part.length >= 2 || /\d/.test(part)));
+    if (!tokens.length) return false;
+    const lines = snip
+      .split(/\n+/)
+      .map((line) => line.trim().toUpperCase())
+      .filter(Boolean);
+    for (let i = 0; i < lines.length; i += 1) {
+      const windowText = [lines[i], lines[i + 1] || ''].filter(Boolean).join(' ');
+      if (!windowText) continue;
+      if (tokens.every((token) => windowText.includes(token))) {
+        return true;
+      }
+    }
+    return false;
   };
 
   const hasDocEvidenceValue = (value) => hasDocEvidence(normalizeCodeKey(value));

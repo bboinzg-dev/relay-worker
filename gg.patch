@@ -1,163 +1,99 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 5ad400dbaeaaf384934c2a35ab04639c1e1cfd62..1205a09aeaddc9d128b91e00a0f523de3520dd9f 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -511,51 +511,53 @@ const SPEC_KEY_ALIAS_MAP = new Map([
-   ['contactform', 'contact_arrangement'],
- ]);
- 
- function normalizeSpecKeyName(value) {
-   if (value == null) return null;
-   let s = String(value).trim().toLowerCase();
-   if (!s) return null;
-   s = s.replace(/[–—―]/g, '-');
-   s = s.replace(/\s+/g, '_');
-   s = s.replace(/[^0-9a-z_]+/g, '_');
-   s = s.replace(/_+/g, '_');
-   s = s.replace(/^_|_$/g, '');
-   if (!s) return null;
-   if (s.length > 63) s = s.slice(0, 63);
-   if (RESERVED_SPEC_KEYS.has(s)) return null;
-   return s;
- }
- 
- const ORDERING_SECTION_RE =
-   /(ordering information|ordering info|how to order|order information|ordering code|how-to-order|\b品番\b|\b型番\b|\b型号\b|\b型號\b|주문|형명|형번|품번|注文|订购信息|订购|订購|订货|型号)/i;
- const CONTACT_LINE_RE = /(contact|arrangement|configuration|form)/i;
- const COIL_LINE_RE = /(coil|voltage|vdc)/i;
- const CONSTRUCTION_LINE_RE = /(construction|sealed|flux\s*proof|enclosure)/i;
- const INSULATION_LINE_RE = /(insulation)/i;
- const MATERIAL_LINE_RE = /(material)/i;
-+const CURRENT_LINE_RE = /(contact\s*current|current\s*\(?type\)?)/i;
- const POWER_LINE_RE = /(coil\s*power|power\s*consumption|power\s*code)/i;
-+const COVER_LINE_RE = /\bcover\b/i;
- const TERMINAL_LINE_RE = /(terminal|shape|style)/i;
- const PACKING_LINE_RE = /(pack|tape|reel|emboss)/i;
- 
- function normalizeOrderingEnumToken(token) {
-   if (token == null) return null;
-   const raw = String(token).trim();
-   if (!raw) return null;
-   if (/^(nil|blank|none|null|n\/a)$/i.test(raw)) return '';
-   // 문자 1~2자 또는 숫자 1~2자(예: Cover 1/2)
-   if (/^[A-Za-z]{1,2}$/.test(raw)) return raw.toUpperCase();
-   if (/^\d{1,2}$/.test(raw)) return raw;
-   if (/^(?:[A-Za-z]\d|\d[A-Za-z])$/.test(raw)) return raw.toUpperCase();
-   return null;
- }
- 
- function addOrderingDomainValue(domains, key, value) {
-   if (!key) return;
-   if (value == null) return;
-   const arr = domains.get(key) || [];
-   if (!arr.some((item) => item === value)) {
-     arr.push(value);
-     domains.set(key, arr);
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 35f261c5dc72dca5b9c3b0304c43d2afef1e432d..f1adf3509fd041b1a20713e241b22010142eac86 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -832,92 +832,94 @@ function hasCoreSpec(row, keys = [], candidateKeys = []) {
+   for (const key of list) {
+     const norm = normKey(key);
+     if (!norm) continue;
+     if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
    }
+   return false;
  }
  
-@@ -697,100 +699,104 @@ function sliceOrderingSections(text) {
+ function isMinimalInsertEnabled() {
+   return String(process.env.ALLOW_MINIMAL_INSERT || '').trim() === '1';
+ }
  
- function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTables }) {
-   const domains = new Map();
+ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
+   if (!row || typeof row !== 'object') {
+     return { ok: false, reason: 'empty_row' };
+   }
  
-   const addMany = (key, values) => {
-     if (!Array.isArray(values)) return;
-     for (const value of values) {
-       if (value == null) continue;
-       addOrderingDomainValue(domains, key, value);
+   const brand = String(row.brand || '').trim().toLowerCase();
+   if (!brand || brand === 'unknown') {
+     row.last_error = 'missing_brand';
+     return { ok: false, reason: 'missing_brand' };
+   }
+ 
+   let pn = String(row.pn || row.code || '').trim();
+   const allowMinimal = isMinimalInsertEnabled();
++  const docType = String(row.doc_type || '').trim().toLowerCase();
++  const allowForOrdering = docType === 'ordering' || Boolean(row.verified_in_doc);
+   if (!isValidCode(pn)) {
+     const rawPn = String(row.pn || '').trim();
+     const rawCode = String(row.code || '').trim();
+     if ((rawPn && /\{[^}]*\}/.test(rawPn)) || (rawCode && /\{[^}]*\}/.test(rawCode))) {
+       row.last_error = 'invalid_code_template_placeholder';
+       return { ok: false, reason: 'invalid_code' };
      }
-   };
- 
-   if (Array.isArray(docAiTables)) {
-     for (const table of docAiTables) {
-       if (!table || typeof table !== 'object') continue;
-       const headers = Array.isArray(table.headers) ? table.headers : [];
-       const rows = Array.isArray(table.rows) ? table.rows : [];
-       if (!headers.length || !rows.length) continue;
-       const keyByIndex = headers.map((header) => {
-         const norm = String(header || '').trim().toLowerCase();
-         if (!norm) return null;
-         if (/contact/.test(norm) || /arrangement/.test(norm) || /configuration/.test(norm)) return 'contact_arrangement';
-         if (/coil/.test(norm) && /volt/.test(norm)) return 'coil_voltage_vdc';
-         if (/voltage\s*\(vdc\)/.test(norm)) return 'coil_voltage_vdc';
-         if (/coil/.test(norm) && /power/.test(norm)) return 'coil_power_code';
-+        if (/contact/.test(norm) && /current/.test(norm)) return 'contact_current_code';
-+        if (/cover/.test(norm)) return 'cover_code';
-         if (/power/.test(norm) && /code/.test(norm)) return 'coil_power_code';
-         if (/construction/.test(norm) || /enclosure/.test(norm)) return 'construction';
-         if (/terminal/.test(norm) || /shape/.test(norm)) return 'terminal_shape';
-         if (/(pack|tape|reel|emboss)/.test(norm)) return 'packing_style';
-         if (/insulation/.test(norm)) return 'insulation_code';
-         if (/material/.test(norm)) return 'material_code';
-         return null;
-       });
-       if (!keyByIndex.some(Boolean)) continue;
-       for (const row of rows) {
-         if (!Array.isArray(row)) continue;
-         row.forEach((cell, idx) => {
-           const key = keyByIndex[idx];
-           if (!key) return;
-           const text = typeof cell === 'string' ? cell : String(cell ?? '');
-           if (!text.trim()) return;
-           if (key === 'contact_arrangement') addMany(key, extractContactValues(text));
-           else if (key === 'coil_voltage_vdc') addMany(key, extractCoilVoltageValues(text));
-           else addMany(key, extractEnumCodeValues(text));
-         });
+     const fixed = repairPn(pn);
+     if (fixed && isValidCode(fixed)) {
+       console.warn('[persist] pn repaired', { original: pn, fixed });
+       row.last_error = row.last_error || 'invalid_code_fixed';
+       pn = fixed;
+     } else if (allowMinimal) {
+       const fallbackPn = repairPn(String(row.series || row.code || ''));
+       if (fallbackPn && isValidCode(fallbackPn)) {
+         console.warn('[persist] pn fallback applied', { original: pn, fallback: fallbackPn });
+         pn = fallbackPn;
+         row.last_error = row.last_error || 'invalid_code_fallback';
+       } else {
+         row.last_error = 'invalid_code';
+         return { ok: false, reason: 'invalid_code' };
+       }
+     } else {
+       row.last_error = 'invalid_code';
+       return { ok: false, reason: 'invalid_code' };
+     }
+   } else {
+     if (FORBIDDEN_RE.test(pn) || BANNED_PREFIX.test(pn) || BANNED_EXACT.test(pn)) {
+       const fixed = repairPn(pn);
+       if (fixed && isValidCode(fixed) && !FORBIDDEN_RE.test(fixed) && !BANNED_PREFIX.test(fixed) && !BANNED_EXACT.test(fixed)) {
+         console.warn('[persist] pn repaired', { original: pn, fixed });
+         row.last_error = row.last_error || 'invalid_code_fixed';
+         pn = fixed;
+       } else {
+         row.last_error = 'invalid_code';
+         return { ok: false, reason: 'invalid_code' };
        }
      }
    }
- 
-   const textSources = new Set();
-   gatherOrderingTexts(orderingInfo, []).forEach((txt) => textSources.add(txt));
-   if (typeof docAiText === 'string' && docAiText.trim()) textSources.add(docAiText);
-   if (typeof previewText === 'string' && previewText.trim()) textSources.add(previewText);
- 
-   for (const rawText of textSources) {
-     const sections = sliceOrderingSections(rawText);
-     for (const section of sections) {
-       const lines = section.split(/\n+/);
-       for (const rawLine of lines) {
-         const line = rawLine.replace(/^[\s•·\-–—]+/, '').trim();
-         if (!line) continue;
-         if (CONTACT_LINE_RE.test(line)) {
-           addMany('contact_arrangement', extractContactValues(line));
-           addMany('contact_arrangement', extractContactFormsFromLine(line));
-         }
-         if (COIL_LINE_RE.test(line)) {
-           addMany('coil_voltage_vdc', extractCoilVoltageValues(line));
-           addMany('coil_voltage_code', extractVoltageCodeTokens(section));
-         }
-         if (CONSTRUCTION_LINE_RE.test(line)) addMany('construction', extractEnumCodeValues(line));
-         if (INSULATION_LINE_RE.test(line)) addMany('insulation_code', extractEnumCodeValues(line));
-         if (MATERIAL_LINE_RE.test(line)) addMany('material_code', extractEnumCodeValues(line));
-         if (POWER_LINE_RE.test(line)) addMany('coil_power_code', extractEnumCodeValues(line));
-+        if (CURRENT_LINE_RE.test(line)) addMany('contact_current_code', extractEnumCodeValues(line));
-         if (TERMINAL_LINE_RE.test(line)) addMany('terminal_shape', extractEnumCodeValues(line));
-         if (PACKING_LINE_RE.test(line)) addMany('packing_style', extractEnumCodeValues(line));
-+        if (COVER_LINE_RE.test(line)) addMany('cover_code', extractEnumCodeValues(line));
-         // 자주 나오는 일반 패턴들
-         if (/led/i.test(line)) addMany('led_code', extractEnumCodeValues(line)); // "L: With LED, Nil: W/O LED"
-         if (/cover/i.test(line)) {
-           const modes = Array.from(line.matchAll(/\b([12])\b/g)).map((m) => m[1]);
-           if (modes.length) addMany('cover_mode', modes);
-         }
-         if (/(insert|pcb)/i.test(line)) {
-           const types = Array.from(line.matchAll(/\b([ab])\s*[:=]/gi)).map((m) => m[1].toLowerCase());
-           if (types.length) addMany('mount_type_code', types);
-         }
-       }
-     }
+   row.pn = pn;
+   if (row.code == null || String(row.code).trim() === '') row.code = pn;
+-  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !allowMinimal) {
++  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !(allowMinimal || allowForOrdering)) {
+     return { ok: false, reason: 'missing_core_spec' };
    }
+   return { ok: true };
+ }
  
-   const result = {};
-   for (const [key, values] of domains.entries()) {
-     if (!values || !values.length) continue;
-     result[key] = values;
+ async function getColumnTypes(targetTable) {
+   const [schema, table] = targetTable.includes('.')
+     ? targetTable.split('.', 2)
+     : ['public', targetTable];
+ 
+   const { rows } = await pool.query(
+     `SELECT lower(column_name) AS column, data_type
+        FROM information_schema.columns
+       WHERE table_schema = $1
+         AND table_name   = $2`,
+     [schema, table],
+   );
+ 
+   const map = new Map();
+   for (const row of rows) {
+     map.set(row.column, String(row.data_type || '').toLowerCase());
    }
-   const normalizedDomains = Object.keys(result).length ? result : null;
-   return {
-     domains: normalizedDomains,
-     textSources: Array.from(textSources),
-   };
+   return map;
  }

@@ -23,8 +23,10 @@ const { safeJsonParse } = require('../utils/safe-json');
 const { explodeToRows } = require('../utils/mpn-exploder');
 const { extractOrderingRecipe } = require('../utils/vertex');
 const { extractOrderingInfo } = require('../utils/ordering-sections');
+const { aiCanonicalizeKeys } = require('../pipeline/ai/canonKeys');
 
 const MAX_PARTS = Number(process.env.MAX_ENUM_PARTS || 200);
+const AUTO_ADD_FIELDS = /^(1|true|on)$/i.test(String(process.env.AUTO_ADD_FIELDS || ''));
 
 /* -------------------- ENV helpers -------------------- */
 function resolveDocAI() {
@@ -254,6 +256,128 @@ function codesFromDocAiTables(tables) {
     });
   }
   return Array.from(set);
+}
+
+function escapeRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function tokenizeForPn(code) {
+  if (!code) return [];
+  const tokens = [];
+  const hay = String(code).trim();
+  if (!hay) return tokens;
+  const re = /(\d+[A-Z]?|[A-Z]+|[^A-Z0-9]+)/g;
+  let match;
+  while ((match = re.exec(hay)) !== null) {
+    const token = match[0];
+    if (!token) continue;
+    tokens.push(token);
+  }
+  return tokens;
+}
+
+function classifyPnToken(token) {
+  if (!token) return 'other';
+  const str = String(token);
+  if (/^\d+$/.test(str)) return 'digit';
+  if (/^[A-Z]+$/.test(str)) return 'alpha';
+  if (/^\d+[A-Z]+$/.test(str)) return 'alnum';
+  return 'other';
+}
+
+function canAcceptPnColumn(column, tokenType) {
+  if (!column || !tokenType) return false;
+  if (!column.type) return true;
+  if (column.type === tokenType) return true;
+  if (column.type === 'digit' && tokenType === 'alnum') return true;
+  if (column.type === 'alnum' && tokenType === 'digit') return true;
+  return false;
+}
+
+function mergePnColumnType(current, tokenType) {
+  if (!current) return tokenType;
+  if (current === tokenType) return current;
+  if ((current === 'digit' && tokenType === 'alnum') || (current === 'alnum' && tokenType === 'digit')) {
+    return 'alnum';
+  }
+  return tokenType;
+}
+
+function buildPnRegexFromExamples(examples) {
+  if (!Array.isArray(examples) || !examples.length) return null;
+  const normalized = examples
+    .map((code) => String(code || '').trim().toUpperCase())
+    .filter((code) => code && /^[A-Z0-9][A-Z0-9._/#-]{1,}$/i.test(code));
+  if (!normalized.length) return null;
+
+  const columns = [];
+  const total = normalized.length;
+
+  for (const code of normalized.slice(0, MAX_PARTS)) {
+    const tokens = tokenizeForPn(code);
+    if (!tokens.length) continue;
+    let colIdx = 0;
+    for (const token of tokens) {
+      const tokenType = classifyPnToken(token);
+      let placed = false;
+      while (colIdx < columns.length) {
+        const col = columns[colIdx];
+        if (canAcceptPnColumn(col, tokenType)) {
+          col.tokens.add(token);
+          col.count += 1;
+          col.type = mergePnColumnType(col.type, tokenType);
+          placed = true;
+          colIdx += 1;
+          break;
+        }
+        col.optional = true;
+        colIdx += 1;
+      }
+      if (!placed) {
+        columns.push({
+          tokens: new Set([token]),
+          type: tokenType,
+          count: 1,
+          optional: false,
+        });
+        colIdx = columns.length;
+      }
+    }
+    while (colIdx < columns.length) {
+      columns[colIdx].optional = true;
+      colIdx += 1;
+    }
+  }
+
+  if (!columns.length) return null;
+
+  const parts = [];
+  for (const col of columns) {
+    const options = Array.from(col.tokens);
+    if (!options.length) continue;
+    if (options.length > 80) return null;
+    const sorted = options.sort((a, b) => a.localeCompare(b));
+    let part;
+    if (sorted.length === 1) {
+      part = escapeRegex(sorted[0]);
+    } else {
+      part = `(?:${sorted.map((opt) => escapeRegex(opt)).join('|')})`;
+    }
+    if (col.optional || col.count < total) {
+      part = `(?:${part})?`;
+    }
+    parts.push(part);
+  }
+
+  if (!parts.length) return null;
+  const pattern = `^(?:${parts.join('')})$`;
+  try {
+    return new RegExp(pattern);
+  } catch (err) {
+    console.warn('[pn-regex] failed to build regex:', err?.message || err);
+    return null;
+  }
 }
 function codesFromFreeText(txt) {
   const set = new Set();
@@ -516,60 +640,59 @@ async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText,
 
 /* -------------------- Public: main extractor -------------------- */
 async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null, brandHint = null }) {
-  let rowAllowedKeys = Array.isArray(allowedKeys) ? allowedKeys : [];
-  rowAllowedKeys = rowAllowedKeys
-    .map((key) => (key == null ? '' : String(key).trim()))
-    .filter(Boolean);
-  const seenAllowed = new Set();
-  const dedupedAllowed = [];
-  for (const key of rowAllowedKeys) {
-    const lower = key.toLowerCase();
-    if (seenAllowed.has(lower)) continue;
-    seenAllowed.add(lower);
-    dedupedAllowed.push(key);
+  const rowAllowedKeySet = new Set();
+  const rowAllowedKeys = [];
+  const ensureAllowedKey = (value) => {
+    const str = value == null ? '' : String(value).trim();
+    if (!str) return;
+    const lower = str.toLowerCase();
+    if (rowAllowedKeySet.has(lower)) return;
+    rowAllowedKeySet.add(lower);
+    rowAllowedKeys.push(str);
+  };
+
+  if (Array.isArray(allowedKeys)) {
+    for (const key of allowedKeys) ensureAllowedKey(key);
   }
-  rowAllowedKeys = dedupedAllowed;
-  for (const baseKey of ['series', 'series_code']) {
-    if (!seenAllowed.has(baseKey)) {
-      seenAllowed.add(baseKey);
-      rowAllowedKeys.push(baseKey);
-    }
-  }
-  const rowAllowedKeySet = new Set(seenAllowed);
+  ensureAllowedKey('series');
+  ensureAllowedKey('series_code');
+  ensureAllowedKey('pn_jp');
+  ensureAllowedKey('pn_aliases');
+  ensureAllowedKey('ordering_market');
+
   const promptAllowedKeys = Array.from(new Set([
     ...rowAllowedKeys,
-    'pn_jp',
-    'pn_aliases',
-    'ordering_market',
   ]));
 
   let docai = await processWithDocAI(gcsUri);
   let fullText = docai?.fullText || '';
   if (!fullText) fullText = await parseTextWithPdfParse(gcsUri);
 
-  const typePartMap = extractTypePartPairs(docai?.tables || []);
+  const tableList = Array.isArray(docai?.tables) ? docai.tables : [];
+  const typePartMap = extractTypePartPairs(tableList);
 
   const brand = brandHint || (await detectBrandFromText(fullText)) || 'unknown';
   const orderingInfo = extractOrderingInfo(fullText, MAX_PARTS);
 
   // 코드 후보
   let codes = [];
-  if (docai?.tables?.length) codes = codesFromDocAiTables(docai.tables);
+  if (tableList.length) codes = codesFromDocAiTables(tableList);
   if (!codes.length && fullText) codes = codesFromFreeText(fullText);
+  const pnRegex = buildPnRegexFromExamples(codes.slice(0, MAX_PARTS));
 
   // 표 프리뷰(LLM 컨텍스트)
   let tablePreview = '';
   let perCodePreviewMap = new Map();
   const baseSegments = [];
-  if (docai?.tables?.length) {
+  if (tableList.length) {
     baseSegments.push(
-      ...docai.tables.slice(0, 6).map((t) => {
+      ...tableList.slice(0, 6).map((t) => {
         const head = (t.headers || []).join(' | ');
         const rows = (t.rows || []).slice(0, 40).map((r) => r.join(' | ')).join('\n');
         return `HEADER: ${head}\n${rows}`;
       })
     );
-    perCodePreviewMap = gatherPerCodeTablePreview(docai.tables, codes.slice(0, MAX_PARTS), {
+    perCodePreviewMap = gatherPerCodeTablePreview(tableList, codes.slice(0, MAX_PARTS), {
       contextRows: 2,
       maxMatchesPerCode: 2,
     });
@@ -616,6 +739,49 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   const mappedParts = Array.isArray(mappedResult?.parts) ? mappedResult.parts : [];
   const tableHintRaw = String(mappedResult?.table_hint || '');
   const orderingHint = tableHintRaw.toUpperCase().includes('ORDERING');
+
+  const canonicalKeyMap = new Map();
+  if (mappedParts.length) {
+    const candidateKeys = new Set();
+    for (const part of mappedParts) {
+      const partValues = part?.values && typeof part.values === 'object' ? part.values : {};
+      for (const rawKey of Object.keys(partValues || {})) {
+        const keyStr = rawKey == null ? '' : String(rawKey).trim();
+        if (!keyStr) continue;
+        const lower = keyStr.toLowerCase();
+        if (!rowAllowedKeySet.has(lower)) candidateKeys.add(keyStr);
+      }
+    }
+    const candidateList = Array.from(candidateKeys).slice(0, 120);
+    for (const key of candidateList) canonicalKeyMap.set(key, key);
+    if (candidateList.length) {
+      try {
+        const knownList = Array.from(rowAllowedKeys);
+        const { map } = await aiCanonicalizeKeys(
+          family || 'generic',
+          candidateList,
+          knownList,
+        );
+        if (map && typeof map === 'object') {
+          for (const key of candidateList) {
+            const rec = map[key] || {};
+            const action = String(rec.action || '').toLowerCase();
+            let canonical = String(rec.canonical || key).trim();
+            if (action !== 'map') canonical = key;
+            if (!canonical) canonical = key;
+            canonicalKeyMap.set(key, canonical);
+            if (!canonicalKeyMap.has(canonical)) canonicalKeyMap.set(canonical, canonical);
+            ensureAllowedKey(canonical);
+          }
+        } else {
+          candidateList.forEach((key) => ensureAllowedKey(key));
+        }
+      } catch (err) {
+        console.warn('[datasheet] aiCanonicalizeKeys failed:', err?.message || err);
+        candidateList.forEach((key) => ensureAllowedKey(key));
+      }
+    }
+  }
 
   const out = [];
   const seenRows = new Set();
@@ -676,18 +842,40 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     const brandValue = rowBrand || brand;
     if (brandValue) row.brand = brandValue;
     if (values && typeof values === 'object') {
+      const normalizedValues = {};
+      const assignValue = (key, rawValue) => {
+        const keyStr = key == null ? '' : String(key).trim();
+        if (!keyStr) return;
+        const canonicalKey = canonicalKeyMap.has(keyStr) ? canonicalKeyMap.get(keyStr) : keyStr;
+        const cleanKey = canonicalKey == null ? '' : String(canonicalKey).trim();
+        if (!cleanKey) return;
+        const lower = cleanKey.toLowerCase();
+        if (!rowAllowedKeySet.has(lower)) {
+          if (!AUTO_ADD_FIELDS) return;
+          ensureAllowedKey(cleanKey);
+        }
+        normalizedValues[cleanKey] = rawValue;
+      };
+
+      for (const [rawKey, rawValue] of Object.entries(values)) {
+        if (rawValue == null) continue;
+        assignValue(rawKey, rawValue);
+      }
+
       if (typePartMap.has(norm)) {
         const jpList = typePartMap.get(norm);
-        values.pn_jp = Array.isArray(jpList) && jpList.length ? jpList[0] : null;
-        values.pn_aliases = jpList && jpList.length ? jpList : null;
-        values.ordering_market = 'GLOBAL';
+        assignValue('pn_jp', Array.isArray(jpList) && jpList.length ? jpList[0] : null);
+        assignValue('pn_aliases', jpList && jpList.length ? jpList : null);
+        assignValue('ordering_market', 'GLOBAL');
       } else if (!/^[A-Z]HE[0-9]/.test(norm) && /^AHE[0-9]/.test(norm)) {
-        values.ordering_market = 'JP';
+        assignValue('ordering_market', 'JP');
       }
-      for (const key of rowAllowedKeys) {
+
+      const allowedSnapshot = Array.from(rowAllowedKeys);
+      for (const key of allowedSnapshot) {
         if (!key) continue;
-        if (Object.prototype.hasOwnProperty.call(values, key) && values[key] != null) {
-          row[key] = values[key];
+        if (Object.prototype.hasOwnProperty.call(normalizedValues, key) && normalizedValues[key] != null) {
+          row[key] = normalizedValues[key];
         }
       }
     }
@@ -723,13 +911,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     .map((key) => String(key || '').trim())
     .filter(Boolean);
   if (variantKeys.length) {
-    for (const key of variantKeys) {
-      const lower = key.toLowerCase();
-      if (!rowAllowedKeySet.has(lower)) {
-        rowAllowedKeySet.add(lower);
-        rowAllowedKeys.push(key);
-      }
-    }
+    for (const key of variantKeys) ensureAllowedKey(key);
     const baseSeries = orderingDomains.series_code?.[0] || orderingDomains.series?.[0] || null;
     const orderingBase = {
       brand,
@@ -741,6 +923,8 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     const beforeCount = out.length;
     for (const generated of generatedRows) {
       if (!generated || typeof generated !== 'object') continue;
+      const codeNorm = String(generated.code || '').trim().toUpperCase();
+      if (pnRegex && codeNorm && !pnRegex.test(codeNorm)) continue;
       const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
       const v = hasDocEvidence(normalizeCodeKey(generated.code)) || hasOrderingEvidence(generated.code);
       if (values && typeof values === 'object' && !Object.prototype.hasOwnProperty.call(values, '_pn_template')) {
@@ -757,7 +941,6 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     }
   }
 
-  const tableList = Array.isArray(docai?.tables) ? docai.tables : [];
   const codeList = mergedCodes.slice(0, MAX_PARTS);
   const uniqueRowCodes = new Set();
   for (const row of out) {

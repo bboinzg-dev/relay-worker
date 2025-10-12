@@ -659,7 +659,10 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   ensureAllowedKey('pn_jp');
   ensureAllowedKey('pn_aliases');
   ensureAllowedKey('ordering_market');
-    if ((family || '').toLowerCase().includes('capacitor')) {
+
+  const familyLower = String(family || '').trim().toLowerCase();
+
+  if (familyLower.includes('capacitor')) {
     [
       'capacitance_uf',
       'rated_voltage_v',
@@ -673,6 +676,22 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
       'rms_current_100khz_85c',
       'rms_current_100khz_105c',
       'rms_current_100khz_125c',
+    ].forEach(ensureAllowedKey);
+  }
+
+    if (familyLower.startsWith('relay')) {
+    [
+      'contact_rating_text',
+      'dielectric_strength_v',
+      'operate_time_ms',
+      'release_time_ms',
+      'coil_resistance_ohm',
+      'insulation_resistance_mohm',
+      'length_mm',
+      'width_mm',
+      'height_mm',
+      'mount_type',
+      'packing_style',
     ].forEach(ensureAllowedKey);
   }
 
@@ -939,15 +958,18 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     const beforeCount = out.length;
     for (const generated of generatedRows) {
       if (!generated || typeof generated !== 'object') continue;
+            const rawCode = generated.code;
+      const codeStr = String(rawCode || '').trim();
+      if (!codeStr) continue;
       // 테이블 예시로 학습한 PN-정규식에 안 맞으면 버림
-      if (pnRegex && !pnRegex.test(String(generated.code || ''))) continue;
-      const codeNorm = String(generated.code || '').trim().toUpperCase();
+      if (pnRegex && !pnRegex.test(codeStr)) continue;
+      const codeNorm = codeStr.toUpperCase();
       const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
-      const v = hasDocEvidence(normalizeCodeKey(generated.code)) || hasOrderingEvidence(generated.code);
+      const v = hasDocEvidence(normalizeCodeKey(codeStr)) || hasOrderingEvidence(codeStr);
       if (values && typeof values === 'object' && !Object.prototype.hasOwnProperty.call(values, '_pn_template')) {
         values._pn_template = pnTemplate || null;
       }
-      pushRow({ code: generated.code, values, brand, verified: v });
+      pushRow({ code: codeStr, values, brand, verified: v });
     }
     orderingExpanded = out.length > beforeCount;
   }

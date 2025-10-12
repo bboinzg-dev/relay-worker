@@ -1,8 +1,8 @@
 diff --git a/src/ai/datasheetExtract.js b/src/ai/datasheetExtract.js
-index 0e0fac3c8ae38f4fc1c5d7fbdb899e3878206dc7..b6dfe836d7b8e82e6ef439dde15548426c62bb77 100644
+index 8887cd09bcd0907e343cd8aa28615e0d87f827b6..13bdd3a44f0e5de3edeeaed0b381922bccbee73a 100644
 --- a/src/ai/datasheetExtract.js
 +++ b/src/ai/datasheetExtract.js
-@@ -637,50 +637,66 @@ async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText,
+@@ -637,67 +637,86 @@ async function geminiMapValues({ family, brandHint, codes, allowedKeys, docText,
     }
     return out; 
  }
@@ -28,23 +28,43 @@ index 0e0fac3c8ae38f4fc1c5d7fbdb899e3878206dc7..b6dfe836d7b8e82e6ef439dde1554842
    ensureAllowedKey('pn_jp');
    ensureAllowedKey('pn_aliases');
    ensureAllowedKey('ordering_market');
-+  if ((family || '').toLowerCase().includes('capacitor')) {
+-    if ((family || '').toLowerCase().includes('capacitor')) {
++
++  const familyLower = String(family || '').trim().toLowerCase();
++
++  if (familyLower.includes('capacitor')) {
+     [
+       'capacitance_uf',
+       'rated_voltage_v',
+       'esr_mohm',
+       'df_percent',
+       'dcl_ua',
+       'case_size_code',
+       'product_category',
+       'msl',
+       'rms_current_100khz_45c',
+       'rms_current_100khz_85c',
+       'rms_current_100khz_105c',
+       'rms_current_100khz_125c',
+     ].forEach(ensureAllowedKey);
+   }
+ 
++  if (familyLower.startsWith('relay')) {
 +    [
-+      'capacitance_uf',
-+      'rated_voltage_v',
-+      'esr_mohm',
-+      'df_percent',
-+      'dcl_ua',
-+      'case_size_code',
-+      'product_category',
-+      'msl',
-+      'rms_current_100khz_45c',
-+      'rms_current_100khz_85c',
-+      'rms_current_100khz_105c',
-+      'rms_current_100khz_125c',
++      'contact_rating_text',
++      'dielectric_strength_v',
++      'operate_time_ms',
++      'release_time_ms',
++      'coil_resistance_ohm',
++      'insulation_resistance_mohm',
++      'length_mm',
++      'width_mm',
++      'height_mm',
++      'mount_type',
++      'packing_style',
 +    ].forEach(ensureAllowedKey);
 +  }
- 
++
    const promptAllowedKeys = Array.from(new Set([
      ...rowAllowedKeys,
    ]));
@@ -69,7 +89,8 @@ index 0e0fac3c8ae38f4fc1c5d7fbdb899e3878206dc7..b6dfe836d7b8e82e6ef439dde1554842
    let tablePreview = '';
    let perCodePreviewMap = new Map();
    const baseSegments = [];
-@@ -901,52 +917,53 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
+   if (tableList.length) {
+@@ -917,59 +936,62 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
        normalizeVariantDomainMap(recipe?.variant_domains),
      );
      if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
@@ -95,16 +116,22 @@ index 0e0fac3c8ae38f4fc1c5d7fbdb899e3878206dc7..b6dfe836d7b8e82e6ef439dde1554842
      const beforeCount = out.length;
      for (const generated of generatedRows) {
        if (!generated || typeof generated !== 'object') continue;
-+      // 테이블 예시로 학습한 PN-정규식에 안 맞으면 버림
-+      if (pnRegex && !pnRegex.test(String(generated.code || ''))) continue;
-       const codeNorm = String(generated.code || '').trim().toUpperCase();
--      if (pnRegex && codeNorm && !pnRegex.test(codeNorm)) continue;
++      const rawCode = generated.code;
++      const codeStr = String(rawCode || '').trim();
++      if (!codeStr) continue;
+       // 테이블 예시로 학습한 PN-정규식에 안 맞으면 버림
+-      if (pnRegex && !pnRegex.test(String(generated.code || ''))) continue;
+-      const codeNorm = String(generated.code || '').trim().toUpperCase();
++      if (pnRegex && !pnRegex.test(codeStr)) continue;
++      const codeNorm = codeStr.toUpperCase();
        const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
-       const v = hasDocEvidence(normalizeCodeKey(generated.code)) || hasOrderingEvidence(generated.code);
+-      const v = hasDocEvidence(normalizeCodeKey(generated.code)) || hasOrderingEvidence(generated.code);
++      const v = hasDocEvidence(normalizeCodeKey(codeStr)) || hasOrderingEvidence(codeStr);
        if (values && typeof values === 'object' && !Object.prototype.hasOwnProperty.call(values, '_pn_template')) {
          values._pn_template = pnTemplate || null;
        }
-       pushRow({ code: generated.code, values, brand, verified: v });
+-      pushRow({ code: generated.code, values, brand, verified: v });
++      pushRow({ code: codeStr, values, brand, verified: v });
      }
      orderingExpanded = out.length > beforeCount;
    }
@@ -124,3 +151,9 @@ index 0e0fac3c8ae38f4fc1c5d7fbdb899e3878206dc7..b6dfe836d7b8e82e6ef439dde1554842
    }
    const uniqueCandidateCodes = new Set(codeList.map((c) => String(c || '').trim().toUpperCase()).filter(Boolean));
    let docType = 'single';
+   if (orderingInfo || orderingExpanded || orderingHint) docType = 'ordering';
+   else if (uniqueRowCodes.size > 1 || uniqueCandidateCodes.size > 1) docType = 'catalog';
+ 
+   return {
+     brand,
+     rows: out.slice(0, MAX_PARTS),

@@ -1,6 +1,6 @@
 'use strict';
 
-const ORDERING_ANCHOR_RE = /(ORDER(?:ING)?\s+(INFO|INFORMATION|GUIDE|CODE|NUMBER)|HOW\s+TO\s+ORDER|주문\s*정보|주문\s*코드|订购信息|订货信息)/i;
+const ORDERING_ANCHOR_RE = /(ORDER(?:ING)?\s+(INFO|INFORMATION|GUIDE|CODE|NUMBER)|HOW\s+TO\s+ORDER|주문\s*정보|주문\s*코드|订购信息|订货信息|PART\s*(?:NO\.?|NUMBER)|品番|型番|품번)/i;
 const ORDERING_CANDIDATE_RE = /[A-Z][A-Z0-9](?:[A-Z0-9\-\.]{1,18})/g;
 const ORDERING_BLACKLIST_RE = /^(ISO|ROHS|UL|VDC|VAC|A|MA|MM|Ω|OHM|PDF|PAGE|NOTE|DATE|LOT|WWW|HTTP|HTTPS)$/i;
 

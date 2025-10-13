@@ -1,412 +1,60 @@
-diff --git a/src/ai/datasheetExtract.js b/src/ai/datasheetExtract.js
-index 382a5246862f2fbfdd3052f251f9530c4189ba35..5d951f2a6e8ff8869038270084628f94b2f56f4f 100644
---- a/src/ai/datasheetExtract.js
-+++ b/src/ai/datasheetExtract.js
-@@ -240,50 +240,298 @@ function codesFromDocAiTables(tables) {
-     });
- 
-     if (!heuristicCols.size && headerCodeCols.size) {
-       headerCodeCols.forEach((i) => heuristicCols.add(i));
+diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
+index 392ab9786248bae3901a7e8f16ad0f7411ddea06..386627ea8b2672a71c551029fdc01a8c92477d78 100644
+--- a/src/utils/mpn-exploder.js
++++ b/src/utils/mpn-exploder.js
+@@ -363,54 +363,53 @@ function explodeToRows(base, options = {}) {
+     else {
+       delete rowValues.coil_voltage_vdc;
+       delete rowValues.coil_voltagevdc;
      }
-     if (!heuristicCols.size) continue;
  
-     rows.forEach((row) => {
-       if (!Array.isArray(row)) return;
-       heuristicCols.forEach((colIdx) => {
-         const cell = row[colIdx];
-         if (cell == null) return;
-         const text = String(cell).trim();
-         if (!text) return;
-         for (const code of extractCodesFromCell(text)) set.add(code);
+     const canUseTemplate = pnTemplate && normalizedSeries;
+ 
+     let generatedByTemplate = false;
+     let generatedByFallback = false;
+     let code = null;
+ 
+     if (pnTemplate && canUseTemplate) {
+       code = renderTemplate(pnTemplate, {
+         ...rowValues,
+         series: normalizedSeries,
+         series_code: normalizedSeries,
+         contact_form: normalizedContactForm,
+         coil_voltage_vdc: normalizedCoilVoltage,
        });
-     });
-   }
-   return Array.from(set);
- }
- 
- function escapeRegex(value) {
-   return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
- }
- 
-+function escapeRegexWithWildcards(value) {
-+  const str = String(value || '').toUpperCase();
-+  let out = '';
-+  for (const ch of str) {
-+    if (ch === '*') {
-+      out += '[A-Z0-9]*';
-+      continue;
-+    }
-+    if (ch === '?') {
-+      out += '[A-Z0-9]';
-+      continue;
-+    }
-+    if (ch === '#') {
-+      out += '\\d';
-+      continue;
-+    }
-+    out += escapeRegex(ch);
-+  }
-+  return out;
-+}
-+
-+function applyTemplateOpsForRegex(value, options = []) {
-+  const arr = Array.isArray(options) ? options : [];
-+  const first = Array.isArray(value) ? value[0] : value;
-+  let current = first == null ? '' : String(first);
-+  for (const rawOption of arr) {
-+    if (!rawOption) continue;
-+    const token = String(rawOption).trim();
-+    if (!token) continue;
-+    const normalized = token.includes('=') ? token.replace('=', ':') : token;
-+    const lower = normalized.toLowerCase();
-+    if (lower === 'upper' || lower === 'uppercase' || lower === 'upcase') {
-+      current = current.toUpperCase();
-+      continue;
-+    }
-+    if (lower === 'lower' || lower === 'downcase' || lower === 'lowercase') {
-+      current = current.toLowerCase();
-+      continue;
-+    }
-+    if (lower === 'first') {
-+      current = current.split(',')[0].trim();
-+      continue;
-+    }
-+    if (lower === 'alnum') {
-+      current = current.replace(/[^0-9A-Z]/gi, '');
-+      continue;
-+    }
-+    if (lower === 'digits') {
-+      current = current.replace(/[^0-9]/g, '');
-+      continue;
-+    }
-+    if (lower === 'num') {
-+      const match = current.match(/-?\d+(?:\.\d+)?/);
-+      current = match ? match[0] : '';
-+      continue;
-+    }
-+    if (lower.startsWith('pad:')) {
-+      const parts = normalized.split(':');
-+      const width = Number(parts[1]) || 0;
-+      const fillRaw = parts.length > 2 ? parts[2] : '';
-+      const fill = fillRaw && fillRaw.trim() ? fillRaw.trim()[0] : '0';
-+      if (width > 0) current = current.padStart(width, fill);
-+      continue;
-+    }
-+    if (lower.startsWith('slice:')) {
-+      const parts = normalized.split(':');
-+      const start = Number(parts[1]) || 0;
-+      const end = parts.length > 2 && parts[2] !== '' ? Number(parts[2]) : undefined;
-+      current = current.slice(start, Number.isNaN(end) ? undefined : end);
-+      continue;
-+    }
-+    if (lower.startsWith('map:')) {
-+      const entries = normalized.slice(4).split(',');
-+      const mapping = Object.create(null);
-+      for (const entry of entries) {
-+        const [from, to] = entry.split('>');
-+        if (!from || to == null) continue;
-+        mapping[String(from).trim().toUpperCase()] = String(to).trim();
-+      }
-+      const key = String(current).trim().toUpperCase();
-+      if (Object.prototype.hasOwnProperty.call(mapping, key)) {
-+        current = mapping[key];
-+      }
-+      continue;
-+    }
-+    if (lower.startsWith('prefix:')) {
-+      const [, rawPrefix = ''] = normalized.split(':');
-+      current = `${rawPrefix}${current}`;
-+      continue;
-+    }
-+    if (lower.startsWith('suffix:')) {
-+      const [, rawSuffix = ''] = normalized.split(':');
-+      current = `${current}${rawSuffix}`;
-+      continue;
-+    }
-+    if (lower.startsWith('replace:')) {
-+      const [, rawArgs = ''] = normalized.split(':');
-+      const [search, replacement = ''] = rawArgs.split('>');
-+      if (search != null) {
-+        const matcher = new RegExp(escapeRegex(search), 'g');
-+        current = current.replace(matcher, replacement);
-+      }
-+      continue;
-+    }
-+  }
-+  return current.trim();
-+}
-+
-+function parseMapOutputs(options = []) {
-+  const outputs = [];
-+  for (const rawOption of options) {
-+    if (!rawOption) continue;
-+    const token = String(rawOption).trim();
-+    if (!token) continue;
-+    const normalized = token.includes('=') ? token.replace('=', ':') : token;
-+    const lower = normalized.toLowerCase();
-+    if (!lower.startsWith('map:')) continue;
-+    const entries = normalized.slice(4).split(',');
-+    for (const entry of entries) {
-+      const [, to] = entry.split('>');
-+      if (to == null) continue;
-+      const clean = String(to).trim();
-+      if (clean) outputs.push(clean);
-+    }
-+  }
-+  return outputs;
-+}
-+
-+function findVariantDomainValues(key, variantDomains = {}) {
-+  const raw = String(key || '').trim();
-+  if (!raw) return [];
-+  const lower = raw.toLowerCase();
-+  const normalized = lower.replace(/[^a-z0-9]/g, '');
-+  const results = [];
-+  for (const [domainKey, domainValues] of Object.entries(variantDomains || {})) {
-+    const domainStr = String(domainKey || '').trim();
-+    if (!domainStr) continue;
-+    const domainLower = domainStr.toLowerCase();
-+    const domainNormalized = domainLower.replace(/[^a-z0-9]/g, '');
-+    if (domainStr === raw || domainLower === lower || domainNormalized === normalized) {
-+      const list = Array.isArray(domainValues) ? domainValues : [domainValues];
-+      for (const value of list) {
-+        const str = value == null ? '' : String(value).trim();
-+        if (!str) continue;
-+        results.push(str);
-+      }
-+    }
-+  }
-+  return results;
-+}
-+
-+function buildPlaceholderRegex(body, variantDomains) {
-+  const tokens = String(body || '')
-+    .split('|')
-+    .map((part) => part.trim())
-+    .filter(Boolean);
-+  if (!tokens.length) return '';
-+  const baseKey = tokens.shift();
-+  const options = tokens;
-+  const domainValues = findVariantDomainValues(baseKey, variantDomains);
-+  const processed = [];
-+  let hasEmpty = false;
-+  if (domainValues.length) {
-+    for (const value of domainValues) {
-+      const applied = applyTemplateOpsForRegex(value, options);
-+      if (applied == null) continue;
-+      const trimmed = String(applied).trim();
-+      if (!trimmed) {
-+        hasEmpty = true;
-+        continue;
-+      }
-+      processed.push(trimmed.toUpperCase());
-+    }
-+  }
-+  if (!processed.length) {
-+    const mapOutputs = parseMapOutputs(options);
-+    if (mapOutputs.length) {
-+      for (const output of mapOutputs) {
-+        const trimmed = String(output).trim();
-+        if (!trimmed) {
-+          hasEmpty = true;
-+          continue;
-+        }
-+        processed.push(trimmed.toUpperCase());
-+      }
-+    }
-+  }
-+  const unique = Array.from(new Set(processed));
-+  if (!unique.length) {
-+    if (hasEmpty) return '';
-+    if (options.some((op) => String(op).toLowerCase().includes('digit'))) {
-+      const padOption = options.find((op) => /^pad[:=]/i.test(String(op)));
-+      if (padOption) {
-+        const normalizedPad = String(padOption).replace('=', ':');
-+        const [, widthRaw = ''] = normalizedPad.split(':');
-+        const width = Number(widthRaw) || 0;
-+        if (width > 0) return `\\d{${width}}`;
-+      }
-+      return '\\d+';
-+    }
-+    if (options.some((op) => String(op).toLowerCase().includes('alnum'))) {
-+      return '[A-Z0-9]+';
-+    }
-+    return '[A-Z0-9]+';
-+  }
-+  const patterns = unique.map((value) => escapeRegexWithWildcards(value)).filter(Boolean);
-+  if (!patterns.length) {
-+    if (hasEmpty) return '';
-+    return '[A-Z0-9]+';
-+  }
-+  let combined;
-+  if (patterns.length === 1) combined = patterns[0];
-+  else combined = `(?:${patterns.join('|')})`;
-+  if (hasEmpty) combined = `(?:${combined})?`;
-+  return combined;
-+}
-+
-+function buildPnRegexFromTemplate(template, variantDomains = {}) {
-+  const tpl = typeof template === 'string' ? template.trim() : '';
-+  if (!tpl) return null;
-+  const parts = [];
-+  const pattern = /\{\{?\s*([^{}]+?)\s*\}\}?/g;
-+  let lastIndex = 0;
-+  let match;
-+  while ((match = pattern.exec(tpl)) !== null) {
-+    if (match.index > lastIndex) {
-+      const literal = tpl.slice(lastIndex, match.index);
-+      if (literal) parts.push(escapeRegex(literal));
-+    }
-+    const placeholder = buildPlaceholderRegex(match[1], variantDomains);
-+    if (placeholder) parts.push(placeholder);
-+    lastIndex = match.index + match[0].length;
-+  }
-+  if (lastIndex < tpl.length) {
-+    const tail = tpl.slice(lastIndex);
-+    if (tail) parts.push(escapeRegex(tail));
-+  }
-+  if (!parts.length) return null;
-+  const combined = parts.join('');
-+  if (!combined) return null;
-+  try {
-+    return new RegExp(`^(?:${combined})$`, 'i');
-+  } catch (err) {
-+    console.warn('[pn-regex] failed to build regex from template:', err?.message || err);
-+    return null;
-+  }
-+}
-+
- function tokenizeForPn(code) {
-   if (!code) return [];
-   const tokens = [];
-   const hay = String(code).trim();
-   if (!hay) return tokens;
-   const re = /(\d+[A-Z]?|[A-Z]+|[^A-Z0-9]+)/g;
-   let match;
-   while ((match = re.exec(hay)) !== null) {
-     const token = match[0];
-     if (!token) continue;
-     tokens.push(token);
-   }
-   return tokens;
- }
- 
- function classifyPnToken(token) {
-   if (!token) return 'other';
-   const str = String(token);
-   if (/^\d+$/.test(str)) return 'digit';
-   if (/^[A-Z]+$/.test(str)) return 'alpha';
-   if (/^\d+[A-Z]+$/.test(str)) return 'alnum';
-   return 'other';
- }
- 
- function canAcceptPnColumn(column, tokenType) {
-@@ -691,51 +939,51 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
-       'width_mm',
-       'height_mm',
-       'mount_type',
-       'packing_style',
-     ].forEach(ensureAllowedKey);
-   }
- 
-   const promptAllowedKeys = Array.from(new Set([
-     ...rowAllowedKeys,
-   ]));
- 
-   let docai = await processWithDocAI(gcsUri);
-   let fullText = docai?.fullText || '';
-   if (!fullText) fullText = await parseTextWithPdfParse(gcsUri);
- 
-   const tableList = Array.isArray(docai?.tables) ? docai.tables : [];
-   const typePartMap = extractTypePartPairs(tableList);
- 
-   const brand = brandHint || (await detectBrandFromText(fullText)) || 'unknown';
-   const orderingInfo = extractOrderingInfo(fullText, MAX_PARTS);
- 
-   // 코드 후보
-   let codes = [];
-   if (tableList.length) codes = codesFromDocAiTables(tableList);
-   if (!codes.length && fullText) codes = codesFromFreeText(fullText);
--  const pnRegex = buildPnRegexFromExamples(codes.slice(0, MAX_PARTS));
-+  let pnRegex = buildPnRegexFromExamples(codes.slice(0, MAX_PARTS));
- 
-   // 표 프리뷰(LLM 컨텍스트)
-   let tablePreview = '';
-   let perCodePreviewMap = new Map();
-   const baseSegments = [];
-   if (tableList.length) {
-     baseSegments.push(
-       ...tableList.slice(0, 6).map((t) => {
-         const head = (t.headers || []).join(' | ');
-         const rows = (t.rows || []).slice(0, 40).map((r) => r.join(' | ')).join('\n');
-         return `HEADER: ${head}\n${rows}`;
-       })
-     );
-     perCodePreviewMap = gatherPerCodeTablePreview(tableList, codes.slice(0, MAX_PARTS), {
-       contextRows: 2,
-       maxMatchesPerCode: 2,
-     });
-   }
-   const perCodeSegments = [];
-   const seenPreviewCodes = new Set();
-   let appended = 0;
-   const previewOrder = codes.slice(0, MAX_PARTS);
-   for (const code of previewOrder) {
-     const norm = normalizeCodeKey(code);
-     if (!norm || seenPreviewCodes.has(norm)) continue;
-@@ -920,50 +1168,55 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
- 
-   for (const part of mappedParts) {
-     const partValues = part?.values && typeof part.values === 'object' ? part.values : {};
-     pushRow({ code: part?.code, values: partValues, brand: part?.brand, verified: true });
-   }
- 
-   let orderingExpanded = false;
-   let orderingDomains = normalizeVariantDomainMap(mappedResult?.variant_domains);
-   let pnTemplate = typeof mappedResult?.pn_template === 'string' && mappedResult.pn_template.trim()
-     ? mappedResult.pn_template.trim()
-     : null;
-   const recipeInput = gcsUri || orderingInfo?.text || tablePreview || (fullText ? String(fullText).slice(0, 6000) : '');
-   try {
-     const recipe = await extractOrderingRecipe(recipeInput);
-     orderingDomains = mergeVariantDomainMaps(
-       orderingDomains,
-       normalizeVariantDomainMap(recipe?.variant_domains),
-     );
-     if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
-       pnTemplate = recipe.pn_template.trim();
+       generatedByTemplate = true;
+     } else if (mpnCandidates[idx]) {
+       code = mpnCandidates[idx];
+     } else if (mpnCandidates.length) {
+       code = mpnCandidates[0];
+     } else {
++      if (!normalizedSeries) return;
+       const parts = [];
+-      if (normalizedSeries) parts.push(normalizedSeries);
+-      else if (base?.series) parts.push(base.series);
+-      else if (base?.series_code) parts.push(base.series_code);
++      parts.push(normalizedSeries);
+       const suffix = variantKeys
+         .map((key) => rowValues[key] ?? rowValues[key?.toLowerCase()])
+         .filter((v) => v != null && v !== '')
+         .map((v) => String(v))
+         .join('');
+       if (suffix) parts.push(suffix);
+       code = parts.join('');
+       generatedByFallback = true;
      }
-   } catch (err) {
-     console.warn('[ordering] extractOrderingRecipe failed:', err?.message || err);
-   }
  
-+  if (!pnRegex && pnTemplate) {
-+    const templateRegex = buildPnRegexFromTemplate(pnTemplate, orderingDomains);
-+    if (templateRegex) pnRegex = templateRegex;
-+  }
-+
-   const variantKeys = Object.keys(orderingDomains)
-     .map((key) => String(key || '').trim())
-     .filter(Boolean);
-   if (variantKeys.length) {
-     for (const key of variantKeys) ensureAllowedKey(key);
-     const baseSeries = orderingDomains.series_code?.[0] || orderingDomains.series?.[0] || null;
-     const orderingBase = {
-       brand,
-       series: baseSeries,
-       series_code: baseSeries,
-       values: orderingDomains,
-     };
-     const generatedRows = explodeToRows(orderingBase, { variantKeys, pnTemplate }) || [];
-     const beforeCount = out.length;
-     for (const generated of generatedRows) {
-       if (!generated || typeof generated !== 'object') continue;
-             const rawCode = generated.code;
-       const codeStr = String(rawCode || '').trim();
-       if (!codeStr) continue;
-       // 테이블 예시로 학습한 PN-정규식에 안 맞으면 버림
-       if (pnRegex && !pnRegex.test(codeStr)) continue;
-       const codeNorm = codeStr.toUpperCase();
-       const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
-       const v = hasDocEvidence(normalizeCodeKey(codeStr)) || hasOrderingEvidence(codeStr);
-       if (values && typeof values === 'object' && !Object.prototype.hasOwnProperty.call(values, '_pn_template')) {
+     code = String(code || '').trim();
+     if (!code) return;
+ 
+     if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
+ 
+     const codeNorm = code.toLowerCase();
+     if (rows.some((r) => r.code_norm === codeNorm)) return;
+ 
+     rows.push({
+       code,
+       code_norm: codeNorm,
+       values: rowValues,
+     });
+   });

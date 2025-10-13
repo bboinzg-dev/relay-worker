@@ -1190,7 +1190,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     console.warn('[ordering] extractOrderingRecipe failed:', err?.message || err);
   }
 
-    if (!pnRegex && pnTemplate) {
+  if (!pnRegex && pnTemplate) {
     const templateRegex = buildPnRegexFromTemplate(pnTemplate, orderingDomains);
     if (templateRegex) pnRegex = templateRegex;
   }

@@ -1,85 +1,63 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 5918deaa6ab1c9d4ae942533c16bca039e1b52b2..79387fb4fbd9e1af0f20fcfce0afbe6545450a89 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -3816,69 +3816,69 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
-     } catch (err) {
-       console.warn('[canon] aiCanonicalizeKeys failed:', err?.message || err);
-       aiCanonicalMap.clear();
-       aiCanonicalMapLower.clear();
-     }
-   }
- 
-   const mpnsFromDoc = harvestMpnCandidates(
-     extracted?.text ?? '',
-     (baseSeries || series || code || '')
-   );
-   const mpnNormFromDoc = new Set(mpnsFromDoc.map((m) => normalizeCode(m)).filter(Boolean));
- 
-   const candidateMap = [];
-   const candidateNormSet = new Set();
-   for (const cand of candidates) {
-     const trimmed = typeof cand === 'string' ? cand.trim() : String(cand || '');
-     if (!trimmed) continue;
-     const norm = normalizeCode(trimmed);
-     if (!norm || candidateNormSet.has(norm)) continue;
-     candidateNormSet.add(norm);
-     candidateMap.push({ raw: trimmed, norm });
-   }
- 
-   const baseRows = (rawRows.length ? rawRows : [{}]).map((row) => {
--  if (variantDomainEntries.length) {
-+    const rowObj = row && typeof row === 'object' ? { ...row } : {};
-+    if (variantDomainEntries.length) {
-       for (const [domainKey, domainValues] of variantDomainEntries) {
-         if (!Array.isArray(domainValues) || !domainValues.length) continue;
--        const current = obj[domainKey];
-+        const current = rowObj[domainKey];
-         if (current == null || (typeof current === 'string' && current.trim() === '')) {
--          obj[domainKey] = domainValues;
-+          rowObj[domainKey] = domainValues;
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 6bf142f88a70ed415d8b27e641ac590101c41ff3..f491a262b49d14e19cc174f324f85495d9678c87 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -1362,50 +1362,58 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+           }
+           if (!orderingCodes.size && Array.isArray(orderingPayload.scored)) {
+             for (const scored of orderingPayload.scored) {
+               if (!scored || typeof scored !== 'object') continue;
+               const normalized = typeof scored.code === 'string'
+                 ? scored.code.trim().toUpperCase()
+                 : null;
+               if (normalized) orderingCodes.add(normalized);
+             }
+           }
+           if (orderingCodes.has(pnUpper)) {
+             rec.verified_in_doc = true;
+           }
          }
        }
-     }
--    const obj = row && typeof row === 'object' ? { ...row } : {};
--    if (obj.brand == null) obj.brand = brandName;
--    const fallbackSeries = obj.series_code || obj.series || baseSeries || null;
-+    if (rowObj.brand == null) rowObj.brand = brandName;
-+    const fallbackSeries = rowObj.series_code || rowObj.series || baseSeries || null;
-     if (fallbackSeries != null) {
--      if (obj.series == null) obj.series = fallbackSeries;
--      if (obj.series_code == null) obj.series_code = fallbackSeries;
-+      if (rowObj.series == null) rowObj.series = fallbackSeries;
-+      if (rowObj.series_code == null) rowObj.series_code = fallbackSeries;
-     }
--    if (obj.datasheet_uri == null) obj.datasheet_uri = gcsUri;
--    if (coverUri && obj.cover == null) obj.cover = coverUri;
--    return obj;
-+    if (rowObj.datasheet_uri == null) rowObj.datasheet_uri = gcsUri;
-+    if (coverUri && rowObj.cover == null) rowObj.cover = coverUri;
-+    return rowObj;
-   });
  
-   let explodedRows = baseRows;
-   if (USE_CODE_RULES) {
-     const expanded = expandRowsWithVariants(baseRows, {
-       variantKeys,
-       pnTemplate,
-       defaultBrand: brandName,
-       defaultSeries: baseSeries,
-     });
-     if (Array.isArray(expanded) && expanded.length) {
-       explodedRows = expanded;
-     }
-   }
-   if (Array.isArray(explodedRows) && explodedRows.length) {
-     if (docAiRecordsFlat.length || docAiRecordsForMerge.length) {
-       const usedRecords = new Set();
-       const variantForMatch = Array.isArray(variantKeys) ? variantKeys : [];
-       const canonicalRefs = new Set(docAiRecordsForMerge);
-       for (const row of explodedRows) {
-         if (!row || typeof row !== 'object') continue;
-         let match = null;
-         if (docAiRecordsForMerge.length) {
-           match =
-             bestRowMatchToSpec(row, docAiRecordsForMerge, usedRecords) ||
+       const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });
+       if (!guard.ok) {
+         const skip = { reason: guard.reason, detail: guard.detail || null };
+         if (rec.last_error) skip.last_error = rec.last_error;
+         result.skipped.push(skip);
+         continue;
+       }
+ 
+       const pnValue = String(rec.pn || rec.code || '').trim();
++      const docType = String(options?.docType || '').toLowerCase();
++      const requiresVoltage = Array.isArray(options?.coreSpecKeys) &&
++        options.coreSpecKeys.some((k) => /coil_voltage/.test(String(k).toLowerCase()));
++      if (docType === 'ordering' && requiresVoltage && !/\d/.test(pnValue)) {
++        if (physicalCols.has('last_error')) rec.last_error = 'incomplete_pn';
++        result.skipped.push({ reason: 'invalid_code', detail: 'missing_voltage_token' });
++        continue;
++      }
+       const pnIsFallback = isMinimalFallbackPn(pnValue);
+       if (!pnValue || !isValidCode(pnValue) || (!pnIsFallback && FORBIDDEN_RE.test(pnValue))) {
+         const skippedCode = pnValue || String(rec.code || rec.pn || '').trim() || '(no-code)';
+         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
+         result.skipped.push({ reason: 'invalid_code', code: skippedCode, last_error: 'invalid_code' });
+         continue;
+       }
+ 
+       rec.pn = pnValue;
+       if (rec.code == null || String(rec.code).trim() === '') {
+         rec.code = pnValue;
+       }
+ 
+       const pnNorm = normKey(pnValue);
+       if (!pnNorm) {
+         if (physicalCols.has('last_error')) rec.last_error = 'missing_pn';
+         result.skipped.push({ reason: 'missing_pn', last_error: 'missing_pn' });
+         continue;
+       }
+       if (physicalCols.has('pn_norm')) rec.pn_norm = pnNorm;
+ 
+       const codeNorm = normKey(rec.code);
+       if (!codeNorm) {
+         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
+         result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });

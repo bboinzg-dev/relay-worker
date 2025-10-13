@@ -1688,6 +1688,12 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   let pnTemplate = typeof mappedResult?.pn_template === 'string' && mappedResult.pn_template.trim()
     ? mappedResult.pn_template.trim()
     : null;
+  const assignPnRegexFromTemplate = () => {
+    if (!pnTemplate) return;
+    const templateRegex = buildPnRegexFromTemplate(pnTemplate, orderingDomains);
+    if (templateRegex) pnRegex = templateRegex;
+  };
+  assignPnRegexFromTemplate();
   const recipeInput = gcsUri || orderingInfo?.text || tablePreview || (fullText ? String(fullText).slice(0, 6000) : '');
   try {
     const recipe = await extractOrderingRecipe(recipeInput);
@@ -1701,11 +1707,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   } catch (err) {
     console.warn('[ordering] extractOrderingRecipe failed:', err?.message || err);
   }
-
-  if (!pnRegex && pnTemplate) {
-    const templateRegex = buildPnRegexFromTemplate(pnTemplate, orderingDomains);
-    if (templateRegex) pnRegex = templateRegex;
-  }
+  assignPnRegexFromTemplate();
 
   const variantKeys = Object.keys(orderingDomains)
     .map((key) => String(key || '').trim())

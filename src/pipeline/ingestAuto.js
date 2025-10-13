@@ -4674,6 +4674,8 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         await ensureDynamicColumnsForRows(qualified, processedRowsInput);
       }
       await ensureDynamicColumnsForRows(qualified, schemaEnsureRows);
+      // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
+      records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
       await ensureDynamicColumnsForRows(qualified, records);
       try {
         persistResult = await saveExtractedSpecs({

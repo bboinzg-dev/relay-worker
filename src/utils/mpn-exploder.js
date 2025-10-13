@@ -368,7 +368,6 @@ function explodeToRows(base, options = {}) {
     const canUseTemplate = pnTemplate && normalizedSeries;
 
     let generatedByTemplate = false;
-    let generatedByFallback = false;
     let code = null;
 
     if (pnTemplate && canUseTemplate) {
@@ -385,23 +384,14 @@ function explodeToRows(base, options = {}) {
     } else if (mpnCandidates.length) {
       code = mpnCandidates[0];
     } else {
-    if (!normalizedSeries) return;
-      const parts = [];
-      parts.push(normalizedSeries);
-      const suffix = variantKeys
-        .map((key) => rowValues[key] ?? rowValues[key?.toLowerCase()])
-        .filter((v) => v != null && v !== '')
-        .map((v) => String(v))
-        .join('');
-      if (suffix) parts.push(suffix);
-      code = parts.join('');
-      generatedByFallback = true;
+      // 템플릿/표 후보가 없으면 "임의 PN"을 만들지 않는다 (가짜 PN 차단)
+      return;
     }
 
     code = String(code || '').trim();
     if (!code) return;
 
-    if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
+    if (generatedByTemplate && !isLikelyPn(code)) return;
 
     const codeNorm = code.toLowerCase();
     if (rows.some((r) => r.code_norm === codeNorm)) return;

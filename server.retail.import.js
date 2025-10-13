@@ -68,17 +68,22 @@ router.post('/api/retail/import', async (req, res, next) => {
         .on('error', reject);
     });
 
+    const errorsPrefix = process.env.RETAIL_ERRORS_PREFIX || 'retail/errors';
     const [op] = await retail.importProducts({
       parent: BRANCH,
       inputConfig: { gcsSource: { inputUris: [gcsUri] } },
       reconciliationMode: 'INCREMENTAL',
+            // ★ 필수: 에러 로그 저장 경로 (gs://버킷/디렉토리)
+      errorsConfig: { gcsPrefix: `gs://${TEMP_BUCKET}/${errorsPrefix}` },
     });
     const [resp] = await op.promise();
 
     res.json({ done: true, result: resp, gcsUri, branch: BRANCH, count });
   } catch (err) {
-    next(err);
-      } finally {
+    console.error('[retail/import]', err?.message || err);
+    // 서버 크래시 방지: 500 JSON으로 돌려보냄
+    res.status(500).json({ done: false, error: String(err?.message || err), gcsUri });
+  } finally {
     dbClient.release();
   }
 });

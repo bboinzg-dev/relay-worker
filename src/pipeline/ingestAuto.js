@@ -285,6 +285,28 @@ function flattenDocAiTablesForMerge(tables) {
   return records;
 }
 
+function normalizeVariantDomains(domains) {
+  const normalized = {};
+  if (!domains || typeof domains !== 'object') return normalized;
+  for (const [rawKey, rawValue] of Object.entries(domains)) {
+    const key = String(rawKey || '').trim();
+    if (!key) continue;
+    const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+    const seen = new Set();
+    const list = [];
+    for (const candidate of values) {
+      if (candidate == null) continue;
+      const str = String(candidate).trim();
+      const marker = str === '' ? '__EMPTY__' : str.toLowerCase();
+      if (seen.has(marker)) continue;
+      seen.add(marker);
+      list.push(str);
+    }
+    if (list.length) normalized[key] = list;
+  }
+  return normalized;
+}
+
 async function canonicalizeDocAiRecords(family, allowedKeys, records) {
   const list = Array.isArray(records) ? records : [];
   if (!list.length) return list;
@@ -776,6 +798,15 @@ function expandRowsWithVariants(baseRows, options = {}) {
       variantKeys,
       pnTemplate,
       haystack: haystackSources,
+      textContainsExact: (text, pn) => {
+        const pat = String(pn || '')
+          .trim()
+          .replace(/[-\s]+/g, '[-\\s]*')
+          .replace(/V$/i, 'V(?:DC)?');
+        if (!pat) return false;
+        const re = new RegExp(`(^|[^A-Za-z0-9])${pat}(?=$|[^A-Za-z0-9])`, 'i');
+        return re.test(String(text || ''));
+      },      
     }) || [];
     if (Array.isArray(exploded) && exploded.length) {
       for (const item of exploded) {
@@ -2710,7 +2741,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     extracted.tables = docAiTables;
   }
 
-  let docAiRecordsForMerge = flattenDocAiTablesForMerge(docAiTables);
+  const docAiRecordsFlat = flattenDocAiTablesForMerge(docAiTables);
+  let docAiRecordsForMerge = docAiRecordsFlat;
   if (docAiRecordsForMerge.length) {
     try {
       docAiRecordsForMerge = await canonicalizeDocAiRecords(
@@ -2762,7 +2794,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
         docMatch = bestAttributeMatchToSpec(row, docAiRecordsForMerge, variantKeys);
       }
       if (!docMatch && String(family || '').toLowerCase() === 'relay_signal') {
-        docMatch = findCoilRowMatchForRelaySignal(row, docAiRecordsForMerge);
+        docMatch = findCoilRowMatchForRelaySignal(row, docAiRecordsFlat);
       }
       if (docMatch && docMatch.values) {
         const patch = safeMergeSpec(row, docMatch.values);
@@ -3254,6 +3286,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   let orderingDomains = null;
   let orderingOverride = null;
   let orderingTextSources = [];
+  let orderingLegendRecipe = null;
   if (USE_CODE_RULES) {
     const orderingCollection = collectOrderingDomains({
       orderingInfo: extracted?.ordering_info,
@@ -3290,28 +3323,10 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
             ? orderingWindowText
             : (gcsUri || orderingWindowText);
           const recipe = await extractOrderingRecipe(recipeInput);
-          const variantDomains = recipe?.variant_domains;
-          const normalizedDomains = {};
-          if (variantDomains && typeof variantDomains === 'object') {
-            for (const [rawKey, rawValue] of Object.entries(variantDomains)) {
-              const key = String(rawKey || '').trim();
-              if (!key) continue;
-              const values = Array.isArray(rawValue) ? rawValue : [rawValue];
-              const seen = new Set();
-              const list = [];
-              for (const candidate of values) {
-                if (candidate == null) continue;
-                const str = String(candidate).trim();
-                const marker = str === '' ? '__EMPTY__' : str.toLowerCase();
-                if (seen.has(marker)) continue;
-                seen.add(marker);
-                list.push(str);
-              }
-              if (list.length) normalizedDomains[key] = list;
-            }
-          }
-          if (Object.keys(normalizedDomains).length) {
-            orderingDomains = normalizedDomains;
+          orderingLegendRecipe = recipe || orderingLegendRecipe;
+          const variantDomains = normalizeVariantDomains(recipe?.variant_domains);
+          if (Object.keys(variantDomains).length) {
+            orderingDomains = variantDomains;
             if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
               pnTemplate = recipe.pn_template.trim();
             }
@@ -3528,6 +3543,89 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
+    let legendVariantDomains = normalizeVariantDomains(orderingDomains);
+  const orderingTextForRecipe = Array.isArray(orderingTextSources)
+    ? orderingTextSources
+        .map((txt) => (typeof txt === 'string' ? txt : String(txt ?? '')))
+        .map((txt) => txt.trim())
+        .filter(Boolean)
+        .join('\n')
+    : '';
+  if (orderingTextForRecipe) {
+    try {
+      const recipe = await extractOrderingRecipe(orderingTextForRecipe);
+      if (recipe) orderingLegendRecipe = recipe;
+    } catch (err) {
+      console.warn('[ordering] legend recipe extract failed:', err?.message || err);
+    }
+  }
+  if (orderingLegendRecipe && orderingLegendRecipe.variant_domains) {
+    const recipeDomains = normalizeVariantDomains(orderingLegendRecipe.variant_domains);
+    if (Object.keys(recipeDomains).length) {
+      if (!legendVariantDomains || !Object.keys(legendVariantDomains).length) {
+        legendVariantDomains = { ...recipeDomains };
+      } else {
+        for (const [domainKey, domainValues] of Object.entries(recipeDomains)) {
+          const key = String(domainKey || '').trim();
+          if (!key) continue;
+          if (!Array.isArray(domainValues) || !domainValues.length) continue;
+          const existing = Array.isArray(legendVariantDomains[key]) ? legendVariantDomains[key] : [];
+          if (!existing.length) {
+            legendVariantDomains[key] = domainValues.slice();
+            continue;
+          }
+          const seen = new Set(existing.map((val) => String(val).trim().toLowerCase()));
+          const merged = existing.slice();
+          for (const val of domainValues) {
+            const trimmed = String(val || '').trim();
+            const marker = trimmed.toLowerCase();
+            if (seen.has(marker)) continue;
+            seen.add(marker);
+            merged.push(trimmed);
+          }
+          legendVariantDomains[key] = merged;
+        }
+      }
+    }
+  }
+  if (USE_PN_TEMPLATE && !pnTemplate) {
+    const recipeTemplate = String(orderingLegendRecipe?.pn_template || '').trim();
+    if (recipeTemplate) {
+      pnTemplate = recipeTemplate;
+    } else {
+      const blueprintTemplate = String(blueprint?.pn_template || '').trim();
+      if (blueprintTemplate) pnTemplate = blueprintTemplate;
+    }
+  }
+  const variantDomainEntries = Object.entries(legendVariantDomains || {});
+  if (variantDomainEntries.length) {
+    orderingDomains = legendVariantDomains;
+  }
+  if (variantDomainEntries.length && Array.isArray(rawRows) && rawRows.length) {
+    for (const row of rawRows) {
+      if (!row || typeof row !== 'object') continue;
+      for (const [domainKey, domainValues] of variantDomainEntries) {
+        if (!Array.isArray(domainValues) || !domainValues.length) continue;
+        const current = row[domainKey];
+        if (current == null || (typeof current === 'string' && current.trim() === '')) {
+          row[domainKey] = domainValues;
+        }
+      }
+    }
+  }
+  if (variantDomainEntries.length && Array.isArray(variantKeys)) {
+    const variantSet = new Set(variantKeys);
+    for (const [domainKey] of variantDomainEntries) {
+      const normalized = String(domainKey || '').trim().toLowerCase();
+      if (!normalized) continue;
+      variantSet.add(normalized);
+      if (Array.isArray(runtimeVariantKeys) && !runtimeVariantKeys.includes(normalized)) {
+        runtimeVariantKeys.push(normalized);
+      }
+    }
+    variantKeys = Array.from(variantSet);
+  }
+
   const runtimeSpecKeys = gatherRuntimeSpecKeys(rawRows);
 
     if (family && extracted && AUTO_ALIAS_LEARN && AUTO_ALIAS_LIMIT) {
@@ -3740,6 +3838,15 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
 
   const baseRows = (rawRows.length ? rawRows : [{}]).map((row) => {
+  if (variantDomainEntries.length) {
+      for (const [domainKey, domainValues] of variantDomainEntries) {
+        if (!Array.isArray(domainValues) || !domainValues.length) continue;
+        const current = obj[domainKey];
+        if (current == null || (typeof current === 'string' && current.trim() === '')) {
+          obj[domainKey] = domainValues;
+        }
+      }
+    }
     const obj = row && typeof row === 'object' ? { ...row } : {};
     if (obj.brand == null) obj.brand = brandName;
     const fallbackSeries = obj.series_code || obj.series || baseSeries || null;
@@ -3764,28 +3871,33 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       explodedRows = expanded;
     }
   }
-  if (docAiRecordsForMerge.length && Array.isArray(explodedRows) && explodedRows.length) {
-    const usedRecords = new Set();
-    const variantForMatch = Array.isArray(variantKeys) ? variantKeys : [];
-    for (const row of explodedRows) {
-      if (!row || typeof row !== 'object') continue;
-      let match = bestRowMatchToSpec(row, docAiRecordsForMerge, usedRecords);
-      if (!match) {
-        match = bestAttributeMatchToSpec(row, docAiRecordsForMerge, variantForMatch);
-      }
-      if (!match && String(family || '').toLowerCase() === 'relay_signal') {
-        match = findCoilRowMatchForRelaySignal(row, docAiRecordsForMerge);
-      }
-      if (match && match.values) {
-        const patch = safeMergeSpec(row, match.values);
-        if (patch && Object.keys(patch).length) {
-          Object.assign(row, patch);
+  if (Array.isArray(explodedRows) && explodedRows.length) {
+    if (docAiRecordsFlat.length || docAiRecordsForMerge.length) {
+      const usedRecords = new Set();
+      const variantForMatch = Array.isArray(variantKeys) ? variantKeys : [];
+      const canonicalRefs = new Set(docAiRecordsForMerge);
+      for (const row of explodedRows) {
+        if (!row || typeof row !== 'object') continue;
+        let match = null;
+        if (docAiRecordsForMerge.length) {
+          match =
+            bestRowMatchToSpec(row, docAiRecordsForMerge, usedRecords) ||
+            bestAttributeMatchToSpec(row, docAiRecordsForMerge, variantForMatch);
         }
-        usedRecords.add(match);
+        if (!match && String(family || '').toLowerCase() === 'relay_signal') {
+          match = findCoilRowMatchForRelaySignal(row, docAiRecordsFlat);
+        }
+        if (match && match.values) {
+          const patch = safeMergeSpec(row, match.values);
+          if (patch && Object.keys(patch).length) {
+            Object.assign(row, patch);
+          }
+          if (canonicalRefs.has(match)) {
+            usedRecords.add(match);
+          }
+        }
       }
     }
-  }
-  if (Array.isArray(explodedRows) && explodedRows.length) {
     try {
       await ensureDynamicColumnsForRows(qualified, explodedRows);
     } catch (err) {

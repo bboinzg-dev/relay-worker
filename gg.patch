@@ -1,57 +1,110 @@
-diff --git a/server.retail.js b/server.retail.js
-index 2c794838fc5e93c0fe04138585d6960bd6dd6b3a..f65588dc433011726f3049cf16937f4f03c9d203 100644
---- a/server.retail.js
-+++ b/server.retail.js
-@@ -50,47 +50,50 @@ router.post('/api/retail/export-catalog', async (req, res) => {
-     await new Promise((resolve, reject) => {
-       pgStream
-         .pipe(toNdjson)
-         .pipe(gcsWrite)
-         .on('finish', resolve)
-         .on('error', reject);
-     });
+diff --git a/server.js b/server.js
+index dfbf29c12f4f5c0dd7a8ce4a962f4eea55b63d50..4129ff0bd18531f3891ac29e484ba57421fa85b2 100644
+--- a/server.js
++++ b/server.js
+@@ -1,57 +1,59 @@
+ /* server.js */
+ 'use strict';
  
-     const [meta] = await gcsFile.getMetadata();
-     res.json({ ok: true, gcsUri: GCS_URI, count, size: meta.size });
-   } catch (e) {
-     console.error('[retail/export] error', e);
-     res.status(500).json({ ok: false, error: e.message });
-   } finally {
-     client.release();
-   }
- });
- 
- /** Start Import (returns operation name) */
- router.post('/api/retail/import-catalog', async (req, res) => {
+ // ───────── 외부콜 차단 플래그 (배포 시 EXT_CALLS_OFF=1 이면 부팅 중 외부 HTTPS 호출 스킵)
+ const EXT_CALLS_OFF = process.env.EXT_CALLS_OFF === '1';
+ const { randomUUID } = require('node:crypto');
+ // ---- run-id safe import (fallback to UUID) ----
+ let generateRunId;
+ try {
+   ({ generateRunId } = require('./src/utils/run-id'));
+ } catch (e) {
+   console.warn('[BOOT] run-id util missing:', e?.message || e);
+ }
+ // ✅ 어떤 상황에서도 안전하게 runId를 생성하는 래퍼 (정의 유무와 무관)
+ function newRunId() {
    try {
-     const [op] = await retail.importProducts({
-       parent: BRANCH,
-       inputConfig: { gcsSource: { inputUris: [GCS_URI] } },
-       reconciliationMode: 'INCREMENTAL',
-+      errorsConfig: {
-+        gcsPrefix: `gs://${BUCKET}/${process.env.RETAIL_ERRORS_PREFIX || 'retail/errors'}`,
-+      },
-     });
-     res.json({ ok: true, operation: op.name, gcsUri: GCS_URI, branch: BRANCH });
-   } catch (e) {
-     console.error('[retail/import] error', e);
-     res.status(500).json({ ok: false, error: e.message });
+     // typeof는 미정의 변수에도 안전
+     // eslint-disable-next-line no-undef
+     return (typeof generateRunId === 'function') ? generateRunId() : randomUUID();
+   } catch {
+     return randomUUID();
    }
+ }
+ // ----------------------------------------------
+ 
++// 배포 환경에서는 프로세스를 죽이지 말고 JSON 에러로 회수
++const FATAL_ON_UNHANDLED = process.env.FATAL_ON_UNHANDLED === '1';
+ process.on('uncaughtException', (e) => {
+-  console.error('[FATAL][uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));
+-  process.exit(1);
++  console.error('[uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));
++  if (FATAL_ON_UNHANDLED) process.exit(1);
+ });
+ process.on('unhandledRejection', (e) => {
+-  console.error('[FATAL][unhandledRejection]', e);
+-  process.exit(1);
++  console.error('[unhandledRejection]', e);
++  if (FATAL_ON_UNHANDLED) process.exit(1);
  });
  
- /** Check Import Status (use ?name=operations/… ) */
- router.get('/api/retail/import-catalog/status', async (req, res) => {
-   try {
-     const name = req.query.name;
-     if (!name) return res.status(400).json({ ok: false, error: 'missing ?name' });
-     const [resp] = await retail.checkImportProductsProgress(String(name));
-     res.json({ ok: true, metadata: resp.metadata, done: resp.done, result: resp.result });
+ // 필수 env 스모크 로그(민감값 제외)
+ (() => {
+   const pick = (k) => (process.env[k] || '').toString();
+   console.log('[BOOT env check]', {
+     GCP_PROJECT_ID: !!pick('GCP_PROJECT_ID'),
+     VERTEX_LOCATION: pick('VERTEX_LOCATION'),
+     DOCAI_PROCESSOR_ID: !!pick('DOCAI_PROCESSOR_ID'),
+     GCS_BUCKET: pick('GCS_BUCKET'),
+     QUEUE_NAME: pick('QUEUE_NAME'),
+     TASKS_LOCATION: pick('TASKS_LOCATION'),
+     GEMINI_MODEL_CLASSIFY: pick('GEMINI_MODEL_CLASSIFY'),
+     GEMINI_MODEL_EXTRACT: pick('GEMINI_MODEL_EXTRACT'),
+     JWT_SECRET: !!pick('JWT_SECRET'),
+   });
+ })();
+ 
+ // --- built-ins (한 번만) ---
+ const path = require('node:path');
+ const fs = require('node:fs');
+ 
+ function tryRequire(paths) {
+   const errors = [];
+   for (const p of paths) {
+@@ -1561,34 +1563,39 @@ async function ensureMarketTables() {
+         }
+         // TODO: notifyWarmup / ensureIngestRunLogs 등 외부콜 루틴이 있다면 여기에서만 실행
+       } catch (e) {
+         console.warn('[BOOT] external init skipped:', e?.message || e);
+       }
+     } else {
+       console.log('[BOOT] EXT_CALLS_OFF=1 → external warmups skipped');
+     }
    } catch (e) {
-     console.error('[retail/status] error', e);
-     res.status(500).json({ ok: false, error: e.message });
+     console.warn('[BOOT] ensure ingest_run_logs failed:', e?.message || e);
    }
+ })();
+ 
+ // ✅ 헬스 라우터는 404보다 "위"에, 맨 마지막에 1번만 마운트
+ try {
+   const healthRouter = require('./server.health');
+   console.log('[BOOT] health resolve =', require.resolve('./server.health'));
+   app.use(healthRouter);
+   console.log('[BOOT] mounted /_healthz, /_env, /api/health (simple=%s)', process.env.HEALTH_SIMPLE);
+ } catch (e) {
+   console.error('[BOOT] health mount failed', e);
+ }
+ 
+ /* ---------------- 404 / error ---------------- */
+ app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));
+-app.use((err, req, res, next) => {
++app.use((err, req, res, _next) => {
+   try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
+-  res.status(500).json({ ok:false, error:'internal error' });
++  try {
++    const msg = (err && (err.message || err.toString())) || 'internal error';
++    if (!res.headersSent) res.status(500).json({ ok: false, error: msg });
++  } catch {
++    if (!res.headersSent) res.status(500).json({ ok: false, error: 'internal error' });
++  }
  });
  
--module.exports = router;
-\ No newline at end of file
-+module.exports = router;
+ // (C) 인라인 헬스 제거(충돌 원인)
+ 
+ /* ---------------- Listen ---------------- */
+ app.listen(PORT, '0.0.0.0', () => console.log(`worker listening on :${PORT}`));

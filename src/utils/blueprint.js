@@ -80,8 +80,7 @@ function ensureFamilyOverrides(blueprint, registryRow) {
   }
 
   if (family === 'relay_signal') {
-    addVariantKeys(['coil_voltage_vdc', 'contact_arrangement', 'contact_form', 'suffix']);
-        // 템플릿은 강제하지 않고 LLM/표에서 추론한 pn_template 사용
+    // 템플릿은 강제하지 않고 LLM/표에서 추론한 pn_template 사용
   }
 
   const variantKeys = Array.from(forcedVariantKeys);
@@ -94,13 +93,19 @@ function ensureFamilyOverrides(blueprint, registryRow) {
     'pn_jp',
     'pn_aliases',
     'ordering_market',
+    'coil_voltage_vdc',
     'coil_voltage_vac',
+    'contact_form',
+    'contact_arrangement',
     'terminal_form',
+    'terminal_shape',
     'contact_rating_text',
     'dielectric_strength_v',
     'operate_time_ms',
     'release_time_ms',
     'coil_resistance_ohm',
+    'operating_function',
+    'packing_style',
     'insulation_resistance_mohm',
     'dim_l_mm',
     'dim_w_mm',

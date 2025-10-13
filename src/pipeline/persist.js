@@ -38,6 +38,11 @@ const { normalizeValueLLM } = require('../utils/ai');
 let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
 
 const STRICT_CODE_RULES = /^(1|true|on)$/i.test(process.env.STRICT_CODE_RULES || '1');
+const MIN_CORE_SPEC_COUNT = (() => {
+  const raw = Number(process.env.MIN_CORE_SPEC_COUNT ?? 2);
+  if (!Number.isFinite(raw) || raw <= 0) return 2;
+  return Math.min(Math.floor(raw), 10);
+})();
 
 function norm(s) {
   return String(s || '')
@@ -792,11 +797,13 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
     } catch (_) {}
   }
 
-  if (!codeCandidate && family === 'relay_signal') {
-    codeCandidate = codeForRelaySignal(spec);
-  }
-
   const docText = String(spec._doc_text || spec.doc_text || '');
+  if (!codeCandidate && family === 'relay_signal') {
+    const fallback = codeForRelaySignal(spec);
+    if (fallback && norm(docText).includes(norm(fallback))) {
+      codeCandidate = fallback;
+    }
+  }
   if (codeCandidate && norm(docText).includes(norm(codeCandidate))) {
     spec.pn = codeCandidate;
     spec.code = codeCandidate;
@@ -823,27 +830,59 @@ function hasCoreSpecValue(value) {
 }
 
 function hasCoreSpec(row, keys = [], candidateKeys = []) {
+  if (!row || typeof row !== 'object') return false;
+  const requiredCount = MIN_CORE_SPEC_COUNT;
   const primary = Array.isArray(keys) ? keys.filter(Boolean) : [];
-  const fallback = Array.isArray(candidateKeys) ? candidateKeys.filter(Boolean) : [];
-  const list = primary.length ? primary : fallback;
-  if (!list.length) {
-    for (const key of Object.keys(row || {})) {
-      const norm = normKey(key);
-      if (!norm || META_KEYS.has(norm)) continue;
-      if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
+  const secondary = Array.isArray(candidateKeys) ? candidateKeys.filter(Boolean) : [];
+  const seen = new Set();
+
+  const testKey = (key) => {
+    if (!key) return false;
+    const norm = normKey(key);
+    if (!norm || seen.has(norm) || META_KEYS.has(norm)) return false;
+    const direct = row[norm];
+    const value = direct !== undefined ? direct : row[key];
+    if (hasCoreSpecValue(value)) {
+      seen.add(norm);
+      return true;
     }
     return false;
+  };
+
+  let count = 0;
+  for (const key of primary) {
+    if (testKey(key)) {
+      count += 1;
+      if (count >= requiredCount) return true;
+    }
   }
-  for (const key of list) {
-    const norm = normKey(key);
-    if (!norm) continue;
-    if (hasCoreSpecValue(row[norm] ?? row[key])) return true;
+
+  if (count < requiredCount) {
+    for (const key of secondary) {
+      if (testKey(key)) {
+        count += 1;
+        if (count >= requiredCount) return true;
+      }
+    }
   }
-  return false;
+
+  if (count < requiredCount && primary.length === 0 && secondary.length === 0) {
+    for (const [rawKey, rawValue] of Object.entries(row)) {
+      const norm = normKey(rawKey);
+      if (!norm || META_KEYS.has(norm) || seen.has(norm)) continue;
+      if (hasCoreSpecValue(rawValue)) {
+        seen.add(norm);
+        count += 1;
+        if (count >= requiredCount) return true;
+      }
+    }
+  }
+
+  return count >= requiredCount;
 }
 
 function isMinimalInsertEnabled() {
-  return String(process.env.ALLOW_MINIMAL_INSERT || '').trim() === '1';
+  return false;
 }
 
 function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
@@ -860,7 +899,17 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   let pn = String(row.pn || row.code || '').trim();
   const allowMinimal = isMinimalInsertEnabled();
   const docType = String(row.doc_type || '').trim().toLowerCase();
-  const allowForOrdering = docType === 'ordering' || Boolean(row.verified_in_doc);
+  let verified = row.verified_in_doc;
+  if (typeof verified === 'string') {
+    verified = verified.trim().toLowerCase() === 'true';
+  } else {
+    verified = Boolean(verified);
+  }
+  row.verified_in_doc = verified;
+  if (!verified) {
+    row.last_error = row.last_error || 'unverified_in_doc';
+    return { ok: false, reason: 'unverified_in_doc' };
+  }
   if (!isValidCode(pn)) {
     const rawPn = String(row.pn || '').trim();
     const rawCode = String(row.code || '').trim();
@@ -902,7 +951,9 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   }
   row.pn = pn;
   if (row.code == null || String(row.code).trim() === '') row.code = pn;
-  if (!hasCoreSpec(row, coreSpecKeys, candidateSpecKeys) && !(allowMinimal || allowForOrdering)) {
+  const hasCore = hasCoreSpec(row, coreSpecKeys, candidateSpecKeys);
+  if (!hasCore) {
+    row.last_error = row.last_error || 'missing_core_spec';
     return { ok: false, reason: 'missing_core_spec' };
   }
   return { ok: true };

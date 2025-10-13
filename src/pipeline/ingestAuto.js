@@ -446,7 +446,16 @@ function expandRowsWithVariants(baseRows, options = {}) {
       values: baseRow,
     };
 
-    const exploded = explodeToRows(explodeBase, { variantKeys, pnTemplate }) || [];
+    const haystackSources = [];
+    const docText = baseRow._doc_text ?? baseRow.doc_text ?? baseRow.text ?? null;
+    if (typeof docText === 'string' && docText.trim()) haystackSources.push(docText);
+    const extraText = baseRow.ordering_text ?? baseRow.ordering_snippet ?? null;
+    if (typeof extraText === 'string' && extraText.trim()) haystackSources.push(extraText);
+    const exploded = explodeToRows(explodeBase, {
+      variantKeys,
+      pnTemplate,
+      haystack: haystackSources,
+    }) || [];
     if (Array.isArray(exploded) && exploded.length) {
       for (const item of exploded) {
         if (!item || typeof item !== 'object') continue;
@@ -2815,7 +2824,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           }
         } catch (_) {}
       }
-      const templateForOrdering = orderingTemplate
+      let templateForOrdering = orderingTemplate
         || orderingOverride?.pnTemplate
         || pnTemplate
         || blueprint?.ingestOptions?.pn_template
@@ -2827,9 +2836,61 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
         series_code: baseSeriesForOrdering,
         values: orderingDomains,
       };
+      let orderingHaystack = '';
+      if (Array.isArray(orderingTextSources) && orderingTextSources.length) {
+        orderingHaystack = orderingTextSources
+          .map((txt) => (typeof txt === 'string' ? txt : String(txt ?? '')))
+          .filter((txt) => txt && txt.trim())
+          .join('\n');
+      }
+
+      const sampleStats = { attempted: 0, accepted: 0 };
+      const sampleLimitRaw = Number(process.env.ORDERING_TEMPLATE_SAMPLE_LIMIT ?? 25);
+      const sampleLimit = Number.isFinite(sampleLimitRaw) && sampleLimitRaw > 0
+        ? Math.min(Math.floor(sampleLimitRaw), 200)
+        : 25;
+      const minHitRateRaw = Number(process.env.ORDERING_TEMPLATE_MIN_HITRATE ?? 0.6);
+      const minHitRate = Number.isFinite(minHitRateRaw)
+        ? Math.min(Math.max(minHitRateRaw, 0), 1)
+        : 0.6;
+
+      if (templateForOrdering) {
+        try {
+          explodeToRows(orderingBase, {
+            variantKeys: orderingKeys,
+            pnTemplate: templateForOrdering,
+            haystack: orderingHaystack,
+            textContainsExact,
+            previewOnly: true,
+            maxTemplateAttempts: sampleLimit,
+            onTemplateRender: ({ accepted }) => {
+              if (sampleStats.attempted >= sampleLimit) return;
+              sampleStats.attempted += 1;
+              if (accepted) sampleStats.accepted += 1;
+            },
+          });
+        } catch (err) {
+          console.warn('[ordering] template preview failed:', err?.message || err);
+        }
+        const attempts = sampleStats.attempted;
+        const hits = sampleStats.accepted;
+        const hitRate = attempts > 0 ? hits / attempts : 0;
+        if (!attempts || hitRate < minHitRate) {
+          console.warn('[ordering] template rejected due to low hit rate', {
+            attempts,
+            hits,
+            hitRate,
+            minHitRate,
+          });
+          templateForOrdering = null;
+        }
+      }
+
       const explodedOrdering = explodeToRows(orderingBase, {
         variantKeys: orderingKeys,
         pnTemplate: templateForOrdering,
+        haystack: orderingHaystack,
+        textContainsExact,
       });
       if (Array.isArray(explodedOrdering) && explodedOrdering.length) {
         const existingCodes = new Set();

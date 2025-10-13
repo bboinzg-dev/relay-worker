@@ -10,8 +10,19 @@ const MODEL_ID   = process.env.GEMINI_MODEL_EXTRACT || 'gemini-2.5-flash';
 
 // 성능/품질 튜닝용 ENV (없으면 기본값 사용)
 const MAX_OUT_TOKENS   = Number(process.env.BLUEPRINT_MAX_TOKENS || 512);     // 응답 토큰 상한
-const TEXT_LIMIT       = Number(process.env.BLUEPRINT_TEXT_LIMIT   || 32000); // 입력 텍스트 바이트/문자 상한(대략)
+const TEXT_LIMIT_RAW   = Number(process.env.BLUEPRINT_TEXT_LIMIT || 60000);
+const TEXT_LIMIT       = Number.isFinite(TEXT_LIMIT_RAW) && TEXT_LIMIT_RAW > 0 ? TEXT_LIMIT_RAW : 60000;
 const MIN_TEXT_FOR_LLM = Number(process.env.BLUEPRINT_MIN_TEXT     || 800);   // 이보다 짧으면 LLM 호출 생략
+const WINDOW_SIZE_RAW  = Number(process.env.BLUEPRINT_WINDOW_SIZE || TEXT_LIMIT);
+const WINDOW_SIZE      = Number.isFinite(WINDOW_SIZE_RAW) && WINDOW_SIZE_RAW > 0
+  ? Math.min(WINDOW_SIZE_RAW, Math.max(2000, TEXT_LIMIT))
+  : Math.min(TEXT_LIMIT, 60000);
+const WINDOW_STRIDE_RAW = Number(process.env.BLUEPRINT_WINDOW_STRIDE || Math.floor(WINDOW_SIZE / 2));
+const WINDOW_STRIDE     = Number.isFinite(WINDOW_STRIDE_RAW) && WINDOW_STRIDE_RAW > 0
+  ? WINDOW_STRIDE_RAW
+  : Math.max(1000, Math.floor(WINDOW_SIZE / 2));
+const WINDOW_MAX_RAW    = Number(process.env.BLUEPRINT_MAX_WINDOWS || 5);
+const WINDOW_MAX        = Number.isFinite(WINDOW_MAX_RAW) && WINDOW_MAX_RAW > 0 ? WINDOW_MAX_RAW : 5;
 
 const vertex = new VertexAI({ project: PROJECT_ID, location: LOCATION });
 
@@ -64,6 +75,74 @@ function coerceValue(val, type) {
   return s || null;
 }
 
+function isEmptyResultValue(value) {
+  if (value == null) return true;
+  if (typeof value === 'string') return value.trim() === '';
+  if (Array.isArray(value)) return value.length === 0;
+  return false;
+}
+
+function pickBetterValue(existing, candidate) {
+  if (isEmptyResultValue(candidate)) return existing;
+  if (isEmptyResultValue(existing)) return candidate;
+  if (Array.isArray(candidate)) {
+    if (!Array.isArray(existing)) return candidate;
+    if (candidate.length > existing.length) return candidate;
+    return existing;
+  }
+  if (Array.isArray(existing)) return existing;
+  if (typeof candidate === 'string' && typeof existing === 'string') {
+    return candidate.length > existing.length ? candidate : existing;
+  }
+  return existing;
+}
+
+function buildTextWindows(fullText) {
+  const text = String(fullText || '');
+  const len = text.length;
+  if (!len) return [];
+  const windowLength = Math.max(1000, Math.min(WINDOW_SIZE, TEXT_LIMIT));
+  if (len <= windowLength) {
+    const segment = text.slice(0, windowLength);
+    return segment ? [segment] : [];
+  }
+
+  const windows = [];
+  const seen = new Set();
+  const addSegment = (segment) => {
+    if (!segment) return;
+    const trimmed = segment.trim();
+    if (!trimmed) return;
+    const key = `${trimmed.slice(0, 512)}:${trimmed.length}`;
+    if (seen.has(key)) return;
+    windows.push(segment);
+    seen.add(key);
+  };
+
+  addSegment(text.slice(0, windowLength));
+  const safeStride = Math.max(1, WINDOW_STRIDE);
+  for (let start = safeStride; start < len - windowLength && windows.length < WINDOW_MAX + 2; start += safeStride) {
+    const end = Math.min(len, start + windowLength);
+    addSegment(text.slice(start, end));
+  }
+  addSegment(text.slice(Math.max(0, len - windowLength)));
+
+  if (windows.length <= WINDOW_MAX) return windows;
+
+  const trimmed = [];
+  if (WINDOW_MAX > 0 && windows.length) trimmed.push(windows[0]);
+  if (WINDOW_MAX > 2) {
+    const middle = windows.slice(1, -1);
+    for (let i = 0; i < middle.length && trimmed.length < WINDOW_MAX - 1; i += 1) {
+      trimmed.push(middle[i]);
+    }
+  }
+  if (WINDOW_MAX > 1 && windows.length > 1) {
+    trimmed.push(windows[windows.length - 1]);
+  }
+  return trimmed.slice(0, WINDOW_MAX);
+}
+
 // --- 메인 ---
 async function extractFields(rawText, code, fieldsJson) {
   const schema = buildSchema(fieldsJson);
@@ -76,13 +155,13 @@ async function extractFields(rawText, code, fieldsJson) {
     return empty;
   }
 
-  // 변경
   const full = String(rawText || '');
-  const win = Math.min(TEXT_LIMIT, full.length);
-  const half = Math.floor(win / 2);
-  const head = full.slice(0, half);
-  const tail = full.slice(Math.max(0, full.length - half));
-  const twoSided = head + '\n---TAIL---\n' + tail;
+  const windows = buildTextWindows(full);
+  if (!windows.length) {
+    const empty = {};
+    for (const k of wantKeys) empty[k] = null;
+    return empty;
+  }
 
   const prompt = [
     `You are an expert extracting exact fields from an electronic component datasheet.`,
@@ -104,44 +183,71 @@ async function extractFields(rawText, code, fieldsJson) {
     },
   });
 
-  const req = {
-    contents: [{
-      role: 'user',
-      parts: [{ text: prompt }, { text: twoSided }]
-    }]
-  };
+  const aggregate = {};
+  for (const key of wantKeys) aggregate[key] = null;
 
+  let best = null;
+  for (const segment of windows) {
+    const req = {
+      contents: [{
+        role: 'user',
+        parts: [{ text: prompt }, { text: segment }]
+      }]
+    };
 
-  let text = '{}';
-  try {
-    const resp = await model.generateContent(req);
-    // SDK 버전에 따라 text()가 있거나 없을 수 있어 둘 다 지원
-    text = (typeof resp?.response?.text === 'function')
-      ? resp.response.text()
-      : (resp?.response?.candidates?.[0]?.content?.parts?.map(p => p?.text || '').join('') || '{}');
-  } catch (e) {
-    // 모델 호출 실패 시 빈 결과
-    const empty = {};
-    for (const k of wantKeys) empty[k] = null;
-    return empty;
-  }
+    let text = '{}';
+    try {
+      const resp = await model.generateContent(req);
+      text = (typeof resp?.response?.text === 'function')
+        ? resp.response.text()
+        : (resp?.response?.candidates?.[0]?.content?.parts?.map((p) => p?.text || '').join('') || '{}');
+    } catch (e) {
+      continue;
+    }
 
-  // 파싱 & 스키마에 맞춰 정돈
-  let parsed = {};
-  try { parsed = safeJsonParse(text) || {}; } catch { parsed = {}; }
+    let parsed = {};
+    try { parsed = safeJsonParse(text) || {}; } catch { parsed = {}; }
 
-  const out = {};
-  for (const { name, type } of schema) {
-    const val = coerceValue(parsed[name], type);
-    if (val == null) { out[name] = null; continue; }
-    if (type === 'text' && typeof val === 'string') {
-      const arr = normalizeList(val);
-      out[name] = arr.length > 1 ? arr : arr[0];
-    } else {
-      out[name] = val;
+    const normalized = {};
+    let filled = 0;
+    for (const { name, type } of schema) {
+      const coerced = coerceValue(parsed[name], type);
+      if (coerced == null) {
+        normalized[name] = null;
+        continue;
+      }
+      if (type === 'text' && typeof coerced === 'string') {
+        const arr = normalizeList(coerced);
+        const value = arr.length > 1 ? arr : arr[0];
+        normalized[name] = value;
+        if (!isEmptyResultValue(value)) filled += 1;
+      } else {
+        normalized[name] = coerced;
+        if (!isEmptyResultValue(coerced)) filled += 1;
+      }
+    }
+
+    for (const key of wantKeys) {
+      aggregate[key] = pickBetterValue(aggregate[key], normalized[key]);
+    }
+
+    if (!best || filled > best.filled) {
+      best = { data: normalized, filled };
     }
   }
-  return out;
+
+  if (!best) {
+    return aggregate;
+  }
+
+  for (const key of wantKeys) {
+    if (isEmptyResultValue(aggregate[key])) {
+      aggregate[key] = best.data[key] ?? null;
+    }
+    if (aggregate[key] == null) aggregate[key] = null;
+  }
+
+  return aggregate;
 }
 
 module.exports = { extractFields };

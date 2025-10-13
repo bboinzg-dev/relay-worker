@@ -1,362 +1,663 @@
-diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
-index 9f03f4033f12cf0c86e4b2244bd100d798336e8c..52038a11d587b12aa11aaf177e165bdbad68d2cb 100644
---- a/src/utils/mpn-exploder.js
-+++ b/src/utils/mpn-exploder.js
-@@ -1,28 +1,29 @@
- 'use strict';
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index b7a4101a0e021cde7e47220a292df409cb157b73..0f802274df7f2b1ca8c39f5c08d93a12f559c866 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -146,50 +146,54 @@ const MERGE_SKIP_KEYS = new Set([
+   'family_slug',
+   'brand',
+   'brand_norm',
+   'pn',
+   'pn_norm',
+   'code',
+   'code_norm',
+   'display_name',
+   'displayname',
+   'image_uri',
+   'datasheet_uri',
+   'cover',
+   'verified_in_doc',
+   'candidates',
+   '_doc_text',
+   'mpn',
+   'mpn_list',
+   'codes',
+   'last_error',
+   'run_id',
+   'job_id',
+   'runid',
+   'jobid',
+ ]);
  
- const LIST_SEP = /[\s,;/|·•]+/;
-+const VOLTAGE_UNIT_RE = /\d\s*(?:V|VAC|VDC)\b/i;
- // 패턴리스 정규화기: 1A/1B/1C/2A/2B/2C/1A1B/2AB 등 조합 처리
- function normalizeContactForm(value) {
-   if (value == null) return null;
-   const raw = Array.isArray(value) ? value[0] : value;
-   if (raw == null) return null;
-   let s = String(raw).normalize('NFKC').toLowerCase();
-   if (!s.trim()) return null;
-   s = s.replace(/[\s\-_/]/g, '');
-   // 동의어 치환
-   s = s
-     .replace(/spstnc/g, '1b')
-     .replace(/spst(no)?/g, '1a')
-     .replace(/dpst(no)?/g, '2a')
-     .replace(/spdt/g, '1c')
-     .replace(/dpdt/g, '2c')
-     .replace(/form/g, '');
-   // (\d+)?[abc]+ 블록들을 누적 카운트
-   let a = 0;
-   let b = 0;
-   let c = 0;
-   const re = /(\d+)?([abc]+)/g;
-   let m;
-   while ((m = re.exec(s)) !== null) {
-     const rawCount = m[1] ? Number.parseInt(m[1], 10) : 1;
-     const n = Number.isFinite(rawCount) && rawCount > 0 ? rawCount : 1;
-@@ -221,50 +222,70 @@ function __applyOps(val, ops = []) {
-       for (const pair of mapPairs) {
-         const [from, to] = pair.split('>');
-         if (!from || to == null) continue;
-         mapping[String(from).trim().toUpperCase()] = String(to).trim();
-       }
-       const key = String(s).trim().toUpperCase();
-       s = mapping[key] ?? s;
-       continue;
++const SPEC_MERGE_OVERRIDES = new Set(['code', 'code_norm', 'pn', 'pn_norm', 'series', 'series_code']);
++const DOC_AI_CODE_HEADER_RE =
++  /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|model|品番|型式|型番|品號|품번|형명|주문\s*번호|order(?:ing)?\s*code)/i;
++
+   const set = new Set();
+   const list = Array.isArray(rows) ? rows : [];
+   for (const row of list) {
+     if (!row || typeof row !== 'object') continue;
+     for (const rawKey of Object.keys(row)) {
+       const trimmed = String(rawKey || '').trim();
+       if (!trimmed) continue;
+       const lower = trimmed.toLowerCase();
+       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
+       set.add(trimmed);
      }
    }
+   return set;
+ }
+ 
+ async function ensureDynamicColumnsForRows(qualifiedTable, rows) {
+   if (!AUTO_ADD_FIELDS || !AUTO_ADD_FIELDS_LIMIT) return;
+   const keys = Array.from(gatherRuntimeSpecKeys(rows)).slice(0, AUTO_ADD_FIELDS_LIMIT);
+   if (!keys.length) return;
+   const sample = {};
+   if (Array.isArray(rows)) {
+     const remaining = new Set(keys);
+     for (const row of rows) {
+       if (!row || typeof row !== 'object') continue;
+       for (const key of keys) {
+@@ -216,50 +220,214 @@ function quoteIdentifier(name) {
+ }
+ 
+ function normalizePnForMerge(value) {
+   const raw = String(value || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+   if (raw.length < 4) return null;
+   return raw;
+ }
+ 
+ function getValueIgnoreCase(row, keyLower) {
+   if (!row || typeof row !== 'object') return undefined;
+   if (Object.prototype.hasOwnProperty.call(row, keyLower)) return row[keyLower];
+   const target = String(keyLower || '').toLowerCase();
+   for (const [k, v] of Object.entries(row)) {
+     if (String(k || '').toLowerCase() === target) return v;
+   }
+   return undefined;
+ }
+ 
+ function isEmptyValue(value) {
+   if (value == null) return true;
+   if (typeof value === 'string') return value.trim() === '';
+   if (Array.isArray(value)) return value.length === 0;
+   return false;
+ }
+ 
++function normalizeDocAiCell(value) {
++  return String(value ?? '')
++    .normalize('NFKC')
++    .replace(/[\u00A0\u2000-\u200B]/g, ' ')
++    .replace(/\s+/g, ' ')
++    .trim();
++}
++
++function flattenDocAiTablesForMerge(tables) {
++  const records = [];
++  const list = Array.isArray(tables) ? tables : [];
++  for (let tableIndex = 0; tableIndex < list.length; tableIndex += 1) {
++    const table = list[tableIndex];
++    if (!table || typeof table !== 'object') continue;
++    const headers = Array.isArray(table.headers) ? table.headers : [];
++    const rows = Array.isArray(table.rows) ? table.rows : [];
++    if (!headers.length || !rows.length) continue;
++    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
++      const row = rows[rowIndex];
++      if (!Array.isArray(row)) continue;
++      const values = {};
++      const headerUsage = new Map();
++      for (let colIndex = 0; colIndex < headers.length; colIndex += 1) {
++        const headerRaw = headers[colIndex];
++        let key = normalizeDocAiCell(headerRaw);
++        if (!key) key = `column_${colIndex}`;
++        const seen = headerUsage.get(key) || 0;
++        headerUsage.set(key, seen + 1);
++        if (seen > 0) {
++          key = `${key}_${seen + 1}`;
++        }
++        const cellValue = normalizeDocAiCell(row[colIndex]);
++        if (!cellValue) continue;
++        values[key] = cellValue;
++      }
++      if (!Object.keys(values).length) continue;
++      records.push({
++        tableIndex,
++        rowIndex,
++        headers: headers.map((h) => normalizeDocAiCell(h)),
++        values,
++      });
++    }
++  }
++  return records;
++}
++
++function normalizeDocAiTokenForMatch(value) {
++  if (value == null) return null;
++  const normalized = String(value)
++    .toUpperCase()
++    .replace(/[^0-9A-Z]/g, '');
++  if (normalized.length < 4) return null;
++  return normalized;
++}
++
++function bestRowMatchToSpec(row, docAiRecords, used = new Set()) {
++  if (!row || typeof row !== 'object') return null;
++  const records = Array.isArray(docAiRecords) ? docAiRecords : [];
++  if (!records.length) return null;
++
++  const codeKeys = [
++    'code',
++    'code_norm',
++    'pn',
++    'pn_norm',
++    'part_no',
++    'part_number',
++    'type_no',
++    'type_number',
++    'type',
++    'typeno',
++    'model',
++    'model_no',
++  ];
++
++  const targetTokens = new Set();
++  const rawTargets = new Set();
++  for (const key of codeKeys) {
++    const value = getValueIgnoreCase(row, key);
++    if (value == null || value === '') continue;
++    const normalized = normalizeDocAiCell(value);
++    if (!normalized) continue;
++    rawTargets.add(normalized.toUpperCase());
++    const token = normalizeDocAiTokenForMatch(normalized);
++    if (token) targetTokens.add(token);
++  }
++
++  if (!targetTokens.size) return null;
++
++  let best = null;
++  for (const record of records) {
++    if (!record || typeof record !== 'object') continue;
++    if (used?.has(record)) continue;
++    const values = record.values || {};
++    const candidateTokens = new Set();
++    const haystackParts = [];
++    let headerBoost = 0;
++    for (const [key, rawValue] of Object.entries(values)) {
++      const value = normalizeDocAiCell(rawValue);
++      if (!value) continue;
++      haystackParts.push(value.toUpperCase());
++      const normToken = normalizeDocAiTokenForMatch(value);
++      if (normToken) candidateTokens.add(normToken);
++      if (DOC_AI_CODE_HEADER_RE.test(String(key || ''))) headerBoost += 1;
++    }
++    if (!candidateTokens.size) continue;
++
++    let exact = 0;
++    let partial = 0;
++    for (const token of targetTokens) {
++      if (candidateTokens.has(token)) {
++        exact += 1;
++        continue;
++      }
++      for (const candidate of candidateTokens) {
++        if (candidate.includes(token) || token.includes(candidate)) {
++          partial += 1;
++          break;
++        }
++      }
++    }
++    if (!exact && !partial) continue;
++
++    let score = exact * 12 + partial * 5 + headerBoost;
++    if (score <= 0 && rawTargets.size) {
++      const haystack = haystackParts.join(' ');
++      for (const raw of rawTargets) {
++        if (haystack.includes(raw)) score += 2;
++      }
++    }
++    if (score <= 0) continue;
++
++    if (!best || score > best.score) {
++      best = { record, score, exact, partial };
++    }
++  }
++
++  if (!best) return null;
++  if (best.exact <= 0 && best.partial <= 0) return null;
++  if (best.exact <= 0 && best.score < 12) return null;
++  return best.record;
++}
++
++function safeMergeSpec(row, source) {
++  if (!row || typeof row !== 'object') return {};
++  if (!source || typeof source !== 'object') return {};
++  const patch = {};
++  for (const [rawKey, rawValue] of Object.entries(source)) {
++    if (rawKey == null) continue;
++    const key = String(rawKey).trim();
++    if (!key) continue;
++    const lower = key.toLowerCase();
++    if (lower.startsWith('_docai')) continue;
++    if (rawValue == null) continue;
++    if (typeof rawValue === 'string' && rawValue.trim() === '') continue;
++    if (MERGE_SKIP_KEYS.has(lower) && !SPEC_MERGE_OVERRIDES.has(lower)) continue;
++    const existing = getValueIgnoreCase(row, lower);
++    if (!isEmptyValue(existing)) continue;
++    patch[key] = rawValue;
++  }
++  return patch;
++}
++
+ function normalizeComparableValueForMerge(value) {
+   if (value == null) return null;
+   if (typeof value === 'number') {
+     if (!Number.isFinite(value)) return null;
+     return Number(value.toFixed(6));
+   }
+   if (typeof value === 'boolean') return value ? 1 : 0;
+   if (value instanceof Date) return value.getTime();
+   if (Array.isArray(value)) {
+     const parts = value
+       .map((item) => normalizeComparableValueForMerge(item))
+       .filter((item) => item != null);
+     return parts.length ? parts.join('|') : null;
+   }
+   const str = String(value).trim();
+   if (!str) return null;
+   const digitsOnly = str.replace(/,/g, '');
+   if (/^-?\d+(?:\.\d+)?$/.test(digitsOnly)) {
+     const num = Number(digitsOnly);
+     if (Number.isFinite(num)) return Number(num.toFixed(6));
+   }
+   return str.toLowerCase().replace(/\s+/g, ' ');
+ }
+ 
+ function valuesConflictForMerge(a, b) {
+@@ -498,50 +666,77 @@ function pickDatasheetUrl(rawUrl, fallbackUrl) {
+   const sanitized = sanitizeDatasheetUrl(rawUrl);
+   if (sanitized) return sanitized;
+   const fallback = typeof fallbackUrl === 'string' ? fallbackUrl.trim() : String(fallbackUrl || '').trim();
+   return fallback || null;
+ }
+ 
+ const RESERVED_SPEC_KEYS = new Set([
+   'id',
+   'created_at',
+   'updated_at',
+   'brand',
+   'brand_norm',
+   'pn',
+   'pn_norm',
+   'code',
+   'series',
+   'image_uri',
+   'datasheet_uri',
+ ]);
+ 
+ const SPEC_KEY_ALIAS_MAP = new Map([
+   ['contact_form', 'contact_arrangement'],
+   ['contactform', 'contact_arrangement'],
+ ]);
+ 
++const TERMINAL_SHAPE_TOKENS = new Set([
++  'S',
++  'SL',
++  'SLF',
++  'SLT',
++  'SF',
++  'SP',
++  'ST',
++  'SV',
++  'SM',
++  'P',
++  'PC',
++  'PD',
++  'PY',
++  'PT',
++  'PR',
++  'T',
++  'TF',
++  'TR',
++  'TL',
++  'TX',
++  'TH',
++  'TM',
++]);
++
++const PACKING_STYLE_TOKENS = new Set(['Z', 'W', 'X', 'Y']);
++
+ function normalizeSpecKeyName(value) {
+   if (value == null) return null;
+   let s = String(value).trim().toLowerCase();
+   if (!s) return null;
+   s = s.replace(/[–—―]/g, '-');
+   s = s.replace(/\s+/g, '_');
+   s = s.replace(/[^0-9a-z_]+/g, '_');
+   s = s.replace(/_+/g, '_');
+   s = s.replace(/^_|_$/g, '');
+   if (!s) return null;
+   if (s.length > 63) s = s.slice(0, 63);
+   if (RESERVED_SPEC_KEYS.has(s)) return null;
    return s;
  }
  
- function renderTemplate(tpl, ctx) {
-   if (!tpl) return '';
-   return String(tpl).replace(/\{\{?([^{}]+)\}\}?/g, (_, expr) => {
-     const [head, ...pipes] = String(expr)
-       .split('|')
-       .map((s) => s.trim());
-     if (!head) return '';
-     const val = __applyOps(ctx[head], pipes);
-     return val == null ? '' : String(val);
-   });
- }
- 
-+function escapeRegex(str) {
-+  return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-+}
-+
-+function templateNeedsPlaceholder(tpl, key) {
-+  if (!tpl || !key) return false;
-+  const pattern = escapeRegex(String(key).trim());
-+  if (!pattern) return false;
-+  const re = new RegExp(`\{\{?\\s*${pattern}(?:\\W|\}|\\|)`, 'i');
-+  return re.test(String(tpl));
-+}
-+
-+function defaultTextContainsExact(text, pn) {
-+  if (!text || !pn) return false;
-+  const pattern = escapeRegex(String(pn).trim());
-+  if (!pattern) return false;
-+  const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
-+  return re.test(String(text));
-+}
-+
- function assignValue(target, key, value) {
-   if (!key) return;
-   target[key] = value;
-   const lower = String(key).toLowerCase();
-   if (lower && lower !== key) target[lower] = value;
- }
- 
- function collectMpnSeeds(base) {
-   const seeds = [];
-   const seen = new Set();
- 
-   const push = (val) => {
-     if (val == null) return;
-     if (Array.isArray(val)) {
-       for (const item of val) push(item);
-       return;
-     }
-     if (typeof val === 'string') {
-       const trimmed = val.trim();
-       if (!trimmed) return;
-       const parts = splitAndCarryPrefix(trimmed);
-       if (parts.length > 1) {
-         for (const part of parts) push(part);
-         return;
+ const ORDERING_SECTION_RE =
+   /(ordering information|ordering info|how to order|order information|ordering code|how-to-order|\b品番\b|\b型番\b|\b型号\b|\b型號\b|주문|형명|형번|품번|注文|订购信息|订购|订購|订货|型号)/i;
+ const CONTACT_LINE_RE = /(contact|arrangement|configuration|form)/i;
+ const COIL_LINE_RE = /(coil|voltage|vdc)/i;
+ const CONSTRUCTION_LINE_RE = /(construction|sealed|flux\s*proof|enclosure)/i;
+ const INSULATION_LINE_RE = /(insulation)/i;
+ const MATERIAL_LINE_RE = /(material)/i;
+ const POWER_LINE_RE = /(coil\s*power|power\s*consumption|power\s*code)/i;
+ const CURRENT_LINE_RE = /(contact\s*current|current\s*\(?type\)?)/i;
+ const COVER_LINE_RE = /\bcover\b/i;
+@@ -1478,69 +1673,170 @@ function expandFromCodeSystem(extracted, bp, docText = '') {
+         code = code.replace(new RegExp(`\\{${k}(:[^}]*)?\\}`, 'g'), (_, fmt) => {
+           if (!fmt) return String(v);
+           const m = fmt.match(/^:0(\d+)d$/);
+           if (m) return String(v).padStart(Number(m[1]), '0');
+           return String(v);
+         });
        }
-@@ -273,146 +294,237 @@ function collectMpnSeeds(base) {
-       seen.add(norm);
-       seeds.push(trimmed);
+       const cleaned = String(code || '').trim();
+       if (!cleaned) return;
+       if (!textContainsExact(haystack, cleaned)) return;
+       if (PN_BLACKLIST_RE.test(cleaned)) return;
+       out.add(cleaned);
        return;
      }
-     const str = String(val);
-     const norm = str.toLowerCase();
-     if (seen.has(norm)) return;
-     seen.add(norm);
-     seeds.push(str);
-   };
- 
-   push(base?.mpn);
-   if (base?.code) push(base.code);
- 
-   const extraKeys = ['mpn', 'part_number', 'part_no', 'code'];
-   const values = base && typeof base.values === 'object' ? base.values : {};
-   for (const key of extraKeys) push(values[key]);
-   return seeds;
- }
- 
- function explodeToRows(base, options = {}) {
-   const variantKeys = Array.isArray(options.variantKeys)
-     ? options.variantKeys.map((k) => String(k || '').trim()).filter(Boolean)
-     : [];
-   const pnTemplate = options.pnTemplate || null;
-+  const haystackInput = options.haystack;
-+  const haystack = Array.isArray(haystackInput)
-+    ? haystackInput.filter((chunk) => typeof chunk === 'string' && chunk.trim()).join('\n')
-+    : typeof haystackInput === 'string'
-+      ? haystackInput
-+      : '';
-+  const textContainsExactFn =
-+    typeof options.textContainsExact === 'function' ? options.textContainsExact : defaultTextContainsExact;
-+  const previewOnly = Boolean(options.previewOnly);
-+  const maxTemplateAttemptsRaw = Number(options.maxTemplateAttempts);
-+  const maxTemplateAttempts = Number.isFinite(maxTemplateAttemptsRaw) && maxTemplateAttemptsRaw > 0
-+    ? Math.floor(maxTemplateAttemptsRaw)
-+    : null;
-+  const onTemplateRender = typeof options.onTemplateRender === 'function' ? options.onTemplateRender : null;
- 
-   const values = {};
-   if (base && typeof base.values === 'object') {
-     for (const [rawKey, rawValue] of Object.entries(base.values)) {
-       const key = String(rawKey || '').trim();
-       if (!key) continue;
-       assignValue(values, key, rawValue);
+     const k = keys[i];
+     const list = Array.isArray(vars[k]) ? vars[k] : [];
+     for (const v of list) {
+       if (out.size >= MAX_EXPANSION) break;
+       dfs(i + 1, { ...ctx, [k]: v });
      }
    }
-   if (base?.series && values.series == null) assignValue(values, 'series', base.series);
-   if (base?.series_code && values.series_code == null) assignValue(values, 'series_code', base.series_code);
- 
-   const lists = variantKeys.map((key) => {
-     const fromExact = values[key];
-     if (fromExact != null) {
-       const normed = normalizeList(fromExact);
-       return normed.length ? normed : [fromExact];
-     }
-     const lower = key.toLowerCase();
-     if (values[lower] != null) {
-       const normed = normalizeList(values[lower]);
-       return normed.length ? normed : [values[lower]];
-     }
-     return [null];
-   });
- 
-   const combos = lists.length ? cartesian(lists) : [[]];
-   const mpnCandidates = collectMpnSeeds(base);
- 
-   const rows = [];
--  combos.forEach((combo, idx) => {
-+  let templateAttempts = 0;
-+  for (let idx = 0; idx < combos.length; idx += 1) {
-+    if (maxTemplateAttempts && templateAttempts >= maxTemplateAttempts) break;
-+    const combo = combos[idx];
-     const rowValues = { ...values };
-     variantKeys.forEach((key, keyIdx) => {
-       const val = combo[keyIdx];
-       if (val == null || val === '') return;
-       assignValue(rowValues, key, val);
-     });
- 
-     const normalizedSeries = normalizeSeriesCode(
-       rowValues.series_code
-         ?? rowValues.series
-         ?? base?.series_code
-         ?? base?.series
-         ?? null,
-     );
-     if (normalizedSeries) {
-       assignValue(rowValues, 'series_code', normalizedSeries);
-       if (rowValues.series == null) assignValue(rowValues, 'series', normalizedSeries);
-     }
- 
-     const normalizedContactForm = normalizeContactForm(
-       rowValues.contact_form
-         ?? rowValues.contact_arrangement
-         ?? rowValues.form
-         ?? null,
-     );
-     if (normalizedContactForm) assignValue(rowValues, 'contact_form', normalizedContactForm);
-     else {
-       delete rowValues.contact_form;
-       delete rowValues.contactform;
-     }
- 
-     assignValue(rowValues, 'coil_voltage_text', rowValues.coil_voltage_vdc);
--    const normalizedCoilVoltage = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
--    if (normalizedCoilVoltage) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltage);
-+    const normalizedCoilVoltageVdc = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
-+    if (normalizedCoilVoltageVdc) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltageVdc);
-     else {
-       delete rowValues.coil_voltage_vdc;
-       delete rowValues.coil_voltagevdc;
-     }
- 
--    const canUseTemplate = pnTemplate && normalizedSeries;
-+    const normalizedCoilVoltageVac = normalizeCoilVoltage(rowValues.coil_voltage_vac);
-+    if (normalizedCoilVoltageVac) assignValue(rowValues, 'coil_voltage_vac', normalizedCoilVoltageVac);
-+    else {
-+      delete rowValues.coil_voltage_vac;
-+      delete rowValues.coil_voltagevac;
-+    }
-+
-+    const needsCoil = pnTemplate
-+      && (templateNeedsPlaceholder(pnTemplate, 'coil_voltage_vdc')
-+        || templateNeedsPlaceholder(pnTemplate, 'coil_voltage_vac'));
-+    const needsContact = pnTemplate && templateNeedsPlaceholder(pnTemplate, 'contact_form');
-+    const needsTerm = pnTemplate && templateNeedsPlaceholder(pnTemplate, 'terminal_shape');
-+    const needsOp = pnTemplate && templateNeedsPlaceholder(pnTemplate, 'operating_function');
-+    const needsPack = pnTemplate && templateNeedsPlaceholder(pnTemplate, 'packing_style');
-+
-+    const hasCoil = Boolean(
-+      normalizeCoilVoltage(rowValues.coil_voltage_vdc ?? rowValues.coil_voltage_vac),
-+    );
-+    const hasContact = Boolean(rowValues.contact_form ?? rowValues.contactform);
-+    const hasTerm = Boolean(
-+      rowValues.terminal_shape
-+        ?? rowValues.terminalshape
-+        ?? rowValues.terminal_form
-+        ?? rowValues.terminalform,
-+    );
-+    const hasOp = Boolean(rowValues.operating_function ?? rowValues.operatingfunction);
-+    const hasPack = Boolean(rowValues.packing_style ?? rowValues.packingstyle);
- 
-     let generatedByTemplate = false;
-     let code = null;
-+    let attempted = false;
- 
--    if (pnTemplate && canUseTemplate) {
--      code = renderTemplate(pnTemplate, {
-+    if (pnTemplate) {
-+      if (!normalizedSeries) continue;
-+      if (needsCoil && !hasCoil) continue;
-+      if (needsContact && !hasContact) continue;
-+      if (needsTerm && !hasTerm) continue;
-+      if (needsOp && !hasOp) continue;
-+      if (needsPack && !hasPack) continue;
-+
-+      const context = {
-         ...rowValues,
-         series: normalizedSeries,
-         series_code: normalizedSeries,
-         contact_form: normalizedContactForm,
--        coil_voltage_vdc: normalizedCoilVoltage,
--      });
-+        coil_voltage_vdc: normalizedCoilVoltageVdc,
-+        coil_voltage_vac: normalizedCoilVoltageVac,
-+      };
-+
-+      const rendered = renderTemplate(pnTemplate, context);
-+      attempted = true;
-+      templateAttempts += 1;
-+      const renderedCode = typeof rendered === 'string' ? rendered.trim() : String(rendered || '').trim();
-+      if (!renderedCode) {
-+        if (onTemplateRender) onTemplateRender({ accepted: false, reason: 'empty_render', context });
-+        continue;
-+      }
-+      if (needsCoil && !VOLTAGE_UNIT_RE.test(renderedCode)) {
-+        if (onTemplateRender) {
-+          onTemplateRender({
-+            accepted: false,
-+            reason: 'missing_voltage_unit',
-+            candidate: renderedCode,
-+            context,
-+          });
-+        }
-+        continue;
-+      }
-+      if (haystack && !textContainsExactFn(haystack, renderedCode)) {
-+        if (onTemplateRender) {
-+          onTemplateRender({
-+            accepted: false,
-+            reason: 'missing_doc_evidence',
-+            candidate: renderedCode,
-+            context,
-+          });
-+        }
-+        continue;
-+      }
-+      code = renderedCode;
-       generatedByTemplate = true;
-+      if (onTemplateRender) {
-+        onTemplateRender({ accepted: true, candidate: renderedCode, context });
-+      }
-     } else if (mpnCandidates[idx]) {
-       code = mpnCandidates[idx];
-     } else if (mpnCandidates.length) {
-       code = mpnCandidates[0];
-     } else {
-       // 템플릿/표 후보가 없으면 "임의 PN"을 만들지 않는다 (가짜 PN 차단)
--      return;
-+      continue;
-     }
- 
-     code = String(code || '').trim();
--    if (!code) return;
-+    if (!code) continue;
- 
--    if (generatedByTemplate && !isLikelyPn(code)) return;
-+    if (generatedByTemplate && !isLikelyPn(code)) continue;
- 
-     const codeNorm = code.toLowerCase();
--    if (rows.some((r) => r.code_norm === codeNorm)) return;
-+    if (rows.some((r) => r.code_norm === codeNorm)) continue;
- 
--    rows.push({
--      code,
--      code_norm: codeNorm,
--      values: rowValues,
--    });
--  });
-+    if (!previewOnly) {
-+      rows.push({
-+        code,
-+        code_norm: codeNorm,
-+        values: rowValues,
-+      });
-+    }
-+
-+    if (maxTemplateAttempts && attempted && templateAttempts >= maxTemplateAttempts) break;
-+  }
- 
-   return rows;
+   dfs(0, {});
+   return Array.from(out).slice(0, MAX_EXPANSION);
  }
  
- module.exports = {
-   LIST_SEP,
-   NON_MPN_WORDS,
-   splitAndCarryPrefix,
-   normalizeList,
-   cartesian,
-   renderTemplate,
-   explodeToRows,
-   normalizeContactForm,
- };
-\ No newline at end of file
++function splitCodeSegments(code) {
++  return String(code || '')
++    .toUpperCase()
++    .split(/[-_/\\\s]+/)
++    .map((segment) => segment.trim())
++    .filter((segment) => segment.length > 0);
++}
++
++function detectTerminalShapeFromCode(code) {
++  const segments = splitCodeSegments(code);
++  for (const segment of segments) {
++    if (!/^[A-Z]{1,4}$/.test(segment)) continue;
++    if (TERMINAL_SHAPE_TOKENS.has(segment)) return segment;
++    for (const token of TERMINAL_SHAPE_TOKENS) {
++      if (segment.startsWith(token) && segment.length <= token.length + 1) return token;
++    }
++  }
++  const normalized = String(code || '').toUpperCase();
++  const match = normalized.match(/(?:-|\\)([A-Z]{1,3})(?=\d{0,3}(?:$|[^A-Z0-9]))/);
++  if (match && TERMINAL_SHAPE_TOKENS.has(match[1])) return match[1];
++  return null;
++}
++
++function detectPackingStyleFromCode(code) {
++  const normalized = String(code || '').toUpperCase();
++  const direct = normalized.match(/(?:-|\\)([ZWXY])(?=[^A-Z0-9]|$)/);
++  if (direct && PACKING_STYLE_TOKENS.has(direct[1])) return direct[1];
++  const segments = splitCodeSegments(code);
++  for (const segment of segments) {
++    if (segment.length === 1 && PACKING_STYLE_TOKENS.has(segment)) return segment;
++    if (/^[0-9]*[ZWXY]$/.test(segment)) return segment.slice(-1);
++  }
++  const lastChar = normalized.replace(/[^A-Z0-9]+$/g, '').slice(-1);
++  if (PACKING_STYLE_TOKENS.has(lastChar)) return lastChar;
++  return null;
++}
++
++function detectOperatingFunctionFromCode(code) {
++  const segments = splitCodeSegments(code);
++  for (const segment of segments) {
++    if (/^L2[A-Z0-9]*$/.test(segment)) return 'dual_coil_latching';
++  }
++  for (const segment of segments) {
++    if (/^L[A-Z0-9]*$/.test(segment) && segment.length <= 3) return 'latching';
++  }
++  for (const segment of segments) {
++    if (/^D[A-Z0-9]*$/.test(segment) && segment.length <= 3) return 'dual_coil';
++  }
++  return null;
++}
++
++function applyDefaultCodeHeuristics(code, out, colTypes) {
++  if (!code || !out || typeof out !== 'object') return;
++  if (!(colTypes instanceof Map)) return;
++  const normalized = String(code || '').toUpperCase();
++
++  const terminalShape = detectTerminalShapeFromCode(code);
++  if (
++    terminalShape &&
++    colTypes.has('terminal_shape') &&
++    (out.terminal_shape == null || out.terminal_shape === '')
++  ) {
++    out.terminal_shape = terminalShape;
++  }
++
++  const packingStyle = detectPackingStyleFromCode(code);
++  if (
++    packingStyle &&
++    colTypes.has('packing_style') &&
++    (out.packing_style == null || out.packing_style === '')
++  ) {
++    out.packing_style = packingStyle;
++  }
++
++  const operating = detectOperatingFunctionFromCode(code);
++  if (
++    operating &&
++    colTypes.has('operating_function') &&
++    (out.operating_function == null || out.operating_function === '')
++  ) {
++    out.operating_function = operating;
++  }
++  if (operating && /latching/i.test(operating)) {
++    if (colTypes.has('is_latching') && (out.is_latching == null || out.is_latching === '')) {
++      out.is_latching = true;
++    }
++  }
++
++  const mbbDetected = /(^|[^A-Z0-9])MBB([^A-Z0-9]|$)/.test(normalized);
++  if (mbbDetected) {
++    if (colTypes.has('mbb') && (out.mbb == null || out.mbb === '')) {
++      out.mbb = true;
++    }
++    if (colTypes.has('is_mbb') && (out.is_mbb == null || out.is_mbb === '')) {
++      out.is_mbb = true;
++    }
++  }
++}
++
+ function applyCodeRules(code, out, rules, colTypes) {
+-  if (!Array.isArray(rules)) return;
++  const columnTypes = colTypes instanceof Map ? colTypes : new Map();
++  const ruleList = Array.isArray(rules) ? rules : [];
+   const src = String(code || '');
+-  for (const r of rules) {
++  for (const r of ruleList) {
+     const re = new RegExp(r.pattern, r.flags || 'i');
+     const m = src.match(re);
+     if (!m) continue;
+     for (const [col, spec] of Object.entries(r.set || {})) {
+-      if (!colTypes.has(col)) continue;
++      if (!columnTypes.has(col)) continue;
+       let v;
+       const gname = spec.from || '1';
+       v = (m.groups && m.groups[gname]) || m[gname] || m[1] || null;
+       if (v == null) continue;
+       if (spec.map) v = spec.map[v] ?? v;
+       if (spec.numeric) v = coerceNumeric(v);
+       if (v == null || v === '') continue;
+       out[col] = v;
+     }
+   }
++  applyDefaultCodeHeuristics(code, out, columnTypes);
+ }
+ 
+ 
+ // DB 함수로 스키마 보장 (ensure_specs_table)
+ async function ensureSpecsTableByFamily(family, qualified){
+   if (!family) return;
+   try {
+     await db.query(`SELECT public.ensure_specs_table($1)`, [family]);
+     return;
+   } catch (err) {
+     console.warn('[schema] ensure_specs_table failed:', err?.message || err);
+     if (qualified) {
+       try {
+         await ensureSpecsTable(qualified);
+         return;
+       } catch (fallbackErr) {
+         console.warn('[schema] local ensureSpecsTable fallback failed:', fallbackErr?.message || fallbackErr);
+       }
+     }
+     throw err;
+   }
+ }
+ 
+ async function ensureBlueprintVariantColumns(family) {
+   await db.query(`SELECT public.ensure_blueprint_variant_columns($1)`, [family]);
+@@ -2169,74 +2465,118 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+           // 스캔/이미지형 PDF 등 텍스트가 없으면 정밀 추출을 1회만 하드캡으로 시도
+           const pdfExtract = await withTimeout(
+             extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
+             EXTRACT_HARD_CAP_MS,
+             'extract',
+           );
+           mergeExtracted(pdfExtract);
+         }
+       } else {
+         const pdfExtract = await withTimeout(
+           extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family, brandHint }),
+           EXTRACT_HARD_CAP_MS,
+           'extract',
+         );
+         mergeExtracted(pdfExtract);
+       }
+     } catch (e) { console.warn('[extract timeout/fail]', e?.message || e); }
+   }
+ 
+   if (docAiText) {
+     const existing = typeof extracted.text === 'string' ? extracted.text : '';
+     if (!existing || docAiText.length > existing.length) {
+       extracted.text = docAiText;
+     }
+   }
+-  if (docAiTables.length) {
+-    if (!extracted.tables.length) {
+-      extracted.tables = docAiTables;
++  if (docAiTables.length && !extracted.tables.length) {
++    extracted.tables = docAiTables;
++  }
++
++  const docAiRecordsForMerge = flattenDocAiTablesForMerge(docAiTables);
++  const vertexSpecValues = (() => {
++    if (!vertexExtractValues || typeof vertexExtractValues !== 'object') return null;
++    const filtered = {};
++    for (const [rawKey, rawValue] of Object.entries(vertexExtractValues)) {
++      const key = String(rawKey || '').trim();
++      if (!key) continue;
++      if (rawValue == null) continue;
++      if (typeof rawValue === 'string' && rawValue.trim() === '') continue;
++      filtered[key] = rawValue;
++    }
++    return Object.keys(filtered).length ? filtered : null;
++  })();
++
++  ensureExtractedShape(extracted);
++
++  const usedDocAiRecords = new Set();
++  if (!Array.isArray(extracted.rows)) extracted.rows = [];
++
++  if (!extracted.rows.length && docAiRecordsForMerge.length) {
++    for (const record of docAiRecordsForMerge) {
++      if (!record || typeof record !== 'object') continue;
++      const values = record.values || {};
++      if (!values || typeof values !== 'object' || !Object.keys(values).length) continue;
++      extracted.rows.push({ ...values });
++      usedDocAiRecords.add(record);
+     }
+   }
+-  if (vertexExtractValues && typeof vertexExtractValues === 'object') {
+-    const entries = Object.entries(vertexExtractValues);
+-    if (entries.length) {
+-      if (!extracted.rows.length) {
+-        extracted.rows = [{ ...vertexExtractValues }];
+-      } else {
+-        for (const row of extracted.rows) {
+-          if (!row || typeof row !== 'object') continue;
+-          for (const [rawKey, rawValue] of entries) {
+-            const key = String(rawKey || '').trim();
+-            if (!key) continue;
+-            if (row[key] == null || row[key] === '') {
+-              row[key] = rawValue;
+-            }
+-          }
++
++  if (!extracted.rows.length && vertexSpecValues) {
++    extracted.rows.push({ ...vertexSpecValues });
++  }
++
++  if (Array.isArray(extracted.rows) && extracted.rows.length) {
++    for (const row of extracted.rows) {
++      if (!row || typeof row !== 'object') continue;
++      const docMatch = bestRowMatchToSpec(row, docAiRecordsForMerge, usedDocAiRecords);
++      if (docMatch && docMatch.values) {
++        const patch = safeMergeSpec(row, docMatch.values);
++        if (patch && Object.keys(patch).length) {
++          Object.assign(row, patch);
++        }
++        usedDocAiRecords.add(docMatch);
++      }
++      if (vertexSpecValues) {
++        const patch = safeMergeSpec(row, vertexSpecValues);
++        if (patch && Object.keys(patch).length) {
++          Object.assign(row, patch);
+         }
+       }
+     }
+   }
++
++  if (docAiRecordsForMerge.length && Array.isArray(extracted.rows)) {
++    for (const record of docAiRecordsForMerge) {
++      if (!record || typeof record !== 'object') continue;
++      if (usedDocAiRecords.has(record)) continue;
++      const patch = safeMergeSpec({}, record.values || {});
++      if (patch && Object.keys(patch).length) {
++        extracted.rows.push(patch);
++      }
++    }
++  }
++
+   ensureExtractedShape(extracted);
+   const mergeSkuCandidates = (...sources) => {
+     const skuMap = new Map();
+     const pushSku = (value) => {
+       if (value == null) return;
+       const raw = typeof value === 'string' ? value : String(value);
+       const trimmed = raw.trim();
+       if (!trimmed) return;
+       if (trimmed === '[object Object]') return;
+       const norm = normalizeCode(trimmed);
+       if (!norm) return;
+       if (!skuMap.has(norm)) skuMap.set(norm, trimmed);
+     };
+     for (const list of sources) {
+       if (!Array.isArray(list)) continue;
+       for (const item of list) pushSku(item);
+     }
+     return Array.from(skuMap.values()).slice(0, 200);
+   };
+   const docTextForSku = typeof extracted?.text === 'string' && extracted.text
+     ? extracted.text
+     : (previewText || '');
+   const skuFromTables = pickSkuListFromTables(extracted);
+   const skuFromSystem = expandFromCodeSystem(extracted, blueprint, docTextForSku);
+   const skuFromText = harvestMpnCandidates(docTextForSku, extracted?.series);

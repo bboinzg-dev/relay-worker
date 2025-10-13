@@ -3855,7 +3855,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         }
       }
 
-      await ensureDynamicColumnsForRows(qualified, records);
+      await ensureDynamicColumnsForRows(qualified, schemaEnsureRows);
       try {
         persistResult = await saveExtractedSpecs(qualified, family, records, {
           brand: brandOverride,

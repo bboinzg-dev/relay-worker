@@ -385,10 +385,9 @@ function explodeToRows(base, options = {}) {
     } else if (mpnCandidates.length) {
       code = mpnCandidates[0];
     } else {
+    if (!normalizedSeries) return;
       const parts = [];
-      if (normalizedSeries) parts.push(normalizedSeries);
-      else if (base?.series) parts.push(base.series);
-      else if (base?.series_code) parts.push(base.series_code);
+      parts.push(normalizedSeries);
       const suffix = variantKeys
         .map((key) => rowValues[key] ?? rowValues[key?.toLowerCase()])
         .filter((v) => v != null && v !== '')

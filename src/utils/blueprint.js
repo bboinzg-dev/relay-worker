@@ -81,7 +81,7 @@ function ensureFamilyOverrides(blueprint, registryRow) {
 
   if (family === 'relay_signal') {
     addVariantKeys(['coil_voltage_vdc', 'contact_arrangement', 'contact_form', 'suffix']);
-    ensureTemplate('{{series}}{{contact_arrangement|upper|alnum}}{{coil_voltage_vdc|digits|pad=2}}{{suffix|upper}}');
+        // 템플릿은 강제하지 않고 LLM/표에서 추론한 pn_template 사용
   }
 
   const variantKeys = Array.from(forcedVariantKeys);

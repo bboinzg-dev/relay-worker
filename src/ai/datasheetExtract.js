@@ -1212,7 +1212,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     for (const generated of generatedRows) {
       if (!generated || typeof generated !== 'object') continue;
       const rawCode = generated.code;
-      const codeStr = String(rawCode || '').trim();
+      const codeStr = String(rawCode ?? '').trim();
       if (!codeStr) continue;
       // 표 예시/템플릿으로 만든 pnRegex가 있으면 반드시 가드
       if (pnRegex && !pnRegex.test(codeStr)) continue;

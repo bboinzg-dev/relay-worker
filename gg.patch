@@ -1,57 +1,92 @@
-diff --git a/src/utils/blueprint.js b/src/utils/blueprint.js
-index 3ad9a3971603b3d26a6fc1bb9b802faf13dfbca0..1f7390d006ed7d3dcc425d25b4b8740c21a302f4 100644
---- a/src/utils/blueprint.js
-+++ b/src/utils/blueprint.js
-@@ -59,51 +59,51 @@ function ensureFamilyOverrides(blueprint, registryRow) {
+diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
+index 9b3176085adbb2b9ea1f73f6ca1a82d92c0db40d..9f03f4033f12cf0c86e4b2244bd100d798336e8c 100644
+--- a/src/utils/mpn-exploder.js
++++ b/src/utils/mpn-exploder.js
+@@ -346,83 +346,73 @@ function explodeToRows(base, options = {}) {
      }
-   };
  
-   const ensureTemplate = (template) => {
-     if (!template) return;
-     if (!ingestOptions.pn_template && !ingestOptions.pnTemplate) {
-       ingestOptions.pn_template = template;
-       ingestOptions.pnTemplate = template;
-       return;
+     const normalizedContactForm = normalizeContactForm(
+       rowValues.contact_form
+         ?? rowValues.contact_arrangement
+         ?? rowValues.form
+         ?? null,
+     );
+     if (normalizedContactForm) assignValue(rowValues, 'contact_form', normalizedContactForm);
+     else {
+       delete rowValues.contact_form;
+       delete rowValues.contactform;
      }
-     if (!ingestOptions.pn_template && ingestOptions.pnTemplate) {
-       ingestOptions.pn_template = ingestOptions.pnTemplate;
+ 
+     assignValue(rowValues, 'coil_voltage_text', rowValues.coil_voltage_vdc);
+     const normalizedCoilVoltage = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
+     if (normalizedCoilVoltage) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltage);
+     else {
+       delete rowValues.coil_voltage_vdc;
+       delete rowValues.coil_voltagevdc;
      }
-     if (!ingestOptions.pnTemplate && ingestOptions.pn_template) {
-       ingestOptions.pnTemplate = ingestOptions.pn_template;
+ 
+     const canUseTemplate = pnTemplate && normalizedSeries;
+ 
+     let generatedByTemplate = false;
+-    let generatedByFallback = false;
+     let code = null;
+ 
+     if (pnTemplate && canUseTemplate) {
+       code = renderTemplate(pnTemplate, {
+         ...rowValues,
+         series: normalizedSeries,
+         series_code: normalizedSeries,
+         contact_form: normalizedContactForm,
+         coil_voltage_vdc: normalizedCoilVoltage,
+       });
+       generatedByTemplate = true;
+     } else if (mpnCandidates[idx]) {
+       code = mpnCandidates[idx];
+     } else if (mpnCandidates.length) {
+       code = mpnCandidates[0];
+     } else {
+-    if (!normalizedSeries) return;
+-      const parts = [];
+-      parts.push(normalizedSeries);
+-      const suffix = variantKeys
+-        .map((key) => rowValues[key] ?? rowValues[key?.toLowerCase()])
+-        .filter((v) => v != null && v !== '')
+-        .map((v) => String(v))
+-        .join('');
+-      if (suffix) parts.push(suffix);
+-      code = parts.join('');
+-      generatedByFallback = true;
++      // 템플릿/표 후보가 없으면 "임의 PN"을 만들지 않는다 (가짜 PN 차단)
++      return;
      }
-   };
  
-   if (family === 'relay_power') {
-     addVariantKeys(['coil_voltage_vdc', 'contact_form', 'suffix']);
-     ensureTemplate('{{series_code}}{{contact_form}}{{coil_voltage_vdc|pad=2}}{{suffix}}');
-   }
+     code = String(code || '').trim();
+     if (!code) return;
  
-   if (family === 'relay_signal') {
-     addVariantKeys(['coil_voltage_vdc', 'contact_arrangement', 'contact_form', 'suffix']);
--    ensureTemplate('{{series}}{{contact_arrangement|upper|alnum}}{{coil_voltage_vdc|digits|pad=2}}{{suffix|upper}}');
-+    // 템플릿은 강제하지 않고 LLM/표에서 추론한 pn_template 사용
-   }
+-    if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
++    if (generatedByTemplate && !isLikelyPn(code)) return;
  
-   const variantKeys = Array.from(forcedVariantKeys);
-   blueprint.variant_keys = variantKeys;
-   ingestOptions.variant_keys = variantKeys;
-   blueprint.ingestOptions = ingestOptions;
+     const codeNorm = code.toLowerCase();
+     if (rows.some((r) => r.code_norm === codeNorm)) return;
  
-   const allowed = Array.isArray(blueprint.allowedKeys) ? blueprint.allowedKeys : [];
-   const generic = [
-     'pn_jp',
-     'pn_aliases',
-     'ordering_market',
-     'coil_voltage_vac',
-     'terminal_form',
-     'contact_rating_text',
-     'dielectric_strength_v',
-     'operate_time_ms',
-     'release_time_ms',
-     'coil_resistance_ohm',
-     'insulation_resistance_mohm',
-     'dim_l_mm',
-     'dim_w_mm',
-     'dim_h_mm',
-   ];
-   blueprint.allowedKeys = Array.from(new Set([...allowed, ...variantKeys, ...generic]));
+     rows.push({
+       code,
+       code_norm: codeNorm,
+       values: rowValues,
+     });
+   });
+ 
+   return rows;
+ }
+ 
+ module.exports = {
+   LIST_SEP,
+   NON_MPN_WORDS,
+   splitAndCarryPrefix,
+   normalizeList,
+   cartesian,
+   renderTemplate,
+   explodeToRows,
+   normalizeContactForm,
+ };
+\ No newline at end of file

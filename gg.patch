@@ -1,90 +1,34 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index b073ba344e0bf0679321ef1bb034492dec905624..d238e87294f5ace0840e0d34ec16ec993498011c 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -1038,50 +1038,85 @@ function coerceColumnValue(column, value, columnTypes, record, rawJson, warningS
- async function ensureSchemaGuards(familySlug, targetTable) {
-   if (!familySlug) return { ok: true };
-   try {
-     await pool.query('SELECT public.ensure_specs_table($1)', [familySlug]);
-   } catch (err) {
-     console.warn('[schema] ensure_specs_table failed (persist):', err?.message || err);
-     if (targetTable) {
-       try {
-         await ensureSpecsTable(targetTable);
-       } catch (fallbackErr) {
-         return { ok: false, reason: 'schema_not_ready', detail: fallbackErr?.message || String(fallbackErr) };
-       }
-     } else {
-       return { ok: false, reason: 'schema_not_ready', detail: err?.message || String(err) };
-     }
-   }
-   try {
-     await pool.query('SELECT public.ensure_blueprint_variant_columns($1)', [familySlug]);
-   } catch (err) {
-     return { ok: false, reason: 'schema_not_ready', detail: err?.message || String(err) };
-   }
-   return { ok: true };
+diff --git a/src/utils/ordering-sections.js b/src/utils/ordering-sections.js
+index cf377d49c8e4125872c022d1b4bd7db4839c58e0..eec60c797ba5d389a41cff69c5a2453ceec2c6af 100644
+--- a/src/utils/ordering-sections.js
++++ b/src/utils/ordering-sections.js
+@@ -1,28 +1,28 @@
+ 'use strict';
+ 
+-const ORDERING_ANCHOR_RE = /(ORDER(?:ING)?\s+(INFO|INFORMATION|GUIDE|CODE|NUMBER)|HOW\s+TO\s+ORDER|주문\s*정보|주문\s*코드|订购信息|订货信息)/i;
++const ORDERING_ANCHOR_RE = /(ORDER(?:ING)?\s+(INFO|INFORMATION|GUIDE|CODE|NUMBER)|HOW\s+TO\s+ORDER|주문\s*정보|주문\s*코드|订购信息|订货信息|PART\s*(?:NO\.?|NUMBER)|品番|型番|품번)/i;
+ const ORDERING_CANDIDATE_RE = /[A-Z][A-Z0-9](?:[A-Z0-9\-\.]{1,18})/g;
+ const ORDERING_BLACKLIST_RE = /^(ISO|ROHS|UL|VDC|VAC|A|MA|MM|Ω|OHM|PDF|PAGE|NOTE|DATE|LOT|WWW|HTTP|HTTPS)$/i;
+ 
+ function normalizeCode(str) {
+   return String(str || '')
+     .replace(/[–—]/g, '-')
+     .replace(/\s+/g, '')
+     .replace(/-+/g, '-')
+     .toUpperCase();
  }
  
- async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = {}) {
-+  if (targetTable && typeof targetTable === 'object' && !Array.isArray(targetTable)) {
-+    const params = targetTable;
-+    const actualTable =
-+      params.qualifiedTable ||
-+      params.qualified ||
-+      params.table ||
-+      params.targetTable ||
-+      null;
-+    const actualRows = Array.isArray(params.records)
-+      ? params.records
-+      : Array.isArray(params.rows)
-+        ? params.rows
-+        : rows;
-+    const actualFamily =
-+      params.family ||
-+      params.familySlug ||
-+      params.family_slug ||
-+      familySlug ||
-+      null;
-+    const nextOptions = { ...params };
-+    delete nextOptions.qualifiedTable;
-+    delete nextOptions.qualified;
-+    delete nextOptions.table;
-+    delete nextOptions.targetTable;
-+    delete nextOptions.family;
-+    delete nextOptions.familySlug;
-+    delete nextOptions.family_slug;
-+    delete nextOptions.records;
-+    delete nextOptions.rows;
-+    targetTable = actualTable;
-+    familySlug = actualFamily;
-+    rows = actualRows;
-+    options = { ...nextOptions };
-+  }
-+
-   const result = { processed: 0, upserts: 0, affected: 0, written: [], skipped: [], warnings: [] };
-   if (!rows.length) return result;
- 
-   console.log(`[PATH] persist family=${familySlug} rows=${rows.length} brand_override=${options?.brand || ''}`);
- 
-   const gcsUri = options?.gcsUri || options?.gcs_uri || null;
- 
-   const runId = options?.runId ?? options?.run_id ?? null;
-   const jobId = options?.jobId ?? options?.job_id ?? null;
-   const suffixParts = [];
-   if (runId) suffixParts.push(`run:${runId}`);
-   if (jobId) suffixParts.push(`job:${jobId}`);
-   const appNameSuffix = suffixParts.length ? ` ${suffixParts.join(' ')}` : '';
- 
-   const guard = await ensureSchemaGuards(familySlug, targetTable);
-   if (!guard.ok) {
-     result.skipped.push({ reason: guard.reason || 'schema_not_ready', detail: guard.detail || null });
-     return result;
+ function clampWindow(text, index, before = 8000, after = 12000) {
+   const len = text.length;
+   if (!Number.isFinite(index) || index < 0 || index > len) {
+     return { text, start: 0, end: len, anchorIndex: -1 };
    }
+   const start = Math.max(0, index - before);
+   const end = Math.min(len, index + after);
+   return { text: text.slice(start, end), start, end, anchorIndex: index };
+ }
  
-   const physicalCols = await getColumnsOf(targetTable);
-   if (!physicalCols.size) {
-     result.skipped.push({ reason: 'schema_not_ready' });
-     return result;
-   }
+ function extractOrderingWindow(full, { before = 8000, after = 12000 } = {}) {
+   const raw = String(full || '');
+   if (!raw) {
+     return { text: '', start: 0, end: 0, anchorIndex: -1 };

@@ -1060,6 +1060,41 @@ async function ensureSchemaGuards(familySlug, targetTable) {
 }
 
 async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = {}) {
+    if (targetTable && typeof targetTable === 'object' && !Array.isArray(targetTable)) {
+    const params = targetTable;
+    const actualTable =
+      params.qualifiedTable ||
+      params.qualified ||
+      params.table ||
+      params.targetTable ||
+      null;
+    const actualRows = Array.isArray(params.records)
+      ? params.records
+      : Array.isArray(params.rows)
+        ? params.rows
+        : rows;
+    const actualFamily =
+      params.family ||
+      params.familySlug ||
+      params.family_slug ||
+      familySlug ||
+      null;
+    const nextOptions = { ...params };
+    delete nextOptions.qualifiedTable;
+    delete nextOptions.qualified;
+    delete nextOptions.table;
+    delete nextOptions.targetTable;
+    delete nextOptions.family;
+    delete nextOptions.familySlug;
+    delete nextOptions.family_slug;
+    delete nextOptions.records;
+    delete nextOptions.rows;
+    targetTable = actualTable;
+    familySlug = actualFamily;
+    rows = actualRows;
+    options = { ...nextOptions };
+  }
+
   const result = { processed: 0, upserts: 0, affected: 0, written: [], skipped: [], warnings: [] };
   if (!rows.length) return result;
 

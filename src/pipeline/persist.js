@@ -36,6 +36,7 @@ const { ensureSpecsTable } = tryRequire([
 const { getColumnsOf } = require('./ensure-spec-columns');
 const { normalizeValueLLM } = require('../utils/ai');
 let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
+const { PN_RE } = require('../utils/patterns');
 
 const STRICT_CODE_RULES = /^(1|true|on)$/i.test(process.env.STRICT_CODE_RULES || '1');
 const MIN_CORE_SPEC_COUNT = (() => {
@@ -98,7 +99,6 @@ const META_KEYS = new Set([
 const CONFLICT_KEYS = ['brand', 'pn'];
 const NEVER_INSERT = new Set(['id', 'brand_norm', 'code_norm', 'pn_norm', 'created_at', 'updated_at']);
 
-const PN_RE = /\b[0-9A-Z][0-9A-Z\-_/().#]{3,63}[0-9A-Z)#]\b/i;
 const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
 const BANNED_PREFIX = /^(pdf|page|figure|table|sheet|rev|ver|draft)\b/i;
 const BANNED_EXACT = /^pdf-?1(\.\d+)?$/i;
@@ -1334,6 +1334,35 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
 
       if (!isValidCode(rec.code) && isValidCode(rec.pn)) {
         rec.code = rec.pn;
+      }
+
+      if (!rec.verified_in_doc && orderingPayload?.codes?.length) {
+        const pnCandidate = String(rec.pn || rec.code || '').trim();
+        if (pnCandidate) {
+          const pnUpper = pnCandidate.toUpperCase();
+          const orderingCodes = new Set();
+          for (const entry of orderingPayload.codes) {
+            if (!entry) continue;
+            const normalized = typeof entry === 'string'
+              ? entry.trim().toUpperCase()
+              : typeof entry === 'object' && entry.code != null
+                ? String(entry.code).trim().toUpperCase()
+                : null;
+            if (normalized) orderingCodes.add(normalized);
+          }
+          if (!orderingCodes.size && Array.isArray(orderingPayload.scored)) {
+            for (const scored of orderingPayload.scored) {
+              if (!scored || typeof scored !== 'object') continue;
+              const normalized = typeof scored.code === 'string'
+                ? scored.code.trim().toUpperCase()
+                : null;
+              if (normalized) orderingCodes.add(normalized);
+            }
+          }
+          if (orderingCodes.has(pnUpper)) {
+            rec.verified_in_doc = true;
+          }
+        }
       }
 
       const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });

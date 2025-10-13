@@ -1,73 +1,37 @@
-diff --git a/src/utils/blueprint.js b/src/utils/blueprint.js
-index 6079e7d9d3c45e13be0336ba72a53da8a5441a91..6d5d57820b133eee5584e49802282ec3426565b6 100644
---- a/src/utils/blueprint.js
-+++ b/src/utils/blueprint.js
-@@ -37,68 +37,52 @@ function deriveVariantKeys(blueprintRow = {}) {
-   const ingestOptions = blueprintRow.ingest_options || blueprintRow.ingestOptions || {};
-   if (Array.isArray(ingestOptions.variant_keys)) {
-     return normalizeKeyList(ingestOptions.variant_keys);
-   }
-   if (Array.isArray(blueprintRow.variant_keys)) {
-     return normalizeKeyList(blueprintRow.variant_keys);
-   }
-   return [];
+diff --git a/src/utils/ordering-sections.js b/src/utils/ordering-sections.js
+index eec60c797ba5d389a41cff69c5a2453ceec2c6af..68fdca816aae42fe087ba913a31c3c66571ce381 100644
+--- a/src/utils/ordering-sections.js
++++ b/src/utils/ordering-sections.js
+@@ -1,29 +1,31 @@
+ 'use strict';
+ 
++const { PN_CANDIDATE_SOURCE } = require('./patterns');
++
+ const ORDERING_ANCHOR_RE = /(ORDER(?:ING)?\s+(INFO|INFORMATION|GUIDE|CODE|NUMBER)|HOW\s+TO\s+ORDER|주문\s*정보|주문\s*코드|订购信息|订货信息|PART\s*(?:NO\.?|NUMBER)|品番|型番|품번)/i;
+-const ORDERING_CANDIDATE_RE = /[A-Z][A-Z0-9](?:[A-Z0-9\-\.]{1,18})/g;
++const ORDERING_CANDIDATE_RE = new RegExp(PN_CANDIDATE_SOURCE, 'g');
+ const ORDERING_BLACKLIST_RE = /^(ISO|ROHS|UL|VDC|VAC|A|MA|MM|Ω|OHM|PDF|PAGE|NOTE|DATE|LOT|WWW|HTTP|HTTPS)$/i;
+ 
+ function normalizeCode(str) {
+   return String(str || '')
+     .replace(/[–—]/g, '-')
+     .replace(/\s+/g, '')
+     .replace(/-+/g, '-')
+     .toUpperCase();
  }
  
- function ensureFamilyOverrides(blueprint, registryRow) {
-   if (!blueprint) return blueprint;
- 
-   const ingestOptions = blueprint.ingestOptions || {};
-   const family = String(blueprint.family_slug || '').trim().toLowerCase();
-   const forcedVariantKeys = new Set(blueprint.variant_keys || []);
- 
-   const addVariantKeys = (keys = []) => {
-     for (const key of keys) {
-       const norm = normalizeKeyList([key])[0];
-       if (!norm) continue;
-       forcedVariantKeys.add(norm);
-     }
-   };
- 
--  const ensureTemplate = (template) => {
--    if (!template) return;
--    if (!ingestOptions.pn_template && !ingestOptions.pnTemplate) {
--      ingestOptions.pn_template = template;
--      ingestOptions.pnTemplate = template;
--      return;
--    }
--    if (!ingestOptions.pn_template && ingestOptions.pnTemplate) {
--      ingestOptions.pn_template = ingestOptions.pnTemplate;
--    }
--    if (!ingestOptions.pnTemplate && ingestOptions.pn_template) {
--      ingestOptions.pnTemplate = ingestOptions.pn_template;
--    }
--  };
--
-   if (family === 'relay_power') {
-     addVariantKeys(['coil_voltage_vdc', 'contact_form', 'suffix']);
--    ensureTemplate('{{series_code}}{{contact_form}}{{coil_voltage_vdc|pad=2}}{{suffix}}');
+ function clampWindow(text, index, before = 8000, after = 12000) {
+   const len = text.length;
+   if (!Number.isFinite(index) || index < 0 || index > len) {
+     return { text, start: 0, end: len, anchorIndex: -1 };
    }
+   const start = Math.max(0, index - before);
+   const end = Math.min(len, index + after);
+   return { text: text.slice(start, end), start, end, anchorIndex: index };
+ }
  
-   if (family === 'relay_signal') {
-     // 템플릿은 강제하지 않고 LLM/표에서 추론한 pn_template 사용
+ function extractOrderingWindow(full, { before = 8000, after = 12000 } = {}) {
+   const raw = String(full || '');
+   if (!raw) {
+     return { text: '', start: 0, end: 0, anchorIndex: -1 };
    }
- 
-   const variantKeys = Array.from(forcedVariantKeys);
-   blueprint.variant_keys = variantKeys;
-   ingestOptions.variant_keys = variantKeys;
-   blueprint.ingestOptions = ingestOptions;
- 
-   const allowed = Array.isArray(blueprint.allowedKeys) ? blueprint.allowedKeys : [];
-   const generic = [
-     'pn_jp',
-     'pn_aliases',
-     'ordering_market',
-     'coil_voltage_vdc',
-     'coil_voltage_vac',
-     'contact_form',
-     'contact_arrangement',
-     'terminal_form',
-     'terminal_shape',
-     'contact_rating_text',
-     'dielectric_strength_v',
-     'operate_time_ms',

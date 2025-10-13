@@ -392,6 +392,7 @@ try {
 try { app.use(require('./server.optimize')); console.log('[BOOT] mounted /api/optimize/*'); } catch {}
 try { app.use(require('./server.checkout')); console.log('[BOOT] mounted /api/checkout/*'); } catch {}
 try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bom/*'); } catch {}
+try { app.use(require('./server.plan'));     console.log('[BOOT] mounted /api/purchase-plans/*'); } catch {}
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
 try { app.use(require('./server.retail')); console.log('[BOOT] mounted /api/retail/*'); } catch (e) { console.error(e); }

@@ -1119,6 +1119,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
 
   const pushRow = ({ code, values = {}, brand: rowBrand, verified }) => {
     const norm = String(code || '').trim().toUpperCase();
+    if (pnRegex && norm && !pnRegex.test(norm)) return;
     if (!norm || seenRows.has(norm)) return;
     seenRows.add(norm);
     const row = { code: norm, verified_in_doc: Boolean(verified || hasDocEvidence(norm)) };

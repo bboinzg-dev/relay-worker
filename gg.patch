@@ -1,92 +1,57 @@
-diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
-index 9b3176085adbb2b9ea1f73f6ca1a82d92c0db40d..9f03f4033f12cf0c86e4b2244bd100d798336e8c 100644
---- a/src/utils/mpn-exploder.js
-+++ b/src/utils/mpn-exploder.js
-@@ -346,83 +346,73 @@ function explodeToRows(base, options = {}) {
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index cee81edcf2021efeea8a4b5f2267c3ed4fb1b59d..2f3be9defd5e3b54067a87ea01cce869f52caebc 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -3833,51 +3833,51 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+               .map((key) => String(key || '').trim())
+               .filter((key) => key && !knownLower.has(key.toLowerCase())),
+           ),
+         );
+         if (unknownKeys.length) {
+           try {
+             const { map } = await aiCanonicalizeKeys(family, unknownKeys, knownList);
+             const widened = new Set(knownList);
+             for (const key of unknownKeys) {
+               const rec = map?.[key] || {};
+               let target = String(rec.canonical || '').trim();
+               if (!target || rec.action !== 'map') target = key;
+               const lower = target.toLowerCase();
+               if (!lower || knownLower.has(lower)) continue;
+               knownLower.add(lower);
+               widened.add(target);
+             }
+             blueprint = blueprint && typeof blueprint === 'object' ? blueprint : {};
+             blueprint.allowedKeys = Array.from(widened);
+           } catch (err) {
+             console.warn('[persist] aiCanonicalizeKeys failed:', err?.message || err);
+           }
+         }
+       }
+ 
+-      await ensureDynamicColumnsForRows(qualified, records);
++      await ensureDynamicColumnsForRows(qualified, schemaEnsureRows);
+       try {
+         persistResult = await saveExtractedSpecs(qualified, family, records, {
+           brand: brandOverride,
+           pnTemplate,
+           requiredKeys: effectiveRequired,
+           coreSpecKeys: effectiveRequired,
+           blueprint,
+           runId,
+           run_id: runId,
+           jobId,
+           job_id: jobId,
+           gcsUri,
+           orderingInfo: processed?.ordering_info,
+           docType: processed?.doc_type,
+         }) || persistResult;
+       } catch (e) {
+         console.warn('[persist] saveExtractedSpecs failed:', e?.message || e);
+         if (!persistResult || typeof persistResult !== 'object') {
+           persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
+         }
+         if (!Array.isArray(persistResult.warnings)) persistResult.warnings = [];
+         persistResult.warnings.push(String(e?.message || e));
+       }
      }
- 
-     const normalizedContactForm = normalizeContactForm(
-       rowValues.contact_form
-         ?? rowValues.contact_arrangement
-         ?? rowValues.form
-         ?? null,
-     );
-     if (normalizedContactForm) assignValue(rowValues, 'contact_form', normalizedContactForm);
-     else {
-       delete rowValues.contact_form;
-       delete rowValues.contactform;
-     }
- 
-     assignValue(rowValues, 'coil_voltage_text', rowValues.coil_voltage_vdc);
-     const normalizedCoilVoltage = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
-     if (normalizedCoilVoltage) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltage);
-     else {
-       delete rowValues.coil_voltage_vdc;
-       delete rowValues.coil_voltagevdc;
-     }
- 
-     const canUseTemplate = pnTemplate && normalizedSeries;
- 
-     let generatedByTemplate = false;
--    let generatedByFallback = false;
-     let code = null;
- 
-     if (pnTemplate && canUseTemplate) {
-       code = renderTemplate(pnTemplate, {
-         ...rowValues,
-         series: normalizedSeries,
-         series_code: normalizedSeries,
-         contact_form: normalizedContactForm,
-         coil_voltage_vdc: normalizedCoilVoltage,
-       });
-       generatedByTemplate = true;
-     } else if (mpnCandidates[idx]) {
-       code = mpnCandidates[idx];
-     } else if (mpnCandidates.length) {
-       code = mpnCandidates[0];
-     } else {
--    if (!normalizedSeries) return;
--      const parts = [];
--      parts.push(normalizedSeries);
--      const suffix = variantKeys
--        .map((key) => rowValues[key] ?? rowValues[key?.toLowerCase()])
--        .filter((v) => v != null && v !== '')
--        .map((v) => String(v))
--        .join('');
--      if (suffix) parts.push(suffix);
--      code = parts.join('');
--      generatedByFallback = true;
-+      // 템플릿/표 후보가 없으면 "임의 PN"을 만들지 않는다 (가짜 PN 차단)
-+      return;
-     }
- 
-     code = String(code || '').trim();
-     if (!code) return;
- 
--    if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
-+    if (generatedByTemplate && !isLikelyPn(code)) return;
- 
-     const codeNorm = code.toLowerCase();
-     if (rows.some((r) => r.code_norm === codeNorm)) return;
- 
-     rows.push({
-       code,
-       code_norm: codeNorm,
-       values: rowValues,
-     });
-   });
- 
-   return rows;
- }
- 
- module.exports = {
-   LIST_SEP,
-   NON_MPN_WORDS,
-   splitAndCarryPrefix,
-   normalizeList,
-   cartesian,
-   renderTemplate,
-   explodeToRows,
-   normalizeContactForm,
- };
-\ No newline at end of file
+   } else if (!records.length) {

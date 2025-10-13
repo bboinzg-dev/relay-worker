@@ -1211,12 +1211,11 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     const beforeCount = out.length;
     for (const generated of generatedRows) {
       if (!generated || typeof generated !== 'object') continue;
-            const rawCode = generated.code;
+      const rawCode = generated.code;
       const codeStr = String(rawCode || '').trim();
       if (!codeStr) continue;
-      // 테이블 예시로 학습한 PN-정규식에 안 맞으면 버림
+      // 표 예시/템플릿으로 만든 pnRegex가 있으면 반드시 가드
       if (pnRegex && !pnRegex.test(codeStr)) continue;
-      const codeNorm = codeStr.toUpperCase();
       const values = generated.values && typeof generated.values === 'object' ? generated.values : {};
       const v = hasDocEvidence(normalizeCodeKey(codeStr)) || hasOrderingEvidence(codeStr);
       if (values && typeof values === 'object' && !Object.prototype.hasOwnProperty.call(values, '_pn_template')) {

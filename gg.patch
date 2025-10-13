@@ -1,60 +1,57 @@
-diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
-index 392ab9786248bae3901a7e8f16ad0f7411ddea06..386627ea8b2672a71c551029fdc01a8c92477d78 100644
---- a/src/utils/mpn-exploder.js
-+++ b/src/utils/mpn-exploder.js
-@@ -363,54 +363,53 @@ function explodeToRows(base, options = {}) {
-     else {
-       delete rowValues.coil_voltage_vdc;
-       delete rowValues.coil_voltagevdc;
+diff --git a/src/utils/blueprint.js b/src/utils/blueprint.js
+index 3ad9a3971603b3d26a6fc1bb9b802faf13dfbca0..1f7390d006ed7d3dcc425d25b4b8740c21a302f4 100644
+--- a/src/utils/blueprint.js
++++ b/src/utils/blueprint.js
+@@ -59,51 +59,51 @@ function ensureFamilyOverrides(blueprint, registryRow) {
      }
+   };
  
-     const canUseTemplate = pnTemplate && normalizedSeries;
- 
-     let generatedByTemplate = false;
-     let generatedByFallback = false;
-     let code = null;
- 
-     if (pnTemplate && canUseTemplate) {
-       code = renderTemplate(pnTemplate, {
-         ...rowValues,
-         series: normalizedSeries,
-         series_code: normalizedSeries,
-         contact_form: normalizedContactForm,
-         coil_voltage_vdc: normalizedCoilVoltage,
-       });
-       generatedByTemplate = true;
-     } else if (mpnCandidates[idx]) {
-       code = mpnCandidates[idx];
-     } else if (mpnCandidates.length) {
-       code = mpnCandidates[0];
-     } else {
-+      if (!normalizedSeries) return;
-       const parts = [];
--      if (normalizedSeries) parts.push(normalizedSeries);
--      else if (base?.series) parts.push(base.series);
--      else if (base?.series_code) parts.push(base.series_code);
-+      parts.push(normalizedSeries);
-       const suffix = variantKeys
-         .map((key) => rowValues[key] ?? rowValues[key?.toLowerCase()])
-         .filter((v) => v != null && v !== '')
-         .map((v) => String(v))
-         .join('');
-       if (suffix) parts.push(suffix);
-       code = parts.join('');
-       generatedByFallback = true;
+   const ensureTemplate = (template) => {
+     if (!template) return;
+     if (!ingestOptions.pn_template && !ingestOptions.pnTemplate) {
+       ingestOptions.pn_template = template;
+       ingestOptions.pnTemplate = template;
+       return;
      }
+     if (!ingestOptions.pn_template && ingestOptions.pnTemplate) {
+       ingestOptions.pn_template = ingestOptions.pnTemplate;
+     }
+     if (!ingestOptions.pnTemplate && ingestOptions.pn_template) {
+       ingestOptions.pnTemplate = ingestOptions.pn_template;
+     }
+   };
  
-     code = String(code || '').trim();
-     if (!code) return;
+   if (family === 'relay_power') {
+     addVariantKeys(['coil_voltage_vdc', 'contact_form', 'suffix']);
+     ensureTemplate('{{series_code}}{{contact_form}}{{coil_voltage_vdc|pad=2}}{{suffix}}');
+   }
  
-     if ((generatedByTemplate || generatedByFallback) && !isLikelyPn(code)) return;
+   if (family === 'relay_signal') {
+     addVariantKeys(['coil_voltage_vdc', 'contact_arrangement', 'contact_form', 'suffix']);
+-    ensureTemplate('{{series}}{{contact_arrangement|upper|alnum}}{{coil_voltage_vdc|digits|pad=2}}{{suffix|upper}}');
++    // 템플릿은 강제하지 않고 LLM/표에서 추론한 pn_template 사용
+   }
  
-     const codeNorm = code.toLowerCase();
-     if (rows.some((r) => r.code_norm === codeNorm)) return;
+   const variantKeys = Array.from(forcedVariantKeys);
+   blueprint.variant_keys = variantKeys;
+   ingestOptions.variant_keys = variantKeys;
+   blueprint.ingestOptions = ingestOptions;
  
-     rows.push({
-       code,
-       code_norm: codeNorm,
-       values: rowValues,
-     });
-   });
+   const allowed = Array.isArray(blueprint.allowedKeys) ? blueprint.allowedKeys : [];
+   const generic = [
+     'pn_jp',
+     'pn_aliases',
+     'ordering_market',
+     'coil_voltage_vac',
+     'terminal_form',
+     'contact_rating_text',
+     'dielectric_strength_v',
+     'operate_time_ms',
+     'release_time_ms',
+     'coil_resistance_ohm',
+     'insulation_resistance_mohm',
+     'dim_l_mm',
+     'dim_w_mm',
+     'dim_h_mm',
+   ];
+   blueprint.allowedKeys = Array.from(new Set([...allowed, ...variantKeys, ...generic]));

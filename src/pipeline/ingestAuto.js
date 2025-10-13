@@ -3838,25 +3838,25 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
 
   const baseRows = (rawRows.length ? rawRows : [{}]).map((row) => {
-  if (variantDomainEntries.length) {
+    const rowObj = row && typeof row === 'object' ? { ...row } : {};
+    if (variantDomainEntries.length) {
       for (const [domainKey, domainValues] of variantDomainEntries) {
         if (!Array.isArray(domainValues) || !domainValues.length) continue;
-        const current = obj[domainKey];
+        const current = rowObj[domainKey];
         if (current == null || (typeof current === 'string' && current.trim() === '')) {
-          obj[domainKey] = domainValues;
+          rowObj[domainKey] = domainValues;
         }
       }
     }
-    const obj = row && typeof row === 'object' ? { ...row } : {};
-    if (obj.brand == null) obj.brand = brandName;
-    const fallbackSeries = obj.series_code || obj.series || baseSeries || null;
+    if (rowObj.brand == null) rowObj.brand = brandName;
+    const fallbackSeries = rowObj.series_code || rowObj.series || baseSeries || null;
     if (fallbackSeries != null) {
-      if (obj.series == null) obj.series = fallbackSeries;
-      if (obj.series_code == null) obj.series_code = fallbackSeries;
+      if (rowObj.series == null) rowObj.series = fallbackSeries;
+      if (rowObj.series_code == null) rowObj.series_code = fallbackSeries;
     }
-    if (obj.datasheet_uri == null) obj.datasheet_uri = gcsUri;
-    if (coverUri && obj.cover == null) obj.cover = coverUri;
-    return obj;
+    if (rowObj.datasheet_uri == null) rowObj.datasheet_uri = gcsUri;
+    if (coverUri && rowObj.cover == null) rowObj.cover = coverUri;
+    return rowObj;
   });
 
   let explodedRows = baseRows;

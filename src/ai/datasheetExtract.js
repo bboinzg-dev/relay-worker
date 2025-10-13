@@ -143,8 +143,8 @@ async function processWithDocAI(gcsUri) {
   const client = new DocumentProcessorServiceClient({ apiEndpoint });
   const name = `projects/${projectId}/locations/${location}/processors/${processorId}`;
 
-  const { bucket, name: obj } = parseGcsUri(gcsUri);
-  const [buf] = await storage.bucket(bucket).file(obj).download();
+  const { bucket, name: gcsObject } = parseGcsUri(gcsUri);
+  const [buf] = await storage.bucket(bucket).file(gcsObject).download();
 
   let res;
   try {

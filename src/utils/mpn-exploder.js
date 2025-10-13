@@ -1,6 +1,7 @@
 'use strict';
 
 const LIST_SEP = /[\s,;/|·•]+/;
+const VOLTAGE_UNIT_RE = /\d\s*(?:V|VAC|VDC)\b/i;
 // 패턴리스 정규화기: 1A/1B/1C/2A/2B/2C/1A1B/2AB 등 조합 처리
 function normalizeContactForm(value) {
   if (value == null) return null;
@@ -243,6 +244,26 @@ function renderTemplate(tpl, ctx) {
   });
 }
 
+function escapeRegex(str) {
+  return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function templateNeedsPlaceholder(tpl, key) {
+  if (!tpl || !key) return false;
+  const pattern = escapeRegex(String(key).trim());
+  if (!pattern) return false;
+  const re = new RegExp(`\{\{?\\s*${pattern}(?:\\W|\}|\\|)`, 'i');
+  return re.test(String(tpl));
+}
+
+function defaultTextContainsExact(text, pn) {
+  if (!text || !pn) return false;
+  const pattern = escapeRegex(String(pn).trim());
+  if (!pattern) return false;
+  const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
+  return re.test(String(text));
+}
+
 function assignValue(target, key, value) {
   if (!key) return;
   target[key] = value;
@@ -295,6 +316,20 @@ function explodeToRows(base, options = {}) {
     ? options.variantKeys.map((k) => String(k || '').trim()).filter(Boolean)
     : [];
   const pnTemplate = options.pnTemplate || null;
+  const haystackInput = options.haystack;
+  const haystack = Array.isArray(haystackInput)
+    ? haystackInput.filter((chunk) => typeof chunk === 'string' && chunk.trim()).join('\n')
+    : typeof haystackInput === 'string'
+      ? haystackInput
+      : '';
+  const textContainsExactFn =
+    typeof options.textContainsExact === 'function' ? options.textContainsExact : defaultTextContainsExact;
+  const previewOnly = Boolean(options.previewOnly);
+  const maxTemplateAttemptsRaw = Number(options.maxTemplateAttempts);
+  const maxTemplateAttempts = Number.isFinite(maxTemplateAttemptsRaw) && maxTemplateAttemptsRaw > 0
+    ? Math.floor(maxTemplateAttemptsRaw)
+    : null;
+  const onTemplateRender = typeof options.onTemplateRender === 'function' ? options.onTemplateRender : null;
 
   const values = {};
   if (base && typeof base.values === 'object') {
@@ -325,7 +360,10 @@ function explodeToRows(base, options = {}) {
   const mpnCandidates = collectMpnSeeds(base);
 
   const rows = [];
-  combos.forEach((combo, idx) => {
+  let templateAttempts = 0;
+  for (let idx = 0; idx < combos.length; idx += 1) {
+    if (maxTemplateAttempts && templateAttempts >= maxTemplateAttempts) break;
+    const combo = combos[idx];
     const rowValues = { ...values };
     variantKeys.forEach((key, keyIdx) => {
       const val = combo[keyIdx];
@@ -358,50 +396,124 @@ function explodeToRows(base, options = {}) {
     }
 
     assignValue(rowValues, 'coil_voltage_text', rowValues.coil_voltage_vdc);
-    const normalizedCoilVoltage = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
-    if (normalizedCoilVoltage) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltage);
+    const normalizedCoilVoltageVdc = normalizeCoilVoltage(rowValues.coil_voltage_vdc);
+    if (normalizedCoilVoltageVdc) assignValue(rowValues, 'coil_voltage_vdc', normalizedCoilVoltageVdc);
     else {
       delete rowValues.coil_voltage_vdc;
       delete rowValues.coil_voltagevdc;
     }
 
-    const canUseTemplate = pnTemplate && normalizedSeries;
+    const normalizedCoilVoltageVac = normalizeCoilVoltage(rowValues.coil_voltage_vac);
+    if (normalizedCoilVoltageVac) assignValue(rowValues, 'coil_voltage_vac', normalizedCoilVoltageVac);
+    else {
+      delete rowValues.coil_voltage_vac;
+      delete rowValues.coil_voltagevac;
+    }
+
+    const needsCoil = pnTemplate
+      && (templateNeedsPlaceholder(pnTemplate, 'coil_voltage_vdc')
+        || templateNeedsPlaceholder(pnTemplate, 'coil_voltage_vac'));
+    const needsContact = pnTemplate && templateNeedsPlaceholder(pnTemplate, 'contact_form');
+    const needsTerm = pnTemplate && templateNeedsPlaceholder(pnTemplate, 'terminal_shape');
+    const needsOp = pnTemplate && templateNeedsPlaceholder(pnTemplate, 'operating_function');
+    const needsPack = pnTemplate && templateNeedsPlaceholder(pnTemplate, 'packing_style');
+
+    const hasCoil = Boolean(
+      normalizeCoilVoltage(rowValues.coil_voltage_vdc ?? rowValues.coil_voltage_vac),
+    );
+    const hasContact = Boolean(rowValues.contact_form ?? rowValues.contactform);
+    const hasTerm = Boolean(
+      rowValues.terminal_shape
+        ?? rowValues.terminalshape
+        ?? rowValues.terminal_form
+        ?? rowValues.terminalform,
+    );
+    const hasOp = Boolean(rowValues.operating_function ?? rowValues.operatingfunction);
+    const hasPack = Boolean(rowValues.packing_style ?? rowValues.packingstyle);
 
     let generatedByTemplate = false;
     let code = null;
+    let attempted = false;
 
-    if (pnTemplate && canUseTemplate) {
-      code = renderTemplate(pnTemplate, {
+    if (pnTemplate) {
+      if (!normalizedSeries) continue;
+      if (needsCoil && !hasCoil) continue;
+      if (needsContact && !hasContact) continue;
+      if (needsTerm && !hasTerm) continue;
+      if (needsOp && !hasOp) continue;
+      if (needsPack && !hasPack) continue;
+
+      const context = {
         ...rowValues,
         series: normalizedSeries,
         series_code: normalizedSeries,
         contact_form: normalizedContactForm,
-        coil_voltage_vdc: normalizedCoilVoltage,
-      });
+        coil_voltage_vdc: normalizedCoilVoltageVdc,
+        coil_voltage_vac: normalizedCoilVoltageVac,
+      };
+
+      const rendered = renderTemplate(pnTemplate, context);
+      attempted = true;
+      templateAttempts += 1;
+      const renderedCode = typeof rendered === 'string' ? rendered.trim() : String(rendered || '').trim();
+      if (!renderedCode) {
+        if (onTemplateRender) onTemplateRender({ accepted: false, reason: 'empty_render', context });
+        continue;
+      }
+      if (needsCoil && !VOLTAGE_UNIT_RE.test(renderedCode)) {
+        if (onTemplateRender) {
+          onTemplateRender({
+            accepted: false,
+            reason: 'missing_voltage_unit',
+            candidate: renderedCode,
+            context,
+          });
+        }
+        continue;
+      }
+      if (haystack && !textContainsExactFn(haystack, renderedCode)) {
+        if (onTemplateRender) {
+          onTemplateRender({
+            accepted: false,
+            reason: 'missing_doc_evidence',
+            candidate: renderedCode,
+            context,
+          });
+        }
+        continue;
+      }
+      code = renderedCode;
       generatedByTemplate = true;
+            if (onTemplateRender) {
+        onTemplateRender({ accepted: true, candidate: renderedCode, context });
+      }
     } else if (mpnCandidates[idx]) {
       code = mpnCandidates[idx];
     } else if (mpnCandidates.length) {
       code = mpnCandidates[0];
     } else {
       // 템플릿/표 후보가 없으면 "임의 PN"을 만들지 않는다 (가짜 PN 차단)
-      return;
+      continue;
     }
 
     code = String(code || '').trim();
-    if (!code) return;
+    if (!code) continue;
 
-    if (generatedByTemplate && !isLikelyPn(code)) return;
+    if (generatedByTemplate && !isLikelyPn(code)) continue;
 
     const codeNorm = code.toLowerCase();
-    if (rows.some((r) => r.code_norm === codeNorm)) return;
+    if (rows.some((r) => r.code_norm === codeNorm)) continue;
 
-    rows.push({
-      code,
-      code_norm: codeNorm,
-      values: rowValues,
-    });
-  });
+    if (!previewOnly) {
+      rows.push({
+        code,
+        code_norm: codeNorm,
+        values: rowValues,
+      });
+    }
+
+    if (maxTemplateAttempts && attempted && templateAttempts >= maxTemplateAttempts) break;
+  }
 
   return rows;
 }

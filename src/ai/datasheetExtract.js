@@ -29,7 +29,8 @@ const MAX_PARTS = Number(process.env.MAX_ENUM_PARTS || 200);
 const AUTO_ADD_FIELDS = /^(1|true|on)$/i.test(String(process.env.AUTO_ADD_FIELDS || ''));
 
 const TYPE_HEADER_RE = /(^|\s)(type\s*(?:no\.?|number)?|형식|형번|형명|型式|型番|タイプ)(\s|$)/i;
-const PART_HEADER_RE = /(^|\s)(part\s*(?:no\.?|number)?|품번|부품번호|品番|型番|型號|品號)(\s|$)/i;
+const PART_HEADER_RE =
+  /(^|\s)(part\s*(?:no\.?|number|name)?|品番|型番|型號|品號|部品番号|品名|품번|부품번호|부품명)(\s|$)/i;
 
 const COIL_RATED_VOLTAGE_HEADER_RE = /((rated|nominal)\s+)?(coil\s*)?voltage|voltage\s*\(vdc\)/i;
 const COIL_RESISTANCE_HEADER_RE = /coil\s*resistance|resistance\s*\([^)]*Ω\)|resistance\s*\(ohm\)/i;
@@ -1579,9 +1580,11 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   const hasDocEvidenceValue = (value) => hasDocEvidence(normalizeCodeKey(value));
 
   const pushCode = (value) => {
-    const norm = String(value || '').trim().toUpperCase();
-    if (!norm || seenCodes.has(norm)) return;
-    if (pnRegex && !pnRegex.test(norm)) return;
+    const raw = String(value ?? '').trim();
+    if (!raw) return;
+    if (pnRegex && !pnRegex.test(raw)) return;
+    const norm = raw.toUpperCase();
+    if (seenCodes.has(norm)) return;
     seenCodes.add(norm);
     mergedCodes.push(norm);
   };
@@ -1589,9 +1592,11 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   seedCodes.forEach(pushCode);
 
   const pushRow = ({ code, values = {}, brand: rowBrand, verified }) => {
-    const norm = String(code || '').trim().toUpperCase();
-    if (pnRegex && norm && !pnRegex.test(norm)) return;
-    if (!norm || seenRows.has(norm)) return;
+    const rawCode = String(code ?? '').trim();
+    if (!rawCode) return;
+    if (pnRegex && !pnRegex.test(rawCode)) return;
+    const norm = rawCode.toUpperCase();
+    if (seenRows.has(norm)) return;
     seenRows.add(norm);
     const row = { code: norm, verified_in_doc: Boolean(verified || hasDocEvidence(norm)) };
     const brandValue = rowBrand || brand;

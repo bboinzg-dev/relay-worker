@@ -147,11 +147,14 @@ const MERGE_SKIP_KEYS = new Set([
   'datasheet_uri',
   'cover',
   'verified_in_doc',
-  'candidates',
-  '_doc_text',
+  'raw_json',
+  'text',
+  'tables',
   'mpn',
   'mpn_list',
   'codes',
+  'candidates',
+  '_doc_text',
   'last_error',
   'run_id',
   'job_id',
@@ -162,7 +165,7 @@ const MERGE_SKIP_KEYS = new Set([
 const SPEC_MERGE_OVERRIDES = new Set(['code', 'code_norm', 'pn', 'pn_norm', 'series', 'series_code']);
 
 const DOC_AI_CODE_HEADER_RE =
-  /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|model|品番|型式|型番|品號|품번|형명|주문\s*번호|order(?:ing)?\s*code)/i;
+  /(part\s*(?:no\.?|number|name)|type\s*(?:no\.?|number)?|model|品番|型式|型番|品號|部品番号|품번|형명|주문\s*번호|order(?:ing)?\s*code)/i;
 
   function gatherRuntimeSpecKeys(rows) {
   const set = new Set();
@@ -4253,6 +4256,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         await ensureDynamicColumnsForRows(qualified, processedRowsInput);
       }
       await ensureDynamicColumnsForRows(qualified, schemaEnsureRows);
+      await ensureDynamicColumnsForRows(qualified, records);
       try {
         persistResult = await saveExtractedSpecs({
           qualifiedTable: qualified,

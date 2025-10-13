@@ -59,12 +59,10 @@ function ensureFamilyOverrides(blueprint, registryRow) {
     }
   };
 
+    addVariantKeys(ingestOptions.variant_keys || []);
+
   if (family === 'relay_power') {
     addVariantKeys(['coil_voltage_vdc', 'contact_form', 'suffix']);
-  }
-
-  if (family === 'relay_signal') {
-    // 템플릿은 강제하지 않고 LLM/표에서 추론한 pn_template 사용
   }
 
   const variantKeys = Array.from(forcedVariantKeys);

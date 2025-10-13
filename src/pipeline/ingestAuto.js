@@ -129,20 +129,11 @@ const SKIP_SPEC_KEYS = new Set([
   'doc_type',
 ]);
 
-function gatherRuntimeSpecKeys(rows) {
 const MERGE_SKIP_KEYS = new Set([
   ...SKIP_SPEC_KEYS,
   'id',
   'created_at',
   'updated_at',
-  'raw_json',
-  'rawspecs',
-  'raw_specs',
-  'raw_table',
-  'raw_tables',
-  'raw_text',
-  'doc_type',
-  'ordering_info',
   'family_slug',
   'brand',
   'brand_norm',
@@ -169,9 +160,11 @@ const MERGE_SKIP_KEYS = new Set([
 ]);
 
 const SPEC_MERGE_OVERRIDES = new Set(['code', 'code_norm', 'pn', 'pn_norm', 'series', 'series_code']);
+
 const DOC_AI_CODE_HEADER_RE =
   /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|model|品番|型式|型番|品號|품번|형명|주문\s*번호|order(?:ing)?\s*code)/i;
 
+  function gatherRuntimeSpecKeys(rows) {
   const set = new Set();
   const list = Array.isArray(rows) ? rows : [];
   for (const row of list) {

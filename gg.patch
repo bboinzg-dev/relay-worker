@@ -1,100 +1,90 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 8cb1465aec82843836e258170eb12dbcb5b9e4a5..fba8fe4743de2e4c43ca4690ec13609c94b60ee5 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -107,93 +107,86 @@ const FAST_PAGES = [0, 1, -1]; // 첫 페이지, 2페이지, 마지막 페이지
- 
- const META_KEYS = new Set(['variant_keys','pn_template','ingest_options','_pn_template']);
- const BASE_KEYS = new Set([
-   'family_slug','brand','code','pn','brand_norm','code_norm','pn_norm','series_code',
-   'datasheet_uri','image_uri','datasheet_url','display_name','displayname',
-   'cover','verified_in_doc','updated_at'
- ]);
- const SKIP_SPEC_KEYS = new Set([
-   'raw_json',
-   'text',
-   'tables',
-   'mpn_list',
-   'mpn',
-   'codes',
-   'series',
-   'series_code',
-   'raw_text',
-   'raw_specs',
-   'rawspecs',
-   'raw_table',
-   'raw_tables',
-   'ordering_info',
-   'doc_type',
- ]);
- 
--function gatherRuntimeSpecKeys(rows) {
- const MERGE_SKIP_KEYS = new Set([
-   ...SKIP_SPEC_KEYS,
-   'id',
-   'created_at',
-   'updated_at',
--  'raw_json',
--  'rawspecs',
--  'raw_specs',
--  'raw_table',
--  'raw_tables',
--  'raw_text',
--  'doc_type',
--  'ordering_info',
-   'family_slug',
-   'brand',
-   'brand_norm',
-   'pn',
-   'pn_norm',
-   'code',
-   'code_norm',
-   'display_name',
-   'displayname',
-   'image_uri',
-   'datasheet_uri',
-   'cover',
-   'verified_in_doc',
-   'candidates',
-   '_doc_text',
-   'mpn',
-   'mpn_list',
-   'codes',
-   'last_error',
-   'run_id',
-   'job_id',
-   'runid',
-   'jobid',
- ]);
- 
- const SPEC_MERGE_OVERRIDES = new Set(['code', 'code_norm', 'pn', 'pn_norm', 'series', 'series_code']);
-+
- const DOC_AI_CODE_HEADER_RE =
-   /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|model|品番|型式|型番|品號|품번|형명|주문\s*번호|order(?:ing)?\s*code)/i;
- 
-+function gatherRuntimeSpecKeys(rows) {
-   const set = new Set();
-   const list = Array.isArray(rows) ? rows : [];
-   for (const row of list) {
-     if (!row || typeof row !== 'object') continue;
-     for (const rawKey of Object.keys(row)) {
-       const trimmed = String(rawKey || '').trim();
-       if (!trimmed) continue;
-       const lower = trimmed.toLowerCase();
-       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
-       set.add(trimmed);
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index b073ba344e0bf0679321ef1bb034492dec905624..d238e87294f5ace0840e0d34ec16ec993498011c 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -1038,50 +1038,85 @@ function coerceColumnValue(column, value, columnTypes, record, rawJson, warningS
+ async function ensureSchemaGuards(familySlug, targetTable) {
+   if (!familySlug) return { ok: true };
+   try {
+     await pool.query('SELECT public.ensure_specs_table($1)', [familySlug]);
+   } catch (err) {
+     console.warn('[schema] ensure_specs_table failed (persist):', err?.message || err);
+     if (targetTable) {
+       try {
+         await ensureSpecsTable(targetTable);
+       } catch (fallbackErr) {
+         return { ok: false, reason: 'schema_not_ready', detail: fallbackErr?.message || String(fallbackErr) };
+       }
+     } else {
+       return { ok: false, reason: 'schema_not_ready', detail: err?.message || String(err) };
      }
    }
-   return set;
+   try {
+     await pool.query('SELECT public.ensure_blueprint_variant_columns($1)', [familySlug]);
+   } catch (err) {
+     return { ok: false, reason: 'schema_not_ready', detail: err?.message || String(err) };
+   }
+   return { ok: true };
  }
  
- async function ensureDynamicColumnsForRows(qualifiedTable, rows) {
-   if (!AUTO_ADD_FIELDS || !AUTO_ADD_FIELDS_LIMIT) return;
-   const keys = Array.from(gatherRuntimeSpecKeys(rows)).slice(0, AUTO_ADD_FIELDS_LIMIT);
-   if (!keys.length) return;
-   const sample = {};
-   if (Array.isArray(rows)) {
-     const remaining = new Set(keys);
-     for (const row of rows) {
-       if (!row || typeof row !== 'object') continue;
-       for (const key of keys) {
+ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = {}) {
++  if (targetTable && typeof targetTable === 'object' && !Array.isArray(targetTable)) {
++    const params = targetTable;
++    const actualTable =
++      params.qualifiedTable ||
++      params.qualified ||
++      params.table ||
++      params.targetTable ||
++      null;
++    const actualRows = Array.isArray(params.records)
++      ? params.records
++      : Array.isArray(params.rows)
++        ? params.rows
++        : rows;
++    const actualFamily =
++      params.family ||
++      params.familySlug ||
++      params.family_slug ||
++      familySlug ||
++      null;
++    const nextOptions = { ...params };
++    delete nextOptions.qualifiedTable;
++    delete nextOptions.qualified;
++    delete nextOptions.table;
++    delete nextOptions.targetTable;
++    delete nextOptions.family;
++    delete nextOptions.familySlug;
++    delete nextOptions.family_slug;
++    delete nextOptions.records;
++    delete nextOptions.rows;
++    targetTable = actualTable;
++    familySlug = actualFamily;
++    rows = actualRows;
++    options = { ...nextOptions };
++  }
++
+   const result = { processed: 0, upserts: 0, affected: 0, written: [], skipped: [], warnings: [] };
+   if (!rows.length) return result;
+ 
+   console.log(`[PATH] persist family=${familySlug} rows=${rows.length} brand_override=${options?.brand || ''}`);
+ 
+   const gcsUri = options?.gcsUri || options?.gcs_uri || null;
+ 
+   const runId = options?.runId ?? options?.run_id ?? null;
+   const jobId = options?.jobId ?? options?.job_id ?? null;
+   const suffixParts = [];
+   if (runId) suffixParts.push(`run:${runId}`);
+   if (jobId) suffixParts.push(`job:${jobId}`);
+   const appNameSuffix = suffixParts.length ? ` ${suffixParts.join(' ')}` : '';
+ 
+   const guard = await ensureSchemaGuards(familySlug, targetTable);
+   if (!guard.ok) {
+     result.skipped.push({ reason: guard.reason || 'schema_not_ready', detail: guard.detail || null });
+     return result;
+   }
+ 
+   const physicalCols = await getColumnsOf(targetTable);
+   if (!physicalCols.size) {
+     result.skipped.push({ reason: 'schema_not_ready' });
+     return result;
+   }

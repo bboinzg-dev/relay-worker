@@ -4249,10 +4249,16 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         }
       }
 
+      if (Array.isArray(processedRowsInput) && processedRowsInput.length) {
+        await ensureDynamicColumnsForRows(qualified, processedRowsInput);
+      }
       await ensureDynamicColumnsForRows(qualified, schemaEnsureRows);
       try {
-        persistResult = await saveExtractedSpecs(qualified, family, records, {
+        persistResult = await saveExtractedSpecs({
+          qualifiedTable: qualified,
+          family,
           brand: brandOverride,
+          records,
           pnTemplate,
           requiredKeys: effectiveRequired,
           coreSpecKeys: effectiveRequired,

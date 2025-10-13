@@ -28,6 +28,45 @@ const { aiCanonicalizeKeys } = require('../pipeline/ai/canonKeys');
 const MAX_PARTS = Number(process.env.MAX_ENUM_PARTS || 200);
 const AUTO_ADD_FIELDS = /^(1|true|on)$/i.test(String(process.env.AUTO_ADD_FIELDS || ''));
 
+const TYPE_HEADER_RE = /(^|\s)(type\s*(?:no\.?|number)?|형식|형번|형명|型式|型番|タイプ)(\s|$)/i;
+const PART_HEADER_RE = /(^|\s)(part\s*(?:no\.?|number)?|품번|부품번호|品番|型番|型號|品號)(\s|$)/i;
+
+const COIL_RATED_VOLTAGE_HEADER_RE = /((rated|nominal)\s+)?(coil\s*)?voltage|voltage\s*\(vdc\)/i;
+const COIL_RESISTANCE_HEADER_RE = /coil\s*resistance|resistance\s*\([^)]*Ω\)|resistance\s*\(ohm\)/i;
+const COIL_OPERATING_CURRENT_HEADER_RE = /(rated\s+)?operating\s*current|current\s*\(ma\)/i;
+const COIL_OPERATING_POWER_HEADER_RE = /(rated\s+)?operating\s*power|power\s*\(mw\)/i;
+const COIL_MAX_ALLOWABLE_HEADER_RE = /max(?:imum)?\s*allowable\s*voltage/i;
+const COIL_OPERATE_HEADER_RE = /(must\s*)?operate\s*(?:voltage|set)/i;
+const COIL_RELEASE_HEADER_RE = /(must\s*)?release\s*(?:voltage|reset)/i;
+
+const RELAY_CONTACT_KEYWORDS = new Map([
+  ['SPST', '1A'],
+  ['SPDT', '1C'],
+  ['DPST', '2A'],
+  ['DPDT', '2C'],
+  ['3PDT', '3C'],
+  ['4PDT', '4C'],
+]);
+
+const RELAY_PACKING_KEYWORDS = new Map([
+  ['TAPE', 'TAPE'],
+  ['REEL', 'REEL'],
+  ['TR', 'TAPE&REEL'],
+  ['TRAY', 'TRAY'],
+  ['TUBE', 'TUBE'],
+  ['BULK', 'BULK'],
+  ['BOX', 'BOX'],
+  ['BAG', 'BAG'],
+]);
+
+const SPEC_LABEL_PATTERNS = [
+  { key: 'contact_rating_text', test: /contact\s*rating/i, numeric: false },
+  { key: 'dielectric_strength_v', test: /dielectric/i, numeric: false },
+  { key: 'insulation_resistance_mohm', test: /insulation\s*resistance/i, numeric: false },
+  { key: 'operate_time_ms', test: /operate\s*time/i, numeric: true },
+  { key: 'release_time_ms', test: /release\s*time/i, numeric: true },
+];
+
 /* -------------------- ENV helpers -------------------- */
 function resolveDocAI() {
   const projectId =
@@ -256,6 +295,39 @@ function codesFromDocAiTables(tables) {
     });
   }
   return Array.from(set);
+}
+
+function collectPnExamplesFromTables(tables = []) {
+  const examples = new Set();
+  for (const table of tables) {
+    const headers = Array.isArray(table?.headers) ? table.headers : [];
+    const rows = Array.isArray(table?.rows) ? table.rows : [];
+    if (!rows.length) continue;
+
+    const partIndexes = [];
+    const typeIndexes = [];
+    headers.forEach((rawHeader, idx) => {
+      const header = String(rawHeader || '').trim();
+      if (!header) return;
+      if (PART_HEADER_RE.test(header)) partIndexes.push(idx);
+      if (TYPE_HEADER_RE.test(header)) typeIndexes.push(idx);
+    });
+
+    const candidateIndexes = partIndexes.length ? partIndexes : typeIndexes;
+    if (!candidateIndexes.length) continue;
+
+    for (const row of rows) {
+      if (!Array.isArray(row)) continue;
+      for (const idx of candidateIndexes) {
+        const cell = row[idx];
+        if (cell == null) continue;
+        for (const code of extractCodesFromCell(cell)) {
+          if (code) examples.add(code);
+        }
+      }
+    }
+  }
+  return Array.from(examples);
 }
 
 function escapeRegex(value) {
@@ -715,10 +787,10 @@ function extractTypePartPairs(tables = []) {
   const pairs = new Map();
   for (const table of tables) {
     const headers = Array.isArray(table?.headers)
-      ? table.headers.map((h) => String(h || '').toLowerCase())
+      ? table.headers.map((h) => String(h || '').trim())
       : [];
-    const typeIdx = headers.findIndex((h) => /(^|\s)type(\s|$)|type no/.test(h));
-    const partIdx = headers.findIndex((h) => /(^|\s)part(\s|$)|part no|品番|型番/.test(h));
+    const typeIdx = headers.findIndex((h) => TYPE_HEADER_RE.test(h));
+    const partIdx = headers.findIndex((h) => PART_HEADER_RE.test(h));
     if (typeIdx < 0 || partIdx < 0) continue;
     for (const row of table?.rows || []) {
       if (!Array.isArray(row)) continue;
@@ -733,6 +805,383 @@ function extractTypePartPairs(tables = []) {
   const out = new Map();
   for (const [key, valueSet] of pairs) out.set(key, Array.from(valueSet));
   return out;
+}
+
+function mergeIfEmpty(row, key, value) {
+  if (!row || typeof row !== 'object') return;
+  if (value == null) return;
+  if (typeof value === 'string' && value.trim() === '') return;
+  if (Object.prototype.hasOwnProperty.call(row, key)) {
+    const existing = row[key];
+    if (existing == null) {
+      row[key] = value;
+    } else if (typeof existing === 'string' && existing.trim() === '') {
+      row[key] = value;
+    }
+    return;
+  }
+  row[key] = value;
+}
+
+function parseNumericCell(value) {
+  if (value == null) return null;
+  const match = String(value)
+    .replace(/[,，]/g, '')
+    .match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const num = Number(match[0]);
+  return Number.isFinite(num) ? num : null;
+}
+
+function normalizeVoltageValue(value) {
+  if (value == null) return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  const rounded = Math.round(num * 1000) / 1000;
+  if (Math.abs(rounded - Math.round(rounded)) < 1e-6) return String(Math.round(rounded));
+  return String(rounded);
+}
+
+function normalizeVoltageInput(value) {
+  if (value == null) return null;
+  if (typeof value === 'number') return normalizeVoltageValue(value);
+  const numeric = parseNumericCell(value);
+  return normalizeVoltageValue(numeric);
+}
+
+function extractAlphaSegments(code) {
+  const segments = [];
+  const upper = String(code || '').toUpperCase();
+  const parts = upper.split(/[-_/]/);
+  for (const part of parts) {
+    const matches = part.match(/[A-Z]+/g);
+    if (!matches) continue;
+    for (const match of matches) {
+      if (match) segments.push(match);
+    }
+  }
+  return segments;
+}
+
+function extractVariantOptionLetters(code) {
+  const upper = String(code || '').toUpperCase();
+  const tokens = new Set();
+  const regex = /\d+([A-Z]+)/g;
+  let match;
+  while ((match = regex.exec(upper))) {
+    const letters = match[1] || '';
+    if (!letters) continue;
+    tokens.add(letters);
+    for (const ch of letters.split('')) tokens.add(ch);
+  }
+  const firstSegment = upper.split('-')[0] || '';
+  const trailingLetters = (firstSegment.match(/[A-Z]+$/) || [null])[0];
+  if (trailingLetters) {
+    tokens.add(trailingLetters);
+    for (const ch of trailingLetters.split('')) tokens.add(ch);
+  }
+  return tokens;
+}
+
+function parseVoltageCandidates(cell) {
+  const text = String(cell || '').trim();
+  if (!text) return [];
+  const upper = text.toUpperCase();
+  if (upper.includes('VAC') && !upper.includes('VDC')) return [];
+  const matches = upper.match(/\d+(?:\.\d+)?/g) || [];
+  const values = [];
+  for (const match of matches) {
+    const num = Number(match);
+    if (Number.isFinite(num)) values.push(num);
+  }
+  return values;
+}
+
+function buildCoilDataLookup(tables = []) {
+  let best = null;
+  for (const table of tables) {
+    const headers = Array.isArray(table?.headers) ? table.headers : [];
+    const rows = Array.isArray(table?.rows) ? table.rows : [];
+    if (!headers.length || !rows.length) continue;
+    const normalizedHeaders = headers.map((h) => String(h || '').trim());
+    const ratedIdx = normalizedHeaders.findIndex((h) => COIL_RATED_VOLTAGE_HEADER_RE.test(h));
+    if (ratedIdx < 0) continue;
+
+    const columnMap = {};
+    normalizedHeaders.forEach((header, idx) => {
+      if (columnMap.coil_resistance_ohm == null && COIL_RESISTANCE_HEADER_RE.test(header)) {
+        columnMap.coil_resistance_ohm = idx;
+      }
+      if (
+        columnMap.rated_operating_current_ma == null &&
+        COIL_OPERATING_CURRENT_HEADER_RE.test(header)
+      ) {
+        columnMap.rated_operating_current_ma = idx;
+      }
+      if (
+        columnMap.rated_operating_power_mw == null &&
+        COIL_OPERATING_POWER_HEADER_RE.test(header)
+      ) {
+        columnMap.rated_operating_power_mw = idx;
+      }
+      if (columnMap.max_allowable_voltage == null && COIL_MAX_ALLOWABLE_HEADER_RE.test(header)) {
+        columnMap.max_allowable_voltage = idx;
+      }
+      if (columnMap.operate_voltage == null && COIL_OPERATE_HEADER_RE.test(header)) {
+        columnMap.operate_voltage = idx;
+      }
+      if (columnMap.release_voltage == null && COIL_RELEASE_HEADER_RE.test(header)) {
+        columnMap.release_voltage = idx;
+      }
+    });
+
+    const specKeys = Object.keys(columnMap).filter((key) => columnMap[key] != null);
+    if (!specKeys.length) continue;
+
+    const lookup = new Map();
+    for (const row of rows) {
+      if (!Array.isArray(row)) continue;
+      const ratedCell = row[ratedIdx];
+      const voltages = parseVoltageCandidates(ratedCell);
+      if (!voltages.length) continue;
+
+      const spec = {};
+      if (columnMap.coil_resistance_ohm != null) {
+        const value = parseNumericCell(row[columnMap.coil_resistance_ohm]);
+        if (value != null) spec.coil_resistance_ohm = value;
+      }
+      if (columnMap.rated_operating_current_ma != null) {
+        const value = parseNumericCell(row[columnMap.rated_operating_current_ma]);
+        if (value != null) spec.rated_operating_current_ma = value;
+      }
+      if (columnMap.rated_operating_power_mw != null) {
+        const value = parseNumericCell(row[columnMap.rated_operating_power_mw]);
+        if (value != null) spec.rated_operating_power_mw = value;
+      }
+      if (columnMap.max_allowable_voltage != null) {
+        const value = parseNumericCell(row[columnMap.max_allowable_voltage]);
+        if (value != null) spec.max_allowable_voltage = value;
+      }
+      if (columnMap.operate_voltage != null) {
+        const value = parseNumericCell(row[columnMap.operate_voltage]);
+        if (value != null) spec.operate_voltage = value;
+      }
+      if (columnMap.release_voltage != null) {
+        const value = parseNumericCell(row[columnMap.release_voltage]);
+        if (value != null) spec.release_voltage = value;
+      }
+
+      if (!Object.keys(spec).length) continue;
+
+      for (const voltage of voltages) {
+        const key = normalizeVoltageValue(voltage);
+        if (!key) continue;
+        if (!lookup.has(key)) lookup.set(key, spec);
+      }
+    }
+
+    if (lookup.size) {
+      if (!best || lookup.size > best.lookup.size) {
+        best = { lookup, columnMap };
+      }
+    }
+  }
+  return best;
+}
+
+function deriveCoilVoltageFromCode(code) {
+  const norm = String(code || '').trim().toUpperCase();
+  if (!norm) return null;
+  const patterns = [
+    /(?:^|[-_\s])(?:AC|DC)\s*(\d{1,3})(?:\s*V(?:AC|DC)?)?(?=$|[^0-9])/,
+    /(\d{1,3})\s*V(?:AC|DC)?\b/,
+    /(?:^|[^0-9])(\d{1,3})(?=\s*V(?:AC|DC)?)/,
+    /(?:^|[-_\s])(\d{2,3})(?=$|[-_\s]|[A-Z]{1,2}$)/,
+  ];
+  for (const pattern of patterns) {
+    const match = norm.match(pattern);
+    if (!match) continue;
+    const numeric = Number(match[1]);
+    if (!Number.isFinite(numeric)) continue;
+    const normalized = normalizeVoltageValue(numeric);
+    if (!normalized) continue;
+    return { numeric, normalized };
+  }
+  return null;
+}
+
+function deriveRelayAttributesFromPn(code) {
+  const norm = String(code || '').trim().toUpperCase();
+  if (!norm) return {};
+  const attrs = {};
+
+  const formMatch = norm.match(/(\d)\s*FORM\s*([ABCD])/);
+  if (formMatch) {
+    attrs.contact_form = `${formMatch[1]}${formMatch[2]}`;
+  } else {
+    let detected = null;
+    for (let i = 0; i < norm.length - 1; i += 1) {
+      const current = norm[i];
+      const next = norm[i + 1];
+      if (!/\d/.test(current) || !/[A-D]/.test(next)) continue;
+      const prev = i > 0 ? norm[i - 1] : '';
+      if (prev && /\d/.test(prev)) continue;
+      detected = `${current}${next}`;
+      break;
+    }
+    if (!detected) {
+      const segments = extractAlphaSegments(norm);
+      for (const seg of segments) {
+        const upperSeg = seg.toUpperCase();
+        if (RELAY_CONTACT_KEYWORDS.has(upperSeg)) {
+          detected = RELAY_CONTACT_KEYWORDS.get(upperSeg);
+          break;
+        }
+        const inline = upperSeg.match(/(\d)([ABCD])/);
+        if (inline && !/\d/.test(upperSeg[inline.index - 1] || '')) {
+          detected = `${inline[1]}${inline[2]}`;
+          break;
+        }
+      }
+      if (!detected) {
+        for (const [token, value] of RELAY_CONTACT_KEYWORDS.entries()) {
+          if (norm.includes(token)) {
+            detected = value;
+            break;
+          }
+        }
+      }
+    }
+    if (detected) attrs.contact_form = detected;
+  }
+
+  const coil = deriveCoilVoltageFromCode(norm);
+  if (coil && attrs.coil_voltage_vdc == null) attrs.coil_voltage_vdc = coil.numeric;
+
+  const variantTokens = extractVariantOptionLetters(norm);
+  const firstSegment = norm.split('-')[0] || '';
+  const trailingLetters = (firstSegment.match(/[A-Z]+$/) || [''])[0] || '';
+  const trailingLastTwo = trailingLetters.slice(-2);
+  if (!attrs.construction) {
+    if (variantTokens.has('SEALED') || /SEALED/.test(norm)) {
+      attrs.construction = 'SEALED';
+    } else if (variantTokens.has('HERMETIC') || /HERMETIC/.test(norm)) {
+      attrs.construction = 'HERMETIC';
+    } else if (trailingLetters.endsWith('S')) {
+      attrs.construction = 'SEALED';
+    } else if (trailingLetters.endsWith('H') || trailingLastTwo.includes('H')) {
+      attrs.construction = 'FLUX-RESISTANT';
+    }
+  }
+
+  if (!attrs.insulation) {
+    if (/(^|[-_\s])CLASS[-_\s]*F($|[-_\s])/.test(norm)) attrs.insulation = 'CLASS F';
+    else if (/(^|[-_\s])CLASS[-_\s]*B($|[-_\s])/.test(norm)) attrs.insulation = 'CLASS B';
+  }
+
+  if (!attrs.packing_style) {
+    let packing = null;
+    for (const token of variantTokens) {
+      if (token.length < 1) continue;
+      if (token.length === 1 && token !== 'W') continue;
+      if (token === 'W') {
+        packing = 'W';
+        break;
+      }
+      if (RELAY_PACKING_KEYWORDS.has(token)) {
+        packing = RELAY_PACKING_KEYWORDS.get(token);
+        break;
+      }
+    }
+    if (!packing) {
+      const match = norm.match(/(?:^|[-_\s])(TAPE|REEL|TRAY|TUBE|BULK|BOX|BAG)(?:$|[-_\s])/);
+      if (match) packing = match[1];
+      else if (/W$/.test(norm) || trailingLetters.endsWith('W')) packing = 'W';
+    }
+    if (packing) attrs.packing_style = packing;
+  }
+
+  return attrs;
+}
+
+function mergeCoilDataIntoRows(rows, tables) {
+  const coilData = buildCoilDataLookup(tables);
+  if (!coilData) return;
+  const { lookup } = coilData;
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    let normalizedVoltage = normalizeVoltageInput(
+      row.coil_voltage_vdc ?? row.coil_voltage ?? row.voltage ?? null,
+    );
+    let derived = null;
+    if (!normalizedVoltage) {
+      const candidate = row.code || row.pn || row.part_no || row.part_number || null;
+      derived = deriveCoilVoltageFromCode(candidate);
+      if (derived) normalizedVoltage = derived.normalized;
+    }
+    if (!normalizedVoltage) continue;
+    if (derived && derived.numeric != null) {
+      mergeIfEmpty(row, 'coil_voltage_vdc', derived.numeric);
+    }
+    const spec = lookup.get(normalizedVoltage);
+    if (!spec) continue;
+    for (const [key, value] of Object.entries(spec)) {
+      mergeIfEmpty(row, key, value);
+    }
+  }
+}
+
+function extractCommonSpecsFromTables(tables = []) {
+  const aggregate = {};
+  for (const table of tables) {
+    const headers = Array.isArray(table?.headers) ? table.headers : [];
+    const rows = Array.isArray(table?.rows) ? table.rows : [];
+    if (!rows.length) continue;
+    const headerStr = headers.map((h) => String(h || '').toLowerCase()).join(' ');
+    let looksLikeSpec = /spec/i.test(headerStr);
+    const tableSpec = {};
+    let matchCount = 0;
+    for (const row of rows) {
+      if (!Array.isArray(row) || row.length < 2) continue;
+      const label = String(row[0] || '').trim();
+      if (!label) continue;
+      const valueText = row
+        .slice(1)
+        .map((cell) => (cell == null ? '' : String(cell).trim()))
+        .filter(Boolean)
+        .join(' ');
+      if (!valueText) continue;
+      for (const pattern of SPEC_LABEL_PATTERNS) {
+        if (!pattern.test.test(label)) continue;
+        matchCount += 1;
+        let value = valueText;
+        if (pattern.numeric) {
+          const numeric = parseNumericCell(valueText);
+          value = numeric != null ? numeric : parseNumericCell(label) ?? valueText;
+        }
+        if (value == null || value === '') continue;
+        if (!(pattern.key in tableSpec)) tableSpec[pattern.key] = value;
+      }
+    }
+    if (!looksLikeSpec && matchCount < 2) continue;
+    for (const [key, value] of Object.entries(tableSpec)) {
+      if (value == null) continue;
+      if (aggregate[key] != null) continue;
+      aggregate[key] = value;
+    }
+  }
+  return aggregate;
+}
+
+function mergeCommonSpecsIntoRows(rows, tables) {
+  const common = extractCommonSpecsFromTables(tables);
+  if (!common || !Object.keys(common).length) return;
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    for (const [key, value] of Object.entries(common)) {
+      mergeIfEmpty(row, key, value);
+    }
+  }
 }
 
 function gatherOrderingSectionEvidence(orderingInfo, code, options = {}) {
@@ -927,14 +1376,24 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     ].forEach(ensureAllowedKey);
   }
 
-    if (familyLower.startsWith('relay')) {
+  if (familyLower.startsWith('relay')) {
     [
+      'coil_voltage_vdc',
       'contact_rating_text',
       'dielectric_strength_v',
       'operate_time_ms',
       'release_time_ms',
       'coil_resistance_ohm',
       'insulation_resistance_mohm',
+      'rated_operating_current_ma',
+      'rated_operating_power_mw',
+      'max_allowable_voltage',
+      'operate_voltage',
+      'release_voltage',
+      'contact_form',
+      'construction',
+      'insulation',
+      'protection',
       'length_mm',
       'width_mm',
       'height_mm',
@@ -961,7 +1420,18 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   let codes = [];
   if (tableList.length) codes = codesFromDocAiTables(tableList);
   if (!codes.length && fullText) codes = codesFromFreeText(fullText);
-  let pnRegex = buildPnRegexFromExamples(codes.slice(0, MAX_PARTS));
+  const pnExampleSet = new Set();
+  for (const example of codes.slice(0, MAX_PARTS)) {
+    const norm = normalizeCodeKey(example);
+    if (norm) pnExampleSet.add(norm);
+  }
+  if (tableList.length) {
+    for (const example of collectPnExamplesFromTables(tableList)) {
+      const norm = normalizeCodeKey(example);
+      if (norm) pnExampleSet.add(norm);
+    }
+  }
+  let pnRegex = buildPnRegexFromExamples(Array.from(pnExampleSet));
 
   // 표 프리뷰(LLM 컨텍스트)
   let tablePreview = '';
@@ -1111,6 +1581,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   const pushCode = (value) => {
     const norm = String(value || '').trim().toUpperCase();
     if (!norm || seenCodes.has(norm)) return;
+    if (pnRegex && !pnRegex.test(norm)) return;
     seenCodes.add(norm);
     mergedCodes.push(norm);
   };
@@ -1127,6 +1598,7 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     if (brandValue) row.brand = brandValue;
     if (values && typeof values === 'object') {
       const normalizedValues = {};
+      const normalizedLowerKeys = new Set();
       const assignValue = (key, rawValue) => {
         const keyStr = key == null ? '' : String(key).trim();
         if (!keyStr) return;
@@ -1139,11 +1611,22 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
           ensureAllowedKey(cleanKey);
         }
         normalizedValues[cleanKey] = rawValue;
+        normalizedLowerKeys.add(lower);
       };
 
       for (const [rawKey, rawValue] of Object.entries(values)) {
         if (rawValue == null) continue;
         assignValue(rawKey, rawValue);
+      }
+
+      const derivedAttrs = deriveRelayAttributesFromPn(code);
+      for (const [derivedKey, derivedValue] of Object.entries(derivedAttrs)) {
+        if (derivedValue == null) continue;
+        const derivedKeyStr = derivedKey == null ? '' : String(derivedKey).trim();
+        if (!derivedKeyStr) continue;
+        const lower = derivedKeyStr.toLowerCase();
+        if (normalizedLowerKeys.has(lower)) continue;
+        assignValue(derivedKeyStr, derivedValue);
       }
 
       if (typePartMap.has(norm)) {
@@ -1231,6 +1714,11 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
     for (const c of seedCodes) {
       pushRow({ code: c, values: {}, brand, verified: hasDocEvidenceValue(c) });
     }
+  }
+
+  if (out.length) {
+    mergeCommonSpecsIntoRows(out, tableList);
+    mergeCoilDataIntoRows(out, tableList);
   }
 
   const codeList = mergedCodes.slice(0, MAX_PARTS);

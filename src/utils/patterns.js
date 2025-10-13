@@ -1,6 +1,6 @@
 'use strict';
 
-const PN_BODY_CHARS = 'A-Za-z0-9\\-_.\\/()#';
+const PN_BODY_CHARS = 'A-Za-z0-9\\-_.\\/()#*';
 const PN_CANDIDATE_SOURCE = `[A-Za-z][A-Za-z0-9](?:[${PN_BODY_CHARS}]{1,35})`;
 const PN_FULL_SOURCE = `[A-Za-z0-9][${PN_BODY_CHARS}]{3,63}[A-Za-z0-9)#]`;
 

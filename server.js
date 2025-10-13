@@ -23,13 +23,15 @@ function newRunId() {
 }
 // ----------------------------------------------
 
+// 배포 환경에서는 프로세스를 죽이지 말고 JSON 에러로 회수
+const FATAL_ON_UNHANDLED = process.env.FATAL_ON_UNHANDLED === '1';
 process.on('uncaughtException', (e) => {
-  console.error('[FATAL][uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));
-  process.exit(1);
+  console.error('[uncaughtException]', e?.message, e?.stack?.split('\n').slice(0, 4).join(' | '));
+  if (FATAL_ON_UNHANDLED) process.exit(1);
 });
 process.on('unhandledRejection', (e) => {
-  console.error('[FATAL][unhandledRejection]', e);
-  process.exit(1);
+  console.error('[unhandledRejection]', e);
+  if (FATAL_ON_UNHANDLED) process.exit(1);
 });
 
 // 필수 env 스모크 로그(민감값 제외)
@@ -1583,9 +1585,14 @@ try {
 
 /* ---------------- 404 / error ---------------- */
 app.use((req, res) => res.status(404).json({ ok:false, error:'not found' }));
-app.use((err, req, res, next) => {
+app.use((err, req, res, _next) => {
   try { require('./src/utils/logger').logError(err, { path: req.originalUrl }); } catch {}
-  res.status(500).json({ ok:false, error:'internal error' });
+  try {
+    const msg = (err && (err.message || err.toString())) || 'internal error';
+    if (!res.headersSent) res.status(500).json({ ok: false, error: msg });
+  } catch {
+    if (!res.headersSent) res.status(500).json({ ok: false, error: 'internal error' });
+  }
 });
 
 // (C) 인라인 헬스 제거(충돌 원인)

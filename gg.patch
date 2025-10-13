@@ -1,47 +1,54 @@
-diff --git a/server.retail.import.js b/server.retail.import.js
-index 365298f97283be713eafcb53bada93c10c0a36da..8a8dc855959dd386bb4dbe692cbdc1cf8f2f289c 100644
---- a/server.retail.import.js
-+++ b/server.retail.import.js
-@@ -51,41 +51,41 @@ router.post('/api/retail/import', async (req, res, next) => {
-     let count = 0;
-     const toNdjson = new Transform({
-       objectMode: true,
-       transform(row, _enc, callback) {
-         count += 1;
-         callback(null, `${row.line}\n`);
-       },
-     });
- 
+diff --git a/server.retail.js b/server.retail.js
+index 2c794838fc5e93c0fe04138585d6960bd6dd6b3a..f65588dc433011726f3049cf16937f4f03c9d203 100644
+--- a/server.retail.js
++++ b/server.retail.js
+@@ -50,47 +50,50 @@ router.post('/api/retail/export-catalog', async (req, res) => {
      await new Promise((resolve, reject) => {
        pgStream
          .pipe(toNdjson)
-         .pipe(gcsFile.createWriteStream({
-           resumable: false,
-           contentType: 'application/x-ndjson',
-         }))
+         .pipe(gcsWrite)
          .on('finish', resolve)
          .on('error', reject);
      });
  
-     const errorsPrefix = process.env.RETAIL_ERRORS_PREFIX || 'retail/errors';
+     const [meta] = await gcsFile.getMetadata();
+     res.json({ ok: true, gcsUri: GCS_URI, count, size: meta.size });
+   } catch (e) {
+     console.error('[retail/export] error', e);
+     res.status(500).json({ ok: false, error: e.message });
+   } finally {
+     client.release();
+   }
+ });
+ 
+ /** Start Import (returns operation name) */
+ router.post('/api/retail/import-catalog', async (req, res) => {
+   try {
      const [op] = await retail.importProducts({
        parent: BRANCH,
-       inputConfig: { gcsSource: { inputUris: [gcsUri] } },
+       inputConfig: { gcsSource: { inputUris: [GCS_URI] } },
        reconciliationMode: 'INCREMENTAL',
--            // ★ 필수: 에러 로그 저장 경로 (gs://버킷/디렉토리)
-+      // ★ 필수: 에러 로그 저장 경로 (gs://버킷/디렉토리)
-       errorsConfig: { gcsPrefix: `gs://${TEMP_BUCKET}/${errorsPrefix}` },
++      errorsConfig: {
++        gcsPrefix: `gs://${BUCKET}/${process.env.RETAIL_ERRORS_PREFIX || 'retail/errors'}`,
++      },
      });
-     const [resp] = await op.promise();
+     res.json({ ok: true, operation: op.name, gcsUri: GCS_URI, branch: BRANCH });
+   } catch (e) {
+     console.error('[retail/import] error', e);
+     res.status(500).json({ ok: false, error: e.message });
+   }
+ });
  
-     res.json({ done: true, result: resp, gcsUri, branch: BRANCH, count });
-   } catch (err) {
-     console.error('[retail/import]', err?.message || err);
-     // 서버 크래시 방지: 500 JSON으로 돌려보냄
--    res.status(500).json({ done: false, error: String(err?.message || err), gcsUri });
-+    return res.status(500).json({ done: false, error: String(err?.message || err), gcsUri });
-   } finally {
-     dbClient.release();
+ /** Check Import Status (use ?name=operations/… ) */
+ router.get('/api/retail/import-catalog/status', async (req, res) => {
+   try {
+     const name = req.query.name;
+     if (!name) return res.status(400).json({ ok: false, error: 'missing ?name' });
+     const [resp] = await retail.checkImportProductsProgress(String(name));
+     res.json({ ok: true, metadata: resp.metadata, done: resp.done, result: resp.result });
+   } catch (e) {
+     console.error('[retail/status] error', e);
+     res.status(500).json({ ok: false, error: e.message });
    }
  });
  

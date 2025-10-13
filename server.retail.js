@@ -72,6 +72,9 @@ router.post('/api/retail/import-catalog', async (req, res) => {
       parent: BRANCH,
       inputConfig: { gcsSource: { inputUris: [GCS_URI] } },
       reconciliationMode: 'INCREMENTAL',
+      errorsConfig: {
+        gcsPrefix: `gs://${BUCKET}/${process.env.RETAIL_ERRORS_PREFIX || 'retail/errors'}`,
+      },
     });
     res.json({ ok: true, operation: op.name, gcsUri: GCS_URI, branch: BRANCH });
   } catch (e) {

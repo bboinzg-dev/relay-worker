@@ -1,22 +1,65 @@
-diff --git a/src/utils/patterns.js b/src/utils/patterns.js
-index 161ddd6e0616cb9901958e56748c1cfc0198c06a..2eab280c4aa9577c6b1b037599e8c1aff5b8ec21 100644
---- a/src/utils/patterns.js
-+++ b/src/utils/patterns.js
-@@ -1,15 +1,15 @@
- 'use strict';
+diff --git a/src/utils/blueprint.js b/src/utils/blueprint.js
+index 6d5d57820b133eee5584e49802282ec3426565b6..d3b4286fbd96d0f6454ecbf2af3b58f8493e49c4 100644
+--- a/src/utils/blueprint.js
++++ b/src/utils/blueprint.js
+@@ -37,58 +37,56 @@ function deriveVariantKeys(blueprintRow = {}) {
+   const ingestOptions = blueprintRow.ingest_options || blueprintRow.ingestOptions || {};
+   if (Array.isArray(ingestOptions.variant_keys)) {
+     return normalizeKeyList(ingestOptions.variant_keys);
+   }
+   if (Array.isArray(blueprintRow.variant_keys)) {
+     return normalizeKeyList(blueprintRow.variant_keys);
+   }
+   return [];
+ }
  
--const PN_BODY_CHARS = 'A-Za-z0-9\\-_.\\/()#';
-+const PN_BODY_CHARS = 'A-Za-z0-9\\-_.\\/()#*';
- const PN_CANDIDATE_SOURCE = `[A-Za-z][A-Za-z0-9](?:[${PN_BODY_CHARS}]{1,35})`;
- const PN_FULL_SOURCE = `[A-Za-z0-9][${PN_BODY_CHARS}]{3,63}[A-Za-z0-9)#]`;
+ function ensureFamilyOverrides(blueprint, registryRow) {
+   if (!blueprint) return blueprint;
  
- const PN_RE = new RegExp(`\\b${PN_FULL_SOURCE}\\b`, 'i');
- const PN_CANDIDATE_RE = new RegExp(PN_CANDIDATE_SOURCE, 'g');
+   const ingestOptions = blueprint.ingestOptions || {};
+   const family = String(blueprint.family_slug || '').trim().toLowerCase();
+   const forcedVariantKeys = new Set(blueprint.variant_keys || []);
  
- module.exports = {
-   PN_RE,
-   PN_CANDIDATE_RE,
-   PN_BODY_CHARS,
-   PN_CANDIDATE_SOURCE,
- };
-\ No newline at end of file
+   const addVariantKeys = (keys = []) => {
+     for (const key of keys) {
+       const norm = normalizeKeyList([key])[0];
+       if (!norm) continue;
+       forcedVariantKeys.add(norm);
+     }
+   };
+ 
++  addVariantKeys(ingestOptions.variant_keys || []);
++
+   if (family === 'relay_power') {
+     addVariantKeys(['coil_voltage_vdc', 'contact_form', 'suffix']);
+   }
+ 
+-  if (family === 'relay_signal') {
+-    // 템플릿은 강제하지 않고 LLM/표에서 추론한 pn_template 사용
+-  }
+-
+   const variantKeys = Array.from(forcedVariantKeys);
+   blueprint.variant_keys = variantKeys;
+   ingestOptions.variant_keys = variantKeys;
+   blueprint.ingestOptions = ingestOptions;
+ 
+   const allowed = Array.isArray(blueprint.allowedKeys) ? blueprint.allowedKeys : [];
+   const generic = [
+     'pn_jp',
+     'pn_aliases',
+     'ordering_market',
+     'coil_voltage_vdc',
+     'coil_voltage_vac',
+     'contact_form',
+     'contact_arrangement',
+     'terminal_form',
+     'terminal_shape',
+     'contact_rating_text',
+     'dielectric_strength_v',
+     'operate_time_ms',
+     'release_time_ms',
+     'coil_resistance_ohm',
+     'operating_function',
+     'packing_style',
+     'insulation_resistance_mohm',
+     'dim_l_mm',

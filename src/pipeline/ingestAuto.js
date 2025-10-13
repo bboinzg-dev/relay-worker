@@ -285,6 +285,59 @@ function flattenDocAiTablesForMerge(tables) {
   return records;
 }
 
+async function canonicalizeDocAiRecords(family, allowedKeys, records) {
+  const list = Array.isArray(records) ? records : [];
+  if (!list.length) return list;
+
+  const headers = new Set();
+  for (const rec of list) {
+    if (!rec || typeof rec !== 'object') continue;
+    const rowHeaders = Array.isArray(rec.headers) ? rec.headers : [];
+    for (const header of rowHeaders) {
+      const normalized = normalizeDocAiCell(header);
+      if (normalized) headers.add(normalized);
+    }
+  }
+  if (!headers.size) return list;
+
+  let mapping = null;
+  try {
+    const known = Array.isArray(allowedKeys) ? allowedKeys : [];
+    const { map } = await aiCanonicalizeKeys(family, Array.from(headers), known);
+    mapping = map || null;
+  } catch (err) {
+    console.warn('[canon] canonicalizeDocAiRecords failed:', err?.message || err);
+    mapping = null;
+  }
+
+  if (!mapping) return list;
+
+  for (const rec of list) {
+    if (!rec || typeof rec !== 'object') continue;
+    const canon = {};
+    const used = new Set();
+    const rowHeaders = Array.isArray(rec.headers) ? rec.headers : [];
+    const values = Object.values(rec.values || {});
+    for (let i = 0; i < rowHeaders.length; i += 1) {
+      const header = rowHeaders[i];
+      if (!header) continue;
+      const normalized = normalizeDocAiCell(header);
+      if (!normalized) continue;
+      const info = mapping[normalized] || mapping[header] || {};
+      if (info.action !== 'map' || !info.canonical) continue;
+      const key = String(info.canonical || '').trim().toLowerCase();
+      if (!key || used.has(key)) continue;
+      const value = values[i];
+      if (value == null || value === '') continue;
+      canon[key] = value;
+      used.add(key);
+    }
+    rec._canon = canon;
+  }
+
+  return list;
+}
+
 function normalizeDocAiTokenForMatch(value) {
   if (value == null) return null;
   const normalized = String(value)
@@ -380,6 +433,110 @@ function bestRowMatchToSpec(row, docAiRecords, used = new Set()) {
   if (best.exact <= 0 && best.partial <= 0) return null;
   if (best.exact <= 0 && best.score < 12) return null;
   return best.record;
+}
+
+function bestAttributeMatchToSpec(row, docAiRecords, variantKeys = []) {
+  if (!row || typeof row !== 'object') return null;
+  const records = Array.isArray(docAiRecords) ? docAiRecords : [];
+  if (!records.length) return null;
+  const keys = Array.isArray(variantKeys)
+    ? variantKeys.map((key) => String(key || '').toLowerCase()).filter(Boolean)
+    : [];
+  if (!keys.length) return null;
+
+  const desired = new Map();
+  for (const key of keys) {
+    const value = getValueIgnoreCase(row, key);
+    if (value == null || value === '') continue;
+    const normalized = String(value).trim().toLowerCase();
+    if (!normalized) continue;
+    desired.set(key, normalized);
+  }
+  if (!desired.size) return null;
+
+  let best = null;
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    const canon = record._canon && typeof record._canon === 'object' ? record._canon : {};
+    let matches = 0;
+    let fields = 0;
+    for (const [key, target] of desired.entries()) {
+      const current = canon[key] != null ? String(canon[key]).trim().toLowerCase() : '';
+      if (!current) continue;
+      fields += 1;
+      if (current === target) {
+        matches += 1;
+        continue;
+      }
+      if (/\d/.test(target) && /\d/.test(current)) {
+        const targetDigits = target.replace(/[^0-9]/g, '');
+        const currentDigits = current.replace(/[^0-9]/g, '');
+        if (targetDigits && targetDigits === currentDigits) {
+          matches += 1;
+        }
+      }
+    }
+    if (!fields || !matches) continue;
+    const score = matches * 10 + fields;
+    if (!best || score > best.score) {
+      best = { record, score };
+    }
+  }
+
+  return best?.record || null;
+}
+
+function findCoilRowMatchForRelaySignal(row, docAiRecords) {
+  if (!row || typeof row !== 'object') return null;
+  const records = Array.isArray(docAiRecords) ? docAiRecords : [];
+  if (!records.length) return null;
+
+  const coilKeys = ['coil_voltage_vdc', 'coil_voltage_vac', 'coil_voltage', 'coil_voltage_code', 'coil_power_code'];
+  const targets = [];
+  for (const key of coilKeys) {
+    const value = getValueIgnoreCase(row, key);
+    if (value == null || value === '') continue;
+    const normalized = String(value).trim();
+    if (normalized) targets.push(normalized);
+  }
+  if (!targets.length) return null;
+
+  const targetDigits = new Set(
+    targets
+      .map((value) => value.replace(/[^0-9]/g, ''))
+      .filter((value) => value.length > 0),
+  );
+
+  let best = null;
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    const values = record.values && typeof record.values === 'object' ? record.values : {};
+    const canon = record._canon && typeof record._canon === 'object' ? record._canon : {};
+    let score = 0;
+
+    const inspectValue = (raw) => {
+      if (!raw) return;
+      const normalized = String(raw).trim();
+      if (!normalized) return;
+      const lower = normalized.toLowerCase();
+      if (!/(coil|volt)/.test(lower)) return;
+      for (const target of targets) {
+        if (lower.includes(target.toLowerCase())) score += 5;
+      }
+      const digits = normalized.replace(/[^0-9]/g, '');
+      if (digits && targetDigits.has(digits)) score += 10;
+    };
+
+    for (const value of Object.values(values)) inspectValue(value);
+    for (const value of Object.values(canon)) inspectValue(value);
+
+    if (score <= 0) continue;
+    if (!best || score > best.score) {
+      best = { record, score };
+    }
+  }
+
+  return best?.record || null;
 }
 
 function safeMergeSpec(row, source) {
@@ -711,6 +868,33 @@ const TERMINAL_SHAPE_TOKENS = new Set([
 
 const PACKING_STYLE_TOKENS = new Set(['Z', 'W', 'X', 'Y']);
 
+const CORE_SPEC_KEYS = [
+  'coil_voltage_vdc',
+  'coil_voltage_vac',
+  'coil_voltage',
+  'contact_form',
+  'contact_arrangement',
+  'voltage',
+  'rated_voltage',
+  'resistance',
+  'resistance_ohm',
+  'current',
+  'contact_rating_a',
+];
+
+const SECONDARY_SPEC_KEYS = [
+  'coil_resistance_ohm',
+  'coil_current',
+  'coil_power_code',
+  'coil_power',
+  'operate_time_ms',
+  'release_time_ms',
+  'insulation_resistance_mohm',
+  'dielectric_strength_v',
+  'contact_rating',
+  'power_consumption',
+];
+
 function normalizeSpecKeyName(value) {
   if (value == null) return null;
   let s = String(value).trim().toLowerCase();
@@ -724,6 +908,24 @@ function normalizeSpecKeyName(value) {
   if (s.length > 63) s = s.slice(0, 63);
   if (RESERVED_SPEC_KEYS.has(s)) return null;
   return s;
+}
+
+function hasCoreSpec(row) {
+  if (!row || typeof row !== 'object') return false;
+  const seen = new Set();
+  for (const key of CORE_SPEC_KEYS) {
+    const value = getValueIgnoreCase(row, key);
+    if (value == null || value === '') continue;
+    seen.add(key);
+    if (seen.size >= 2) return true;
+  }
+  if (seen.size > 0) return true;
+  for (const key of SECONDARY_SPEC_KEYS) {
+    const value = getValueIgnoreCase(row, key);
+    if (value == null || value === '') continue;
+    return true;
+  }
+  return false;
 }
 
 const ORDERING_SECTION_RE =
@@ -2385,9 +2587,13 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
       ? blueprint.ingestOptions.variant_keys
       : (Array.isArray(blueprint?.variant_keys) ? blueprint.variant_keys : []);
-    variantKeys = variantKeys
-      .map((k) => String(k || '').trim().toLowerCase())
-      .filter(Boolean);
+    variantKeys = Array.from(
+      new Set(
+        variantKeys
+          .map((k) => String(k || '').trim().toLowerCase())
+          .filter(Boolean),
+      ),
+    );
   }
 
   let pnTemplate = USE_PN_TEMPLATE
@@ -2504,7 +2710,18 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     extracted.tables = docAiTables;
   }
 
-  const docAiRecordsForMerge = flattenDocAiTablesForMerge(docAiTables);
+  let docAiRecordsForMerge = flattenDocAiTablesForMerge(docAiTables);
+  if (docAiRecordsForMerge.length) {
+    try {
+      docAiRecordsForMerge = await canonicalizeDocAiRecords(
+        family,
+        Array.isArray(allowedKeys) ? allowedKeys : [],
+        docAiRecordsForMerge,
+      );
+    } catch (err) {
+      console.warn('[canon] docAiRecordsForMerge canonicalization failed:', err?.message || err);
+    }
+  }
   const vertexSpecValues = (() => {
     if (!vertexExtractValues || typeof vertexExtractValues !== 'object') return null;
     const filtered = {};
@@ -2540,7 +2757,13 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   if (Array.isArray(extracted.rows) && extracted.rows.length) {
     for (const row of extracted.rows) {
       if (!row || typeof row !== 'object') continue;
-      const docMatch = bestRowMatchToSpec(row, docAiRecordsForMerge, usedDocAiRecords);
+      let docMatch = bestRowMatchToSpec(row, docAiRecordsForMerge, usedDocAiRecords);
+      if (!docMatch) {
+        docMatch = bestAttributeMatchToSpec(row, docAiRecordsForMerge, variantKeys);
+      }
+      if (!docMatch && String(family || '').toLowerCase() === 'relay_signal') {
+        docMatch = findCoilRowMatchForRelaySignal(row, docAiRecordsForMerge);
+      }
       if (docMatch && docMatch.values) {
         const patch = safeMergeSpec(row, docMatch.values);
         if (patch && Object.keys(patch).length) {
@@ -3539,6 +3762,72 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     });
     if (Array.isArray(expanded) && expanded.length) {
       explodedRows = expanded;
+    }
+  }
+  if (docAiRecordsForMerge.length && Array.isArray(explodedRows) && explodedRows.length) {
+    const usedRecords = new Set();
+    const variantForMatch = Array.isArray(variantKeys) ? variantKeys : [];
+    for (const row of explodedRows) {
+      if (!row || typeof row !== 'object') continue;
+      let match = bestRowMatchToSpec(row, docAiRecordsForMerge, usedRecords);
+      if (!match) {
+        match = bestAttributeMatchToSpec(row, docAiRecordsForMerge, variantForMatch);
+      }
+      if (!match && String(family || '').toLowerCase() === 'relay_signal') {
+        match = findCoilRowMatchForRelaySignal(row, docAiRecordsForMerge);
+      }
+      if (match && match.values) {
+        const patch = safeMergeSpec(row, match.values);
+        if (patch && Object.keys(patch).length) {
+          Object.assign(row, patch);
+        }
+        usedRecords.add(match);
+      }
+    }
+  }
+  if (Array.isArray(explodedRows) && explodedRows.length) {
+    try {
+      await ensureDynamicColumnsForRows(qualified, explodedRows);
+    } catch (err) {
+      console.warn('[schema] ensureDynamicColumnsForRows explodedRows failed:', err?.message || err);
+    }
+  }
+  if (
+    Array.isArray(explodedRows) &&
+    explodedRows.length &&
+    blueprint?.fields &&
+    Object.keys(blueprint.fields).length
+  ) {
+    const docTextForLlm = String(docAiText || previewText || '').slice(0, 60000);
+    if (docTextForLlm) {
+      const llmTargets = explodedRows
+        .map((row, index) => ({ row, index }))
+        .filter(({ row }) => !hasCoreSpec(row))
+        .slice(0, 3);
+      for (const target of llmTargets) {
+        try {
+          const llmValues = await extractFields(
+            docTextForLlm,
+            target.row?.pn || target.row?.code || '',
+            blueprint.fields,
+          );
+          if (llmValues && typeof llmValues === 'object') {
+            const patch = safeMergeSpec(target.row, llmValues);
+            if (patch && Object.keys(patch).length) {
+              Object.assign(target.row, patch);
+            }
+          }
+        } catch (err) {
+          console.warn('[llm] extractFields backfill failed:', err?.message || err);
+        }
+      }
+      if (llmTargets.length) {
+        try {
+          await ensureDynamicColumnsForRows(qualified, explodedRows);
+        } catch (err) {
+          console.warn('[schema] ensureDynamicColumnsForRows llm failed:', err?.message || err);
+        }
+      }
     }
   }
   const physicalCols = new Set(colTypes ? [...colTypes.keys()] : []);

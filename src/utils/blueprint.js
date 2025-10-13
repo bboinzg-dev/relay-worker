@@ -59,24 +59,8 @@ function ensureFamilyOverrides(blueprint, registryRow) {
     }
   };
 
-  const ensureTemplate = (template) => {
-    if (!template) return;
-    if (!ingestOptions.pn_template && !ingestOptions.pnTemplate) {
-      ingestOptions.pn_template = template;
-      ingestOptions.pnTemplate = template;
-      return;
-    }
-    if (!ingestOptions.pn_template && ingestOptions.pnTemplate) {
-      ingestOptions.pn_template = ingestOptions.pnTemplate;
-    }
-    if (!ingestOptions.pnTemplate && ingestOptions.pn_template) {
-      ingestOptions.pnTemplate = ingestOptions.pn_template;
-    }
-  };
-
   if (family === 'relay_power') {
     addVariantKeys(['coil_voltage_vdc', 'contact_form', 'suffix']);
-    ensureTemplate('{{series_code}}{{contact_form}}{{coil_voltage_vdc|pad=2}}{{suffix}}');
   }
 
   if (family === 'relay_signal') {

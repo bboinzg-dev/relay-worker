@@ -1,37 +1,22 @@
-diff --git a/src/utils/ordering-sections.js b/src/utils/ordering-sections.js
-index eec60c797ba5d389a41cff69c5a2453ceec2c6af..68fdca816aae42fe087ba913a31c3c66571ce381 100644
---- a/src/utils/ordering-sections.js
-+++ b/src/utils/ordering-sections.js
-@@ -1,29 +1,31 @@
+diff --git a/src/utils/patterns.js b/src/utils/patterns.js
+index 161ddd6e0616cb9901958e56748c1cfc0198c06a..2eab280c4aa9577c6b1b037599e8c1aff5b8ec21 100644
+--- a/src/utils/patterns.js
++++ b/src/utils/patterns.js
+@@ -1,15 +1,15 @@
  'use strict';
  
-+const { PN_CANDIDATE_SOURCE } = require('./patterns');
-+
- const ORDERING_ANCHOR_RE = /(ORDER(?:ING)?\s+(INFO|INFORMATION|GUIDE|CODE|NUMBER)|HOW\s+TO\s+ORDER|주문\s*정보|주문\s*코드|订购信息|订货信息|PART\s*(?:NO\.?|NUMBER)|品番|型番|품번)/i;
--const ORDERING_CANDIDATE_RE = /[A-Z][A-Z0-9](?:[A-Z0-9\-\.]{1,18})/g;
-+const ORDERING_CANDIDATE_RE = new RegExp(PN_CANDIDATE_SOURCE, 'g');
- const ORDERING_BLACKLIST_RE = /^(ISO|ROHS|UL|VDC|VAC|A|MA|MM|Ω|OHM|PDF|PAGE|NOTE|DATE|LOT|WWW|HTTP|HTTPS)$/i;
+-const PN_BODY_CHARS = 'A-Za-z0-9\\-_.\\/()#';
++const PN_BODY_CHARS = 'A-Za-z0-9\\-_.\\/()#*';
+ const PN_CANDIDATE_SOURCE = `[A-Za-z][A-Za-z0-9](?:[${PN_BODY_CHARS}]{1,35})`;
+ const PN_FULL_SOURCE = `[A-Za-z0-9][${PN_BODY_CHARS}]{3,63}[A-Za-z0-9)#]`;
  
- function normalizeCode(str) {
-   return String(str || '')
-     .replace(/[–—]/g, '-')
-     .replace(/\s+/g, '')
-     .replace(/-+/g, '-')
-     .toUpperCase();
- }
+ const PN_RE = new RegExp(`\\b${PN_FULL_SOURCE}\\b`, 'i');
+ const PN_CANDIDATE_RE = new RegExp(PN_CANDIDATE_SOURCE, 'g');
  
- function clampWindow(text, index, before = 8000, after = 12000) {
-   const len = text.length;
-   if (!Number.isFinite(index) || index < 0 || index > len) {
-     return { text, start: 0, end: len, anchorIndex: -1 };
-   }
-   const start = Math.max(0, index - before);
-   const end = Math.min(len, index + after);
-   return { text: text.slice(start, end), start, end, anchorIndex: index };
- }
- 
- function extractOrderingWindow(full, { before = 8000, after = 12000 } = {}) {
-   const raw = String(full || '');
-   if (!raw) {
-     return { text: '', start: 0, end: 0, anchorIndex: -1 };
-   }
+ module.exports = {
+   PN_RE,
+   PN_CANDIDATE_RE,
+   PN_BODY_CHARS,
+   PN_CANDIDATE_SOURCE,
+ };
+\ No newline at end of file

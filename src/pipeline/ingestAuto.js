@@ -819,16 +819,21 @@ function extractContactFormsFromLine(text) {
 function extractEnumCodeValues(text) {
   if (!text) return [];
   const out = [];
+  const hay = String(text);
   const directRe = /(Nil|Blank|None|[A-Za-z]{1,3})\s*(?=[:=（(\-])/g;
   let m;
-  while ((m = directRe.exec(text)) !== null) {
+  while ((m = directRe.exec(hay)) !== null) {
     const normalized = normalizeOrderingEnumToken(m[1]);
     if (normalized == null) continue;
     out.push(normalized);
   }
+  for (const qm of hay.matchAll(/["'’”]([A-Za-z0-9]{1,3})["'’”]/g)) {
+    const token = normalizeOrderingEnumToken(qm[1]);
+    if (token != null) out.push(token);
+  }
   if (out.length) return out;
 
-  const fragments = String(text)
+  const fragments = hay
     .split(/[\n,\/|•·]+/)
     .map((part) => part.replace(/[()]/g, '').trim())
     .filter(Boolean);
@@ -955,7 +960,14 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
   if (typeof previewText === 'string' && previewText.trim()) textSources.add(previewText);
 
   for (const rawText of textSources) {
-    const sections = sliceOrderingSections(rawText);
+    const sections = sliceOrderingSections(rawText); // 주문/형명/품번 중심
+    const typesWin = (() => {
+      const full = String(rawText || '');
+      const idx = full.search(/\bTYPES\b/i);
+      if (idx >= 0) return full.slice(Math.max(0, idx - 4000), Math.min(full.length, idx + 16000));
+      return '';
+    })();
+    if (typesWin) sections.push(typesWin);
     for (const section of sections) {
       const lines = section.split(/\n+/);
       for (const rawLine of lines) {
@@ -980,6 +992,11 @@ function collectOrderingDomains({ orderingInfo, previewText, docAiText, docAiTab
         if (COVER_LINE_RE.test(line)) addMany('cover_code', extractEnumCodeValues(line));
         // 자주 나오는 일반 패턴들
         if (/led/i.test(line)) addMany('led_code', extractEnumCodeValues(line)); // "L: With LED, Nil: W/O LED"
+        if (/A\s*type\s*:\s*A/i.test(line) && /S\s*type\s*:\s*S/i.test(line)) {
+          addMany('terminal_shape', ['A', 'S']);
+        }
+        if (/tape.*reel.*pack/i.test(line)) addMany('packing_style', ['Z', 'X', 'W', 'Y']);
+        if (/tube\s*pack/i.test(line)) addMany('packing_style', ['TUBE', 'NIL']);
         if (/cover/i.test(line)) {
           const modes = Array.from(line.matchAll(/\b([12])\b/g)).map((m) => m[1]);
           if (modes.length) addMany('cover_mode', modes);

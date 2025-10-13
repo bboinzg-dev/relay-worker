@@ -2,7 +2,8 @@
 
 const { PN_CANDIDATE_SOURCE } = require('./patterns');
 
-const ORDERING_ANCHOR_RE = /(ORDER(?:ING)?\s+(INFO|INFORMATION|GUIDE|CODE|NUMBER)|HOW\s+TO\s+ORDER|주문\s*정보|주문\s*코드|订购信息|订货信息|PART\s*(?:NO\.?|NUMBER)|品番|型番|품번)/i;
+const ORDERING_ANCHOR_RE =
+  /(ORDER(?:ING)?\s+(INFO|INFORMATION|GUIDE|CODE|NUMBER)|HOW\s+TO\s+ORDER|주문\s*정보|주문\s*코드|형명\s*구분|형명구분|형명\s*구성|형식\s*구분|Part\s*selection|PART\s*(?:NO\.?|NUMBER)|品番|型番|품번|订购信息|订货信息)/i;
 const ORDERING_CANDIDATE_RE = new RegExp(PN_CANDIDATE_SOURCE, 'g');
 const ORDERING_BLACKLIST_RE = /^(ISO|ROHS|UL|VDC|VAC|A|MA|MM|Ω|OHM|PDF|PAGE|NOTE|DATE|LOT|WWW|HTTP|HTTPS)$/i;
 

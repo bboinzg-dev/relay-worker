@@ -65,7 +65,7 @@ function codeForRelaySignal(spec) {
   const cv = (spec.coil_voltage_vdc || spec.voltage || '')
     .toString()
     .replace(/\D/g, '');
-  if (cv) parts.push(`DC${cv}V`);
+  if (cv) parts.push(`DC${cv}${/H$/i.test(suf) ? 'H' : ''}`); // 'V' 대신 접미 'H'까지 고려
 
   return parts
     .filter(Boolean)
@@ -812,8 +812,18 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
     spec.code = spec.pn;
     if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
   }
+  if (!spec.verified_in_doc) {
+    const oi = spec.ordering_info || spec.orderingInfo || null;
+    const codes = Array.isArray(oi?.codes) ? oi.codes : null;
+    if (codes && codes.length) {
+      const me = String(spec.pn || spec.code || '').trim().toUpperCase();
+      if (me && codes.some((c) => String(c || '').trim().toUpperCase() === me)) {
+        spec.verified_in_doc = true;
+      }
+    }
+  }
 
-    if (Object.prototype.hasOwnProperty.call(spec, '_pn_template')) {
+  if (Object.prototype.hasOwnProperty.call(spec, '_pn_template')) {
     delete spec._pn_template;
   }
 

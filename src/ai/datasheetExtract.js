@@ -32,13 +32,17 @@ const TYPE_HEADER_RE = /(^|\s)(type\s*(?:no\.?|number)?|형식|형번|형명|型
 const PART_HEADER_RE =
   /(^|\s)(part\s*(?:no\.?|number|name)?|品番|型番|型號|品號|部品番号|品名|품번|부품번호|부품명)(\s|$)/i;
 
-const COIL_RATED_VOLTAGE_HEADER_RE = /((rated|nominal)\s+)?(coil\s*)?voltage|voltage\s*\(vdc\)/i;
-const COIL_RESISTANCE_HEADER_RE = /coil\s*resistance|resistance\s*\([^)]*Ω\)|resistance\s*\(ohm\)/i;
-const COIL_OPERATING_CURRENT_HEADER_RE = /(rated\s+)?operating\s*current|current\s*\(ma\)/i;
-const COIL_OPERATING_POWER_HEADER_RE = /(rated\s+)?operating\s*power|power\s*\(mw\)/i;
+const COIL_RATED_VOLTAGE_HEADER_RE =
+  /((rated|nominal)\s+)?(coil\s*)?voltage|voltage\s*\(vdc\)|정격전압|전압\s*\(vdc\)/i;
+const COIL_RESISTANCE_HEADER_RE =
+  /coil\s*resistance|resistance\s*\([^)]*Ω\)|resistance\s*\(ohm\)|코일\s*저항|저항\s*\(Ω\)/i;
+const COIL_OPERATING_CURRENT_HEADER_RE =
+  /(rated\s+)?operating\s*current|current\s*\(ma\)|정격\s*전류|전류\s*\(mA\)/i;
+const COIL_OPERATING_POWER_HEADER_RE =
+  /(rated\s+)?operating\s*power|power\s*\(mw\)|소비전력|정격\s*소비전력|전력\s*\(mW\)/i;
 const COIL_MAX_ALLOWABLE_HEADER_RE = /max(?:imum)?\s*allowable\s*voltage/i;
-const COIL_OPERATE_HEADER_RE = /(must\s*)?operate\s*(?:voltage|set)/i;
-const COIL_RELEASE_HEADER_RE = /(must\s*)?release\s*(?:voltage|reset)/i;
+const COIL_OPERATE_HEADER_RE = /(must\s*)?operate\s*(?:voltage|set)|동작전압/i;
+const COIL_RELEASE_HEADER_RE = /(must\s*)?release\s*(?:voltage|reset)|석방전압|리셋전압/i;
 
 const RELAY_CONTACT_KEYWORDS = new Map([
   ['SPST', '1A'],
@@ -206,7 +210,7 @@ async function parseTextWithPdfParse(gcsUri) {
 /* -------------------- code extraction -------------------- */
 function looksLikeCode(x) {
   const s = String(x || '').trim();
-  if (!/^[A-Za-z0-9][A-Za-z0-9._/#-]{2,}$/.test(s)) return false;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/#*-]{2,}$/.test(s)) return false;
   if (!/\d/.test(s)) return false;
   if (!/[A-Za-z]/.test(s) && !/[-_/]/.test(s)) return false;
   if (/\b(OHM|Ω|VDC|VAC|AMP|A|V|W|HZ|MS|SEC|UL|ROHS|REACH|DATE|PAGE)\b/i.test(s)) return false;
@@ -224,10 +228,12 @@ function extractCodesFromCell(cell) {
     .map((v) => v.trim())
     .filter(Boolean);
   const out = [];
+  const expandAS = (code) =>
+    code.includes('*') ? [code.replace(/\*/g, 'A'), code.replace(/\*/g, 'S')] : [code];
   for (const chunk of chunks) {
-    const normalized = chunk.toUpperCase();
+    const normalized = chunk.replace(/^[+•●·]+/, '').toUpperCase();
     if (!looksLikeCode(normalized)) continue;
-    out.push(normalized);
+    for (const v of expandAS(normalized)) out.push(v);
   }
   return out;
 }
@@ -629,13 +635,23 @@ function buildPnRegexFromExamples(examples) {
   if (!Array.isArray(examples) || !examples.length) return null;
   const normalized = examples
     .map((code) => String(code || '').trim().toUpperCase())
-    .filter((code) => code && /^[A-Z0-9][A-Z0-9._/#-]{1,}$/i.test(code));
+    .filter((code) => code && /^[A-Z0-9][A-Z0-9._/#*-]{1,}$/i.test(code));
   if (!normalized.length) return null;
 
-  const columns = [];
-  const total = normalized.length;
+  const expanded = [];
+  for (const c of normalized) {
+    if (c.includes('*')) {
+      expanded.push(c.replace(/\*/g, 'A'), c.replace(/\*/g, 'S'));
+    } else {
+      expanded.push(c);
+    }
+  }
+  const base = expanded.length ? expanded : normalized;
 
-  for (const code of normalized.slice(0, MAX_PARTS)) {
+  const columns = [];
+  const total = base.length;
+
+  for (const code of base.slice(0, MAX_PARTS)) {
     const tokens = tokenizeForPn(code);
     if (!tokens.length) continue;
     let colIdx = 0;
@@ -702,10 +718,17 @@ function buildPnRegexFromExamples(examples) {
 }
 function codesFromFreeText(txt) {
   const set = new Set();
-  const re = /\b([A-Z0-9][A-Z0-9\-_/\.]{2,})\b/g;
-  let m; while ((m = re.exec(txt)) !== null) {
+  const re = /(?<![A-Z0-9])(?:[+•●·])?([A-Z0-9][A-Z0-9._/#*-]{2,})\b/g;
+  let m;
+  while ((m = re.exec(txt)) !== null) {
     const cand = m[1].toUpperCase();
-    if (looksLikeCode(cand)) set.add(cand);
+    if (!looksLikeCode(cand)) continue;
+    if (cand.includes('*')) {
+      set.add(cand.replace(/\*/g, 'A'));
+      set.add(cand.replace(/\*/g, 'S'));
+    } else {
+      set.add(cand);
+    }
     if (set.size > MAX_PARTS) break;
   }
   return Array.from(set);

@@ -1384,6 +1384,14 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       const pnValue = String(rec.pn || rec.code || '').trim();
+      const docType = String(options?.docType || '').toLowerCase();
+      const requiresVoltage = Array.isArray(options?.coreSpecKeys) &&
+        options.coreSpecKeys.some((k) => /coil_voltage/.test(String(k).toLowerCase()));
+      if (docType === 'ordering' && requiresVoltage && !/\d/.test(pnValue)) {
+        if (physicalCols.has('last_error')) rec.last_error = 'incomplete_pn';
+        result.skipped.push({ reason: 'invalid_code', detail: 'missing_voltage_token' });
+        continue;
+      }
       const pnIsFallback = isMinimalFallbackPn(pnValue);
       if (!pnValue || !isValidCode(pnValue) || (!pnIsFallback && FORBIDDEN_RE.test(pnValue))) {
         const skippedCode = pnValue || String(rec.code || rec.pn || '').trim() || '(no-code)';

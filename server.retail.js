@@ -7,6 +7,7 @@ const { Storage } = require('@google-cloud/storage');
 const { Transform } = require('stream');
 const QueryStream = require('pg-query-stream');
 const { ProductServiceClient } = require('@google-cloud/retail').v2;
+const { enqueueRetailImport } = require('./src/utils/retailTasks');
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const storage = new Storage();
@@ -80,6 +81,17 @@ router.post('/api/retail/import-catalog', async (req, res) => {
   } catch (e) {
     console.error('[retail/import] error', e);
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/api/retail/import/schedule', async (req, res) => {
+  try {
+    const since = (req.query.since || '5m').toString();
+    const result = await enqueueRetailImport({ since, delaySec: 90 });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('[retail/import/schedule]', e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 

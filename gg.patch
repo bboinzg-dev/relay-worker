@@ -1,72 +1,8 @@
 diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 7f3029fbf0e52b298cbd9be5618549cf9414a5d7..74647d50c1ab2b6cf6ee87a8e82a408d6d4978b7 100644
+index 12ea54a9dbd3cc0722afe45addb06371a765d66b..ab8db7affb4462c4fd2bee1334552124cbc99553 100644
 --- a/src/pipeline/persist.js
 +++ b/src/pipeline/persist.js
-@@ -803,64 +803,74 @@ function renderAnyTemplate(template, record = {}, ctxOrOptions = {}, maybeOption
-   let working = String(template);
-   let used = false;
- 
-   const double = renderTemplateWithPattern(working, context, /\{\{\s*([^{}]+?)\s*\}\}/g);
-   working = double.rendered;
-   if (double.used) used = true;
- 
-   const single = renderTemplateWithPattern(working, context, /\{\s*([^{}]+?)\s*\}/g);
-   working = single.rendered;
-   if (single.used) used = true;
- 
-   if (!used) return null;
-   const collapseWhitespace = options?.collapseWhitespace !== false;
-   let cleaned = collapseWhitespace ? working.replace(/\s+/g, '') : working;
-   cleaned = cleaned.trim();
-   return cleaned || null;
- }
- 
- function renderPnTemplateLocal(template, record = {}) {
-   return renderAnyTemplate(template, record);
- }
- 
- const renderPnTemplate =
-   typeof renderPnTemplateFromOrdering === 'function' ? renderPnTemplateFromOrdering : renderPnTemplateLocal;
- 
-+function fuzzyContainsPn(text, pn) {
-+  if (!pn) return false;
-+  const template = String(pn || '').trim();
-+  if (!template) return false;
-+  const haystack = typeof text === 'string' ? text : String(text ?? '');
-+  if (!haystack) return false;
-+  const pattern = template
-+    .replace(/[-\s]+/g, '[-\\s]*')
-+    .replace(/V$/i, 'V(?:DC)?');
-+  if (!pattern) return false;
-+  const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
-+  return re.test(haystack);
-+}
-+
- function buildPnIfMissing(record = {}, pnTemplate) {
-   const existing = String(record.pn || '').trim();
-   if (existing) return;
-   const fromTemplate = renderPnTemplate(pnTemplate, record);
-   // 본문 검증: 템플릿 결과가 실제 문서 텍스트에 존재할 때만 채택
-   const ctxText = String(record._doc_text || record.doc_text || '');
--  if (fromTemplate && ctxText) {
--    const normalizedContext = norm(ctxText);
--    const normalizedTemplate = norm(fromTemplate);
--    if (normalizedTemplate && normalizedContext.includes(normalizedTemplate)) {
--      record.pn = fromTemplate;
--      if (!record.code) record.code = fromTemplate;
--      return;
--    }
-+  if (fromTemplate && ctxText && fuzzyContainsPn(ctxText, fromTemplate)) {
-+    record.pn = fromTemplate;
-+    if (!record.code) record.code = fromTemplate;
-+    return;
-   }
-   const code = String(record.code || '').trim();
-   if (code) record.pn = code;
- }
- 
- function buildBestIdentifiers(family, spec = {}, blueprint) {
-   if (!spec || typeof spec !== 'object') return spec;
+@@ -859,51 +859,51 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
  
    let codeCandidate = null;
    const localTemplate = blueprint?.pn_template || spec?._pn_template || null;
@@ -85,3 +21,151 @@ index 7f3029fbf0e52b298cbd9be5618549cf9414a5d7..74647d50c1ab2b6cf6ee87a8e82a408d
    }
    if (codeCandidate && norm(docText).includes(norm(codeCandidate))) {
      spec.pn = codeCandidate;
+     spec.code = codeCandidate;
+     spec.verified_in_doc = true;
+   } else {
+     spec.code = spec.pn;
+     if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
+   }
+   if (!spec.verified_in_doc) {
+-    const oi = spec.ordering_info || spec.orderingInfo || null;
++    const oi = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
+     const codes = Array.isArray(oi?.codes) ? oi.codes : null;
+     if (codes && codes.length) {
+       const me = String(spec.pn || spec.code || '').trim().toUpperCase();
+       if (me && codes.some((c) => String(c || '').trim().toUpperCase() === me)) {
+         spec.verified_in_doc = true;
+       }
+     }
+   }
+ 
+   if (Object.prototype.hasOwnProperty.call(spec, '_pn_template')) {
+     delete spec._pn_template;
+   }
+ 
+   return spec;
+ }
+ 
+ function hasCoreSpecValue(value) {
+   if (value == null) return false;
+   if (Array.isArray(value)) return value.some((v) => hasCoreSpecValue(v));
+   if (typeof value === 'boolean') return true;
+   if (typeof value === 'number') return Number.isFinite(value);
+   const str = String(value).trim();
+   return Boolean(str);
+ }
+ 
+@@ -942,51 +942,51 @@ function hasCoreSpec(row, keys = [], candidateKeys = []) {
+   if (count < requiredCount) {
+     for (const key of secondary) {
+       if (testKey(key)) {
+         count += 1;
+         if (count >= requiredCount) return true;
+       }
+     }
+   }
+ 
+   if (count < requiredCount && primary.length === 0 && secondary.length === 0) {
+     for (const [rawKey, rawValue] of Object.entries(row)) {
+       const norm = normKey(rawKey);
+       if (!norm || META_KEYS.has(norm) || seen.has(norm)) continue;
+       if (hasCoreSpecValue(rawValue)) {
+         seen.add(norm);
+         count += 1;
+         if (count >= requiredCount) return true;
+       }
+     }
+   }
+ 
+   return count >= requiredCount;
+ }
+ 
+ function isMinimalInsertEnabled() {
+-  return false;
++  return /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
+ }
+ 
+ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
+   if (!row || typeof row !== 'object') {
+     return { ok: false, reason: 'empty_row' };
+   }
+ 
+   const brand = String(row.brand || '').trim().toLowerCase();
+   if (!brand || brand === 'unknown') {
+     row.last_error = 'missing_brand';
+     return { ok: false, reason: 'missing_brand' };
+   }
+ 
+   let pn = String(row.pn || row.code || '').trim();
+   const allowMinimal = isMinimalInsertEnabled();
+   const docType = String(row.doc_type || '').trim().toLowerCase();
+   let verified = row.verified_in_doc;
+   if (typeof verified === 'string') {
+     verified = verified.trim().toLowerCase() === 'true';
+   } else {
+     verified = Boolean(verified);
+   }
+   row.verified_in_doc = verified;
+   if (!verified) {
+     row.last_error = row.last_error || 'unverified_in_doc';
+@@ -1344,50 +1344,60 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+ 
+       if (orderingPayload || docTypeValue) {
+         let rawHolder = rec.raw_json;
+         if (typeof rawHolder === 'string') {
+           try {
+             rawHolder = JSON.parse(rawHolder);
+           } catch (_) {
+             rawHolder = {};
+           }
+         }
+         if (!rawHolder || typeof rawHolder !== 'object' || Array.isArray(rawHolder)) {
+           rawHolder = {};
+         }
+         if (orderingPayload && !rawHolder.ordering_info) {
+           let cloned = orderingPayload;
+           try {
+             cloned = JSON.parse(JSON.stringify(orderingPayload));
+           } catch (_) {}
+           rawHolder.ordering_info = cloned;
+         }
+         if (docTypeValue && !rawHolder.doc_type) {
+           rawHolder.doc_type = docTypeValue;
+         }
+         rec.raw_json = rawHolder;
+       }
++
++      const verificationOrderingInfo =
++        orderingPayload ??
++        (Object.prototype.hasOwnProperty.call(rec, 'ordering_info') ? rec.ordering_info : null) ??
++        null;
++      if (verificationOrderingInfo) {
++        rec._ordering_info = verificationOrderingInfo;
++      } else if (Object.prototype.hasOwnProperty.call(rec, '_ordering_info')) {
++        delete rec._ordering_info;
++      }
+       if (Object.prototype.hasOwnProperty.call(rec, 'ordering_info')) {
+         delete rec.ordering_info;
+       }
+       if (Object.prototype.hasOwnProperty.call(rec, 'doc_type')) {
+         delete rec.doc_type;
+       }
+ 
+       const templateContext = { ...rec };
+       const ctxText = docTextRaw;
+       const pnWasTemplate = looksLikeTemplate(templateContext.pn);
+       const codeWasTemplate = looksLikeTemplate(templateContext.code);
+ 
+       if (pnWasTemplate) {
+         const renderedPn = renderAnyTemplate(templateContext.pn, templateContext, ctxText);
+         rec.pn = renderedPn ?? null;
+       }
+ 
+       if (codeWasTemplate) {
+         const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
+         const renderedCode = renderAnyTemplate(templateContext.code, contextForCode, ctxText);
+         rec.code = renderedCode ?? null;
+       }
+ 
+       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
+         rec.pn = rec.code;

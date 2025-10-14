@@ -1,47 +1,94 @@
 diff --git a/server.ai.js b/server.ai.js
-index 11a00f070c17fd6fd77f8ecb4ed34d54f15b8b05..422e3a1413ac9dc354bb780cb9664c0775b84d55 100644
+index 11a00f070c17fd6fd77f8ecb4ed34d54f15b8b05..abec546145eb0c33b28c775437f778b560d8db4b 100644
 --- a/server.ai.js
 +++ b/server.ai.js
-@@ -1,25 +1,322 @@
- // server.ai.js — Express Router export (최종 경로는 /api/ai/*)
+@@ -1,25 +1,239 @@
+-// server.ai.js — Express Router export (최종 경로는 /api/ai/*)
++// server.ai.js — Express Router export (mounted at /api/ai/*)
  'use strict';
 +
  const express = require('express');
  const router = express.Router();
- 
--// 루트 DB 모듈(필요 시 사용)
--const { query } = require('./db');
-+const { VertexAI } = require('@google-cloud/vertexai');
 +const db = require('./db');
-+const { safeJsonParse } = require('./src/utils/safe-json');
-+
-+let vertexInstance = null;
++const { VertexAI } = require('@google-cloud/vertexai');
 +
 +function getVertex() {
-+  if (vertexInstance) return vertexInstance;
 +  const project = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
-+  const location = process.env.VERTEX_LOCATION || 'us-central1';
-+  if (!project) {
-+    throw new Error('GCP_PROJECT_ID/GOOGLE_CLOUD_PROJECT is required');
-+  }
-+  vertexInstance = new VertexAI({ project, location });
-+  return vertexInstance;
++  const location = process.env.VERTEX_LOCATION || 'asia-northeast3';
++  if (!project) throw new Error('GCP_PROJECT_ID/GOOGLE_CLOUD_PROJECT is required');
++  return new VertexAI({ project, location });
 +}
 +
-+async function getFamiliesAndTables() {
-+  const sql = `SELECT family_slug, specs_table FROM public.component_registry ORDER BY family_slug`;
-+  const { rows } = await db.query(sql);
-+  return rows.map((row) => ({ family: row.family_slug, table: row.specs_table }));
++// 숫자 파싱: '20 A', '2A', '20A/125VAC' → 20 (numeric)
++function numExpr(pgTextIdent) {
++  // regexp_replace(text, '[^0-9.]', '', 'g')::numeric
++  return `COALESCE(NULLIF(regexp_replace(${pgTextIdent}, '[^0-9.]', '', 'g'), '')::numeric, NULL)`;
 +}
 +
-+const FAMILY_COL_ALIAS = {
++// family → specs_table
++async function getSpecsTableByFamily(family) {
++  const sql = `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`;
++  const { rows } = await db.query(sql, [family]);
++  const t = rows[0]?.specs_table;
++  if (!t || !/^[A-Za-z0-9_]+$/.test(t)) throw new Error('Invalid or unknown specs_table for family=' + family);
++  return t;
++}
++
++// LLM에 물어볼 스키마 (최소화)
++const SEARCH_PLAN_SCHEMA = [
++  '{',
++  ' "family": string|null,              // ex: "relay_power", "relay_signal", "resistor_chip", etc.',
++  ' "brand_like": string|null,          // brand substring',
++  ' "pn_like": string|null,             // part-number substring',
++  ' "must": string[],                   // keywords that MUST appear in text fields',
++  ' "numeric": [                        // numeric filters',
++  '   { "key": string, "op": ">="|"<="|"="|">"|"<", "value": number, "unit": string|null }',
++  ' ]',
++  ' // Examples:',
++  ' // "20A 이상인 릴레이" -> family=relay_power or relay_signal, numeric=[{key:"contact_rating_a", op:">=", value:20, unit:"A"}]',
++  ' // "소형 전등용 저항"   -> family=resistor_chip, must=["lamp","lighting"]',
++  '}'
++].join('\n');
++
++async function callGeminiToPlan(q) {
++  const client = getVertex();
++  const mdl = client.getGenerativeModel({
++    model: process.env.VERTEX_MODEL_ID || 'gemini-2.5-flash',
++    systemInstruction: {
++      parts: [{ text:
++        'You convert Korean natural-language electronic component queries into a strict JSON search plan.\n' +
++        'Follow this JSON schema exactly:\n' + SEARCH_PLAN_SCHEMA + '\n' +
++        'Return ONLY JSON. Family must be one of known slugs if obvious: ' +
++        '["relay_power","relay_signal","relay_reed","relay_ssr","resistor_chip","mosfet","capacitor_mlcc","capacitor_elec","tvs_diode","op_amp","comparator", "inductor_power"].'
++      }]
++    },
++    generationConfig: { temperature: 0.1, responseMimeType: 'application/json', maxOutputTokens: 1024 }
++  });
++
++  const resp = await mdl.generateContent({
++    contents: [{ role: 'user', parts: [{ text: String(q) }]}]
++  });
++  let plan = {};
++  try { plan = JSON.parse(resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}'); }
++  catch { plan = {}; }
++  // 기본값 보정
++  if (!Array.isArray(plan.must)) plan.must = [];
++  if (!Array.isArray(plan.numeric)) plan.numeric = [];
++  plan.family = (plan.family || '').trim() || null;
++  plan.brand_like = (plan.brand_like || '').trim() || null;
++  plan.pn_like = (plan.pn_like || '').trim() || null;
++  return plan;
++}
++
++// family별 컬럼 alias(자주 쓰는 것만)
++const FAMILY_ALIAS = {
 +  relay_power: {
-+    amps: ['contact_rating_a', 'contact_rating_dc_a', 'contact_rating_ac_a', 'contact_rating_text'],
-+    coil_v: ['coil_voltage_vdc', 'rated_coil_voltage_dc', 'coil_voltage_text', 'coil_voltage_code'],
++    contactA: ['contact_rating_a', 'contact_rating_dc_a', 'contact_rating_ac_a', 'contact_rating_text'],
++    coilV:    ['coil_voltage_vdc', 'rated_coil_voltage_dc', 'coil_voltage_text', 'coil_voltage_code'],
 +  },
 +  relay_signal: {
-+    amps: ['contact_rating_a', 'contact_rating_dc_a', 'contact_rating_ac_a', 'contact_rating_text'],
-+    coil_v: ['coil_voltage_vdc', 'coil_voltage_text', 'coil_voltage_code'],
++    contactA: ['contact_rating_a', 'contact_rating_dc_a', 'contact_rating_ac_a', 'contact_rating_text'],
++    coilV:    ['coil_voltage_vdc', 'coil_voltage_text', 'coil_voltage_code'],
 +  },
 +  resistor_chip: {
 +    ohm: ['resistance_ohm'],
@@ -53,287 +100,155 @@ index 11a00f070c17fd6fd77f8ecb4ed34d54f15b8b05..422e3a1413ac9dc354bb780cb9664c07
 +  },
 +};
 +
-+function sanitizeIdentifier(input, type = 'identifier') {
-+  if (!input) throw new Error(`Invalid ${type}`);
-+  const text = String(input);
-+  if (!/^[_a-zA-Z][_a-zA-Z0-9]*$/.test(text)) {
-+    throw new Error(`Unsafe ${type}: ${text}`);
-+  }
-+  return text;
++// numeric 키를 실제 컬럼 후보로 확장
++function expandNumericKey(family, key) {
++  const a = FAMILY_ALIAS[family] || {};
++  if (a[key]) return a[key];
++  return [key]; // 그대로 시도
 +}
 +
-+function parseSchemaAndTable(raw) {
-+  if (!raw) throw new Error('Missing table');
-+  const text = String(raw);
-+  if (text.includes('.')) {
-+    const [schema, table] = text.split('.', 2);
-+    return {
-+      schema: sanitizeIdentifier(schema, 'schema'),
-+      table: sanitizeIdentifier(table, 'table'),
-+    };
-+  }
-+  return { schema: 'public', table: sanitizeIdentifier(text, 'table') };
-+}
-+
-+const NUMERIC_TYPES = new Set([
-+  'smallint',
-+  'integer',
-+  'bigint',
-+  'decimal',
-+  'numeric',
-+  'real',
-+  'double precision',
-+]);
-+
-+async function loadColumnMeta(schemaTable) {
-+  const { schema, table } = parseSchemaAndTable(schemaTable);
-+  const sql = `
-+    SELECT column_name, data_type
-+    FROM information_schema.columns
-+    WHERE table_schema = $1 AND table_name = $2
-+  `;
-+  const { rows } = await db.query(sql, [schema, table]);
-+  const all = new Set();
-+  const numeric = new Set();
-+  for (const row of rows) {
-+    const col = row.column_name;
-+    all.add(col);
-+    if (NUMERIC_TYPES.has(row.data_type)) numeric.add(col);
-+  }
-+  return { schema, table, all, numeric };
-+}
-+
-+function pickExistingColumn(candidates = [], meta) {
-+  for (const candidate of candidates) {
-+    if (meta.all.has(candidate)) return candidate;
-+  }
-+  return null;
-+}
-+
-+function sqlNumericExpression(column, isNumeric) {
-+  const colExpr = `"${column}"`;
-+  if (isNumeric) return `${colExpr}::numeric`;
-+  return `NULLIF(regexp_replace(${colExpr}, '[^0-9.]+', '', 'g'), '')::numeric`;
-+}
-+
-+function buildPredicate({ family, filters = [], meta }) {
++// 동적 필터 SQL 만들기
++function buildFilterSQL({ table, family, plan, limit }) {
 +  const where = [];
-+  const params = [];
-+  let paramIndex = 0;
++  const args = [];
++  let arg = 0;
 +
-+  for (const rawFilter of filters) {
-+    const key = String(rawFilter?.key || '').toLowerCase();
-+    if (!key) continue;
-+    const op = String(rawFilter?.op || '>=').toUpperCase();
-+    const value = rawFilter?.value;
++  // family 고정(안전)
++  if (family) where.push(`(family_slug = $${++arg})`), args.push(family);
 +
-+    const aliasList = FAMILY_COL_ALIAS[family]?.[key] || [key];
-+    const column = pickExistingColumn(aliasList, meta);
-+    if (!column) continue;
++  // brand/pn like
++  if (plan.brand_like) where.push(`(unaccent(brand)::text ILIKE unaccent('%' || $${++arg} || '%'))`), args.push(plan.brand_like);
++  if (plan.pn_like)    where.push(`(unaccent(pn)::text    ILIKE unaccent('%' || $${++arg} || '%'))`),    args.push(plan.pn_like);
 +
-+    const numericExpr = sqlNumericExpression(column, meta.numeric.has(column));
-+    const colExpr = `"${column}"`;
-+
-+    if (typeof value === 'number') {
-+      if (!['>=', '>', '<=', '<', '=', '!='].includes(op)) continue;
-+      where.push(`${numericExpr} ${op} $${++paramIndex}`);
-+      params.push(value);
-+      continue;
-+    }
-+
-+    if (typeof value === 'string' && value.trim() !== '') {
-+      where.push(`COALESCE(${colExpr}::text, '') ILIKE $${++paramIndex}`);
-+      params.push(`%${value.trim()}%`);
-+    }
-+  }
-+
-+  return {
-+    where: where.length ? `WHERE ${where.join(' AND ')}` : '',
-+    params,
-+  };
-+}
-+
-+function mapRow(row) {
-+  const title = row.title || `${row.brand || ''} ${row.pn || ''}`.trim();
-+  return {
-+    family: row.family_slug,
-+    brand: row.brand,
-+    pn: row.pn,
-+    title: title || null,
-+    uri: row.datasheet_url || row.uri || null,
-+    image: row.image_uri || null,
-+  };
-+}
-+
-+async function planQuery(query, families) {
-+  try {
-+    const modelName = process.env.VERTEX_MODEL_ID || process.env.GEMINI_MODEL_CLASSIFY || 'gemini-2.5-flash';
-+    const vertex = getVertex();
-+    const mdl = vertex.getGenerativeModel({
-+      model: modelName,
-+      generationConfig: {
-+        responseMimeType: 'application/json',
-+        temperature: 0.2,
-+        maxOutputTokens: 1024,
-+      },
-+      systemInstruction: {
-+        parts: [
-+          {
-+            text: [
-+              '너는 전자부품 검색 질의를 구조화 계획으로 바꾸는 엔진이다.',
-+              `허용된 family 슬러그만 사용: ${families.map((f) => f.family).join(', ')}`,
-+              '출력 JSON 스키마: {"families": string[], "filters": [{"family"?: string, "key": string, "op": ">=|>|<=|<|=|!=", "value": number|string }], "keywords": string[] }',
-+              '예: "컨택트 20A 이상 릴레이" → {"families":["relay_power"],"filters":[{"family":"relay_power","key":"amps","op":">=","value":20}] }',
-+            ].join('\n'),
-+          },
-+        ],
-+      },
-+    });
-+
-+    const resp = await mdl.generateContent({
-+      contents: [
-+        {
-+          role: 'user',
-+          parts: [{ text: query }],
-+        },
-+      ],
-+    });
-+
-+    const parts = resp?.response?.candidates?.[0]?.content?.parts || [];
-+    const text = parts.map((part) => part?.text || '').join('');
-+    return safeJsonParse(text) || {};
-+  } catch (err) {
-+    console.error('[ai/search] plan generation failed:', err?.message || err);
-+    return {};
-+  }
-+}
-+
-+function pickFamilies(planFamilies, allFamilies) {
-+  if (!Array.isArray(planFamilies) || planFamilies.length === 0) return allFamilies;
-+  const allow = new Set(planFamilies);
-+  return allFamilies.filter((family) => allow.has(family.family));
-+}
-+
-+async function queryFamilyTable({ family, filters, meta }) {
-+  const { schema, table: tableName } = meta;
-+  const predicate = buildPredicate({ family, filters, meta });
-+  const sql = [
-+    `SELECT id::text, '${family}'::text AS family_slug, brand, pn,`,
-+    `CASE WHEN COALESCE(NULLIF(pn, ''), '') <> '' THEN CONCAT_WS(' ', brand, pn) ELSE COALESCE(brand, '') END AS title,`,
-+    `image_uri, datasheet_url`,
-+    `FROM ${schema}.${tableName}`,
-+    predicate.where,
-+    'ORDER BY updated_at DESC NULLS LAST',
-+    'LIMIT 30',
-+  ].join('\n');
-+  const { rows } = await db.query(sql, predicate.params);
-+  return rows.map(mapRow);
-+}
-+
-+async function keywordFallback(keyword) {
-+  if (!keyword) return [];
-+  const { schema, table } = parseSchemaAndTable('retail.products_src');
-+  const sql = `
-+    SELECT id::text, family_slug, brand, pn, title, image_uri, datasheet_url
-+    FROM ${schema}.${table}
-+    WHERE (title ILIKE $1 OR brand ILIKE $1)
-+    ORDER BY updated_at DESC
-+    LIMIT 30
-+  `;
-+  const { rows } = await db.query(sql, [`%${keyword}%`]);
-+  return rows.map(mapRow);
-+}
-+
-+function mergeResults(lists) {
-+  const map = new Map();
-+  for (const list of lists) {
-+    for (const item of list) {
-+      const key = `${item.family}::${item.pn || item.uri || item.title}`;
-+      if (!map.has(key)) map.set(key, item);
-+    }
-+  }
-+  return Array.from(map.values());
-+}
-+
-+async function runSearchPipeline(q) {
-+  const families = await getFamiliesAndTables();
-+  const plan = await planQuery(q, families);
-+  const targetFamilies = pickFamilies(plan?.families, families);
-+
-+  const perFamilyResults = [];
-+  const filtersByFamily = Array.isArray(plan?.filters) ? plan.filters : [];
-+
-+  for (const familyInfo of targetFamilies) {
-+    try {
-+      const meta = await loadColumnMeta(familyInfo.table);
-+      const relevantFilters = filtersByFamily.filter(
-+        (filter) => !filter?.family || filter.family === familyInfo.family,
-+      );
-+      const rows = await queryFamilyTable({
-+        family: familyInfo.family,
-+        filters: relevantFilters,
-+        meta,
-+      });
-+      if (rows.length) perFamilyResults.push(rows);
-+    } catch (err) {
-+      console.error('[ai/search] table query failed:', familyInfo.family, err?.message || err);
-+    }
-+  }
-+
-+  let items = mergeResults(perFamilyResults);
-+
-+  if (items.length === 0) {
-+    const keywords = Array.isArray(plan?.keywords) ? plan.keywords : [];
-+    const fallbackQuery = keywords.length ? keywords.join(' ') : q;
-+    items = await keywordFallback(fallbackQuery);
-+  }
-+
-+  return { ok: true, items };
-+}
-+
-+router.get('/search', async (req, res) => {
-+  const q = String(req.query?.q || '').trim();
-+  if (!q) {
-+    return res.status(400).json({ ok: false, error: 'q required' });
++  // must 키워드: raw_json과 title 성격 필드에 or-축약 없이 AND로
++  for (const k of plan.must) {
++    const p = `%${k}%`;
++    where.push(`( (raw_json::text ILIKE $${++arg}) OR (series ILIKE $${arg}) OR (contact_form ILIKE $${arg}) )`);
++    args.push(p);
 +  }
  
+-// 루트 DB 모듈(필요 시 사용)
+-const { query } = require('./db');
++  // numeric: 각 키마다 가능한 컬럼 후보 중 하나라도 만족하면 OK → (col1 OP v OR col2 OP v ...)
++  for (const f of (plan.numeric || [])) {
++    const op = (f.op || '>=')?.replace(/[^<=>]/g,'');
++    const v  = Number(f.value);
++    if (!isFinite(v)) continue;
+ 
 -async function resolveHandler(req, res) {
++    const cols = expandNumericKey(family, (f.key || '').trim());
++    const pieces = [];
++    for (const col of cols) {
++      // 텍스트 컬럼도 있으니 numExpr로 변환
++      pieces.push(`(${numExpr(`"${col}"`)} ${op} $${++arg})`);
++      args.push(v);
++    }
++    if (pieces.length) where.push(`(${pieces.join(' OR ')})`);
++  }
++
++  const sql =
++    `SELECT id, family_slug, brand, pn,
++            COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
++            image_uri, datasheet_url, series, updated_at
++       FROM public.${table}
++      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
++      ORDER BY updated_at DESC
++      LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`;
++
++  return { sql, args };
++}
++
++/* ---------- /api/ai/resolve : 브랜드/PN 추출 ---------- */
++router.get('/resolve', async (req, res) => {
    try {
 -    const q = (req.body && req.body.q) || req.query?.q || '';
--    if (!q) return res.status(400).json({ ok:false, error:'q required' });
-+    const payload = await runSearchPipeline(q);
-+    return res.json(payload);
-+  } catch (err) {
-+    console.error('[ai/search] failed:', err?.message || err);
-+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
-+  }
-+});
++    const q = String(req.query?.q || req.body?.q || '').trim();
+     if (!q) return res.status(400).json({ ok:false, error:'q required' });
  
 -    // TODO: 여기서 Vertex(Gemini) 호출/DB 조회를 넣으세요.
 -    return res.json({ ok:true, echo:q }); // 일단 경로 확인용 에코
--  } catch (e) {
--    return res.status(500).json({ ok:false, error:String(e?.message||e) });
-+async function handleResolve(req, res) {
-+  const q = String(req.body?.q || req.query?.q || '').trim();
-+  if (!q) {
-+    return res.status(400).json({ ok: false, error: 'q required' });
-+  }
++    // 간단 규칙 우선
++    const simple = /([A-Za-z][A-Za-z0-9.+-]+)\s+([A-Za-z0-9][A-Za-z0-9.+-]+)/.exec(q);
++    if (simple) {
++      const [, brand, code] = simple;
++      return res.json({ ok:true, brand, code, source:'simple' });
++    }
 +
-+  try {
-+    const payload = await runSearchPipeline(q);
-+    return res.json(payload);
-+  } catch (err) {
-+    console.error('[ai/resolve] failed:', err?.message || err);
-+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
++    // LLM로 추출 → brand_like / pn_like로 반환
++    const plan = await callGeminiToPlan(q);
++    if (plan.brand_like || plan.pn_like) {
++      return res.json({ ok:true, brand: plan.brand_like || null, code: plan.pn_like || null, source:'ai' });
++    }
++    return res.json({ ok:true, echo:q });
+   } catch (e) {
+     return res.status(500).json({ ok:false, error:String(e?.message||e) });
    }
- }
+-}
++});
++
++/* ---------- /api/ai/search : AI/PN 검색 ---------- */
++// e.g. GET /api/ai/search?q=컨택트 정격 20A 릴레이&mode=ai
++router.get('/search', async (req, res) => {
++  try {
++    const q = String(req.query?.q || '').trim();
++    const mode = String(req.query?.mode || 'ai');
++    const limit = String(req.query?.limit || '24');
++    if (!q) return res.status(400).json({ ok:false, error:'q required' });
++
++    // 1) pn 간단 검색 모드
++    if (mode === 'pn') {
++      const rows = await db.query(
++        `SELECT id, family_slug, brand, pn,
++                COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
++                image_uri, datasheet_url, series, updated_at
++           FROM public.component_specs
++          WHERE unaccent(brand) ILIKE unaccent('%' || $1 || '%')
++             OR unaccent(pn)    ILIKE unaccent('%' || $1 || '%')
++          ORDER BY updated_at DESC
++          LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`,
++        [q]
++      );
++      return res.json({ ok:true, explain:{ mode:'pn', q }, items: rows.rows });
++    }
++
++    // 2) AI 의미 검색 모드
++    const plan = await callGeminiToPlan(q);
++
++    // family 없으면 릴레이/저항 등 빈도 높은 후보로 시도 (간단 휴리스틱)
++    const family = plan.family || (/릴레이/.test(q) ? 'relay_power' : /저항|resistor/i.test(q) ? 'resistor_chip' : null);
++
++    // family가 있어야 스펙 필터를 정확히 적용 가능. 없으면 component_specs에 넓게 걸쳐서 must/brand/pn로 검색
++    if (!family) {
++      const rows = await db.query(
++        `SELECT id, family_slug, brand, pn,
++                COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
++                image_uri, datasheet_url, series, updated_at
++           FROM public.component_specs
++          WHERE ($1::text IS NULL OR unaccent(brand) ILIKE unaccent('%' || $1::text || '%'))
++            OR ($2::text IS NULL OR unaccent(pn)    ILIKE unaccent('%' || $2::text || '%'))
++          ORDER BY updated_at DESC
++          LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`,
++        [plan.brand_like || null, plan.pn_like || null]
++      );
++      return res.json({ ok:true, explain:{ mode:'ai-broad', plan }, items: rows.rows });
++    }
++
++    const table = await getSpecsTableByFamily(family);
++    const { sql, args } = buildFilterSQL({ table, family, plan, limit });
++    const rows = await db.query(sql, args);
++
++    return res.json({
++      ok:true,
++      explain:{ mode:'ai', family, table, plan, sql_preview: sql.replace(/\s+/g,' ').slice(0,280) + '...' },
++      items: rows.rows
++    });
++  } catch (e) {
++    return res.status(500).json({ ok:false, error:String(e?.message||e) });
++  }
++});
  
 -router.get('/resolve', resolveHandler);
 -router.post('/resolve', resolveHandler);
--router.get('/ping', (_req, res) => res.json({ ok:true }));
-+router.get('/resolve', handleResolve);
-+router.post('/resolve', handleResolve);
-+
-+router.get('/ping', (_req, res) => res.json({ ok: true }));
+ router.get('/ping', (_req, res) => res.json({ ok:true }));
  
  module.exports = router;

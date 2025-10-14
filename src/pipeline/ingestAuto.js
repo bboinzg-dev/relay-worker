@@ -4104,6 +4104,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     coverUri,
     records,
     rows: records,
+    explodedRows,
     mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
     extractedBrand: extracted?.brand || null,
     brandName,
@@ -4270,6 +4271,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     coverUri = null,
     records: initialRecords = [],
     rows: processedRowsInput = [],
+    explodedRows: processedExplodedRows = [],
     mpnList = [],
     extractedBrand = null,
     brandName = null,
@@ -4395,6 +4397,10 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   sanitizeRecordTemplates(records);
   if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
     sanitizeRecordTemplates(processedRowsInput);
+  }
+  const explodedRows = Array.isArray(processedExplodedRows) ? processedExplodedRows : [];
+  if (explodedRows.length && explodedRows !== records && explodedRows !== processedRowsInput) {
+    sanitizeRecordTemplates(explodedRows);
   }
   const runtimeMeta = {
     brand_source: processedBrandSource ?? null,

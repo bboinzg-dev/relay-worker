@@ -134,22 +134,25 @@ function buildBlueprintFieldMap(blueprint) {
     blueprint.fields_json ||
     blueprint;
 
+  const assign = (sourceKey, value) => {
+    const normed = normalizeSpecKey(sourceKey) || normKey(sourceKey);
+    if (!normed) return;
+    map.set(normed, value);
+  };
+
   if (Array.isArray(raw)) {
     for (const entry of raw) {
       if (!entry || typeof entry !== 'object') continue;
-      const key = normKey(entry.name || entry.key || entry.field);
-      if (!key) continue;
-      map.set(key, entry);
+      const sourceKey = entry.name || entry.key || entry.field;
+      assign(sourceKey, entry);
     }
     return map;
   }
 
   if (raw && typeof raw === 'object') {
     for (const [name, meta] of Object.entries(raw)) {
-      const key = normKey(name);
-      if (!key) continue;
-      if (meta && typeof meta === 'object') map.set(key, meta);
-      else map.set(key, { type: meta });
+      const value = meta && typeof meta === 'object' ? meta : { type: meta };
+      assign(name, value);
     }
   }
   return map;
@@ -159,7 +162,7 @@ function buildAllowedKeySet(blueprint) {
   const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
   const set = new Set();
   for (const key of allowed) {
-    const norm = normKey(key);
+    const norm = normalizeSpecKey(key) || normKey(key);
     if (norm) set.add(norm);
   }
   return set;
@@ -209,6 +212,28 @@ function normKey(key) {
   return String(key || '')
     .trim()
     .toLowerCase();
+}
+
+function normalizeSpecKey(key) {
+  if (key == null) return '';
+  let str = String(key || '').trim();
+  if (!str) return '';
+
+  let prefix = '';
+  const leading = str.match(/^_+/);
+  if (leading) {
+    prefix = leading[0];
+    str = str.slice(prefix.length);
+  }
+
+  if (!str) return prefix.toLowerCase();
+
+  const camelConverted = str.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
+  const sanitized = camelConverted.replace(/[^a-zA-Z0-9_]/g, '_');
+  const collapsed = sanitized.replace(/__+/g, '_').replace(/^_+|_+$/g, '');
+  const final = collapsed ? `${prefix}${collapsed}` : prefix;
+
+  return final ? final.toLowerCase() : '';
 }
 
 function isMinimalFallbackPn(value) {
@@ -842,13 +867,17 @@ function hasCoreSpecValue(value) {
 function hasCoreSpec(row, keys = [], candidateKeys = []) {
   if (!row || typeof row !== 'object') return false;
   const requiredCount = MIN_CORE_SPEC_COUNT;
-  const primary = Array.isArray(keys) ? keys.filter(Boolean) : [];
-  const secondary = Array.isArray(candidateKeys) ? candidateKeys.filter(Boolean) : [];
+  const primary = Array.isArray(keys)
+    ? keys.map((key) => normalizeSpecKey(key) || normKey(key)).filter(Boolean)
+    : [];
+  const secondary = Array.isArray(candidateKeys)
+    ? candidateKeys.map((key) => normalizeSpecKey(key) || normKey(key)).filter(Boolean)
+    : [];
   const seen = new Set();
 
   const testKey = (key) => {
     if (!key) return false;
-    const norm = normKey(key);
+    const norm = normalizeSpecKey(key) || normKey(key);
     if (!norm || seen.has(norm) || META_KEYS.has(norm)) return false;
     const direct = row[norm];
     const value = direct !== undefined ? direct : row[key];
@@ -1143,11 +1172,12 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   const pnTemplate = typeof options.pnTemplate === 'string' && options.pnTemplate ? options.pnTemplate : null;
   const sharedOrderingInfo = normalizeOrderingInfoPayload(options?.orderingInfo);
   const sharedDocType = normalizeDocType(options?.docType);
+  const normalizeKeyInput = (value) => normalizeSpecKey(value) || normKey(value);
   const requiredKeys = Array.isArray(options.requiredKeys)
-    ? options.requiredKeys.map((k) => normKey(k)).filter(Boolean)
+    ? options.requiredKeys.map(normalizeKeyInput).filter(Boolean)
     : [];
   const explicitCoreKeys = Array.isArray(options.coreSpecKeys)
-    ? options.coreSpecKeys.map((k) => normKey(k)).filter(Boolean)
+    ? options.coreSpecKeys.map(normalizeKeyInput).filter(Boolean)
     : [];
   const guardKeys = explicitCoreKeys.length ? explicitCoreKeys : requiredKeys;
   let candidateSpecKeys = [];
@@ -1164,7 +1194,8 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
 
   for (const row of rows) {
     for (const key of Object.keys(row || {})) {
-      const normalized = normKey(key);
+      const normalized = normalizeSpecKey(key) || normKey(key);
+      if (!normalized) continue;
       if (physicalCols.has(normalized)) allKeys.add(normalized);
     }
   }
@@ -1207,7 +1238,21 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       result.processed += 1;
       const rec = {};
       for (const [key, value] of Object.entries(row || {})) {
-        rec[normKey(key)] = value;
+        const norm = normKey(key);
+        const specKey = normalizeSpecKey(key) || norm;
+        let target = specKey;
+        if (specKey && physicalCols.has(specKey)) {
+          target = specKey;
+        } else if (norm && physicalCols.has(norm)) {
+          target = norm;
+        } else if (!specKey && norm) {
+          target = norm;
+        }
+
+        if (target) rec[target] = value;
+        if (norm && norm !== target && !Object.prototype.hasOwnProperty.call(rec, norm)) {
+          rec[norm] = value;
+        }
       }
 
       if (options?.brand) {

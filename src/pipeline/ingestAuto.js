@@ -4693,6 +4693,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
           requiredKeys: effectiveRequired,
           coreSpecKeys: effectiveRequired,
           blueprint,
+          mpnList,
           runId,
           run_id: runId,
           jobId,

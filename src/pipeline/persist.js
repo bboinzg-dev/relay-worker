@@ -371,6 +371,39 @@ function normalizeOrderingInfoPayload(raw) {
   return payload;
 }
 
+function normalizeCodeCandidateList(list) {
+  if (!Array.isArray(list) || !list.length) return [];
+  const normalized = [];
+  const seen = new Set();
+  for (const entry of list) {
+    if (entry == null) continue;
+    let raw = entry;
+    if (typeof entry === 'object' && entry && Object.prototype.hasOwnProperty.call(entry, 'code')) {
+      raw = entry.code;
+    }
+    if (typeof raw !== 'string') {
+      if (raw == null) continue;
+      raw = String(raw);
+    }
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const upper = trimmed.toUpperCase();
+    if (seen.has(upper)) continue;
+    seen.add(upper);
+    normalized.push(upper);
+  }
+  return normalized;
+}
+
+function buildCandidateCodeSet(...lists) {
+  const set = new Set();
+  for (const list of lists) {
+    const normalized = normalizeCodeCandidateList(list);
+    for (const code of normalized) set.add(code);
+  }
+  return set.size ? set : null;
+}
+
 function repairPn(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
@@ -1172,6 +1205,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   const pnTemplate = typeof options.pnTemplate === 'string' && options.pnTemplate ? options.pnTemplate : null;
   const sharedOrderingInfo = normalizeOrderingInfoPayload(options?.orderingInfo);
   const sharedDocType = normalizeDocType(options?.docType);
+  const sharedMpnSet = buildCandidateCodeSet(options?.mpnList, options?.mpn_list);
   const normalizeKeyInput = (value) => normalizeSpecKey(value) || normKey(value);
   const requiredKeys = Array.isArray(options.requiredKeys)
     ? options.requiredKeys.map(normalizeKeyInput).filter(Boolean)
@@ -1391,30 +1425,45 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         rec.code = rec.pn;
       }
 
-      if (!rec.verified_in_doc && orderingPayload?.codes?.length) {
+      const rowMpnSet = buildCandidateCodeSet(
+        row?.mpn_list,
+        row?.mpnList,
+        rec?.mpn_list,
+        rec?.mpnList,
+      );
+
+      if (!rec.verified_in_doc) {
         const pnCandidate = String(rec.pn || rec.code || '').trim();
         if (pnCandidate) {
           const pnUpper = pnCandidate.toUpperCase();
-          const orderingCodes = new Set();
-          for (const entry of orderingPayload.codes) {
-            if (!entry) continue;
-            const normalized = typeof entry === 'string'
-              ? entry.trim().toUpperCase()
-              : typeof entry === 'object' && entry.code != null
-                ? String(entry.code).trim().toUpperCase()
-                : null;
-            if (normalized) orderingCodes.add(normalized);
-          }
-          if (!orderingCodes.size && Array.isArray(orderingPayload.scored)) {
-            for (const scored of orderingPayload.scored) {
-              if (!scored || typeof scored !== 'object') continue;
-              const normalized = typeof scored.code === 'string'
-                ? scored.code.trim().toUpperCase()
-                : null;
+          if (orderingPayload?.codes?.length) {
+            const orderingCodes = new Set();
+            for (const entry of orderingPayload.codes) {
+              if (!entry) continue;
+              const normalized = typeof entry === 'string'
+                ? entry.trim().toUpperCase()
+                : typeof entry === 'object' && entry.code != null
+                  ? String(entry.code).trim().toUpperCase()
+                  : null;
               if (normalized) orderingCodes.add(normalized);
             }
+                        if (!orderingCodes.size && Array.isArray(orderingPayload.scored)) {
+              for (const scored of orderingPayload.scored) {
+                if (!scored || typeof scored !== 'object') continue;
+                const normalized = typeof scored.code === 'string'
+                  ? scored.code.trim().toUpperCase()
+                  : null;
+                if (normalized) orderingCodes.add(normalized);
+              }
+            }
+            if (orderingCodes.has(pnUpper)) {
+              rec.verified_in_doc = true;
+            }
           }
-          if (orderingCodes.has(pnUpper)) {
+          if (
+            !rec.verified_in_doc &&
+            ((sharedMpnSet && sharedMpnSet.has(pnUpper)) || (rowMpnSet && rowMpnSet.has(pnUpper)))
+          ) {
             rec.verified_in_doc = true;
           }
         }

@@ -825,20 +825,30 @@ function renderPnTemplateLocal(template, record = {}) {
 const renderPnTemplate =
   typeof renderPnTemplateFromOrdering === 'function' ? renderPnTemplateFromOrdering : renderPnTemplateLocal;
 
+  function fuzzyContainsPn(text, pn) {
+  if (!pn) return false;
+  const template = String(pn || '').trim();
+  if (!template) return false;
+  const haystack = typeof text === 'string' ? text : String(text ?? '');
+  if (!haystack) return false;
+  const pattern = template
+    .replace(/[-\s]+/g, '[-\\s]*')
+    .replace(/V$/i, 'V(?:DC)?');
+  if (!pattern) return false;
+  const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
+  return re.test(haystack);
+}
+
 function buildPnIfMissing(record = {}, pnTemplate) {
   const existing = String(record.pn || '').trim();
   if (existing) return;
   const fromTemplate = renderPnTemplate(pnTemplate, record);
   // 본문 검증: 템플릿 결과가 실제 문서 텍스트에 존재할 때만 채택
   const ctxText = String(record._doc_text || record.doc_text || '');
-  if (fromTemplate && ctxText) {
-    const normalizedContext = norm(ctxText);
-    const normalizedTemplate = norm(fromTemplate);
-    if (normalizedTemplate && normalizedContext.includes(normalizedTemplate)) {
-      record.pn = fromTemplate;
-      if (!record.code) record.code = fromTemplate;
-      return;
-    }
+  if (fromTemplate && ctxText && fuzzyContainsPn(ctxText, fromTemplate)) {
+    record.pn = fromTemplate;
+    if (!record.code) record.code = fromTemplate;
+    return;
   }
   const code = String(record.code || '').trim();
   if (code) record.pn = code;

@@ -1,92 +1,163 @@
-diff --git a/server.retail.js b/server.retail.js
-index 2c03c29393212bd2384c3d25ba1289a252cceb1c..859e24429d34dae06f944d2820fb4046be3ac074 100644
---- a/server.retail.js
-+++ b/server.retail.js
-@@ -1,34 +1,35 @@
- 'use strict';
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 350fb9f1e1bc57487934a944414acc6d19aabcf4..33c675b905bca698e66f8b301c287ed600a52816 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -4082,50 +4082,51 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+       const tpl = await learnPnTemplate({
+         family,
+         brand: brand || extracted.brand,
+         series,
+         docText: fullText,
+         rows: Array.isArray(records) && records.length ? records : extracted.rows,
+       });
+       if (tpl) {
+         await upsertExtractionRecipe({ family, brand: brand || extracted.brand, series, pnTemplate: tpl });
+         pnTemplate = tpl; // 이번 런에 바로 적용
+       }
+     }
+   } catch (e) { console.warn('[pn-learn] skipped:', e?.message || e); }
  
- const express = require('express');
- const router = express.Router();
- const { Pool } = require('pg');
- const { Storage } = require('@google-cloud/storage');
- const { Transform } = require('stream');
- const QueryStream = require('pg-query-stream');
- const { ProductServiceClient } = require('@google-cloud/retail').v2;
-+const { enqueueRetailImport } = require('./src/utils/retailTasks');
+   const processedPayload = {
+     started,
+     gcsUri,
+     family,
+     table,
+     qualified,
+     pnTemplate,
+     requiredFields,
+     coverUri,
+     records,
+     rows: records,
++    explodedRows,
+     mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
+     extractedBrand: extracted?.brand || null,
+     brandName,
+     baseSeries,
+     runId,
+     run_id: runId,
+     jobId,
+     job_id: jobId,
+     text: extractedText,
+     brand: brandEffectiveResolved || extracted?.brand || null,
+     brand_detected: detectedBrand || null,
+     brand_effective: brandEffectiveResolved || null,
+     brand_source: brandSource || null,
+     variant_keys_runtime: runtimeVariantKeys,
+     ordering_info: extracted?.ordering_info ?? null,
+     doc_type: typeof extracted?.doc_type === 'string' ? extracted.doc_type : null,
+   };
  
- const pool = new Pool({ connectionString: process.env.DATABASE_URL });
- const storage = new Storage();
- const retail = new ProductServiceClient();
- 
- const PROJECT_NUMBER = process.env.GCP_PROJECT_NUMBER;
- const BUCKET = process.env.GCS_BUCKET;
- const NDJSON_PATH = process.env.RETAIL_CATALOG_OBJECT || 'retail/catalog/products.ndjson';
- const GCS_URI = `gs://${BUCKET}/${NDJSON_PATH}`;
- const BRANCH =
-   process.env.RETAIL_BRANCH ||
-   `projects/${PROJECT_NUMBER}/locations/global/catalogs/default_catalog/branches/default_branch`;
- 
- /** NDJSON Export to GCS */
- router.post('/api/retail/export-catalog', async (req, res) => {
-   const client = await pool.connect();
-   try {
-     const sql = `
-       SELECT (product)::text AS line
-       FROM retail.products_for_import
-       ORDER BY family_slug, brand, code, id
-     `;
-     const query = new QueryStream(sql);
-     const pgStream = client.query(query);
- 
-@@ -61,39 +62,50 @@ router.post('/api/retail/export-catalog', async (req, res) => {
-     console.error('[retail/export] error', e);
-     res.status(500).json({ ok: false, error: e.message });
+   console.log(
+     '[DIAG] processedPayload recs=%d mpnList=%d docType=%s ordering=%s',
+     Array.isArray(records) ? records.length : -1,
+     Array.isArray(processedPayload.mpnList) ? processedPayload.mpnList.length : -1,
+     processedPayload.doc_type || null,
+     processedPayload.ordering_info ? 'yes' : 'no',
+   );
+@@ -4248,50 +4249,51 @@ async function runAutoIngest(payload = {}) {
+     } catch (err) {
+       console.warn('[ingest] failure update failed:', err?.message || err);
+     }
+     throw e;
    } finally {
-     client.release();
+     clearTimeout(watchdog);
+     try { await db.query('SELECT pg_advisory_unlock(hashtextextended($1))', [runId]); } catch {}
+     try { await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]); } catch {}
    }
- });
+ }
  
- /** Start Import (returns operation name) */
- router.post('/api/retail/import-catalog', async (req, res) => {
+ async function persistProcessedData(processed = {}, overrides = {}) {
+   const {
+     started = Date.now(),
+     gcsUri = null,
+     family: processedFamily = null,
+     family_slug: processedFamilySlug = null,
+     table: processedTable = null,
+     specs_table: processedSpecsTable = null,
+     qualified: qualifiedInput = null,
+     pnTemplate = null,
+     requiredFields = [],
+     coverUri = null,
+     records: initialRecords = [],
+     rows: processedRowsInput = [],
++    explodedRows: processedExplodedRows = [],
+     mpnList = [],
+     extractedBrand = null,
+     brandName = null,
+     baseSeries = null,
+     text: processedText = null,
+     brand: processedBrand = null,
+     brand_detected: processedDetected = null,
+     brand_effective: processedEffective = null,
+     brand_source: processedBrandSource = null,
+     variant_keys_runtime: processedVariantKeys = [],
+     meta: processedMeta = null,
+   } = processed || {};
+ 
+   // persist: Cloud Tasks가 별도 요청으로 호출 → 매번 family/table/colTypes 재확정 필수
+   const normalizeFamily = (value) => {
+     if (!value) return null;
+     const trimmed = String(value).trim();
+     return trimmed || null;
+   };
+ 
+   const pickFamily = (...values) => {
+     for (const value of values) {
+       const normalized = normalizeFamily(value);
+       if (normalized) return normalized;
+     }
+@@ -4374,50 +4376,54 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+ 
+   if (!table) {
+     throw new Error('persist_no_table');
+   }
+ 
+   if (!qualified) {
+     qualified = table.includes('.') ? table : `public.${table}`;
+   }
+ 
+   let colTypes = new Map();
    try {
-     const [op] = await retail.importProducts({
-       parent: BRANCH,
-       inputConfig: { gcsSource: { inputUris: [GCS_URI] } },
-       reconciliationMode: 'INCREMENTAL',
-       errorsConfig: {
-         gcsPrefix: `gs://${BUCKET}/${process.env.RETAIL_ERRORS_PREFIX || 'retail/errors'}`,
-       },
-     });
-     res.json({ ok: true, operation: op.name, gcsUri: GCS_URI, branch: BRANCH });
-   } catch (e) {
-     console.error('[retail/import] error', e);
-     res.status(500).json({ ok: false, error: e.message });
+     colTypes = await getColumnTypes(qualified);
+   } catch (err) {
+     console.warn('[persist] column type fetch failed:', err?.message || err);
+     colTypes = new Map();
    }
- });
  
-+router.post('/api/retail/import/schedule', async (req, res) => {
-+  try {
-+    const since = (req.query.since || '5m').toString();
-+    const result = await enqueueRetailImport({ since, delaySec: 90 });
-+    res.json({ ok: true, ...result });
-+  } catch (e) {
-+    console.error('[retail/import/schedule]', e);
-+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
+     ? initialRecords
+     : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
+   let records = Array.isArray(recordsSource) ? recordsSource : [];
+   sanitizeRecordTemplates(records);
+   if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+     sanitizeRecordTemplates(processedRowsInput);
+   }
++  const explodedRows = Array.isArray(processedExplodedRows) ? processedExplodedRows : [];
++  if (explodedRows.length && explodedRows !== records && explodedRows !== processedRowsInput) {
++    sanitizeRecordTemplates(explodedRows);
 +  }
-+});
-+
- /** Check Import Status (use ?name=operations/… ) */
- router.get('/api/retail/import-catalog/status', async (req, res) => {
-   try {
-     const name = req.query.name;
-     if (!name) return res.status(400).json({ ok: false, error: 'missing ?name' });
-     const [resp] = await retail.checkImportProductsProgress(String(name));
-     res.json({ ok: true, metadata: resp.metadata, done: resp.done, result: resp.result });
-   } catch (e) {
-     console.error('[retail/status] error', e);
-     res.status(500).json({ ok: false, error: e.message });
-   }
- });
- 
- module.exports = router;
-\ No newline at end of file
+   const runtimeMeta = {
+     brand_source: processedBrandSource ?? null,
+     variant_keys_runtime: Array.isArray(processedVariantKeys) ? processedVariantKeys : [],
+   };
+   const hasRuntimeMeta =
+     runtimeMeta.brand_source != null ||
+     (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
+   const docText = typeof processedText === 'string'
+     ? processedText
+     : (processedText != null ? String(processedText) : '');
+   const normalizeSeedBrand = (value) => {
+     if (value == null) return null;
+     const trimmed = String(value).trim();
+     if (!trimmed) return null;
+     if (trimmed.toLowerCase() === 'unknown') return null;
+     return trimmed;
+   };
+   const brandSeed =
+     normalizeSeedBrand(processedEffective) ||
+     normalizeSeedBrand(processedBrand) ||
+     normalizeSeedBrand(processedDetected) ||
+     null;
+   const attachRuntimeMeta = (row) => {
+     if (!hasRuntimeMeta) return;
+     if (!row || typeof row !== 'object') return;

@@ -1,163 +1,248 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 350fb9f1e1bc57487934a944414acc6d19aabcf4..33c675b905bca698e66f8b301c287ed600a52816 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -4082,50 +4082,51 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
-       const tpl = await learnPnTemplate({
-         family,
-         brand: brand || extracted.brand,
-         series,
-         docText: fullText,
-         rows: Array.isArray(records) && records.length ? records : extracted.rows,
-       });
-       if (tpl) {
-         await upsertExtractionRecipe({ family, brand: brand || extracted.brand, series, pnTemplate: tpl });
-         pnTemplate = tpl; // 이번 런에 바로 적용
-       }
-     }
-   } catch (e) { console.warn('[pn-learn] skipped:', e?.message || e); }
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index 650f6c048bd3e2795e9b0c747664556c942a3821..0180e0003e3673fd2a92001312b9b29d77a65929 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -349,50 +349,83 @@ function normalizeOrderingInfoPayload(raw) {
  
-   const processedPayload = {
-     started,
-     gcsUri,
-     family,
-     table,
-     qualified,
-     pnTemplate,
-     requiredFields,
-     coverUri,
-     records,
-     rows: records,
-+    explodedRows,
-     mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
-     extractedBrand: extracted?.brand || null,
-     brandName,
-     baseSeries,
-     runId,
-     run_id: runId,
-     jobId,
-     job_id: jobId,
-     text: extractedText,
-     brand: brandEffectiveResolved || extracted?.brand || null,
-     brand_detected: detectedBrand || null,
-     brand_effective: brandEffectiveResolved || null,
-     brand_source: brandSource || null,
-     variant_keys_runtime: runtimeVariantKeys,
-     ordering_info: extracted?.ordering_info ?? null,
-     doc_type: typeof extracted?.doc_type === 'string' ? extracted.doc_type : null,
-   };
+   const scored = Array.isArray(value.scored)
+     ? value.scored
+         .map((entry) => {
+           if (!entry || typeof entry !== 'object') return null;
+           const code = typeof entry.code === 'string' ? entry.code.trim().toUpperCase() : null;
+           if (!code) return null;
+           const score = Number(entry.score);
+           const normalized = { code };
+           if (Number.isFinite(score)) normalized.score = score;
+           return normalized;
+         })
+         .filter(Boolean)
+     : null;
  
-   console.log(
-     '[DIAG] processedPayload recs=%d mpnList=%d docType=%s ordering=%s',
-     Array.isArray(records) ? records.length : -1,
-     Array.isArray(processedPayload.mpnList) ? processedPayload.mpnList.length : -1,
-     processedPayload.doc_type || null,
-     processedPayload.ordering_info ? 'yes' : 'no',
-   );
-@@ -4248,50 +4249,51 @@ async function runAutoIngest(payload = {}) {
-     } catch (err) {
-       console.warn('[ingest] failure update failed:', err?.message || err);
-     }
-     throw e;
-   } finally {
-     clearTimeout(watchdog);
-     try { await db.query('SELECT pg_advisory_unlock(hashtextextended($1))', [runId]); } catch {}
-     try { await db.query('SELECT pg_advisory_unlock(hashtext($1))', [runId]); } catch {}
-   }
+   const payload = { codes };
+   if (text) payload.text = text;
+   if (start != null) payload.start = start;
+   if (end != null) payload.end = end;
+   if (anchorIndex != null) payload.anchor_index = anchorIndex;
+   if (scored && scored.length) payload.scored = scored;
+ 
+   return payload;
  }
  
- async function persistProcessedData(processed = {}, overrides = {}) {
-   const {
-     started = Date.now(),
-     gcsUri = null,
-     family: processedFamily = null,
-     family_slug: processedFamilySlug = null,
-     table: processedTable = null,
-     specs_table: processedSpecsTable = null,
-     qualified: qualifiedInput = null,
-     pnTemplate = null,
-     requiredFields = [],
-     coverUri = null,
-     records: initialRecords = [],
-     rows: processedRowsInput = [],
-+    explodedRows: processedExplodedRows = [],
-     mpnList = [],
-     extractedBrand = null,
-     brandName = null,
-     baseSeries = null,
-     text: processedText = null,
-     brand: processedBrand = null,
-     brand_detected: processedDetected = null,
-     brand_effective: processedEffective = null,
-     brand_source: processedBrandSource = null,
-     variant_keys_runtime: processedVariantKeys = [],
-     meta: processedMeta = null,
-   } = processed || {};
- 
-   // persist: Cloud Tasks가 별도 요청으로 호출 → 매번 family/table/colTypes 재확정 필수
-   const normalizeFamily = (value) => {
-     if (!value) return null;
-     const trimmed = String(value).trim();
-     return trimmed || null;
-   };
- 
-   const pickFamily = (...values) => {
-     for (const value of values) {
-       const normalized = normalizeFamily(value);
-       if (normalized) return normalized;
-     }
-@@ -4374,50 +4376,54 @@ async function persistProcessedData(processed = {}, overrides = {}) {
- 
-   if (!table) {
-     throw new Error('persist_no_table');
-   }
- 
-   if (!qualified) {
-     qualified = table.includes('.') ? table : `public.${table}`;
-   }
- 
-   let colTypes = new Map();
-   try {
-     colTypes = await getColumnTypes(qualified);
-   } catch (err) {
-     console.warn('[persist] column type fetch failed:', err?.message || err);
-     colTypes = new Map();
-   }
- 
-   const recordsSource = Array.isArray(initialRecords) && initialRecords.length
-     ? initialRecords
-     : (Array.isArray(processedRowsInput) ? processedRowsInput : []);
-   let records = Array.isArray(recordsSource) ? recordsSource : [];
-   sanitizeRecordTemplates(records);
-   if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
-     sanitizeRecordTemplates(processedRowsInput);
-   }
-+  const explodedRows = Array.isArray(processedExplodedRows) ? processedExplodedRows : [];
-+  if (explodedRows.length && explodedRows !== records && explodedRows !== processedRowsInput) {
-+    sanitizeRecordTemplates(explodedRows);
++function normalizeCodeCandidateList(list) {
++  if (!Array.isArray(list) || !list.length) return [];
++  const normalized = [];
++  const seen = new Set();
++  for (const entry of list) {
++    if (entry == null) continue;
++    let raw = entry;
++    if (typeof entry === 'object' && entry && Object.prototype.hasOwnProperty.call(entry, 'code')) {
++      raw = entry.code;
++    }
++    if (typeof raw !== 'string') {
++      if (raw == null) continue;
++      raw = String(raw);
++    }
++    const trimmed = raw.trim();
++    if (!trimmed) continue;
++    const upper = trimmed.toUpperCase();
++    if (seen.has(upper)) continue;
++    seen.add(upper);
++    normalized.push(upper);
 +  }
-   const runtimeMeta = {
-     brand_source: processedBrandSource ?? null,
-     variant_keys_runtime: Array.isArray(processedVariantKeys) ? processedVariantKeys : [],
-   };
-   const hasRuntimeMeta =
-     runtimeMeta.brand_source != null ||
-     (Array.isArray(runtimeMeta.variant_keys_runtime) && runtimeMeta.variant_keys_runtime.length > 0);
-   const docText = typeof processedText === 'string'
-     ? processedText
-     : (processedText != null ? String(processedText) : '');
-   const normalizeSeedBrand = (value) => {
-     if (value == null) return null;
-     const trimmed = String(value).trim();
-     if (!trimmed) return null;
-     if (trimmed.toLowerCase() === 'unknown') return null;
-     return trimmed;
-   };
-   const brandSeed =
-     normalizeSeedBrand(processedEffective) ||
-     normalizeSeedBrand(processedBrand) ||
-     normalizeSeedBrand(processedDetected) ||
-     null;
-   const attachRuntimeMeta = (row) => {
-     if (!hasRuntimeMeta) return;
-     if (!row || typeof row !== 'object') return;
++  return normalized;
++}
++
++function buildCandidateCodeSet(...lists) {
++  const set = new Set();
++  for (const list of lists) {
++    const normalized = normalizeCodeCandidateList(list);
++    for (const code of normalized) set.add(code);
++  }
++  return set.size ? set : null;
++}
++
+ function repairPn(raw) {
+   if (!raw) return null;
+   let s = String(raw).trim();
+   if (!s) return null;
+   if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
+   s = s.replace(/[–—―]/g, '-');
+   s = s.replace(/\s+/g, '');
+   s = s.replace(/[^0-9A-Za-z\-_/().#]/g, '');
+   if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
+   return s.length >= 3 ? s : null;
+ }
+ 
+ function isNumericType(type = '') {
+   const t = String(type || '').toLowerCase();
+   return (
+     t.includes('int') ||
+     t.includes('numeric') ||
+     t.includes('decimal') ||
+     t.includes('real') ||
+     t.includes('double')
+   );
+ }
+ 
+ function parseNumberToken(token, suffix) {
+   if (!token) return null;
+@@ -1150,50 +1183,51 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+ 
+   const guard = await ensureSchemaGuards(familySlug, targetTable);
+   if (!guard.ok) {
+     result.skipped.push({ reason: guard.reason || 'schema_not_ready', detail: guard.detail || null });
+     return result;
+   }
+ 
+   const physicalCols = await getColumnsOf(targetTable);
+   if (!physicalCols.size) {
+     result.skipped.push({ reason: 'schema_not_ready' });
+     return result;
+   }
+ 
+   if (!physicalCols.has('pn') || !physicalCols.has('brand')) {
+     result.skipped.push({ reason: 'schema_not_ready' });
+     return result;
+   }
+ 
+   const columnTypes = await getColumnTypes(targetTable);
+   const blueprintMeta = options?.blueprint || null;
+   const blueprintFieldMap = buildBlueprintFieldMap(blueprintMeta);
+   const blueprintAllowedSet = buildAllowedKeySet(blueprintMeta);
+   const pnTemplate = typeof options.pnTemplate === 'string' && options.pnTemplate ? options.pnTemplate : null;
+   const sharedOrderingInfo = normalizeOrderingInfoPayload(options?.orderingInfo);
+   const sharedDocType = normalizeDocType(options?.docType);
++  const sharedMpnSet = buildCandidateCodeSet(options?.mpnList, options?.mpn_list);
+   const normalizeKeyInput = (value) => normalizeSpecKey(value) || normKey(value);
+   const requiredKeys = Array.isArray(options.requiredKeys)
+     ? options.requiredKeys.map(normalizeKeyInput).filter(Boolean)
+     : [];
+   const explicitCoreKeys = Array.isArray(options.coreSpecKeys)
+     ? options.coreSpecKeys.map(normalizeKeyInput).filter(Boolean)
+     : [];
+   const guardKeys = explicitCoreKeys.length ? explicitCoreKeys : requiredKeys;
+   let candidateSpecKeys = [];
+ 
+   const allKeys = new Set();
+   for (const meta of META_KEYS) {
+     if (physicalCols.has(meta)) allKeys.add(meta);
+   }
+   for (const col of columnTypes.keys()) {
+     if (/_min(?:_[a-z0-9]+)?$/.test(col) || /_max(?:_[a-z0-9]+)?$/.test(col)) {
+       allKeys.add(col);
+     }
+   }
+ 
+   for (const row of rows) {
+     for (const key of Object.keys(row || {})) {
+       const normalized = normalizeSpecKey(key) || normKey(key);
+       if (!normalized) continue;
+       if (physicalCols.has(normalized)) allKeys.add(normalized);
+@@ -1369,74 +1403,89 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+         );
+       }
+ 
+       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
+         rec.pn = rec.code;
+       }
+ 
+       // 🔹 템플릿 미치환 차단: 아직 { } 가 남아있다면 유효 PN 아님
+       if (looksLikeTemplate(rec.pn) || looksLikeTemplate(rec.code)) {
+         if (physicalCols.has('last_error')) rec.last_error = 'template_unresolved';
+         result.skipped.push({ reason: 'invalid_code', detail: 'template_unresolved' });
+         continue;
+       }
+ 
+       const pnMissing = !isValidCode(rec.pn);
+       if (pnMissing && (pnWasTemplate || codeWasTemplate)) {
+         if (physicalCols.has('last_error')) rec.last_error = 'template_render_failed';
+         result.skipped.push({ reason: 'invalid_code', detail: 'template_render_failed' });
+         continue;
+       }
+ 
+       if (!isValidCode(rec.code) && isValidCode(rec.pn)) {
+         rec.code = rec.pn;
+       }
+ 
+-      if (!rec.verified_in_doc && orderingPayload?.codes?.length) {
++      const rowMpnSet = buildCandidateCodeSet(
++        row?.mpn_list,
++        row?.mpnList,
++        rec?.mpn_list,
++        rec?.mpnList,
++      );
++
++      if (!rec.verified_in_doc) {
+         const pnCandidate = String(rec.pn || rec.code || '').trim();
+         if (pnCandidate) {
+           const pnUpper = pnCandidate.toUpperCase();
+-          const orderingCodes = new Set();
+-          for (const entry of orderingPayload.codes) {
+-            if (!entry) continue;
+-            const normalized = typeof entry === 'string'
+-              ? entry.trim().toUpperCase()
+-              : typeof entry === 'object' && entry.code != null
+-                ? String(entry.code).trim().toUpperCase()
+-                : null;
+-            if (normalized) orderingCodes.add(normalized);
+-          }
+-          if (!orderingCodes.size && Array.isArray(orderingPayload.scored)) {
+-            for (const scored of orderingPayload.scored) {
+-              if (!scored || typeof scored !== 'object') continue;
+-              const normalized = typeof scored.code === 'string'
+-                ? scored.code.trim().toUpperCase()
+-                : null;
++          if (orderingPayload?.codes?.length) {
++            const orderingCodes = new Set();
++            for (const entry of orderingPayload.codes) {
++              if (!entry) continue;
++              const normalized = typeof entry === 'string'
++                ? entry.trim().toUpperCase()
++                : typeof entry === 'object' && entry.code != null
++                  ? String(entry.code).trim().toUpperCase()
++                  : null;
+               if (normalized) orderingCodes.add(normalized);
+             }
++            if (!orderingCodes.size && Array.isArray(orderingPayload.scored)) {
++              for (const scored of orderingPayload.scored) {
++                if (!scored || typeof scored !== 'object') continue;
++                const normalized = typeof scored.code === 'string'
++                  ? scored.code.trim().toUpperCase()
++                  : null;
++                if (normalized) orderingCodes.add(normalized);
++              }
++            }
++            if (orderingCodes.has(pnUpper)) {
++              rec.verified_in_doc = true;
++            }
+           }
+-          if (orderingCodes.has(pnUpper)) {
++          if (
++            !rec.verified_in_doc &&
++            ((sharedMpnSet && sharedMpnSet.has(pnUpper)) || (rowMpnSet && rowMpnSet.has(pnUpper)))
++          ) {
+             rec.verified_in_doc = true;
+           }
+         }
+       }
+ 
+       const guard = shouldInsert(rec, { coreSpecKeys: guardKeys, candidateSpecKeys });
+       if (!guard.ok) {
+         const skip = { reason: guard.reason, detail: guard.detail || null };
+         if (rec.last_error) skip.last_error = rec.last_error;
+         result.skipped.push(skip);
+         continue;
+       }
+ 
+       const pnValue = String(rec.pn || rec.code || '').trim();
+       const docType = String(options?.docType || '').toLowerCase();
+       const requiresVoltage = Array.isArray(options?.coreSpecKeys) &&
+         options.coreSpecKeys.some((k) => /coil_voltage/.test(String(k).toLowerCase()));
+       if (docType === 'ordering' && requiresVoltage && !/\d/.test(pnValue)) {
+         if (physicalCols.has('last_error')) rec.last_error = 'incomplete_pn';
+         result.skipped.push({ reason: 'invalid_code', detail: 'missing_voltage_token' });
+         continue;
+       }
+       const pnIsFallback = isMinimalFallbackPn(pnValue);
+       if (!pnValue || !isValidCode(pnValue) || (!pnIsFallback && FORBIDDEN_RE.test(pnValue))) {
+         const skippedCode = pnValue || String(rec.code || rec.pn || '').trim() || '(no-code)';

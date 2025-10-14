@@ -745,9 +745,10 @@ async function mergeRecordsWithExisting({
   }
 }
 
-function expandRowsWithVariants(baseRows, options = {}) {
+async function expandRowsWithVariants(baseRows, options = {}) {
   const list = Array.isArray(baseRows) ? baseRows : [];
-  const variantKeys = Array.isArray(options.variantKeys)
+  let rows = list.map((row) => (row && typeof row === 'object' ? { ...row } : {}));
+  let variantKeys = Array.isArray(options.variantKeys)
     ? Array.from(
         new Set(
           options.variantKeys
@@ -760,12 +761,66 @@ function expandRowsWithVariants(baseRows, options = {}) {
   const defaultBrand = typeof options.defaultBrand === 'string' ? options.defaultBrand : null;
   const defaultSeries = options.defaultSeries ?? null;
 
-  if (!variantKeys.length && !pnTemplate) {
-    return list;
+  const orderingChunks = [];
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const candidates = [row.ordering_text, row.ordering_snippet];
+    const info = row.ordering_info || row.orderingInfo || null;
+    if (info && typeof info === 'object') {
+      candidates.push(info.text, info.snippet, info.window);
+      if (Array.isArray(info.lines)) candidates.push(info.lines.join('\n'));
+      if (Array.isArray(info.snippets)) candidates.push(info.snippets.join('\n'));
+    }
+    for (const candidate of candidates) {
+      if (candidate == null) continue;
+      const str = typeof candidate === 'string' ? candidate : String(candidate ?? '');
+      const trimmed = str.trim();
+      if (trimmed) orderingChunks.push(trimmed);
+    }
+  }
+
+  let recipeDomains = null;
+  let recipePnTemplate = null;
+  if (orderingChunks.length) {
+    try {
+      const orderingText = orderingChunks.join('\n');
+      const { variant_domains, pn_template } = await extractOrderingRecipe(orderingText);
+      recipeDomains = normalizeVariantDomains(variant_domains);
+      recipePnTemplate = typeof pn_template === 'string' && pn_template.trim() ? pn_template.trim() : null;
+    } catch (err) {
+      console.warn('[variant] ordering recipe expand failed:', err?.message || err);
+    }
+  }
+
+  if (recipeDomains && Object.keys(recipeDomains).length) {
+    rows = rows.map((r) => {
+      const v = r && typeof r === 'object' ? { ...r } : {};
+      for (const [key, listValues] of Object.entries(recipeDomains)) {
+        if (!Array.isArray(listValues) || !listValues.length) continue;
+        if (v[key] == null || v[key] === '') {
+          v[key] = listValues;
+        }
+      }
+      return v;
+    });
+    variantKeys = Array.from(new Set([...(variantKeys || []), ...Object.keys(recipeDomains)]));
+  }
+
+  const effectiveVariantKeys = Array.isArray(variantKeys)
+    ? variantKeys.map((key) => String(key || '').trim()).filter(Boolean)
+    : [];
+  const effectivePnTemplate = recipePnTemplate || pnTemplate;
+
+  if (!effectiveVariantKeys.length && !effectivePnTemplate) {
+    return {
+      rows,
+      variantKeys: effectiveVariantKeys,
+      pnTemplate: effectivePnTemplate,
+    };
   }
 
   const expanded = [];
-  for (const rawRow of list) {
+  for (const rawRow of rows) {
     const baseRow = rawRow && typeof rawRow === 'object' ? { ...rawRow } : {};
     if (defaultBrand) {
       const brandCurrent = String(baseRow.brand || '').trim().toLowerCase();
@@ -794,20 +849,21 @@ function expandRowsWithVariants(baseRows, options = {}) {
     if (typeof docText === 'string' && docText.trim()) haystackSources.push(docText);
     const extraText = baseRow.ordering_text ?? baseRow.ordering_snippet ?? null;
     if (typeof extraText === 'string' && extraText.trim()) haystackSources.push(extraText);
-    const exploded = explodeToRows(explodeBase, {
-      variantKeys,
-      pnTemplate,
-      haystack: haystackSources,
-      textContainsExact: (text, pn) => {
-        const pat = String(pn || '')
-          .trim()
-          .replace(/[-\s]+/g, '[-\\s]*')
-          .replace(/V$/i, 'V(?:DC)?');
-        if (!pat) return false;
-        const re = new RegExp(`(^|[^A-Za-z0-9])${pat}(?=$|[^A-Za-z0-9])`, 'i');
-        return re.test(String(text || ''));
-      },      
-    }) || [];
+    const exploded =
+      explodeToRows(explodeBase, {
+        variantKeys: effectiveVariantKeys,
+        pnTemplate: effectivePnTemplate,
+        haystack: haystackSources,
+        textContainsExact: (text, pn) => {
+          const pat = String(pn || '')
+            .trim()
+            .replace(/[-\s]+/g, '[-\\s]*')
+            .replace(/V$/i, 'V(?:DC)?');
+          if (!pat) return false;
+          const re = new RegExp(`(^|[^A-Za-z0-9])${pat}(?=$|[^A-Za-z0-9])`, 'i');
+          return re.test(String(text || ''));
+        },
+      }) || [];
     if (Array.isArray(exploded) && exploded.length) {
       for (const item of exploded) {
         if (!item || typeof item !== 'object') continue;
@@ -823,7 +879,11 @@ function expandRowsWithVariants(baseRows, options = {}) {
     expanded.push(baseRow);
   }
 
-  return expanded;
+  return {
+    rows: expanded.length ? expanded : rows,
+    variantKeys: effectiveVariantKeys,
+    pnTemplate: effectivePnTemplate,
+  };
 }
 
 const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().#]{3,63}[0-9A-Z)#]/gi;
@@ -3861,37 +3921,58 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
   let explodedRows = baseRows;
   if (USE_CODE_RULES) {
-    const expanded = expandRowsWithVariants(baseRows, {
-      variantKeys,
-      pnTemplate,
-      defaultBrand: brandName,
-      defaultSeries: baseSeries,
-    });
-    if (Array.isArray(expanded) && expanded.length) {
-      explodedRows = expanded;
+    try {
+      const expanded = await expandRowsWithVariants(baseRows, {
+        variantKeys,
+        pnTemplate,
+        defaultBrand: brandName,
+        defaultSeries: baseSeries,
+      });
+      if (expanded && typeof expanded === 'object') {
+        const { rows: expandedRows, variantKeys: expandedVariantKeys, pnTemplate: expandedTemplate } = expanded;
+        if (Array.isArray(expandedRows) && expandedRows.length) {
+          explodedRows = expandedRows;
+        }
+        if (Array.isArray(expandedVariantKeys) && expandedVariantKeys.length) {
+          const combined = new Set(
+            [
+              ...(Array.isArray(variantKeys) ? variantKeys : []),
+              ...expandedVariantKeys
+                .map((key) => String(key || '').trim().toLowerCase())
+                .filter(Boolean),
+            ],
+          );
+          variantKeys = Array.from(combined);
+        }
+        if (expandedTemplate) {
+          pnTemplate = expandedTemplate || pnTemplate;
+        }
+      }
+    } catch (err) {
+      console.warn('[variant] expandRowsWithVariants failed:', err?.message || err);
     }
   }
-  if (Array.isArray(explodedRows) && explodedRows.length) {
-    if (docAiRecordsFlat.length || docAiRecordsForMerge.length) {
+
+  explodedRows = Array.isArray(explodedRows) ? explodedRows : [];
+  if (explodedRows.length) {
+    const flatRecs = Array.isArray(docAiRecordsFlat) ? docAiRecordsFlat : [];
+    const canonRecs = Array.isArray(docAiRecordsForMerge) ? docAiRecordsForMerge : [];
+    if (flatRecs.length || canonRecs.length) {
       const usedRecords = new Set();
-      const variantForMatch = Array.isArray(variantKeys) ? variantKeys : [];
-      const canonicalRefs = new Set(docAiRecordsForMerge);
+      const canonicalRefs = new Set(canonRecs);
       for (const row of explodedRows) {
         if (!row || typeof row !== 'object') continue;
         let match = null;
-        if (docAiRecordsForMerge.length) {
+        if (canonRecs.length) {
           match =
-            bestRowMatchToSpec(row, docAiRecordsForMerge, usedRecords) ||
-            bestAttributeMatchToSpec(row, docAiRecordsForMerge, variantForMatch);
+            bestRowMatchToSpec(row, canonRecs, usedRecords) ||
+            bestAttributeMatchToSpec(row, canonRecs, variantKeys);
         }
         if (!match && String(family || '').toLowerCase() === 'relay_signal') {
-          match = findCoilRowMatchForRelaySignal(row, docAiRecordsFlat);
+          match = findCoilRowMatchForRelaySignal(row, flatRecs);
         }
         if (match && match.values) {
-          const patch = safeMergeSpec(row, match.values);
-          if (patch && Object.keys(patch).length) {
-            Object.assign(row, patch);
-          }
+          Object.assign(row, safeMergeSpec(row, match.values));
           if (canonicalRefs.has(match)) {
             usedRecords.add(match);
           }

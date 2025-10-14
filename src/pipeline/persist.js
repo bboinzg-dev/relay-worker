@@ -861,7 +861,7 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
   const localTemplate = blueprint?.pn_template || spec?._pn_template || null;
   if (localTemplate) {
     try {
-      codeCandidate = renderPnTemplate(localTemplate, spec);
+    const oi = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
     } catch (_) {}
   }
 
@@ -964,7 +964,7 @@ function hasCoreSpec(row, keys = [], candidateKeys = []) {
 }
 
 function isMinimalInsertEnabled() {
-  return false;
+  return /^(1|true|on)$/i.test(process.env.ALLOW_MINIMAL_INSERT || '0');
 }
 
 function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
@@ -1365,6 +1365,16 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           rawHolder.doc_type = docTypeValue;
         }
         rec.raw_json = rawHolder;
+      }
+      
+      const verificationOrderingInfo =
+        orderingPayload ??
+        (Object.prototype.hasOwnProperty.call(rec, 'ordering_info') ? rec.ordering_info : null) ??
+        null;
+      if (verificationOrderingInfo) {
+        rec._ordering_info = verificationOrderingInfo;
+      } else if (Object.prototype.hasOwnProperty.call(rec, '_ordering_info')) {
+        delete rec._ordering_info;
       }
       if (Object.prototype.hasOwnProperty.call(rec, 'ordering_info')) {
         delete rec.ordering_info;

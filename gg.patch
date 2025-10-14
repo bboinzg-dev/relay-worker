@@ -1,89 +1,90 @@
-diff --git a/server.retail.import.js b/server.retail.import.js
-index 82561041914d81915d7d0cefd78619d910149993..62e01fdd63d9c644b64999e0813b048084516f38 100644
---- a/server.retail.import.js
-+++ b/server.retail.import.js
-@@ -21,71 +21,83 @@ const BRANCH = process.env.RETAIL_BRANCH ||
- const TEMP_BUCKET = process.env.GCS_TEMP_BUCKET || '';
+diff --git a/server.retail.js b/server.retail.js
+index 2c03c29393212bd2384c3d25ba1289a252cceb1c..859e24429d34dae06f944d2820fb4046be3ac074 100644
+--- a/server.retail.js
++++ b/server.retail.js
+@@ -1,34 +1,35 @@
+ 'use strict';
  
- function createObjectPath() {
-   const now = new Date();
-   const pad = (n, l = 2) => String(n).padStart(l, '0');
-   const timestamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}` +
-     `${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
-   return `retail/import/products_${timestamp}_${Date.now()}.ndjson`;
- }
+ const express = require('express');
+ const router = express.Router();
+ const { Pool } = require('pg');
+ const { Storage } = require('@google-cloud/storage');
+ const { Transform } = require('stream');
+ const QueryStream = require('pg-query-stream');
+ const { ProductServiceClient } = require('@google-cloud/retail').v2;
++const { enqueueRetailImport } = require('./src/utils/retailTasks');
  
- router.post('/api/retail/import', async (req, res, next) => {
-   if (!BRANCH) {
-     res.status(500).json({ done: false, error: 'RETAIL_BRANCH or GCP_PROJECT_NUMBER not configured' });
-     return;
-   }
-   if (!TEMP_BUCKET) {
-     res.status(500).json({ done: false, error: 'GCS_TEMP_BUCKET not configured' });
-     return;
-   }
+ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+ const storage = new Storage();
+ const retail = new ProductServiceClient();
  
-   const dbClient = await pool.connect();
-   const objectPath = createObjectPath();
-   const bucket = storage.bucket(TEMP_BUCKET);
-   const gcsFile = bucket.file(objectPath);
-   const gcsUri = `gs://${TEMP_BUCKET}/${objectPath}`;
-+  const since = (req.query.since || '').toString().trim();
-+  const usePartial = since.length > 0;
+ const PROJECT_NUMBER = process.env.GCP_PROJECT_NUMBER;
+ const BUCKET = process.env.GCS_BUCKET;
+ const NDJSON_PATH = process.env.RETAIL_CATALOG_OBJECT || 'retail/catalog/products.ndjson';
+ const GCS_URI = `gs://${BUCKET}/${NDJSON_PATH}`;
+ const BRANCH =
+   process.env.RETAIL_BRANCH ||
+   `projects/${PROJECT_NUMBER}/locations/global/catalogs/default_catalog/branches/default_branch`;
  
+ /** NDJSON Export to GCS */
+ router.post('/api/retail/export-catalog', async (req, res) => {
+   const client = await pool.connect();
    try {
--    const query = new QueryStream('SELECT line FROM retail.export_products_ndjson()');
-+    const sql = usePartial
-+      ? 'SELECT line FROM retail.export_products_ndjson_since($1)'
-+      : 'SELECT line FROM retail.export_products_ndjson()';
-+    const query = new QueryStream(sql, usePartial ? [since] : []);
-     const pgStream = dbClient.query(query);
+     const sql = `
+       SELECT (product)::text AS line
+       FROM retail.products_for_import
+       ORDER BY family_slug, brand, code, id
+     `;
+     const query = new QueryStream(sql);
+     const pgStream = client.query(query);
  
-     let count = 0;
-     const toNdjson = new Transform({
-       objectMode: true,
-       transform(row, _enc, callback) {
-         count += 1;
-         callback(null, `${row.line}\n`);
-       },
-     });
+@@ -61,39 +62,50 @@ router.post('/api/retail/export-catalog', async (req, res) => {
+     console.error('[retail/export] error', e);
+     res.status(500).json({ ok: false, error: e.message });
+   } finally {
+     client.release();
+   }
+ });
  
-     await new Promise((resolve, reject) => {
-       pgStream
-         .pipe(toNdjson)
-         .pipe(gcsFile.createWriteStream({
-           resumable: false,
-           contentType: 'application/x-ndjson',
-         }))
-         .on('finish', resolve)
-         .on('error', reject);
-     });
- 
-     const errorsPrefix = process.env.RETAIL_ERRORS_PREFIX || 'retail/errors';
+ /** Start Import (returns operation name) */
+ router.post('/api/retail/import-catalog', async (req, res) => {
+   try {
      const [op] = await retail.importProducts({
        parent: BRANCH,
-       inputConfig: { gcsSource: { inputUris: [gcsUri] } },
+       inputConfig: { gcsSource: { inputUris: [GCS_URI] } },
        reconciliationMode: 'INCREMENTAL',
-       // ★ 필수: 에러 로그 저장 경로 (gs://버킷/디렉토리)
-       errorsConfig: { gcsPrefix: `gs://${TEMP_BUCKET}/${errorsPrefix}` },
+       errorsConfig: {
+         gcsPrefix: `gs://${BUCKET}/${process.env.RETAIL_ERRORS_PREFIX || 'retail/errors'}`,
+       },
      });
-     const [resp] = await op.promise();
+     res.json({ ok: true, operation: op.name, gcsUri: GCS_URI, branch: BRANCH });
+   } catch (e) {
+     console.error('[retail/import] error', e);
+     res.status(500).json({ ok: false, error: e.message });
+   }
+ });
  
--    res.json({ done: true, result: resp, gcsUri, branch: BRANCH, count });
-+    res.json({
-+      done: true,
-+      result: resp,
-+      gcsUri,
-+      branch: BRANCH,
-+      count,
-+      since: usePartial ? since : null,
-+    });
-   } catch (err) {
-     console.error('[retail/import]', err?.message || err);
-     // 서버 크래시 방지: 500 JSON으로 돌려보냄
-     return res.status(500).json({ done: false, error: String(err?.message || err), gcsUri });
-   } finally {
-     dbClient.release();
++router.post('/api/retail/import/schedule', async (req, res) => {
++  try {
++    const since = (req.query.since || '5m').toString();
++    const result = await enqueueRetailImport({ since, delaySec: 90 });
++    res.json({ ok: true, ...result });
++  } catch (e) {
++    console.error('[retail/import/schedule]', e);
++    res.status(500).json({ ok: false, error: String(e?.message || e) });
++  }
++});
++
+ /** Check Import Status (use ?name=operations/… ) */
+ router.get('/api/retail/import-catalog/status', async (req, res) => {
+   try {
+     const name = req.query.name;
+     if (!name) return res.status(400).json({ ok: false, error: 'missing ?name' });
+     const [resp] = await retail.checkImportProductsProgress(String(name));
+     res.json({ ok: true, metadata: resp.metadata, done: resp.done, result: resp.result });
+   } catch (e) {
+     console.error('[retail/status] error', e);
+     res.status(500).json({ ok: false, error: e.message });
    }
  });
  

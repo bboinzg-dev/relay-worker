@@ -43,9 +43,14 @@ router.post('/api/retail/import', async (req, res, next) => {
   const bucket = storage.bucket(TEMP_BUCKET);
   const gcsFile = bucket.file(objectPath);
   const gcsUri = `gs://${TEMP_BUCKET}/${objectPath}`;
+  const since = (req.query.since || '').toString().trim();
+  const usePartial = since.length > 0;
 
   try {
-    const query = new QueryStream('SELECT line FROM retail.export_products_ndjson()');
+    const sql = usePartial
+      ? 'SELECT line FROM retail.export_products_ndjson_since($1)'
+      : 'SELECT line FROM retail.export_products_ndjson()';
+    const query = new QueryStream(sql, usePartial ? [since] : []);
     const pgStream = dbClient.query(query);
 
     let count = 0;
@@ -78,7 +83,14 @@ router.post('/api/retail/import', async (req, res, next) => {
     });
     const [resp] = await op.promise();
 
-    res.json({ done: true, result: resp, gcsUri, branch: BRANCH, count });
+    res.json({
+      done: true,
+      result: resp,
+      gcsUri,
+      branch: BRANCH,
+      count,
+      since: usePartial ? since : null,
+    });
   } catch (err) {
     console.error('[retail/import]', err?.message || err);
     // 서버 크래시 방지: 500 JSON으로 돌려보냄

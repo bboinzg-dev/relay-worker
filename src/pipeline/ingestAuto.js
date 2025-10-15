@@ -192,9 +192,19 @@ const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
   return set;
 }
 
-async function ensureDynamicColumnsForRows(qualifiedTable, rows) {
+async function ensureDynamicColumnsForRows(qualifiedTable, rows, allowedKeys = []) {
   if (!AUTO_ADD_FIELDS || !AUTO_ADD_FIELDS_LIMIT) return;
-  const keys = Array.from(gatherRuntimeSpecKeys(rows)).slice(0, AUTO_ADD_FIELDS_LIMIT);
+  let keys = Array.from(gatherRuntimeSpecKeys(rows)).slice(0, AUTO_ADD_FIELDS_LIMIT);
+  if (Array.isArray(allowedKeys) && allowedKeys.length) {
+    const allow = new Set(
+      allowedKeys
+        .map((s) => String(s || '').trim().toLowerCase())
+        .filter(Boolean),
+    );
+    if (allow.size) {
+      keys = keys.filter((k) => allow.has(String(k || '').trim().toLowerCase()));
+    }
+  }
   if (!keys.length) return;
   const sample = {};
   if (Array.isArray(rows)) {
@@ -3807,7 +3817,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           rawText: detectionInput,
           family,
           blueprintVariantKeys: blueprint?.variant_keys,
-          allowedKeys: blueprint?.allowedKeys,
+          allowedKeys,
         });
       } catch (err) {
         console.warn('[variant] runtime detect failed:', err?.message || err);
@@ -4383,7 +4393,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
     }
     try {
-      await ensureDynamicColumnsForRows(qualified, explodedRows);
+      await ensureDynamicColumnsForRows(qualified, explodedRows, allowedKeys);
     } catch (err) {
       console.warn('[schema] ensureDynamicColumnsForRows explodedRows failed:', err?.message || err);
     }
@@ -4419,7 +4429,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
       if (llmTargets.length) {
         try {
-          await ensureDynamicColumnsForRows(qualified, explodedRows);
+          await ensureDynamicColumnsForRows(qualified, explodedRows, allowedKeys);
         } catch (err) {
           console.warn('[schema] ensureDynamicColumnsForRows llm failed:', err?.message || err);
         }
@@ -5050,12 +5060,14 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     }
 
     let blueprint;
+    let allowedKeys = [];
     let variantKeysSource = USE_VARIANT_KEYS && Array.isArray(processedVariantKeys)
       ? processedVariantKeys
       : null;
     if (USE_VARIANT_KEYS && (!Array.isArray(variantKeysSource) || !variantKeysSource.length) && family) {
       try {
         blueprint = await getBlueprint(family);
+        allowedKeys = Array.isArray(blueprint?.allowedKeys) ? [...blueprint.allowedKeys] : allowedKeys;
         if (!Array.isArray(variantKeysSource) || !variantKeysSource.length) {
           variantKeysSource = Array.isArray(blueprint?.ingestOptions?.variant_keys)
             ? blueprint.ingestOptions.variant_keys
@@ -5190,6 +5202,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
           }
         }
         const knownList = Array.isArray(blueprint?.allowedKeys) ? [...blueprint.allowedKeys] : [];
+        allowedKeys = knownList.length ? [...knownList] : allowedKeys;
         const knownLower = new Set(
           knownList.map((key) => String(key || '').trim().toLowerCase()).filter(Boolean),
         );
@@ -5216,6 +5229,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
             }
             blueprint = blueprint && typeof blueprint === 'object' ? blueprint : {};
             blueprint.allowedKeys = Array.from(widened);
+            allowedKeys = Array.from(blueprint.allowedKeys);
           } catch (err) {
             console.warn('[persist] aiCanonicalizeKeys failed:', err?.message || err);
           }
@@ -5223,12 +5237,12 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       }
 
       if (Array.isArray(processedRowsInput) && processedRowsInput.length) {
-        await ensureDynamicColumnsForRows(qualified, processedRowsInput);
+        await ensureDynamicColumnsForRows(qualified, processedRowsInput, allowedKeys);
       }
-      await ensureDynamicColumnsForRows(qualified, schemaEnsureRows);
+      await ensureDynamicColumnsForRows(qualified, schemaEnsureRows, allowedKeys);
       // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
       records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
-      await ensureDynamicColumnsForRows(qualified, records);
+      await ensureDynamicColumnsForRows(qualified, records, allowedKeys);
       try {
         persistResult = await saveExtractedSpecs({
           qualifiedTable: qualified,

@@ -1,63 +1,156 @@
-diff --git a/src/utils/blueprint.js b/src/utils/blueprint.js
-index 3de03d89b1b5e1dac9347897ab581094e6cdd0e5..bf06c8c77843a7c8499c46dddc9fd38762efb7d5 100644
---- a/src/utils/blueprint.js
-+++ b/src/utils/blueprint.js
-@@ -67,53 +67,58 @@ function ensureFamilyOverrides(blueprint, registryRow) {
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index d7106532efbe4f0054a279e7588d2ed1ae80e0c5..51d262972e58b1403a747951a04058d286e7c432 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -1,64 +1,67 @@
++// @ts-check
++/// <reference path="../types/blueprint.d.ts" />
+ 'use strict';
  
-   const variantKeys = Array.from(forcedVariantKeys);
-   blueprint.variant_keys = variantKeys;
-   ingestOptions.variant_keys = variantKeys;
-   blueprint.ingestOptions = ingestOptions;
+ const path = require('node:path');
  
-   const allowed = Array.isArray(blueprint.allowedKeys) ? blueprint.allowedKeys : [];
-   const generic = [
-     'pn_jp',
-     'pn_aliases',
-     'ordering_market',
-     'coil_voltage_vdc',
-     'coil_voltage_vac',
-     'contact_form',
-     'contact_arrangement',
-     'terminal_form',
-     'terminal_shape',
-     'contact_rating_text',
-     'dielectric_strength_v',
-     'operate_time_ms',
-     'release_time_ms',
-     'coil_resistance_ohm',
-     'operating_function',
-     'packing_style',
-     'insulation_resistance_mohm',
-+    // legacy dimension keys (keep for backward compatibility)
-     'dim_l_mm',
-     'dim_w_mm',
-     'dim_h_mm',
-+    // normalized dimension keys (preferred)
-+    'length_mm',
-+    'width_mm',
-+    'height_mm',
-   ];
-   blueprint.allowedKeys = Array.from(new Set([...allowed, ...variantKeys, ...generic]));
- 
-   if (registryRow?.specs_table && !blueprint.specsTable) {
-     blueprint.specsTable = registryRow.specs_table;
+ function tryRequire(paths) {
+   const errors = [];
+   for (const p of paths) {
+     try {
+       return require(p);
+     } catch (err) {
+       if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
+         errors.push(err);
+         continue;
+       }
+       throw err;
+     }
    }
- 
-   return blueprint;
+   const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
+   error.code = 'MODULE_NOT_FOUND';
+   error.attempts = errors.map((e) => e?.message || String(e));
+   throw error;
  }
  
- function normalizeBlueprint(row, registryRow) {
-   if (!row) return null;
-   const fields = row.fields_json || row.fields || {};
-   const ingestOptionsRaw = row.ingest_options || row.ingestOptions || {};
-   const ingestOptions = ingestOptionsRaw && typeof ingestOptionsRaw === 'object'
-     ? { ...ingestOptionsRaw }
-     : {};
-   const codeRules = row.code_rules || row.codeRules || null;
-   const allowedKeys = deriveAllowedKeys(fields, ingestOptionsRaw);
-   let variantKeys = deriveVariantKeys(row);
-   const specsTable = registryRow?.specs_table || registryRow?.specsTable || `${row.family_slug}_specs`;
+ const { pool } = tryRequire([
+   path.join(__dirname, '../../db'),
+   path.join(__dirname, '../db'),
+   path.join(__dirname, './db'),
+   path.join(process.cwd(), 'db'),
+ ]);
+ const { ensureSpecsTable } = tryRequire([
+   path.join(__dirname, '../utils/schema'),
+   path.join(__dirname, '../../utils/schema'),
+   path.join(__dirname, '../schema'),
+   path.join(process.cwd(), 'schema'),
+ ]);
+ const { getColumnsOf } = require('./ensure-spec-columns');
+ const { normalizeValueLLM } = require('../utils/ai');
+ let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
+ const { PN_RE } = require('../utils/patterns');
++const { getBlueprintPnTemplate } = require('../utils/getBlueprintPnTemplate');
  
-   if (Array.isArray(ingestOptions.variant_keys)) {
-     ingestOptions.variant_keys = normalizeKeyList(ingestOptions.variant_keys);
+ const STRICT_CODE_RULES = /^(1|true|on)$/i.test(process.env.STRICT_CODE_RULES || '1');
+ const MIN_CORE_SPEC_COUNT = (() => {
+   const raw = Number(process.env.MIN_CORE_SPEC_COUNT ?? 2);
+   if (!Number.isFinite(raw) || raw <= 0) return 2;
+   return Math.min(Math.floor(raw), 10);
+ })();
+ 
+ function norm(s) {
+   return String(s || '')
+     .replace(/[\s\-_/()]/g, '')
+     .toUpperCase();
+ }
+ 
+ function codeForRelaySignal(spec) {
+   const parts = [];
+   const base = spec.pn || spec.series_code || spec.series || '';
+   if (base) parts.push(base);
+ 
+   const op = String(spec.operating_function || '').toLowerCase();
+   if (op.includes('latch')) parts.push('L');
+ 
+   const suf = (spec.suffix || '').trim();
+   if (suf) parts.push(suf.toUpperCase());
+ 
+@@ -832,76 +835,63 @@ const renderPnTemplate =
+   const haystack = typeof text === 'string' ? text : String(text ?? '');
+   if (!haystack) return false;
+   const pattern = template
+     .replace(/[-\s]+/g, '[-\\s]*')
+     .replace(/V$/i, 'V(?:DC)?');
+   if (!pattern) return false;
+   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
+   return re.test(haystack);
+ }
+ 
+ function buildPnIfMissing(record = {}, pnTemplate) {
+   const existing = String(record.pn || '').trim();
+   if (existing) return;
+   const fromTemplate = renderPnTemplate(pnTemplate, record);
+   // 본문 검증: 템플릿 결과가 실제 문서 텍스트에 존재할 때만 채택
+   const ctxText = String(record._doc_text || record.doc_text || '');
+   if (fromTemplate && ctxText && fuzzyContainsPn(ctxText, fromTemplate)) {
+     record.pn = fromTemplate;
+     if (!record.code) record.code = fromTemplate;
+     return;
    }
+   const code = String(record.code || '').trim();
+   if (code) record.pn = code;
+ }
+ 
++/**
++ * @param {string} family
++ * @param {import('../types/blueprint').Spec} spec
++ * @param {import('../types/blueprint').Blueprint} [blueprint]
++ */
+ function buildBestIdentifiers(family, spec = {}, blueprint) {
+   if (!spec || typeof spec !== 'object') return spec;
+ 
+   let codeCandidate = null;
+-  const localTemplate = (() => {
+-    if (typeof blueprint?.pn_template === 'string') return blueprint.pn_template;
+-
+-    const cr = blueprint?.code_rules;
+-    if (Array.isArray(cr)) {
+-      const hit = cr.find((r) => r && typeof r === 'object' && typeof r.pn_template === 'string');
+-      if (hit) return hit.pn_template;
+-    } else if (cr && typeof cr === 'object' && typeof cr.pn_template === 'string') {
+-      return cr.pn_template;
+-    }
+-
+-    const io = blueprint?.ingestOptions || blueprint?.ingest_options;
+-    if (io && typeof io === 'object' && typeof io.pn_template === 'string') {
+-      return io.pn_template;
+-    }
+-
+-    if (typeof spec?._pn_template === 'string') return spec._pn_template;
+-    return null;
+-  })();
++  const localTemplate = getBlueprintPnTemplate(blueprint || {}, spec);
+   if (localTemplate) {
+     try {
+-    const oi = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
++      const oi = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
+     } catch (_) {}
+   }
+ 
+   const docText = String(spec._doc_text || spec.doc_text || '');
+   if (!codeCandidate && family === 'relay_signal') {
+     const fallback = codeForRelaySignal(spec);
+     if (fallback && norm(docText).includes(norm(fallback))) {
+       codeCandidate = fallback;
+     }
+   }
+   if (codeCandidate && norm(docText).includes(norm(codeCandidate))) {
+     spec.pn = codeCandidate;
+     spec.code = codeCandidate;
+     spec.verified_in_doc = true;
+   } else {
+     spec.code = spec.pn;
+     if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
+   }
+   if (!spec.verified_in_doc) {
+     const oi = spec.ordering_info || spec.orderingInfo || null;
+     const codes = Array.isArray(oi?.codes) ? oi.codes : null;
+     if (codes && codes.length) {
+       const me = String(spec.pn || spec.code || '').trim().toUpperCase();
+       if (me && codes.some((c) => String(c || '').trim().toUpperCase() === me)) {
+         spec.verified_in_doc = true;

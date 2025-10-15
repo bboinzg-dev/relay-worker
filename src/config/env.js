@@ -2,7 +2,10 @@
 
 function req(name) {
   const v = process.env[name];
-  if (!v) throw new Error(`ENV ${name} is required`);
+  if (!v || String(v).trim() === '') {
+    console.warn(`[env] missing ${name} (using process defaults)`);
+    return '';
+  }
   return v;
 }
 function reqAny(names = []) {

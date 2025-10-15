@@ -1,6 +1,7 @@
 'use strict';
 
 const { pool } = require('../../db');
+const { DIM_KEYS } = require('../types/blueprint.js');
 
 const CACHE = new Map();
 const TTL = Number(process.env.BLUEPRINT_CACHE_TTL_MS || 60_000);
@@ -89,14 +90,8 @@ function ensureFamilyOverrides(blueprint, registryRow) {
     'operating_function',
     'packing_style',
     'insulation_resistance_mohm',
-    // legacy dimension keys (keep for backward compatibility)
-    'dim_l_mm',
-    'dim_w_mm',
-    'dim_h_mm',
-        // normalized dimension keys (preferred)
-    'length_mm',
-    'width_mm',
-    'height_mm',
+    // dimension keys (legacy + normalized)
+    ...DIM_KEYS,
   ];
   blueprint.allowedKeys = Array.from(new Set([...allowed, ...variantKeys, ...generic]));
 

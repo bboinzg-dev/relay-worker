@@ -1,8 +1,21 @@
 diff --git a/server.ai.js b/server.ai.js
-index d3ebc490dafb76399a1f1b93c8399c61ae463841..4641edc9f4de135f8a5ac05ba6be6c4aab119d1c 100644
+index 4641edc9f4de135f8a5ac05ba6be6c4aab119d1c..589dcf70f5c8252d72c2e6a0bafe32ad6316d5ad 100644
 --- a/server.ai.js
 +++ b/server.ai.js
-@@ -85,58 +85,59 @@ const FAMILY_ALIAS = {
+@@ -72,71 +72,87 @@ const FAMILY_ALIAS = {
+     contactA: ['contact_rating_a', 'contact_rating_dc_a', 'contact_rating_ac_a', 'contact_rating_text'],
+     coilV:    ['coil_voltage_vdc', 'rated_coil_voltage_dc', 'coil_voltage_text', 'coil_voltage_code'],
+   },
+   relay_signal: {
+     contactA: ['contact_rating_a', 'contact_rating_dc_a', 'contact_rating_ac_a', 'contact_rating_text'],
+     coilV:    ['coil_voltage_vdc', 'coil_voltage_text', 'coil_voltage_code'],
+   },
+   resistor_chip: {
+     ohm: ['resistance_ohm'],
+   },
+   mosfet: {
+     ida: ['current_id_a'],
+     vds: ['voltage_vds_v'],
      rds: ['rds_on_mohm'],
    },
  };
@@ -15,33 +28,47 @@ index d3ebc490dafb76399a1f1b93c8399c61ae463841..4641edc9f4de135f8a5ac05ba6be6c4a
  }
  
  // 동적 필터 SQL 만들기
- function buildFilterSQL({ table, family, plan, limit }) {
+-function buildFilterSQL({ table, family, plan, limit }) {
++async function buildFilterSQL({ table, family, plan, limit }) {
    const where = [];
    const args = [];
    let arg = 0;
  
-     const baseTable = String(table || '').trim();
+-    const baseTable = String(table || '').trim();
++  const baseTable = String(table || '').trim();
    if (!baseTable) throw new Error('table required');
    const qualifiedTable = baseTable.includes('.') ? baseTable : `public.${baseTable}`;
++  const dotIdx = qualifiedTable.indexOf('.');
++  const schemaName = dotIdx >= 0 ? qualifiedTable.slice(0, dotIdx) : 'public';
++  const tableName = dotIdx >= 0 ? qualifiedTable.slice(dotIdx + 1) : qualifiedTable;
++  if (!tableName) throw new Error('invalid table name');
++
++  // 정보스키마로 존재 컬럼 감지
++  const cols = await db.query(
++    `SELECT column_name FROM information_schema.columns
++      WHERE table_schema=$1 AND table_name=$2 AND column_name IN ('series','contact_form')`,
++    [schemaName || 'public', tableName]
++  );
++  const have = new Set(cols.rows.map(r => r.column_name));
++  const ftsParts = [`COALESCE(raw_json::text,'')`];
++  if (have.has('series'))       ftsParts.push(`COALESCE(series,'')`);
++  if (have.has('contact_form')) ftsParts.push(`COALESCE(contact_form,'')`);
++  const ftsExpr = `to_tsvector('simple', ${ftsParts.join(`||' '||`)})`;
  
    // family 고정(안전)
    if (family) where.push(`(family_slug = $${++arg})`), args.push(family);
  
    // brand/pn like
--  if (plan.brand_like) where.push(`(unaccent(brand)::text ILIKE unaccent('%' || $${++arg} || '%'))`), args.push(plan.brand_like);
--  if (plan.pn_like)    where.push(`(unaccent(pn)::text    ILIKE unaccent('%' || $${++arg} || '%'))`),    args.push(plan.pn_like);
-+  if (plan.brand_like) where.push(`(public.immutable_unaccent(brand)::text ILIKE public.immutable_unaccent('%' || $${++arg} || '%'))`), args.push(plan.brand_like);
-+  if (plan.pn_like)    where.push(`(public.immutable_unaccent(pn)::text    ILIKE public.immutable_unaccent('%' || $${++arg} || '%'))`),    args.push(plan.pn_like);
+   if (plan.brand_like) where.push(`(public.immutable_unaccent(brand)::text ILIKE public.immutable_unaccent('%' || $${++arg} || '%'))`), args.push(plan.brand_like);
+   if (plan.pn_like)    where.push(`(public.immutable_unaccent(pn)::text    ILIKE public.immutable_unaccent('%' || $${++arg} || '%'))`),    args.push(plan.pn_like);
  
    // must 키워드: raw_json과 title 성격 필드에 or-축약 없이 AND로
    for (const k of plan.must) {
--    const p = `%${k}%`;
--    where.push(`( (raw_json::text ILIKE $${++arg}) OR (series ILIKE $${arg}) OR (contact_form ILIKE $${arg}) )`);
--    args.push(p);
-+    const keyword = String(k || '').trim();
-+    if (!keyword) continue;
-+    where.push(`( to_tsvector('simple', COALESCE(series,'')||' '||COALESCE(contact_form,'')||' '||COALESCE(raw_json::text,'')) @@ plainto_tsquery('simple', $${++arg}) )`);
-+    args.push(keyword);
+     const keyword = String(k || '').trim();
+     if (!keyword) continue;
+-    where.push(`( to_tsvector('simple', COALESCE(series,'')||' '||COALESCE(contact_form,'')||' '||COALESCE(raw_json::text,'')) @@ plainto_tsquery('simple', $${++arg}) )`);
++    where.push(`( ${ftsExpr} @@ plainto_tsquery('simple', $${++arg}) )`);
+     args.push(keyword);
    }
  
    // numeric: 각 키마다 가능한 컬럼 후보 중 하나라도 만족하면 OK → (col1 OP v OR col2 OP v ...)
@@ -66,42 +93,7 @@ index d3ebc490dafb76399a1f1b93c8399c61ae463841..4641edc9f4de135f8a5ac05ba6be6c4a
              image_uri, datasheet_url, series, updated_at
         FROM ${qualifiedTable}
        ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-       ORDER BY updated_at DESC
-@@ -164,74 +165,74 @@ router.get('/resolve', async (req, res) => {
-       return res.json({ ok:true, brand: plan.brand_like || null, code: plan.pn_like || null, source:'ai' });
-     }
-     
-     return res.json({ ok: true, echo: q });
-   } catch (e) {
-     return res.status(500).json({ ok:false, error:String(e?.message||e) });
-   }
- });
- 
- /* ---------- /api/ai/search : AI/PN 검색 ---------- */
- // e.g. GET /api/ai/search?q=컨택트 정격 20A 릴레이&mode=ai
- router.get('/search', async (req, res) => {
-   try {
-     const q = String(req.query?.q || '').trim();
-     const mode = String(req.query?.mode || 'ai');
-     const limit = String(req.query?.limit || '24');
-     if (!q) return res.status(400).json({ ok:false, error:'q required' });
- 
-     // 1) pn 간단 검색 모드
-     if (mode === 'pn') {
-       const rows = await db.query(
-         `SELECT id, family_slug, brand, pn,
-                 COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
-                 image_uri, datasheet_url, series, updated_at
-            FROM public.component_specs
--          WHERE unaccent(brand) ILIKE unaccent('%' || $1 || '%')
--             OR unaccent(pn)    ILIKE unaccent('%' || $1 || '%')
-+          WHERE public.immutable_unaccent(brand) ILIKE public.immutable_unaccent('%' || $1 || '%')
-+             OR public.immutable_unaccent(pn)    ILIKE public.immutable_unaccent('%' || $1 || '%')
-           ORDER BY updated_at DESC
-           LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`,
-         [q]
-       );
-       return res.json({ ok:true, explain:{ mode:'pn', q }, items: rows.rows });
+@@ -197,42 +213,42 @@ router.get('/search', async (req, res) => {
      }
  
      // 2) AI 의미 검색 모드
@@ -117,10 +109,8 @@ index d3ebc490dafb76399a1f1b93c8399c61ae463841..4641edc9f4de135f8a5ac05ba6be6c4a
                  COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
                  image_uri, datasheet_url, series, updated_at
             FROM public.component_specs
--          WHERE ($1::text IS NULL OR unaccent(brand) ILIKE unaccent('%' || $1::text || '%'))
--            OR ($2::text IS NULL OR unaccent(pn)    ILIKE unaccent('%' || $2::text || '%'))
-+          WHERE ($1::text IS NULL OR public.immutable_unaccent(brand) ILIKE public.immutable_unaccent('%' || $1::text || '%'))
-+            OR ($2::text IS NULL OR public.immutable_unaccent(pn)    ILIKE public.immutable_unaccent('%' || $2::text || '%'))
+           WHERE ($1::text IS NULL OR public.immutable_unaccent(brand) ILIKE public.immutable_unaccent('%' || $1::text || '%'))
+             OR ($2::text IS NULL OR public.immutable_unaccent(pn)    ILIKE public.immutable_unaccent('%' || $2::text || '%'))
            ORDER BY updated_at DESC
            LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`,
          [plan.brand_like || null, plan.pn_like || null]
@@ -129,7 +119,8 @@ index d3ebc490dafb76399a1f1b93c8399c61ae463841..4641edc9f4de135f8a5ac05ba6be6c4a
      }
  
      const table = await getTableForFamily(family);
-     const { sql, args } = buildFilterSQL({ table, family, plan, limit });
+-    const { sql, args } = buildFilterSQL({ table, family, plan, limit });
++    const { sql, args } = await buildFilterSQL({ table, family, plan, limit });
      const rows = await db.query(sql, args);
  
      return res.json({

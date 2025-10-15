@@ -1,5 +1,14 @@
 'use strict';
 
+const rawPerKeyLimit = Number(process.env.VARIANT_DOMAIN_MAX_PER_KEY);
+const PER_KEY_DOMAIN_MAX = Number.isFinite(rawPerKeyLimit) && rawPerKeyLimit > 0
+  ? Math.floor(rawPerKeyLimit)
+  : 8;
+const rawMaxCombos = Number(process.env.VARIANT_COMBOS_MAX);
+const MAX_COMBOS = Number.isFinite(rawMaxCombos) && rawMaxCombos > 0
+  ? Math.floor(rawMaxCombos)
+  : 5000;
+
 const LIST_SEP = /[\s,;/|·•]+/;
 const VOLTAGE_UNIT_RE = /\d\s*(?:V|VAC|VDC)\b/i;
 // 패턴리스 정규화기: 1A/1B/1C/2A/2B/2C/1A1B/2AB 등 조합 처리
@@ -153,10 +162,20 @@ function normalizeList(value) {
 }
 
 function cartesian(lists) {
-  return lists.reduce(
-    (acc, list) => acc.flatMap((a) => list.map((b) => a.concat([b]))),
-    [[]]
-  );
+  const limit = Number.isFinite(MAX_COMBOS) && MAX_COMBOS > 0 ? MAX_COMBOS : Infinity;
+  let out = [[]];
+  for (const list of lists) {
+    const next = [];
+    for (const a of out) {
+      for (const b of list) {
+        if (next.length >= limit) return next;
+        next.push(a.concat([b]));
+      }
+    }
+    out = next;
+    if (!out.length) break;
+  }
+  return out;
 }
 
 function __applyOps(val, ops = []) {
@@ -325,7 +344,9 @@ function explodeToRows(base, options = {}) {
   const textContainsExactFn =
     typeof options.textContainsExact === 'function' ? options.textContainsExact : defaultTextContainsExact;
   const previewOnly = Boolean(options.previewOnly);
-  const maxTemplateAttemptsRaw = Number(options.maxTemplateAttempts);
+  const maxTemplateAttemptsSource =
+    options.maxTemplateAttempts ?? process.env.MAX_TEMPLATE_ATTEMPTS ?? 200;
+  const maxTemplateAttemptsRaw = Number(maxTemplateAttemptsSource);
   const maxTemplateAttempts = Number.isFinite(maxTemplateAttemptsRaw) && maxTemplateAttemptsRaw > 0
     ? Math.floor(maxTemplateAttemptsRaw)
     : null;
@@ -345,12 +366,12 @@ function explodeToRows(base, options = {}) {
   const lists = variantKeys.map((key) => {
     const fromExact = values[key];
     if (fromExact != null) {
-      const normed = normalizeList(fromExact);
+      const normed = normalizeList(fromExact).slice(0, PER_KEY_DOMAIN_MAX);
       return normed.length ? normed : [fromExact];
     }
     const lower = key.toLowerCase();
     if (values[lower] != null) {
-      const normed = normalizeList(values[lower]);
+      const normed = normalizeList(values[lower]).slice(0, PER_KEY_DOMAIN_MAX);
       return normed.length ? normed : [values[lower]];
     }
     return [null];

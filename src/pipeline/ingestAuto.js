@@ -59,6 +59,7 @@ const { inferVariantKeys, normalizeSlug } = require('./variant-keys');
 const { classifyByGcs, extractValuesByGcs } = require('../services/vertex');
 const { processDocument: processDocAi } = require('../services/docai');
 const { rankPartNumbersFromOrderingSections } = require('../utils/ordering-sections');
+const { decodeCoilVoltageVdc } = require('../utils/coil-voltage');
 
 const HARD_CAP_MS = Number(process.env.EXTRACT_HARD_CAP_MS || 120000);
 
@@ -4549,6 +4550,23 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       return trimmed;
     };
 
+    const fillCoilVoltage = (row) => {
+      if (!row || typeof row !== 'object') return;
+      const current = row.coil_voltage_vdc;
+      const hasValue = current != null && String(current).trim() !== '';
+      if (hasValue) return;
+      const candidate =
+        row.coil_voltage_code ??
+        row.coil_voltage ??
+        row.pn ??
+        row.code ??
+        '';
+      const decoded = decodeCoilVoltageVdc(candidate);
+      if (decoded != null) {
+        row.coil_voltage_vdc = String(decoded);
+      }
+    };
+
     let brandOverride = safeBrand(overrides?.brand)
       || safeBrand(processedEffective)
       || safeBrand(processedBrand)
@@ -4658,6 +4676,12 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         if (r.pn != null && String(r.pn).trim() === '') r.pn = null;
         if (r.code != null && String(r.code).trim() === '') r.code = null;
         if (r.brand != null && String(r.brand).trim() === '') r.brand = null;
+
+        fillCoilVoltage(r);
+      }
+
+      if (Array.isArray(processedRowsInput) && processedRowsInput !== records) {
+        for (const row of processedRowsInput) fillCoilVoltage(row);
       }
 
       const mergeBrandFallback =

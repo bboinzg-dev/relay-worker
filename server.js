@@ -655,7 +655,7 @@ app.get('/parts/detail', async (req, res) => {
               COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
               image_uri, datasheet_url, series, updated_at
          FROM public.component_specs
-        WHERE lower(brand) = lower($1) AND lower(pn) = lower($2)
+        WHERE brand_norm = lower($1) AND pn_norm = lower($2)
         LIMIT 1`,
       [brand, pn]
     );

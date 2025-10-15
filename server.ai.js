@@ -107,14 +107,15 @@ function buildFilterSQL({ table, family, plan, limit }) {
   if (family) where.push(`(family_slug = $${++arg})`), args.push(family);
 
   // brand/pn like
-  if (plan.brand_like) where.push(`(unaccent(brand)::text ILIKE unaccent('%' || $${++arg} || '%'))`), args.push(plan.brand_like);
-  if (plan.pn_like)    where.push(`(unaccent(pn)::text    ILIKE unaccent('%' || $${++arg} || '%'))`),    args.push(plan.pn_like);
+  if (plan.brand_like) where.push(`(public.immutable_unaccent(brand)::text ILIKE public.immutable_unaccent('%' || $${++arg} || '%'))`), args.push(plan.brand_like);
+  if (plan.pn_like)    where.push(`(public.immutable_unaccent(pn)::text    ILIKE public.immutable_unaccent('%' || $${++arg} || '%'))`),    args.push(plan.pn_like);
 
   // must 키워드: raw_json과 title 성격 필드에 or-축약 없이 AND로
   for (const k of plan.must) {
-    const p = `%${k}%`;
-    where.push(`( (raw_json::text ILIKE $${++arg}) OR (series ILIKE $${arg}) OR (contact_form ILIKE $${arg}) )`);
-    args.push(p);
+    const keyword = String(k || '').trim();
+    if (!keyword) continue;
+    where.push(`( to_tsvector('simple', COALESCE(series,'')||' '||COALESCE(contact_form,'')||' '||COALESCE(raw_json::text,'')) @@ plainto_tsquery('simple', $${++arg}) )`);
+    args.push(keyword);
   }
 
   // numeric: 각 키마다 가능한 컬럼 후보 중 하나라도 만족하면 OK → (col1 OP v OR col2 OP v ...)
@@ -186,8 +187,8 @@ router.get('/search', async (req, res) => {
                 COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
                 image_uri, datasheet_url, series, updated_at
            FROM public.component_specs
-          WHERE unaccent(brand) ILIKE unaccent('%' || $1 || '%')
-             OR unaccent(pn)    ILIKE unaccent('%' || $1 || '%')
+          WHERE public.immutable_unaccent(brand) ILIKE public.immutable_unaccent('%' || $1 || '%')
+             OR public.immutable_unaccent(pn)    ILIKE public.immutable_unaccent('%' || $1 || '%')
           ORDER BY updated_at DESC
           LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`,
         [q]
@@ -208,8 +209,8 @@ router.get('/search', async (req, res) => {
                 COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
                 image_uri, datasheet_url, series, updated_at
            FROM public.component_specs
-          WHERE ($1::text IS NULL OR unaccent(brand) ILIKE unaccent('%' || $1::text || '%'))
-            OR ($2::text IS NULL OR unaccent(pn)    ILIKE unaccent('%' || $2::text || '%'))
+          WHERE ($1::text IS NULL OR public.immutable_unaccent(brand) ILIKE public.immutable_unaccent('%' || $1::text || '%'))
+            OR ($2::text IS NULL OR public.immutable_unaccent(pn)    ILIKE public.immutable_unaccent('%' || $2::text || '%'))
           ORDER BY updated_at DESC
           LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`,
         [plan.brand_like || null, plan.pn_like || null]

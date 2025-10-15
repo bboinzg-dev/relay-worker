@@ -99,7 +99,7 @@ const {
   storage,
   parseGcsUri,
 } = tryRequire(['./src/utils/gcs', './gcs']);
-const { ensureSpecsTable, upsertByBrandCode } = tryRequire(['./src/utils/schema', './schema']);
+const { ensureSpecsTable, upsertByBrandCode, ensureSpecsFtsIndices } = tryRequire(['./src/utils/schema', './schema']);
 const authUtils = tryRequire(['./src/utils/auth', './auth']);
 const parseActor = typeof authUtils?.parseActor === 'function' ? authUtils.parseActor : () => ({ roles: [] });
 const hasRole = typeof authUtils?.hasRole === 'function' ? authUtils.hasRole : () => false;
@@ -114,6 +114,15 @@ if (typeof ensureRegistryFromBlueprints === 'function') {
       } catch (e) {
         console.warn('[registry] ensure failed:', e?.message || e);
       }
+    }
+  })();
+}
+if (typeof ensureSpecsFtsIndices === 'function') {
+  (async () => {
+    try {
+      await ensureSpecsFtsIndices();
+    } catch (e) {
+      console.warn('[schema] ensureSpecsFtsIndices failed:', e?.message || e);
     }
   })();
 }
@@ -667,7 +676,7 @@ app.get('/parts/detail', async (req, res) => {
         }
         const qualifiedTable = table.includes('.') ? table : `public.${table}`;
         const detail = await db.query(
-          `SELECT * FROM ${qualifiedTable} WHERE lower(brand)=lower($1) AND lower(pn)=lower($2) LIMIT 1`,
+          `SELECT * FROM ${qualifiedTable} WHERE brand_norm = lower($1) AND pn_norm = lower($2) LIMIT 1`,
           [brand, pn]
         );
         specs = sanitizeSpecsRow(detail.rows[0]) || null;
@@ -697,8 +706,8 @@ app.get('/parts/search', async (req, res) => {
        FROM public.component_specs
       WHERE ($1::text IS NULL OR family_slug = $1::text)
         AND (
-             unaccent(brand) ILIKE unaccent('%' || $2::text || '%')
-          OR unaccent(pn)    ILIKE unaccent('%' || $2::text || '%')
+             public.immutable_unaccent(brand) ILIKE public.immutable_unaccent('%' || $2::text || '%')
+          OR public.immutable_unaccent(pn)    ILIKE public.immutable_unaccent('%' || $2::text || '%')
         )
       ORDER BY updated_at DESC
       LIMIT $3 OFFSET $4`,

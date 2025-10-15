@@ -284,4 +284,31 @@ async function upsertByBrandCode(tableName, values = {}) {
   return res.rows?.[0] || null;
 }
 
-module.exports = { ensureSpecsTable, upsertByBrandCode };
+async function ensureSpecsFtsIndices() {
+  try {
+    const res = await db.query(
+      `SELECT specs_table FROM public.component_registry`
+    );
+    for (const row of res.rows || []) {
+      const raw = String(row.specs_table || '').trim();
+      if (!raw) continue;
+      let parsed;
+      try {
+        parsed = parseTableName(raw);
+      } catch (err) {
+        console.warn('[schema] skip FTS index for table', raw, err?.message || err);
+        continue;
+      }
+      const { schema, table, qualified } = parsed;
+      const indexName = normalizeIdentifier(`${schema}_${table}_gin_fts`);
+      if (!indexName) continue;
+      await db.query(
+        `CREATE INDEX IF NOT EXISTS ${indexName} ON ${qualified} USING GIN (to_tsvector('simple', COALESCE(series,'')||' '||COALESCE(contact_form,'')||' '||COALESCE(raw_json::text,'')))`
+      );
+    }
+  } catch (err) {
+    console.warn('[schema] ensureSpecsFtsIndices failed:', err?.message || err);
+  }
+}
+
+module.exports = { ensureSpecsTable, upsertByBrandCode, ensureSpecsFtsIndices };

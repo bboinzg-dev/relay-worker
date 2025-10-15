@@ -1,39 +1,71 @@
-diff --git a/src/config/env.js b/src/config/env.js
-index b7264a1feb90034d535b5ef309283a8a4b0e6753..0721a3072937313a74db2c23228f2332683d8d37 100644
---- a/src/config/env.js
-+++ b/src/config/env.js
-@@ -1,30 +1,33 @@
- 'use strict';
+diff --git a/src/utils/schema.js b/src/utils/schema.js
+index 969bc26f529db9171e9bf9901815eb1342c46c36..f8fa56a7dcf1ed727f12756d9ad965d733132cdd 100644
+--- a/src/utils/schema.js
++++ b/src/utils/schema.js
+@@ -264,51 +264,61 @@ async function upsertByBrandCode(tableName, values = {}) {
+   if (!insertCols.length) return null;
  
- function req(name) {
-   const v = process.env[name];
--  if (!v) throw new Error(`ENV ${name} is required`);
-+  if (!v || String(v).trim() === '') {
-+    console.warn(`[env] missing ${name} (using process defaults)`);
-+    return '';
-+  }
-   return v;
+   const params = insertCols.map((_, i) => `$${i + 1}`);
+   const updates = insertCols
+     .filter((col) => !NO_UPDATE.has(col))
+     .map((col) => `${col}=EXCLUDED.${col}`);
+ 
+   // Spec tables enforce uniqueness via the expression index (lower(brand), lower(pn)).
+   // The backing database creates this as an expression index (not a constraint),
+   // therefore we must always target the raw expression in ON CONFLICT clauses.
+   const conflict = `ON CONFLICT ((lower(brand)), (lower(pn)))`;
+ 
+   const sql = `
+     insert into ${qualified} (${insertCols.join(',')})
+     values (${params.join(',')})
+     ${conflict}
+     do update set ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
+     returning *`;
+ 
+   const res = await db.query(sql, insertVals);
+   return res.rows?.[0] || null;
  }
- function reqAny(names = []) {
-   for (const name of names) {
-     const v = process.env[name];
-     if (v) return v;
+ 
+ async function ensureSpecsFtsIndices() {
+   try {
+-    const res = await db.query(
+-      `SELECT specs_table FROM public.component_registry`
+-    );
++    const res = await db.query(`SELECT specs_table FROM public.component_registry`);
+     for (const row of res.rows || []) {
+       const raw = String(row.specs_table || '').trim();
+       if (!raw) continue;
+       let parsed;
+       try {
+         parsed = parseTableName(raw);
+       } catch (err) {
+         console.warn('[schema] skip FTS index for table', raw, err?.message || err);
+         continue;
+       }
+       const { schema, table, qualified } = parsed;
+       const indexName = normalizeIdentifier(`${schema}_${table}_gin_fts`);
+       if (!indexName) continue;
++
++      const colsRes = await db.query(
++        `SELECT column_name FROM information_schema.columns
++           WHERE table_schema=$1 AND table_name=$2 AND column_name IN ('series','contact_form')`,
++        [schema || 'public', table]
++      );
++      const have = new Set(colsRes.rows.map((r) => r.column_name));
++      const parts = [`COALESCE(raw_json::text,'')`];
++      if (have.has('series')) parts.push(`COALESCE(series,'')`);
++      if (have.has('contact_form')) parts.push(`COALESCE(contact_form,'')`);
++      const expr = `to_tsvector('simple', ${parts.join("||' '||")})`;
++
+       await db.query(
+-        `CREATE INDEX IF NOT EXISTS ${indexName} ON ${qualified} USING GIN (to_tsvector('simple', COALESCE(series,'')||' '||COALESCE(contact_form,'')||' '||COALESCE(raw_json::text,'')))`
++        `CREATE INDEX IF NOT EXISTS ${indexName} ON ${qualified} USING GIN (${expr})`
+       );
+     }
+   } catch (err) {
+     console.warn('[schema] ensureSpecsFtsIndices failed:', err?.message || err);
    }
-   throw new Error(`ENV ${names.join('/') || '(none)'} is required`);
- }
- function opt(name, def = undefined) {
-   const v = process.env[name];
-   return (v === undefined || v === '') ? def : v;
- }
- function bucketName(v) {
-   if (!v) return v;
-   if (v.startsWith('gs://')) return v.replace(/^gs:\/\//, '');
-   return v;
  }
  
- const PROJECT_ID = reqAny(['GCP_PROJECT_ID', 'GOOGLE_CLOUD_PROJECT']);
- const GCS_BUCKET = req('GCS_BUCKET');
- 
- module.exports = {
-   // 프로젝트/리전
-   PROJECT_ID,
+ module.exports = { ensureSpecsTable, upsertByBrandCode, ensureSpecsFtsIndices };
+\ No newline at end of file

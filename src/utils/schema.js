@@ -286,9 +286,7 @@ async function upsertByBrandCode(tableName, values = {}) {
 
 async function ensureSpecsFtsIndices() {
   try {
-    const res = await db.query(
-      `SELECT specs_table FROM public.component_registry`
-    );
+    const res = await db.query(`SELECT specs_table FROM public.component_registry`);
     for (const row of res.rows || []) {
       const raw = String(row.specs_table || '').trim();
       if (!raw) continue;
@@ -302,8 +300,20 @@ async function ensureSpecsFtsIndices() {
       const { schema, table, qualified } = parsed;
       const indexName = normalizeIdentifier(`${schema}_${table}_gin_fts`);
       if (!indexName) continue;
+      
+      const colsRes = await db.query(
+        `SELECT column_name FROM information_schema.columns
+           WHERE table_schema=$1 AND table_name=$2 AND column_name IN ('series','contact_form')`,
+        [schema || 'public', table]
+      );
+      const have = new Set(colsRes.rows.map((r) => r.column_name));
+      const parts = [`COALESCE(raw_json::text,'')`];
+      if (have.has('series')) parts.push(`COALESCE(series,'')`);
+      if (have.has('contact_form')) parts.push(`COALESCE(contact_form,'')`);
+      const expr = `to_tsvector('simple', ${parts.join("||' '||")})`;
+
       await db.query(
-        `CREATE INDEX IF NOT EXISTS ${indexName} ON ${qualified} USING GIN (to_tsvector('simple', COALESCE(series,'')||' '||COALESCE(contact_form,'')||' '||COALESCE(raw_json::text,'')))`
+        `CREATE INDEX IF NOT EXISTS ${indexName} ON ${qualified} USING GIN (${expr})`
       );
     }
   } catch (err) {

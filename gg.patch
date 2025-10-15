@@ -1,140 +1,369 @@
-diff --git a/server.ai.js b/server.ai.js
-index 4641edc9f4de135f8a5ac05ba6be6c4aab119d1c..589dcf70f5c8252d72c2e6a0bafe32ad6316d5ad 100644
---- a/server.ai.js
-+++ b/server.ai.js
-@@ -72,71 +72,87 @@ const FAMILY_ALIAS = {
-     contactA: ['contact_rating_a', 'contact_rating_dc_a', 'contact_rating_ac_a', 'contact_rating_text'],
-     coilV:    ['coil_voltage_vdc', 'rated_coil_voltage_dc', 'coil_voltage_text', 'coil_voltage_code'],
-   },
-   relay_signal: {
-     contactA: ['contact_rating_a', 'contact_rating_dc_a', 'contact_rating_ac_a', 'contact_rating_text'],
-     coilV:    ['coil_voltage_vdc', 'coil_voltage_text', 'coil_voltage_code'],
-   },
-   resistor_chip: {
-     ohm: ['resistance_ohm'],
-   },
-   mosfet: {
-     ida: ['current_id_a'],
-     vds: ['voltage_vds_v'],
-     rds: ['rds_on_mohm'],
-   },
- };
- 
- // numeric 키를 실제 컬럼 후보로 확장
- function expandNumericKey(family, key) {
-   const a = FAMILY_ALIAS[family] || {};
-   if (a[key]) return a[key];
-   return [key]; // 그대로 시도
+diff --git a/server.js b/server.js
+index edff26d2b9629561380efb9c2a48c8d62110c1a2..812ea0b085b02754dc0f14308d48784b8ddeadfb 100644
+--- a/server.js
++++ b/server.js
+@@ -60,120 +60,200 @@ function tryRequire(paths) {
+     try {
+       return require(p);
+     } catch (err) {
+       if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
+         errors.push(err);
+         continue;
+       }
+       throw err;
+     }
+   }
+   const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
+   error.code = 'MODULE_NOT_FOUND';
+   error.attempts = errors.map((e) => e?.message || String(e));
+   throw error;
  }
  
- // 동적 필터 SQL 만들기
--function buildFilterSQL({ table, family, plan, limit }) {
-+async function buildFilterSQL({ table, family, plan, limit }) {
-   const where = [];
-   const args = [];
-   let arg = 0;
  
--    const baseTable = String(table || '').trim();
-+  const baseTable = String(table || '').trim();
-   if (!baseTable) throw new Error('table required');
-   const qualifiedTable = baseTable.includes('.') ? baseTable : `public.${baseTable}`;
-+  const dotIdx = qualifiedTable.indexOf('.');
-+  const schemaName = dotIdx >= 0 ? qualifiedTable.slice(0, dotIdx) : 'public';
-+  const tableName = dotIdx >= 0 ? qualifiedTable.slice(dotIdx + 1) : qualifiedTable;
-+  if (!tableName) throw new Error('invalid table name');
+ // --- 3rd-party ---
+ const express = require('express');
+ const cors = require('cors');
+ const bodyParser = require('body-parser');
+ const multer = require('multer');
+ const crypto = require('crypto');
+ const jwt = require('jsonwebtoken');
+ 
++const rawIngestParser = express.raw({ type: '*/*', limit: process.env.INGEST_MAX_PAYLOAD || '10mb' });
 +
-+  // 정보스키마로 존재 컬럼 감지
-+  const cols = await db.query(
-+    `SELECT column_name FROM information_schema.columns
-+      WHERE table_schema=$1 AND table_name=$2 AND column_name IN ('series','contact_form')`,
-+    [schemaName || 'public', tableName]
-+  );
-+  const have = new Set(cols.rows.map(r => r.column_name));
-+  const ftsParts = [`COALESCE(raw_json::text,'')`];
-+  if (have.has('series'))       ftsParts.push(`COALESCE(series,'')`);
-+  if (have.has('contact_form')) ftsParts.push(`COALESCE(contact_form,'')`);
-+  const ftsExpr = `to_tsvector('simple', ${ftsParts.join(`||' '||`)})`;
++let verifyTaskOidc = async () => ({ verified: false });
++try {
++  const { OAuth2Client } = require('google-auth-library');
++  const oidcClient = new OAuth2Client();
++  verifyTaskOidc = async (req) => {
++    const auth = req.headers['authorization'] || '';
++    const match = auth.match(/^Bearer (.+)$/);
++    if (!match) return { verified: false, reason: 'no-bearer' };
++    const aud = process.env.TASK_AUDIENCE || process.env.WORKER_AUDIENCE;
++    const ticket = await oidcClient.verifyIdToken({ idToken: match[1], audience: aud });
++    const payload = ticket.getPayload() || {};
++    const invoker = process.env.TASKS_INVOKER_SA;
++    if (invoker && payload.email && payload.email !== invoker) {
++      throw new Error(`unauthorized: expected ${invoker}, got ${payload.email}`);
++    }
++    return { verified: true, email: payload.email, aud: payload.aud };
++  };
++} catch (err) {
++  if (process.env.ROUTE_DEBUG) {
++    console.warn('[ingest] oidc verifier disabled:', err?.message || err);
++  }
++}
++
++const SEEN_TASKS = new Map();
++function seenTask(taskName, ttlMs = 15 * 60 * 1000) {
++  const now = Date.now();
++  for (const [name, exp] of SEEN_TASKS) {
++    if (exp < now) SEEN_TASKS.delete(name);
++  }
++  if (!taskName) return false;
++  if (SEEN_TASKS.has(taskName)) return true;
++  SEEN_TASKS.set(taskName, now + ttlMs);
++  return false;
++}
++
++function parseTaskBody(req) {
++  const buf = Buffer.isBuffer(req.body)
++    ? req.body
++    : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body ?? {}));
++  const str = buf.toString('utf8').trim();
++  if (!str) return { payload: {}, raw: '' };
++
++  const tryJSON = (s) => {
++    try { return JSON.parse(s); } catch { return null; }
++  };
++  const b64ToJSON = (s) => {
++    try {
++      const decoded = Buffer.from(s, 'base64').toString('utf8');
++      return tryJSON(decoded) ?? { _raw: decoded };
++    } catch {
++      return null;
++    }
++  };
++
++  const asJSON = tryJSON(str);
++  if (asJSON) {
++    if (asJSON?.message?.data) {
++      return { payload: b64ToJSON(asJSON.message.data) ?? { data: asJSON.message.data }, raw: str };
++    }
++    return { payload: asJSON, raw: str };
++  }
++
++  const looksB64 = /^[A-Za-z0-9+/_=-]+$/.test(str) && (str.length % 4 === 0);
++  if (looksB64) {
++    const parsed = b64ToJSON(str);
++    if (parsed) return { payload: parsed, raw: str, wasBase64: true };
++  }
++
++  return { payload: { _raw: str }, raw: str };
++}
++
+ // --- local ---
+ // 1) DB 모듈: 로드 실패해도 서버는 떠야 함
+ let db;
+ try {
+   db = require('./db');
+ } catch (err) {
+   console.error('[BOOT] db load failed:', err?.message || err);
+   db = { query: async () => { throw new Error('DB_UNAVAILABLE'); } };
+ }
+ const {
+   getSignedUrl,
+   canonicalDatasheetPath,
+   canonicalCoverPath,
+   moveObject,
+   storage,
+   parseGcsUri,
+ } = tryRequire(['./src/utils/gcs', './gcs']);
+ const { ensureSpecsTable, upsertByBrandCode, ensureSpecsFtsIndices } = tryRequire(['./src/utils/schema', './schema']);
+ const authUtils = tryRequire(['./src/utils/auth', './auth']);
+ const parseActor = typeof authUtils?.parseActor === 'function' ? authUtils.parseActor : () => ({ roles: [] });
+ const hasRole = typeof authUtils?.hasRole === 'function' ? authUtils.hasRole : () => false;
+ const { getTableForFamily, ensureRegistryFromBlueprints } = tryRequire(['./src/lib/registry', './lib/registry']);
  
-   // family 고정(안전)
-   if (family) where.push(`(family_slug = $${++arg})`), args.push(family);
- 
-   // brand/pn like
-   if (plan.brand_like) where.push(`(public.immutable_unaccent(brand)::text ILIKE public.immutable_unaccent('%' || $${++arg} || '%'))`), args.push(plan.brand_like);
-   if (plan.pn_like)    where.push(`(public.immutable_unaccent(pn)::text    ILIKE public.immutable_unaccent('%' || $${++arg} || '%'))`),    args.push(plan.pn_like);
- 
-   // must 키워드: raw_json과 title 성격 필드에 or-축약 없이 AND로
-   for (const k of plan.must) {
-     const keyword = String(k || '').trim();
-     if (!keyword) continue;
--    where.push(`( to_tsvector('simple', COALESCE(series,'')||' '||COALESCE(contact_form,'')||' '||COALESCE(raw_json::text,'')) @@ plainto_tsquery('simple', $${++arg}) )`);
-+    where.push(`( ${ftsExpr} @@ plainto_tsquery('simple', $${++arg}) )`);
-     args.push(keyword);
+ if (typeof ensureRegistryFromBlueprints === 'function') {
+   (async () => {
+     if (String(process.env.REGISTRY_AUTO_ENSURE || '1') === '1') {
+       try {
+         const r = await ensureRegistryFromBlueprints();
+         if (r?.added) console.log('[registry] ensured, added:', r.added);
+       } catch (e) {
+         console.warn('[registry] ensure failed:', e?.message || e);
+       }
+     }
+   })();
+ }
+ if (typeof ensureSpecsFtsIndices === 'function') {
+   (async () => {
+     try {
+       await ensureSpecsFtsIndices();
+     } catch (e) {
+       console.warn('[schema] ensureSpecsFtsIndices failed:', e?.message || e);
+     }
+   })();
+ }
+ // 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
+ let __INGEST_MOD__ = null;
+ function getIngest() {
+-  if (__INGEST_MOD__) return __INGEST_MOD__;
++  if (global.__INGEST_MOD__) return global.__INGEST_MOD__;
++  if (__INGEST_MOD__) {
++    global.__INGEST_MOD__ = __INGEST_MOD__;
++    return __INGEST_MOD__;
++  }
+   try {
+     const absSrc = path.join(__dirname, 'src', 'pipeline', 'ingestAuto.js');
+     const absRoot = path.join(__dirname, 'ingestAuto.js');
+     __INGEST_MOD__ = tryRequire([
+       absSrc,
+       absRoot,
+       './src/pipeline/ingestAuto.js',
+       './ingestAuto.js',
+       'src/pipeline/ingestAuto.js',
+     ]);
++    global.__INGEST_MOD__ = __INGEST_MOD__;
+   } catch (e) {
+     console.error('[INGEST] module load failed:', e?.message || e);
+     if (e?.stack) console.error('[INGEST] stack:', e.stack);
+     try {
+       const dir = path.join(__dirname, 'src', 'pipeline');
+-      console.error('[INGEST] ls src/pipeline =', fs.readdirSync(dir));
++      const listing = fs.existsSync(dir) ? fs.readdirSync(dir) : '(missing)';
++      console.error('[INGEST] ls src/pipeline =', listing);
+       console.error('[INGEST] CWD =', process.cwd(), ' __dirname =', __dirname);
+     } catch {}
+     __INGEST_MOD__ = {
+       runAutoIngest: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
+       persistProcessedData: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
+     };
++    global.__INGEST_MOD__ = __INGEST_MOD__;
    }
+   return __INGEST_MOD__;
+ }
  
-   // numeric: 각 키마다 가능한 컬럼 후보 중 하나라도 만족하면 OK → (col1 OP v OR col2 OP v ...)
-   for (const f of (plan.numeric || [])) {
-     const op = (f.op || '>=')?.replace(/[^<=>]/g,'');
-     const v  = Number(f.value);
-     if (!isFinite(v)) continue;
  
-     const cols = expandNumericKey(family, (f.key || '').trim());
-     const pieces = [];
-     for (const col of cols) {
-       // 텍스트 컬럼도 있으니 numExpr로 변환
-       pieces.push(`(${numExpr(`"${col}"`)} ${op} $${++arg})`);
-       args.push(v);
-     }
-     if (pieces.length) where.push(`(${pieces.join(' OR ')})`);
-   }
  
-   const sql =
-     `SELECT id, family_slug, brand, pn,
-             COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
-             image_uri, datasheet_url, series, updated_at
-        FROM ${qualifiedTable}
-       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-@@ -197,42 +213,42 @@ router.get('/search', async (req, res) => {
-     }
+ // ───────────────── Cloud Tasks (enqueue next-step) ─────────────────
+ // 2) Cloud Tasks: 런타임에 없으면 비활성화
+ let CloudTasksClient;
+ try { ({ CloudTasksClient } = require('@google-cloud/tasks')); }
+ catch (e) { console.warn('[BOOT] @google-cloud/tasks unavailable:', e?.message || e); }
+ const PROJECT_ID       = process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+ const TASKS_LOCATION   = process.env.TASKS_LOCATION   || 'asia-northeast3';
+ const QUEUE_NAME       = process.env.QUEUE_NAME       || 'ingest-queue';
+ // step 라우트 폐지 → ingest 하나로 통일
+ const WORKER_TASK_URL = process.env.WORKER_TASK_URL || process.env.WORKER_STEP_URL || 'https://<YOUR-RUN-URL>/api/worker/ingest';
+ const TASKS_INVOKER_SA = process.env.TASKS_INVOKER_SA || '';
  
-     // 2) AI 의미 검색 모드
-     const plan = await callGeminiToPlan(q);
+ // ⚠️ 외부 API(예: Vertex/HTTP) 가능성이 있는 부팅 태스크는 가드 안에서만 실행
+ //   → 아래 부팅 IIFE 내부의  if (!EXT_CALLS_OFF)  블록으로 이동
+ //try { require('./src/tasks/embedFamilies').run().catch(console.error); } catch {}
  
-     // family 없으면 릴레이/저항 등 빈도 높은 후보로 시도 (간단 휴리스틱)
-     const family = plan.family || (/릴레이/.test(q) ? 'relay_power' : /저항|resistor/i.test(q) ? 'resistor_chip' : null);
+ // lazy init: gRPC 문제 대비 regional endpoint + REST fallback
+ let _tasks = null;
+ let _queuePath = null;
+@@ -272,50 +352,97 @@ const app = express();
  
-     // family가 있어야 스펙 필터를 정확히 적용 가능. 없으면 component_specs에 넓게 걸쳐서 must/brand/pn로 검색
-     if (!family) {
-       const rows = await db.query(
-         `SELECT id, family_slug, brand, pn,
-                 COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
-                 image_uri, datasheet_url, series, updated_at
-            FROM public.component_specs
-           WHERE ($1::text IS NULL OR public.immutable_unaccent(brand) ILIKE public.immutable_unaccent('%' || $1::text || '%'))
-             OR ($2::text IS NULL OR public.immutable_unaccent(pn)    ILIKE public.immutable_unaccent('%' || $2::text || '%'))
-           ORDER BY updated_at DESC
-           LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`,
-         [plan.brand_like || null, plan.pn_like || null]
-       );
-       return res.json({ ok:true, explain:{ mode:'ai-broad', plan }, items: rows.rows });
-     }
+ // ✅ 항상 찍히는 부팅 로그 + 간단 헬스/정보
+ console.log('[BOOT] server.js starting', {
+   file: __filename,
+   node: process.version,
+   ROUTE_DEBUG: process.env.ROUTE_DEBUG || null,
+   revision: process.env.K_REVISION || null,
+ });
  
-     const table = await getTableForFamily(family);
--    const { sql, args } = buildFilterSQL({ table, family, plan, limit });
-+    const { sql, args } = await buildFilterSQL({ table, family, plan, limit });
-     const rows = await db.query(sql, args);
+ // 가장 가벼운 핑
+ app.get('/_ping', (_req, res) => res.json({ ok: true, rev: process.env.K_REVISION || null }));
  
-     return res.json({
-       ok:true,
-       explain:{ mode:'ai', family, table, plan, sql_preview: sql.replace(/\s+/g,' ').slice(0,280) + '...' },
-       items: rows.rows
+ // 현재 실행 중인 엔트리/디렉토리 확인 (정말 server.js가 실행되는지 확인)
+ app.get('/_whoami', (_req, res) => {
+   try {
+     res.json({
+       main: require.main && require.main.filename,
+       dir: __dirname,
+       ROUTE_DEBUG: process.env.ROUTE_DEBUG || null
      });
    } catch (e) {
-     return res.status(500).json({ ok:false, error:String(e?.message||e) });
+     res.status(500).json({ ok: false, error: String(e?.message || e) });
    }
  });
  
++const workerRouter = express.Router();
++workerRouter.post('/ingest', rawIngestParser, async (req, res) => {
++  const taskName = req.header('X-CloudTasks-TaskName') || req.header('X-Cloudtasks-Taskname') || '';
++  const queueName = req.header('X-CloudTasks-QueueName') || req.header('X-Cloudtasks-Queuename') || '';
++  const retryHeader = req.header('X-CloudTasks-TaskRetryCount') || req.header('X-Cloudtasks-Taskretrycount');
++  const retryCount = Number(retryHeader || 0);
++
++  try {
++    await verifyTaskOidc(req);
++  } catch (e) {
++    console.warn('[ingest] oidc verify failed:', e?.message || e);
++    return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
++  }
++
++  if (seenTask(taskName)) {
++    return res.status(200).json({ ok: true, dedup: true, task: taskName, queue: queueName });
++  }
++
++  const parsed = parseTaskBody(req);
++  const payload = parsed.payload || {};
++  const ctx = {
++    task: {
++      name: taskName,
++      queue: queueName,
++      retry: Number.isFinite(retryCount) ? retryCount : 0,
++      wasBase64: !!parsed.wasBase64,
++    },
++    ip: req.ip,
++    trace: req.header('X-Cloud-Trace-Context') || '',
++    rawLength: typeof parsed.raw === 'string' ? parsed.raw.length : 0,
++  };
++
++  try {
++    const ingest = getIngest();
++    const result = await ingest.runAutoIngest(payload, ctx);
++    const ok = !!(result?.ok ?? true);
++    return res.status(ok ? 200 : 202).json({ ok, result });
++  } catch (err) {
++    const msg = err?.message || String(err);
++    console.error('[api/worker/ingest] failed:', msg);
++    if (err?.stack) console.error(err.stack);
++    console.error('[ingest] ctx=', ctx, 'payload.keys=', Object.keys(payload || {}));
++    return res.status(500).json({ ok: false, error: msg.slice(0, 512) });
++  }
++});
++app.use('/api/worker', workerRouter);
++
+ app.use(bodyParser.json({ limit: '25mb' }));
+ app.use(bodyParser.urlencoded({ extended: true }));
+ app.disable('x-powered-by');
  
- router.get('/ping', (_req, res) => res.json({ ok:true }));
+ /* ---------------- Env / Config ---------------- */
+ const PORT = process.env.PORT || 8080;
+ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
  
- module.exports = router;
-\ No newline at end of file
+ function parseCorsOrigins(envStr) {
+   if (!envStr) return null;
+   const items = envStr.split(',').map(s => s.trim()).filter(Boolean);
+   return items.map(p => {
+     if (p.startsWith('/') && p.endsWith('/')) {
+       const body = p.slice(1, -1);
+       return new RegExp(body);
+     }
+     return p;
+   });
+ }
+ const CORS_ALLOW = parseCorsOrigins(process.env.CORS_ALLOW_ORIGINS);
+ 
+ /* ---------------- CORS / Security ---------------- */
+ if (CORS_ALLOW) {
+   app.use(cors({ origin: CORS_ALLOW, credentials: true }));
+ } else {
+@@ -785,63 +912,50 @@ app.post('/ingest/bulk', requireSession, async (req, res) => {
+   } catch (e) { console.error(e); res.status(500).json({ ok:false, error:'bulk ingest failed', detail:String(e?.message || e) }); }
+ });
+ 
+ app.post('/ingest/auto', requireSession, async (req, res) => {
+   try {
+     const { gcsUri, gcsPdfUri, gcs_uri, gcs_pdf_uri, brand, code, series, display_name, family_slug } = req.body || {};
+     const uri = gcsUri || gcsPdfUri || gcs_uri || gcs_pdf_uri;
+     if (!uri) return res.status(400).json({ ok:false, error:'gcsUri required' });
+     const overrides = {
+       brand: brand || null,
+       series: series || null,
+     };
+     const result = await getIngest().runAutoIngest({
+       gcsUri: uri,
+       family_slug,
+       brand,
+       code,
+       series,
+       display_name,
+       overrides,
+     });
+     res.json(result);
+   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
+ });
+ 
+-app.post('/api/worker/ingest', async (req, res) => {
+-  try {
+-    const payload = (req?.body && typeof req.body === 'object' && 'payload' in req.body)
+-      ? (req.body.payload || {})
+-      : (req.body || {});
+-    const result = await getIngest().runAutoIngest(payload || {});
+-    return res.status(202).json({ ok: true, run: result?.runId || null });
+-  } catch (e) {
+-    console.error('[api/worker/ingest] failed:', e);
+-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+-  }
+-});
+-
+ function pickFirstString(...values) {
+   for (const value of values) {
+     if (typeof value === 'string' && value.trim()) {
+       return value.trim();
+     }
+   }
+   return null;
+ }
+ 
+ function getTaskContext(req, phase) {
+   const headerName = req.get('X-CloudTasks-TaskName') || req.get('X-Cloud-Tasks-TaskName') || null;
+   const retryHeader = req.get('X-CloudTasks-TaskRetryCount') || req.get('X-Cloud-Tasks-TaskRetryCount');
+   const parsedRetry = Number(retryHeader);
+   return {
+     taskName: headerName || `phase:${phase}`,
+     retryCount: Number.isFinite(parsedRetry) ? parsedRetry : 0,
+   };
+ }
+ 
+ const ingestJobMeta = { inspectedAt: 0, columns: null };
+ 
+ async function getIngestJobColumns() {
+   const now = Date.now();
+   if (ingestJobMeta.inspectedAt && now - ingestJobMeta.inspectedAt < 60_000) {
+     return ingestJobMeta.columns;

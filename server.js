@@ -131,9 +131,14 @@ let __INGEST_MOD__ = null;
 function getIngest() {
   if (__INGEST_MOD__) return __INGEST_MOD__;
   try {
+    const absSrc = path.join(__dirname, 'src', 'pipeline', 'ingestAuto.js');
+    const absRoot = path.join(__dirname, 'ingestAuto.js');
     __INGEST_MOD__ = tryRequire([
+      absSrc,
+      absRoot,
       './src/pipeline/ingestAuto.js',
       './ingestAuto.js',
+      'src/pipeline/ingestAuto.js',
     ]);
   } catch (e) {
     console.error('[INGEST] module load failed:', e?.message || e);

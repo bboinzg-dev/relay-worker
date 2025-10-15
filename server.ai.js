@@ -4,6 +4,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('./db');
+const { getTableForFamily } = require('./src/lib/registry');
 const { VertexAI } = require('@google-cloud/vertexai');
 
 function getVertex() {
@@ -17,15 +18,6 @@ function getVertex() {
 function numExpr(pgTextIdent) {
   // regexp_replace(text, '[^0-9.]', '', 'g')::numeric
   return `COALESCE(NULLIF(regexp_replace(${pgTextIdent}, '[^0-9.]', '', 'g'), '')::numeric, NULL)`;
-}
-
-// family → specs_table
-async function getSpecsTableByFamily(family) {
-  const sql = `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`;
-  const { rows } = await db.query(sql, [family]);
-  const t = rows[0]?.specs_table;
-  if (!t || !/^[A-Za-z0-9_]+$/.test(t)) throw new Error('Invalid or unknown specs_table for family=' + family);
-  return t;
 }
 
 // LLM에 물어볼 스키마 (최소화)
@@ -107,6 +99,10 @@ function buildFilterSQL({ table, family, plan, limit }) {
   const args = [];
   let arg = 0;
 
+    const baseTable = String(table || '').trim();
+  if (!baseTable) throw new Error('table required');
+  const qualifiedTable = baseTable.includes('.') ? baseTable : `public.${baseTable}`;
+
   // family 고정(안전)
   if (family) where.push(`(family_slug = $${++arg})`), args.push(family);
 
@@ -141,7 +137,7 @@ function buildFilterSQL({ table, family, plan, limit }) {
     `SELECT id, family_slug, brand, pn,
             COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
             image_uri, datasheet_url, series, updated_at
-       FROM public.${table}
+       FROM ${qualifiedTable}
       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
       ORDER BY updated_at DESC
       LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`;
@@ -221,7 +217,7 @@ router.get('/search', async (req, res) => {
       return res.json({ ok:true, explain:{ mode:'ai-broad', plan }, items: rows.rows });
     }
 
-    const table = await getSpecsTableByFamily(family);
+    const table = await getTableForFamily(family);
     const { sql, args } = buildFilterSQL({ table, family, plan, limit });
     const rows = await db.query(sql, args);
 

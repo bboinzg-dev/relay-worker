@@ -103,6 +103,20 @@ const { ensureSpecsTable, upsertByBrandCode } = tryRequire(['./src/utils/schema'
 const authUtils = tryRequire(['./src/utils/auth', './auth']);
 const parseActor = typeof authUtils?.parseActor === 'function' ? authUtils.parseActor : () => ({ roles: [] });
 const hasRole = typeof authUtils?.hasRole === 'function' ? authUtils.hasRole : () => false;
+const { getTableForFamily, ensureRegistryFromBlueprints } = tryRequire(['./src/lib/registry', './lib/registry']);
+
+if (typeof ensureRegistryFromBlueprints === 'function') {
+  (async () => {
+    if (String(process.env.REGISTRY_AUTO_ENSURE || '1') === '1') {
+      try {
+        const r = await ensureRegistryFromBlueprints();
+        if (r?.added) console.log('[registry] ensured, added:', r.added);
+      } catch (e) {
+        console.warn('[registry] ensure failed:', e?.message || e);
+      }
+    }
+  })();
+}
 // 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
 let __INGEST_MOD__ = null;
 function getIngest() {
@@ -645,18 +659,15 @@ app.get('/parts/detail', async (req, res) => {
     const requestFamilySlug = (req.query.family || '').toString().trim().toLowerCase();
     const familySlug = metaFamilySlug || requestFamilySlug || null;
     if (familySlug) {
-      const registry = await db.query(
-        `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
-        [familySlug]
-      );
-      const table = registry.rows[0]?.specs_table;
+      const table = await getTableForFamily(familySlug);
       if (table) {
-        if (!/^[a-zA-Z0-9_]+$/.test(table)) {
+        if (!/^[a-zA-Z0-9_.]+$/.test(table)) {
           console.error('[parts/detail] invalid table name', { table });
           return res.status(500).json({ ok:false, error:'INVALID_TABLE' });
         }
+        const qualifiedTable = table.includes('.') ? table : `public.${table}`;
         const detail = await db.query(
-          `SELECT * FROM public.${table} WHERE lower(brand)=lower($1) AND lower(pn)=lower($2) LIMIT 1`,
+          `SELECT * FROM ${qualifiedTable} WHERE lower(brand)=lower($1) AND lower(pn)=lower($2) LIMIT 1`,
           [brand, pn]
         );
         specs = sanitizeSpecsRow(detail.rows[0]) || null;

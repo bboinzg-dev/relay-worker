@@ -167,6 +167,8 @@ router.get('/resolve', async (req, res) => {
     if (plan.brand_like || plan.pn_like) {
       return res.json({ ok:true, brand: plan.brand_like || null, code: plan.pn_like || null, source:'ai' });
     }
+    
+    return res.json({ ok: true, echo: q });
   } catch (e) {
     return res.status(500).json({ ok:false, error:String(e?.message||e) });
   }

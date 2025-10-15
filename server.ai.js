@@ -94,14 +94,30 @@ function expandNumericKey(family, key) {
 }
 
 // 동적 필터 SQL 만들기
-function buildFilterSQL({ table, family, plan, limit }) {
+async function buildFilterSQL({ table, family, plan, limit }) {
   const where = [];
   const args = [];
   let arg = 0;
 
-    const baseTable = String(table || '').trim();
+  const baseTable = String(table || '').trim();
   if (!baseTable) throw new Error('table required');
   const qualifiedTable = baseTable.includes('.') ? baseTable : `public.${baseTable}`;
+    const dotIdx = qualifiedTable.indexOf('.');
+  const schemaName = dotIdx >= 0 ? qualifiedTable.slice(0, dotIdx) : 'public';
+  const tableName = dotIdx >= 0 ? qualifiedTable.slice(dotIdx + 1) : qualifiedTable;
+  if (!tableName) throw new Error('invalid table name');
+
+  // 정보스키마로 존재 컬럼 감지
+  const cols = await db.query(
+    `SELECT column_name FROM information_schema.columns
+      WHERE table_schema=$1 AND table_name=$2 AND column_name IN ('series','contact_form')`,
+    [schemaName || 'public', tableName]
+  );
+  const have = new Set(cols.rows.map(r => r.column_name));
+  const ftsParts = [`COALESCE(raw_json::text,'')`];
+  if (have.has('series'))       ftsParts.push(`COALESCE(series,'')`);
+  if (have.has('contact_form')) ftsParts.push(`COALESCE(contact_form,'')`);
+  const ftsExpr = `to_tsvector('simple', ${ftsParts.join(`||' '||`)})`;
 
   // family 고정(안전)
   if (family) where.push(`(family_slug = $${++arg})`), args.push(family);
@@ -114,7 +130,7 @@ function buildFilterSQL({ table, family, plan, limit }) {
   for (const k of plan.must) {
     const keyword = String(k || '').trim();
     if (!keyword) continue;
-    where.push(`( to_tsvector('simple', COALESCE(series,'')||' '||COALESCE(contact_form,'')||' '||COALESCE(raw_json::text,'')) @@ plainto_tsquery('simple', $${++arg}) )`);
+    where.push(`( ${ftsExpr} @@ plainto_tsquery('simple', $${++arg}) )`);
     args.push(keyword);
   }
 
@@ -219,7 +235,7 @@ router.get('/search', async (req, res) => {
     }
 
     const table = await getTableForFamily(family);
-    const { sql, args } = buildFilterSQL({ table, family, plan, limit });
+    const { sql, args } = await buildFilterSQL({ table, family, plan, limit });
     const rows = await db.query(sql, args);
 
     return res.json({

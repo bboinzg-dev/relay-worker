@@ -82,6 +82,79 @@ const multer = require('multer');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
+const rawIngestParser = express.raw({ type: '*/*', limit: process.env.INGEST_MAX_PAYLOAD || '10mb' });
+
+let verifyTaskOidc = async () => ({ verified: false });
+try {
+  const { OAuth2Client } = require('google-auth-library');
+  const oidcClient = new OAuth2Client();
+  verifyTaskOidc = async (req) => {
+    const auth = req.headers['authorization'] || '';
+    const match = auth.match(/^Bearer (.+)$/);
+    if (!match) return { verified: false, reason: 'no-bearer' };
+    const aud = process.env.TASK_AUDIENCE || process.env.WORKER_AUDIENCE;
+    const ticket = await oidcClient.verifyIdToken({ idToken: match[1], audience: aud });
+    const payload = ticket.getPayload() || {};
+    const invoker = process.env.TASKS_INVOKER_SA;
+    if (invoker && payload.email && payload.email !== invoker) {
+      throw new Error(`unauthorized: expected ${invoker}, got ${payload.email}`);
+    }
+    return { verified: true, email: payload.email, aud: payload.aud };
+  };
+} catch (err) {
+  if (process.env.ROUTE_DEBUG) {
+    console.warn('[ingest] oidc verifier disabled:', err?.message || err);
+  }
+}
+
+const SEEN_TASKS = new Map();
+function seenTask(taskName, ttlMs = 15 * 60 * 1000) {
+  const now = Date.now();
+  for (const [name, exp] of SEEN_TASKS) {
+    if (exp < now) SEEN_TASKS.delete(name);
+  }
+  if (!taskName) return false;
+  if (SEEN_TASKS.has(taskName)) return true;
+  SEEN_TASKS.set(taskName, now + ttlMs);
+  return false;
+}
+
+function parseTaskBody(req) {
+  const buf = Buffer.isBuffer(req.body)
+    ? req.body
+    : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body ?? {}));
+  const str = buf.toString('utf8').trim();
+  if (!str) return { payload: {}, raw: '' };
+
+  const tryJSON = (s) => {
+    try { return JSON.parse(s); } catch { return null; }
+  };
+  const b64ToJSON = (s) => {
+    try {
+      const decoded = Buffer.from(s, 'base64').toString('utf8');
+      return tryJSON(decoded) ?? { _raw: decoded };
+    } catch {
+      return null;
+    }
+  };
+
+  const asJSON = tryJSON(str);
+  if (asJSON) {
+    if (asJSON?.message?.data) {
+      return { payload: b64ToJSON(asJSON.message.data) ?? { data: asJSON.message.data }, raw: str };
+    }
+    return { payload: asJSON, raw: str };
+  }
+
+  const looksB64 = /^[A-Za-z0-9+/_=-]+$/.test(str) && (str.length % 4 === 0);
+  if (looksB64) {
+    const parsed = b64ToJSON(str);
+    if (parsed) return { payload: parsed, raw: str, wasBase64: true };
+  }
+
+  return { payload: { _raw: str }, raw: str };
+}
+
 // --- local ---
 // 1) DB 모듈: 로드 실패해도 서버는 떠야 함
 let db;
@@ -129,7 +202,11 @@ if (typeof ensureSpecsFtsIndices === 'function') {
 // 3) ingestAuto: 부팅 시점에 절대 로드하지 말고, 요청 시점에만 로드
 let __INGEST_MOD__ = null;
 function getIngest() {
-  if (__INGEST_MOD__) return __INGEST_MOD__;
+  if (global.__INGEST_MOD__) return global.__INGEST_MOD__;
+  if (__INGEST_MOD__) {
+    global.__INGEST_MOD__ = __INGEST_MOD__;
+    return __INGEST_MOD__;
+  }
   try {
     const absSrc = path.join(__dirname, 'src', 'pipeline', 'ingestAuto.js');
     const absRoot = path.join(__dirname, 'ingestAuto.js');
@@ -140,18 +217,21 @@ function getIngest() {
       './ingestAuto.js',
       'src/pipeline/ingestAuto.js',
     ]);
+    global.__INGEST_MOD__ = __INGEST_MOD__;
   } catch (e) {
     console.error('[INGEST] module load failed:', e?.message || e);
     if (e?.stack) console.error('[INGEST] stack:', e.stack);
     try {
       const dir = path.join(__dirname, 'src', 'pipeline');
-      console.error('[INGEST] ls src/pipeline =', fs.readdirSync(dir));
+      const listing = fs.existsSync(dir) ? fs.readdirSync(dir) : '(missing)';
+      console.error('[INGEST] ls src/pipeline =', listing);
       console.error('[INGEST] CWD =', process.cwd(), ' __dirname =', __dirname);
     } catch {}
     __INGEST_MOD__ = {
       runAutoIngest: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
       persistProcessedData: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
     };
+        global.__INGEST_MOD__ = __INGEST_MOD__;
   }
   return __INGEST_MOD__;
 }
@@ -293,6 +373,53 @@ app.get('/_whoami', (_req, res) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
+const workerRouter = express.Router();
+workerRouter.post('/ingest', rawIngestParser, async (req, res) => {
+  const taskName = req.header('X-CloudTasks-TaskName') || req.header('X-Cloudtasks-Taskname') || '';
+  const queueName = req.header('X-CloudTasks-QueueName') || req.header('X-Cloudtasks-Queuename') || '';
+  const retryHeader = req.header('X-CloudTasks-TaskRetryCount') || req.header('X-Cloudtasks-Taskretrycount');
+  const retryCount = Number(retryHeader || 0);
+
+  try {
+    await verifyTaskOidc(req);
+  } catch (e) {
+    console.warn('[ingest] oidc verify failed:', e?.message || e);
+    return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+  }
+
+  if (seenTask(taskName)) {
+    return res.status(200).json({ ok: true, dedup: true, task: taskName, queue: queueName });
+  }
+
+  const parsed = parseTaskBody(req);
+  const payload = parsed.payload || {};
+  const ctx = {
+    task: {
+      name: taskName,
+      queue: queueName,
+      retry: Number.isFinite(retryCount) ? retryCount : 0,
+      wasBase64: !!parsed.wasBase64,
+    },
+    ip: req.ip,
+    trace: req.header('X-Cloud-Trace-Context') || '',
+    rawLength: typeof parsed.raw === 'string' ? parsed.raw.length : 0,
+  };
+
+  try {
+    const ingest = getIngest();
+    const result = await ingest.runAutoIngest(payload, ctx);
+    const ok = !!(result?.ok ?? true);
+    return res.status(ok ? 200 : 202).json({ ok, result });
+  } catch (err) {
+    const msg = err?.message || String(err);
+    console.error('[api/worker/ingest] failed:', msg);
+    if (err?.stack) console.error(err.stack);
+    console.error('[ingest] ctx=', ctx, 'payload.keys=', Object.keys(payload || {}));
+    return res.status(500).json({ ok: false, error: msg.slice(0, 512) });
+  }
+});
+app.use('/api/worker', workerRouter);
 
 app.use(bodyParser.json({ limit: '25mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -805,19 +932,6 @@ app.post('/ingest/auto', requireSession, async (req, res) => {
     });
     res.json(result);
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e?.message || e) }); }
-});
-
-app.post('/api/worker/ingest', async (req, res) => {
-  try {
-    const payload = (req?.body && typeof req.body === 'object' && 'payload' in req.body)
-      ? (req.body.payload || {})
-      : (req.body || {});
-    const result = await getIngest().runAutoIngest(payload || {});
-    return res.status(202).json({ ok: true, run: result?.runId || null });
-  } catch (e) {
-    console.error('[api/worker/ingest] failed:', e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
 });
 
 function pickFirstString(...values) {

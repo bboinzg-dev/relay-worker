@@ -203,35 +203,39 @@ if (typeof ensureSpecsFtsIndices === 'function') {
 let __INGEST_MOD__ = null;
 function getIngest() {
   if (global.__INGEST_MOD__) return global.__INGEST_MOD__;
-  if (__INGEST_MOD__) {
-    global.__INGEST_MOD__ = __INGEST_MOD__;
-    return __INGEST_MOD__;
-  }
+  if (__INGEST_MOD__) { global.__INGEST_MOD__ = __INGEST_MOD__; return __INGEST_MOD__; }
   try {
     const absSrc = path.join(__dirname, 'src', 'pipeline', 'ingestAuto.js');
     const absRoot = path.join(__dirname, 'ingestAuto.js');
+    // 더 넓은 탐색(일부 런타임이 CWD 기준 해석)
     __INGEST_MOD__ = tryRequire([
       absSrc,
       absRoot,
       './src/pipeline/ingestAuto.js',
       './ingestAuto.js',
+      path.join(process.cwd(), 'src', 'pipeline', 'ingestAuto.js'),
       'src/pipeline/ingestAuto.js',
     ]);
     global.__INGEST_MOD__ = __INGEST_MOD__;
   } catch (e) {
-    console.error('[INGEST] module load failed:', e?.message || e);
+    const msg = e?.message || String(e);
+    console.error('[INGEST] module load failed:', msg);
     if (e?.stack) console.error('[INGEST] stack:', e.stack);
+    // MODULE_NOT_FOUND 케이스면 시도 경로들을 그대로 노출(tryRequire가 attempts에 담음)
+    if (e?.code === 'MODULE_NOT_FOUND' && Array.isArray(e.attempts)) {
+      console.error('[INGEST] attempts:', e.attempts);
+    }
     try {
       const dir = path.join(__dirname, 'src', 'pipeline');
-      const listing = fs.existsSync(dir) ? fs.readdirSync(dir) : '(missing)';
-      console.error('[INGEST] ls src/pipeline =', listing);
+      const listing = fs.existsSync(dir) ? fs.readdirSync(dir) : null;
+      console.error('[INGEST] ls src/pipeline =', listing || '(missing)');
       console.error('[INGEST] CWD =', process.cwd(), ' __dirname =', __dirname);
     } catch {}
     __INGEST_MOD__ = {
-      runAutoIngest: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
+      runAutoIngest: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED:' + (msg || 'unknown')); },
       persistProcessedData: async () => { throw new Error('INGEST_MODULE_LOAD_FAILED'); },
     };
-        global.__INGEST_MOD__ = __INGEST_MOD__;
+    global.__INGEST_MOD__ = __INGEST_MOD__;
   }
   return __INGEST_MOD__;
 }

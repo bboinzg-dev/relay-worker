@@ -1,73 +1,149 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 51d262972e58b1403a747951a04058d286e7c432..fd2903af7844f08d0f8335cdeb1def6d2c8f28dd 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -847,52 +847,66 @@ function buildPnIfMissing(record = {}, pnTemplate) {
-   if (existing) return;
-   const fromTemplate = renderPnTemplate(pnTemplate, record);
-   // 본문 검증: 템플릿 결과가 실제 문서 텍스트에 존재할 때만 채택
-   const ctxText = String(record._doc_text || record.doc_text || '');
-   if (fromTemplate && ctxText && fuzzyContainsPn(ctxText, fromTemplate)) {
-     record.pn = fromTemplate;
-     if (!record.code) record.code = fromTemplate;
-     return;
-   }
-   const code = String(record.code || '').trim();
-   if (code) record.pn = code;
+diff --git a/server.ai.js b/server.ai.js
+index d3ebc490dafb76399a1f1b93c8399c61ae463841..4641edc9f4de135f8a5ac05ba6be6c4aab119d1c 100644
+--- a/server.ai.js
++++ b/server.ai.js
+@@ -85,58 +85,59 @@ const FAMILY_ALIAS = {
+     rds: ['rds_on_mohm'],
+   },
+ };
+ 
+ // numeric 키를 실제 컬럼 후보로 확장
+ function expandNumericKey(family, key) {
+   const a = FAMILY_ALIAS[family] || {};
+   if (a[key]) return a[key];
+   return [key]; // 그대로 시도
  }
  
- /**
-  * @param {string} family
-  * @param {import('../types/blueprint').Spec} spec
-  * @param {import('../types/blueprint').Blueprint} [blueprint]
-  */
- function buildBestIdentifiers(family, spec = {}, blueprint) {
-   if (!spec || typeof spec !== 'object') return spec;
+ // 동적 필터 SQL 만들기
+ function buildFilterSQL({ table, family, plan, limit }) {
+   const where = [];
+   const args = [];
+   let arg = 0;
  
-   let codeCandidate = null;
-   const localTemplate = getBlueprintPnTemplate(blueprint || {}, spec);
-   if (localTemplate) {
-     try {
--      const oi = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
--    } catch (_) {}
-+      const orderingInfo = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
-+      const context = { ...spec };
-+      if (orderingInfo && typeof orderingInfo === 'object') {
-+        context.ordering_info = orderingInfo;
-+        context.orderingInfo = orderingInfo;
-+        if (context.codes == null && Array.isArray(orderingInfo.codes)) {
-+          context.codes = orderingInfo.codes;
-+        }
-+      }
-+      const rendered = renderPnTemplate(localTemplate, context);
-+      if (rendered) {
-+        codeCandidate = rendered;
-+      }
-+    } catch (_) {
-+      // ignore template rendering errors for identifier derivation
-+    }
+     const baseTable = String(table || '').trim();
+   if (!baseTable) throw new Error('table required');
+   const qualifiedTable = baseTable.includes('.') ? baseTable : `public.${baseTable}`;
+ 
+   // family 고정(안전)
+   if (family) where.push(`(family_slug = $${++arg})`), args.push(family);
+ 
+   // brand/pn like
+-  if (plan.brand_like) where.push(`(unaccent(brand)::text ILIKE unaccent('%' || $${++arg} || '%'))`), args.push(plan.brand_like);
+-  if (plan.pn_like)    where.push(`(unaccent(pn)::text    ILIKE unaccent('%' || $${++arg} || '%'))`),    args.push(plan.pn_like);
++  if (plan.brand_like) where.push(`(public.immutable_unaccent(brand)::text ILIKE public.immutable_unaccent('%' || $${++arg} || '%'))`), args.push(plan.brand_like);
++  if (plan.pn_like)    where.push(`(public.immutable_unaccent(pn)::text    ILIKE public.immutable_unaccent('%' || $${++arg} || '%'))`),    args.push(plan.pn_like);
+ 
+   // must 키워드: raw_json과 title 성격 필드에 or-축약 없이 AND로
+   for (const k of plan.must) {
+-    const p = `%${k}%`;
+-    where.push(`( (raw_json::text ILIKE $${++arg}) OR (series ILIKE $${arg}) OR (contact_form ILIKE $${arg}) )`);
+-    args.push(p);
++    const keyword = String(k || '').trim();
++    if (!keyword) continue;
++    where.push(`( to_tsvector('simple', COALESCE(series,'')||' '||COALESCE(contact_form,'')||' '||COALESCE(raw_json::text,'')) @@ plainto_tsquery('simple', $${++arg}) )`);
++    args.push(keyword);
    }
  
-   const docText = String(spec._doc_text || spec.doc_text || '');
-   if (!codeCandidate && family === 'relay_signal') {
-     const fallback = codeForRelaySignal(spec);
-     if (fallback && norm(docText).includes(norm(fallback))) {
-       codeCandidate = fallback;
+   // numeric: 각 키마다 가능한 컬럼 후보 중 하나라도 만족하면 OK → (col1 OP v OR col2 OP v ...)
+   for (const f of (plan.numeric || [])) {
+     const op = (f.op || '>=')?.replace(/[^<=>]/g,'');
+     const v  = Number(f.value);
+     if (!isFinite(v)) continue;
+ 
+     const cols = expandNumericKey(family, (f.key || '').trim());
+     const pieces = [];
+     for (const col of cols) {
+       // 텍스트 컬럼도 있으니 numExpr로 변환
+       pieces.push(`(${numExpr(`"${col}"`)} ${op} $${++arg})`);
+       args.push(v);
      }
+     if (pieces.length) where.push(`(${pieces.join(' OR ')})`);
    }
-   if (codeCandidate && norm(docText).includes(norm(codeCandidate))) {
-     spec.pn = codeCandidate;
-     spec.code = codeCandidate;
-     spec.verified_in_doc = true;
-   } else {
-     spec.code = spec.pn;
-     if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
+ 
+   const sql =
+     `SELECT id, family_slug, brand, pn,
+             COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
+             image_uri, datasheet_url, series, updated_at
+        FROM ${qualifiedTable}
+       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY updated_at DESC
+@@ -164,74 +165,74 @@ router.get('/resolve', async (req, res) => {
+       return res.json({ ok:true, brand: plan.brand_like || null, code: plan.pn_like || null, source:'ai' });
+     }
+     
+     return res.json({ ok: true, echo: q });
+   } catch (e) {
+     return res.status(500).json({ ok:false, error:String(e?.message||e) });
    }
-   if (!spec.verified_in_doc) {
-     const oi = spec.ordering_info || spec.orderingInfo || null;
-     const codes = Array.isArray(oi?.codes) ? oi.codes : null;
-     if (codes && codes.length) {
-       const me = String(spec.pn || spec.code || '').trim().toUpperCase();
-       if (me && codes.some((c) => String(c || '').trim().toUpperCase() === me)) {
-         spec.verified_in_doc = true;
-       }
+ });
+ 
+ /* ---------- /api/ai/search : AI/PN 검색 ---------- */
+ // e.g. GET /api/ai/search?q=컨택트 정격 20A 릴레이&mode=ai
+ router.get('/search', async (req, res) => {
+   try {
+     const q = String(req.query?.q || '').trim();
+     const mode = String(req.query?.mode || 'ai');
+     const limit = String(req.query?.limit || '24');
+     if (!q) return res.status(400).json({ ok:false, error:'q required' });
+ 
+     // 1) pn 간단 검색 모드
+     if (mode === 'pn') {
+       const rows = await db.query(
+         `SELECT id, family_slug, brand, pn,
+                 COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
+                 image_uri, datasheet_url, series, updated_at
+            FROM public.component_specs
+-          WHERE unaccent(brand) ILIKE unaccent('%' || $1 || '%')
+-             OR unaccent(pn)    ILIKE unaccent('%' || $1 || '%')
++          WHERE public.immutable_unaccent(brand) ILIKE public.immutable_unaccent('%' || $1 || '%')
++             OR public.immutable_unaccent(pn)    ILIKE public.immutable_unaccent('%' || $1 || '%')
+           ORDER BY updated_at DESC
+           LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`,
+         [q]
+       );
+       return res.json({ ok:true, explain:{ mode:'pn', q }, items: rows.rows });
+     }
+ 
+     // 2) AI 의미 검색 모드
+     const plan = await callGeminiToPlan(q);
+ 
+     // family 없으면 릴레이/저항 등 빈도 높은 후보로 시도 (간단 휴리스틱)
+     const family = plan.family || (/릴레이/.test(q) ? 'relay_power' : /저항|resistor/i.test(q) ? 'resistor_chip' : null);
+ 
+     // family가 있어야 스펙 필터를 정확히 적용 가능. 없으면 component_specs에 넓게 걸쳐서 must/brand/pn로 검색
+     if (!family) {
+       const rows = await db.query(
+         `SELECT id, family_slug, brand, pn,
+                 COALESCE(NULLIF(brand,''),'') || CASE WHEN COALESCE(NULLIF(pn,''),'')<>'' THEN ' '||pn ELSE '' END AS title,
+                 image_uri, datasheet_url, series, updated_at
+            FROM public.component_specs
+-          WHERE ($1::text IS NULL OR unaccent(brand) ILIKE unaccent('%' || $1::text || '%'))
+-            OR ($2::text IS NULL OR unaccent(pn)    ILIKE unaccent('%' || $2::text || '%'))
++          WHERE ($1::text IS NULL OR public.immutable_unaccent(brand) ILIKE public.immutable_unaccent('%' || $1::text || '%'))
++            OR ($2::text IS NULL OR public.immutable_unaccent(pn)    ILIKE public.immutable_unaccent('%' || $2::text || '%'))
+           ORDER BY updated_at DESC
+           LIMIT ${Math.min(Math.max(parseInt(limit,10)||24, 1), 100)}`,
+         [plan.brand_like || null, plan.pn_like || null]
+       );
+       return res.json({ ok:true, explain:{ mode:'ai-broad', plan }, items: rows.rows });
+     }
+ 
+     const table = await getTableForFamily(family);
+     const { sql, args } = buildFilterSQL({ table, family, plan, limit });
+     const rows = await db.query(sql, args);
+ 
+     return res.json({
+       ok:true,
+       explain:{ mode:'ai', family, table, plan, sql_preview: sql.replace(/\s+/g,' ').slice(0,280) + '...' },
+       items: rows.rows
+     });
+   } catch (e) {
+     return res.status(500).json({ ok:false, error:String(e?.message||e) });
+   }
+ });
+ 
+ 
+ router.get('/ping', (_req, res) => res.json({ ok:true }));
+ 
+ module.exports = router;
+\ No newline at end of file

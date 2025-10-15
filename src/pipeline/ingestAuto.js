@@ -167,6 +167,14 @@ const SPEC_MERGE_OVERRIDES = new Set(['code', 'code_norm', 'pn', 'pn_norm', 'ser
 
 const DOC_AI_CODE_HEADER_RE =
   /(part\s*(?:no\.?|number|name)|type\s*(?:no\.?|number)?|model|品番|型式|型番|品號|部品番号|품번|형명|주문\s*번호|order(?:ing)?\s*code)/i;
+const DOC_TABLE_ORDERING_HINT_RE =
+  /(ordering|order\s*info|order\s*code|types?\b|type\s*(?:no\.?|number)|selection|品番|型式|型番|형명)/i;
+const DOC_TABLE_HEADER_FOOTER_RE = /(header|footer|page\s*\d+)/i;
+const PN_CANON_KEY_RE = /(^|_)(part|pn|code|model|type)(_|$)/;
+const PN_HEADER_LABEL_RE = /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|catalog\s*(?:no\.?|number)|model|品番|型式|형名|型番)/i;
+const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().#]{3,63}[0-9A-Z)#]/gi;
+const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
+const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
 
   function gatherRuntimeSpecKeys(rows) {
   const set = new Set();
@@ -256,6 +264,12 @@ function flattenDocAiTablesForMerge(tables) {
     const headers = Array.isArray(table.headers) ? table.headers : [];
     const rows = Array.isArray(table.rows) ? table.rows : [];
     if (!headers.length || !rows.length) continue;
+
+    const headerNorms = headers.map((h) => normalizeDocAiCell(h));
+    const headerText = headerNorms.join(' ');
+    const isOrderingTable =
+      DOC_TABLE_ORDERING_HINT_RE.test(headerText) || headerNorms.some((h) => PN_HEADER_LABEL_RE.test(h));
+    const isHeaderFooter = !isOrderingTable && DOC_TABLE_HEADER_FOOTER_RE.test(headerText);
     for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
       const row = rows[rowIndex];
       if (!Array.isArray(row)) continue;
@@ -278,8 +292,13 @@ function flattenDocAiTablesForMerge(tables) {
       records.push({
         tableIndex,
         rowIndex,
-        headers: headers.map((h) => normalizeDocAiCell(h)),
+        headers: headerNorms,
         values,
+        _tableHints: {
+          headerText,
+          isOrderingTable,
+          isHeaderFooter,
+        },
       });
     }
   }
@@ -370,10 +389,25 @@ function normalizeDocAiTokenForMatch(value) {
   return normalized;
 }
 
-function bestRowMatchToSpec(row, docAiRecords, used = new Set()) {
+function bestRowMatchToSpec(row, docAiRecords, used = new Set(), options = {}) {
   if (!row || typeof row !== 'object') return null;
   const records = Array.isArray(docAiRecords) ? docAiRecords : [];
   if (!records.length) return null;
+
+  const tokenStats = options && typeof options === 'object' ? options.tokenStats || null : null;
+  const hasTokenFilter = Boolean(
+    tokenStats &&
+      ((tokenStats.orderingTokens && tokenStats.orderingTokens.size) ||
+        (tokenStats.headerOnlyTokens && tokenStats.headerOnlyTokens.size))
+  );
+  const allowToken = (token) => {
+    if (!token) return false;
+    if (tokenStats?.headerOnlyTokens?.has(token)) return false;
+    if (tokenStats?.orderingTokens?.size) {
+      return tokenStats.orderingTokens.has(token);
+    }
+    return true;
+  };
 
   const codeKeys = [
     'code',
@@ -392,17 +426,30 @@ function bestRowMatchToSpec(row, docAiRecords, used = new Set()) {
 
   const targetTokens = new Set();
   const rawTargets = new Set();
+  const filteredTargetTokens = new Set();
+  const filteredRawTargets = new Set();
   for (const key of codeKeys) {
     const value = getValueIgnoreCase(row, key);
     if (value == null || value === '') continue;
     const normalized = normalizeDocAiCell(value);
     if (!normalized) continue;
-    rawTargets.add(normalized.toUpperCase());
+    const rawUpper = normalized.toUpperCase();
+    rawTargets.add(rawUpper);
     const token = normalizeDocAiTokenForMatch(normalized);
-    if (token) targetTokens.add(token);
+    if (token) {
+      targetTokens.add(token);
+      if (!hasTokenFilter || allowToken(token)) {
+        filteredTargetTokens.add(token);
+        filteredRawTargets.add(rawUpper);
+      }
+    }
   }
 
   if (!targetTokens.size) return null;
+
+  const tokensForScore = hasTokenFilter ? filteredTargetTokens : targetTokens;
+  if (!tokensForScore.size) return null;
+  const rawTargetsForScore = hasTokenFilter ? filteredRawTargets : rawTargets;
 
   let best = null;
   for (const record of records) {
@@ -417,14 +464,16 @@ function bestRowMatchToSpec(row, docAiRecords, used = new Set()) {
       if (!value) continue;
       haystackParts.push(value.toUpperCase());
       const normToken = normalizeDocAiTokenForMatch(value);
-      if (normToken) candidateTokens.add(normToken);
+      if (normToken && (!hasTokenFilter || allowToken(normToken))) {
+        candidateTokens.add(normToken);
+      }
       if (DOC_AI_CODE_HEADER_RE.test(String(key || ''))) headerBoost += 1;
     }
     if (!candidateTokens.size) continue;
 
     let exact = 0;
     let partial = 0;
-    for (const token of targetTokens) {
+    for (const token of tokensForScore) {
       if (candidateTokens.has(token)) {
         exact += 1;
         continue;
@@ -439,9 +488,9 @@ function bestRowMatchToSpec(row, docAiRecords, used = new Set()) {
     if (!exact && !partial) continue;
 
     let score = exact * 12 + partial * 5 + headerBoost;
-    if (score <= 0 && rawTargets.size) {
+    if (score <= 0 && rawTargetsForScore.size) {
       const haystack = haystackParts.join(' ');
-      for (const raw of rawTargets) {
+      for (const raw of rawTargetsForScore) {
         if (haystack.includes(raw)) score += 2;
       }
     }
@@ -456,6 +505,312 @@ function bestRowMatchToSpec(row, docAiRecords, used = new Set()) {
   if (best.exact <= 0 && best.partial <= 0) return null;
   if (best.exact <= 0 && best.score < 12) return null;
   return best.record;
+}
+
+function summarizeDocAiTokenUsage(records = []) {
+  const summary = new Map();
+  for (const record of Array.isArray(records) ? records : []) {
+    if (!record || typeof record !== 'object') continue;
+    const values = record.values && typeof record.values === 'object' ? record.values : {};
+    const isOrdering = Boolean(record?._tableHints?.isOrderingTable);
+    const isHeaderFooter = Boolean(record?._tableHints?.isHeaderFooter);
+    for (const [key, rawValue] of Object.entries(values)) {
+      const value = normalizeDocAiCell(rawValue);
+      if (!value) continue;
+      const token = normalizeDocAiTokenForMatch(value);
+      if (!token) continue;
+      const entry = summary.get(token) || {
+        total: 0,
+        ordering: 0,
+        headerFooter: 0,
+        codeHeader: 0,
+      };
+      entry.total += 1;
+      if (isOrdering) entry.ordering += 1;
+      if (isHeaderFooter) entry.headerFooter += 1;
+      if (DOC_AI_CODE_HEADER_RE.test(String(key || ''))) entry.codeHeader += 1;
+      summary.set(token, entry);
+    }
+  }
+
+  const orderingTokens = new Set();
+  const headerOnlyTokens = new Set();
+  for (const [token, info] of summary.entries()) {
+    if (!info) continue;
+    if (info.ordering > 0) orderingTokens.add(token);
+    const onlyHeaderFooter = info.headerFooter >= info.total && info.total > 0;
+    const onlyCodeHeaders = info.codeHeader >= info.total && info.total > 0;
+    if (info.ordering === 0 && (onlyHeaderFooter || onlyCodeHeaders)) {
+      headerOnlyTokens.add(token);
+    }
+  }
+
+  return { summary, orderingTokens, headerOnlyTokens };
+}
+
+function extractPnCandidatesFromValue(value) {
+  const normalized = normalizeDocAiCell(value);
+  if (!normalized) return [];
+  const results = [];
+  PN_CANDIDATE_RE.lastIndex = 0;
+  let match;
+  while ((match = PN_CANDIDATE_RE.exec(normalized)) != null) {
+    const raw = match[0];
+    if (!raw) continue;
+    if (PN_BLACKLIST_RE.test(raw)) continue;
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    if (!PN_STRICT.test(trimmed)) continue;
+    results.push(trimmed);
+  }
+  return results;
+}
+
+function gatherPnCandidatesFromDoc(records = []) {
+  const map = new Map();
+  const orderingNorms = new Set();
+  let order = 0;
+  for (const record of Array.isArray(records) ? records : []) {
+    if (!record || typeof record !== 'object') continue;
+    const canon = record._canon && typeof record._canon === 'object' ? record._canon : {};
+    const isOrdering = Boolean(record?._tableHints?.isOrderingTable);
+    const headerText = String(record?._tableHints?.headerText || '').trim();
+    for (const [rawKey, rawValue] of Object.entries(canon)) {
+      const key = String(rawKey || '').trim().toLowerCase();
+      if (!key || !PN_CANON_KEY_RE.test(key)) continue;
+      const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+      for (const value of values) {
+        const candidates = extractPnCandidatesFromValue(value);
+        for (const candidate of candidates) {
+          const norm = normalizeCode(candidate);
+          if (!norm || norm.length < 4) continue;
+          let entry = map.get(norm);
+          if (!entry) {
+            entry = {
+              norm,
+              total: 0,
+              ordering: 0,
+              headerTextSet: new Set(),
+              samples: new Set(),
+              order: order += 1,
+            };
+            map.set(norm, entry);
+          }
+          entry.total += 1;
+          if (isOrdering) entry.ordering += 1;
+          if (headerText) entry.headerTextSet.add(headerText);
+          entry.samples.add(candidate);
+        }
+      }
+    }
+  }
+
+  for (const entry of map.values()) {
+    if (!entry.sample) {
+      entry.sample = entry.samples.size ? entry.samples.values().next().value : entry.norm;
+    }
+    if (entry.ordering > 0) orderingNorms.add(entry.norm);
+  }
+
+  return { map, orderingNorms };
+}
+
+function collectVariantSignalsFromRow(row, variantKeys = []) {
+  const digits = new Set();
+  const tokens = new Set();
+  const pushValue = (raw) => {
+    if (raw == null) return;
+    if (Array.isArray(raw)) {
+      for (const item of raw) pushValue(item);
+      return;
+    }
+    if (typeof raw === 'number') {
+      if (!Number.isFinite(raw)) return;
+      const str = String(Math.round(raw * 1000) / 1000);
+      const digitsOnly = str.replace(/[^0-9]/g, '');
+      if (digitsOnly.length >= 2) digits.add(digitsOnly);
+      return;
+    }
+    const str = normalizeDocAiCell(raw);
+    if (!str) return;
+    const digitMatches = str.match(/\d+/g) || [];
+    for (const m of digitMatches) {
+      if (m.length >= 2) digits.add(m);
+    }
+    const tokenMatches = str.match(/[A-Z]{1,4}/gi) || [];
+    for (const t of tokenMatches) {
+      const upper = t.toUpperCase();
+      if (!upper) continue;
+      if (upper.length > 4) continue;
+      tokens.add(upper);
+    }
+  };
+
+  const lowerKeys = Array.isArray(variantKeys)
+    ? variantKeys.map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  const keySet = new Set([
+    ...lowerKeys,
+    'coil_voltage_vdc',
+    'coil_voltage_vac',
+    'coil_voltage',
+    'coil_voltage_code',
+    'coil_power_code',
+    'contact_form',
+    'suffix',
+  ]);
+  for (const key of keySet) {
+    const value = getValueIgnoreCase(row, key);
+    if (value != null) pushValue(value);
+  }
+
+  const decodedCoil = decodeCoilVoltageVdc(getValueIgnoreCase(row, 'coil_voltage_code'));
+  if (decodedCoil != null) pushValue(decodedCoil);
+
+  return {
+    digits: Array.from(digits),
+    tokens: Array.from(tokens),
+  };
+}
+
+function collectSeriesTokens(row, seriesHints = []) {
+  const tokens = new Set();
+  const pushToken = (value) => {
+    const normalized = normalizeDocAiCell(value);
+    if (!normalized) return;
+    const cleaned = normalized.replace(/[^0-9A-Z]/gi, '').toUpperCase();
+    if (cleaned.length >= 2 && cleaned.length <= 8) tokens.add(cleaned);
+    const parts = normalized.split(/[^0-9A-Za-z]+/g);
+    for (const part of parts) {
+      const piece = part.replace(/[^0-9A-Z]/gi, '').toUpperCase();
+      if (piece.length >= 2 && piece.length <= 8) tokens.add(piece);
+    }
+  };
+
+  const hints = [];
+  if (Array.isArray(seriesHints)) hints.push(...seriesHints);
+  if (row) {
+    hints.push(row.series, row.series_code);
+  }
+  for (const hint of hints) {
+    if (hint == null) continue;
+    pushToken(hint);
+  }
+
+  return Array.from(tokens);
+}
+
+function collectBrandTokens(brand) {
+  const tokens = new Set();
+  const normalized = normalizeDocAiCell(brand);
+  if (!normalized) return tokens;
+  const cleaned = normalized.replace(/[^0-9A-Z]/gi, '').toUpperCase();
+  if (cleaned.length >= 2 && cleaned.length <= 8) tokens.add(cleaned);
+  const parts = normalized.split(/[^0-9A-Za-z]+/g);
+  for (const part of parts) {
+    const piece = part.replace(/[^0-9A-Z]/gi, '').toUpperCase();
+    if (piece.length >= 2 && piece.length <= 8) tokens.add(piece);
+  }
+  return tokens;
+}
+
+function scoreOrderingPnCandidate(entry, sample, ctx = {}) {
+  if (!sample) return Number.NEGATIVE_INFINITY;
+  const pnUpper = sample.toUpperCase();
+  let score = 0;
+  if (entry) {
+    score += entry.ordering * 12;
+    score += entry.total * 2;
+  }
+  for (const digit of Array.isArray(ctx.variantDigits) ? ctx.variantDigits : []) {
+    const str = String(digit || '');
+    if (str && pnUpper.includes(str)) score += 6;
+  }
+  for (const token of Array.isArray(ctx.variantTokens) ? ctx.variantTokens : []) {
+    if (token && pnUpper.includes(token)) score += 3;
+  }
+  for (const token of Array.isArray(ctx.seriesTokens) ? ctx.seriesTokens : []) {
+    if (token && pnUpper.includes(token)) score += 4;
+  }
+  for (const token of Array.isArray(ctx.brandTokens) ? ctx.brandTokens : []) {
+    if (token && pnUpper.includes(token)) score += 2;
+  }
+  return score;
+}
+
+function pickOrderingPreferredPn(row, options = {}) {
+  const info = options && typeof options === 'object' ? options.candidateInfo || null : null;
+  const map = info && info.map instanceof Map ? info.map : null;
+  const hintList = [];
+  if (Array.isArray(options?.hints)) {
+    for (const hint of options.hints) hintList.push(hint);
+  } else {
+    if (options?.hintPn != null) hintList.push(options.hintPn);
+    if (options?.hintCode != null) hintList.push(options.hintCode);
+  }
+  const firstHint = hintList.find((hint) => typeof hint === 'string' && hint.trim());
+
+  if (!map || !map.size) {
+    return firstHint ? String(firstHint).trim() : null;
+  }
+
+  const normalizedHints = hintList
+    .map((value) => {
+      if (value == null) return null;
+      const raw = String(value).trim();
+      if (!raw) return null;
+      const norm = normalizeCode(raw);
+      if (!norm) return null;
+      return { raw, norm };
+    })
+    .filter(Boolean);
+
+  const variantSignals = collectVariantSignalsFromRow(row, options.variantKeys || []);
+  const seriesTokens = collectSeriesTokens(row, options.seriesHints || []);
+  const brandTokens = Array.from(collectBrandTokens(options.brand));
+  const context = {
+    variantDigits: variantSignals.digits,
+    variantTokens: variantSignals.tokens,
+    seriesTokens,
+    brandTokens,
+  };
+
+  const candidateEntries = [];
+  for (const [norm, entry] of map.entries()) {
+    if (entry && entry.ordering > 0) candidateEntries.push({ norm, entry });
+  }
+  if (!candidateEntries.length) {
+    for (const [norm, entry] of map.entries()) {
+      candidateEntries.push({ norm, entry });
+    }
+  }
+  if (!candidateEntries.length) {
+    return firstHint ? String(firstHint).trim() : null;
+  }
+
+  let best = null;
+  for (const { norm, entry } of candidateEntries) {
+    if (!entry) continue;
+    const sample = entry.sample || (entry.samples && entry.samples.values().next().value) || norm;
+    if (!sample) continue;
+    const score = scoreOrderingPnCandidate(entry, sample, context);
+    if (best == null || score > best.score) {
+      best = { norm, sample, score };
+    }
+  }
+
+  for (const hint of normalizedHints) {
+    const entry = map.get(hint.norm);
+    if (!entry) continue;
+    const sample = entry.sample || (entry.samples && entry.samples.values().next().value) || hint.raw;
+    const score = scoreOrderingPnCandidate(entry, sample, context);
+    if (!best || score > best.score || (best && score === best.score && hint.norm === best.norm)) {
+      best = { norm: hint.norm, sample, score };
+    }
+  }
+
+  if (best && best.sample) return best.sample;
+  return firstHint ? String(firstHint).trim() : null;
 }
 
 function bestAttributeMatchToSpec(row, docAiRecords, variantKeys = []) {
@@ -886,10 +1241,6 @@ async function expandRowsWithVariants(baseRows, options = {}) {
     pnTemplate: effectivePnTemplate,
   };
 }
-
-const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().#]{3,63}[0-9A-Z)#]/gi;
-const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
-const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
 
 function sanitizeDatasheetUrl(url) {
   if (url == null) return null;
@@ -2815,6 +3166,11 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       console.warn('[canon] docAiRecordsForMerge canonicalization failed:', err?.message || err);
     }
   }
+  const docAiTokenStats = summarizeDocAiTokenUsage(docAiRecordsForMerge);
+  const docPnCandidatesInfo = gatherPnCandidatesFromDoc(docAiRecordsForMerge);
+  const docOrderingNorms = docPnCandidatesInfo?.orderingNorms instanceof Set
+    ? docPnCandidatesInfo.orderingNorms
+    : new Set();
   const vertexSpecValues = (() => {
     if (!vertexExtractValues || typeof vertexExtractValues !== 'object') return null;
     const filtered = {};
@@ -2850,7 +3206,9 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   if (Array.isArray(extracted.rows) && extracted.rows.length) {
     for (const row of extracted.rows) {
       if (!row || typeof row !== 'object') continue;
-      let docMatch = bestRowMatchToSpec(row, docAiRecordsForMerge, usedDocAiRecords);
+      let docMatch = bestRowMatchToSpec(row, docAiRecordsForMerge, usedDocAiRecords, {
+        tokenStats: docAiTokenStats,
+      });
       if (!docMatch) {
         docMatch = bestAttributeMatchToSpec(row, docAiRecordsForMerge, variantKeys);
       }
@@ -3343,6 +3701,45 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   await ensureSpecColumnsForBlueprint(qualified, blueprint);
 
   const rawRows = Array.isArray(extracted?.rows) && extracted.rows.length ? extracted.rows : [];
+    if (docPnCandidatesInfo?.map instanceof Map && docPnCandidatesInfo.map.size && rawRows.length) {
+    const variantKeyUnion = Array.from(
+      new Set([
+        ...(Array.isArray(variantKeys) ? variantKeys : []),
+        ...(Array.isArray(runtimeVariantKeys) ? runtimeVariantKeys : []),
+      ])
+    );
+    for (const row of rawRows) {
+      if (!row || typeof row !== 'object') continue;
+      const hints = [row.pn, row.code, row.part_number, row.part_no, row.code_norm, code]
+        .map((value) => (value == null ? null : String(value)))
+        .filter((value) => value && value.trim());
+      const bestPn = pickOrderingPreferredPn(row, {
+        candidateInfo: docPnCandidatesInfo,
+        hints,
+        variantKeys: variantKeyUnion,
+        seriesHints: [baseSeries, series],
+        brand: row.brand || brandName,
+      });
+      if (!bestPn) continue;
+      const bestNorm = normalizeCode(bestPn);
+      if (!bestNorm) continue;
+      const existingCode = typeof row.code === 'string' ? row.code.trim() : '';
+      const existingCodeNorm = existingCode ? normalizeCode(existingCode) : null;
+      if (!existingCodeNorm || existingCodeNorm !== bestNorm) {
+        if (existingCode && existingCodeNorm && existingCodeNorm !== bestNorm && row._code_hint == null) {
+          row._code_hint = existingCode;
+        }
+        row.code = bestPn;
+      }
+      const existingPn = typeof row.pn === 'string' ? row.pn.trim() : '';
+      const existingPnNorm = existingPn ? normalizeCode(existingPn) : null;
+      if (!existingPnNorm || existingPnNorm !== bestNorm) {
+        row.pn = bestPn;
+      }
+      if (!row.part_number || normalizeCode(row.part_number) !== bestNorm) row.part_number = bestPn;
+      if (!row.part_no || normalizeCode(row.part_no) !== bestNorm) row.part_no = bestPn;
+    }
+  }
 
   let orderingDomains = null;
   let orderingOverride = null;
@@ -3886,6 +4283,11 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     (baseSeries || series || code || '')
   );
   const mpnNormFromDoc = new Set(mpnsFromDoc.map((m) => normalizeCode(m)).filter(Boolean));
+  if (docOrderingNorms.size) {
+    for (const norm of docOrderingNorms) {
+      if (norm) mpnNormFromDoc.add(norm);
+    }
+  }
 
   const candidateMap = [];
   const candidateNormSet = new Set();
@@ -3966,7 +4368,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
         let match = null;
         if (canonRecs.length) {
           match =
-            bestRowMatchToSpec(row, canonRecs, usedRecords) ||
+            bestRowMatchToSpec(row, canonRecs, usedRecords, { tokenStats: docAiTokenStats }) ||
             bestAttributeMatchToSpec(row, canonRecs, variantKeys);
         }
         if (!match && String(family || '').toLowerCase() === 'relay_signal') {
@@ -4022,6 +4424,45 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           console.warn('[schema] ensureDynamicColumnsForRows llm failed:', err?.message || err);
         }
       }
+    }
+  }
+  if (docPnCandidatesInfo?.map instanceof Map && docPnCandidatesInfo.map.size && explodedRows.length) {
+    const variantKeyUnion = Array.from(
+      new Set([
+        ...(Array.isArray(variantKeys) ? variantKeys : []),
+        ...(Array.isArray(runtimeVariantKeys) ? runtimeVariantKeys : []),
+      ])
+    );
+    for (const row of explodedRows) {
+      if (!row || typeof row !== 'object') continue;
+      const hints = [row.pn, row.code, row.part_number, row.part_no, row.code_norm, code]
+        .map((value) => (value == null ? null : String(value)))
+        .filter((value) => value && value.trim());
+      const bestPn = pickOrderingPreferredPn(row, {
+        candidateInfo: docPnCandidatesInfo,
+        hints,
+        variantKeys: variantKeyUnion,
+        seriesHints: [baseSeries, series, row.series, row.series_code],
+        brand: row.brand || brandName,
+      });
+      if (!bestPn) continue;
+      const bestNorm = normalizeCode(bestPn);
+      if (!bestNorm) continue;
+      const existingCode = typeof row.code === 'string' ? row.code.trim() : '';
+      const existingCodeNorm = existingCode ? normalizeCode(existingCode) : null;
+      if (!existingCodeNorm || existingCodeNorm !== bestNorm) {
+        if (existingCode && existingCodeNorm && existingCodeNorm !== bestNorm && row._code_hint == null) {
+          row._code_hint = existingCode;
+        }
+        row.code = bestPn;
+      }
+      const existingPn = typeof row.pn === 'string' ? row.pn.trim() : '';
+      const existingPnNorm = existingPn ? normalizeCode(existingPn) : null;
+      if (!existingPnNorm || existingPnNorm !== bestNorm) {
+        row.pn = bestPn;
+      }
+      if (!row.part_number || normalizeCode(row.part_number) !== bestNorm) row.part_number = bestPn;
+      if (!row.part_no || normalizeCode(row.part_no) !== bestNorm) row.part_no = bestPn;
     }
   }
   const physicalCols = new Set(colTypes ? [...colTypes.keys()] : []);

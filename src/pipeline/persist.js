@@ -869,8 +869,22 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
   const localTemplate = getBlueprintPnTemplate(blueprint || {}, spec);
   if (localTemplate) {
     try {
-      const oi = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
-    } catch (_) {}
+      const orderingInfo = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
+      const context = { ...spec };
+      if (orderingInfo && typeof orderingInfo === 'object') {
+        context.ordering_info = orderingInfo;
+        context.orderingInfo = orderingInfo;
+        if (context.codes == null && Array.isArray(orderingInfo.codes)) {
+          context.codes = orderingInfo.codes;
+        }
+      }
+      const rendered = renderPnTemplate(localTemplate, context);
+      if (rendered) {
+        codeCandidate = rendered;
+      }
+    } catch (_) {
+      // ignore template rendering errors for identifier derivation
+    }
   }
 
   const docText = String(spec._doc_text || spec.doc_text || '');

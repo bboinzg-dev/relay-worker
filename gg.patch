@@ -1,88 +1,8 @@
 diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index d7106532efbe4f0054a279e7588d2ed1ae80e0c5..51d262972e58b1403a747951a04058d286e7c432 100644
+index 51d262972e58b1403a747951a04058d286e7c432..fd2903af7844f08d0f8335cdeb1def6d2c8f28dd 100644
 --- a/src/pipeline/persist.js
 +++ b/src/pipeline/persist.js
-@@ -1,64 +1,67 @@
-+// @ts-check
-+/// <reference path="../types/blueprint.d.ts" />
- 'use strict';
- 
- const path = require('node:path');
- 
- function tryRequire(paths) {
-   const errors = [];
-   for (const p of paths) {
-     try {
-       return require(p);
-     } catch (err) {
-       if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
-         errors.push(err);
-         continue;
-       }
-       throw err;
-     }
-   }
-   const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
-   error.code = 'MODULE_NOT_FOUND';
-   error.attempts = errors.map((e) => e?.message || String(e));
-   throw error;
- }
- 
- const { pool } = tryRequire([
-   path.join(__dirname, '../../db'),
-   path.join(__dirname, '../db'),
-   path.join(__dirname, './db'),
-   path.join(process.cwd(), 'db'),
- ]);
- const { ensureSpecsTable } = tryRequire([
-   path.join(__dirname, '../utils/schema'),
-   path.join(__dirname, '../../utils/schema'),
-   path.join(__dirname, '../schema'),
-   path.join(process.cwd(), 'schema'),
- ]);
- const { getColumnsOf } = require('./ensure-spec-columns');
- const { normalizeValueLLM } = require('../utils/ai');
- let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
- const { PN_RE } = require('../utils/patterns');
-+const { getBlueprintPnTemplate } = require('../utils/getBlueprintPnTemplate');
- 
- const STRICT_CODE_RULES = /^(1|true|on)$/i.test(process.env.STRICT_CODE_RULES || '1');
- const MIN_CORE_SPEC_COUNT = (() => {
-   const raw = Number(process.env.MIN_CORE_SPEC_COUNT ?? 2);
-   if (!Number.isFinite(raw) || raw <= 0) return 2;
-   return Math.min(Math.floor(raw), 10);
- })();
- 
- function norm(s) {
-   return String(s || '')
-     .replace(/[\s\-_/()]/g, '')
-     .toUpperCase();
- }
- 
- function codeForRelaySignal(spec) {
-   const parts = [];
-   const base = spec.pn || spec.series_code || spec.series || '';
-   if (base) parts.push(base);
- 
-   const op = String(spec.operating_function || '').toLowerCase();
-   if (op.includes('latch')) parts.push('L');
- 
-   const suf = (spec.suffix || '').trim();
-   if (suf) parts.push(suf.toUpperCase());
- 
-@@ -832,76 +835,63 @@ const renderPnTemplate =
-   const haystack = typeof text === 'string' ? text : String(text ?? '');
-   if (!haystack) return false;
-   const pattern = template
-     .replace(/[-\s]+/g, '[-\\s]*')
-     .replace(/V$/i, 'V(?:DC)?');
-   if (!pattern) return false;
-   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
-   return re.test(haystack);
- }
- 
- function buildPnIfMissing(record = {}, pnTemplate) {
-   const existing = String(record.pn || '').trim();
+@@ -847,52 +847,66 @@ function buildPnIfMissing(record = {}, pnTemplate) {
    if (existing) return;
    const fromTemplate = renderPnTemplate(pnTemplate, record);
    // 본문 검증: 템플릿 결과가 실제 문서 텍스트에 존재할 때만 채택
@@ -96,40 +16,36 @@ index d7106532efbe4f0054a279e7588d2ed1ae80e0c5..51d262972e58b1403a747951a04058d2
    if (code) record.pn = code;
  }
  
-+/**
-+ * @param {string} family
-+ * @param {import('../types/blueprint').Spec} spec
-+ * @param {import('../types/blueprint').Blueprint} [blueprint]
-+ */
+ /**
+  * @param {string} family
+  * @param {import('../types/blueprint').Spec} spec
+  * @param {import('../types/blueprint').Blueprint} [blueprint]
+  */
  function buildBestIdentifiers(family, spec = {}, blueprint) {
    if (!spec || typeof spec !== 'object') return spec;
  
    let codeCandidate = null;
--  const localTemplate = (() => {
--    if (typeof blueprint?.pn_template === 'string') return blueprint.pn_template;
--
--    const cr = blueprint?.code_rules;
--    if (Array.isArray(cr)) {
--      const hit = cr.find((r) => r && typeof r === 'object' && typeof r.pn_template === 'string');
--      if (hit) return hit.pn_template;
--    } else if (cr && typeof cr === 'object' && typeof cr.pn_template === 'string') {
--      return cr.pn_template;
--    }
--
--    const io = blueprint?.ingestOptions || blueprint?.ingest_options;
--    if (io && typeof io === 'object' && typeof io.pn_template === 'string') {
--      return io.pn_template;
--    }
--
--    if (typeof spec?._pn_template === 'string') return spec._pn_template;
--    return null;
--  })();
-+  const localTemplate = getBlueprintPnTemplate(blueprint || {}, spec);
+   const localTemplate = getBlueprintPnTemplate(blueprint || {}, spec);
    if (localTemplate) {
      try {
--    const oi = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
-+      const oi = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
-     } catch (_) {}
+-      const oi = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
+-    } catch (_) {}
++      const orderingInfo = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
++      const context = { ...spec };
++      if (orderingInfo && typeof orderingInfo === 'object') {
++        context.ordering_info = orderingInfo;
++        context.orderingInfo = orderingInfo;
++        if (context.codes == null && Array.isArray(orderingInfo.codes)) {
++          context.codes = orderingInfo.codes;
++        }
++      }
++      const rendered = renderPnTemplate(localTemplate, context);
++      if (rendered) {
++        codeCandidate = rendered;
++      }
++    } catch (_) {
++      // ignore template rendering errors for identifier derivation
++    }
    }
  
    const docText = String(spec._doc_text || spec.doc_text || '');
@@ -154,3 +70,4 @@ index d7106532efbe4f0054a279e7588d2ed1ae80e0c5..51d262972e58b1403a747951a04058d2
        const me = String(spec.pn || spec.code || '').trim().toUpperCase();
        if (me && codes.some((c) => String(c || '').trim().toUpperCase() === me)) {
          spec.verified_in_doc = true;
+       }

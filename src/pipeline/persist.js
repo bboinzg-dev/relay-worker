@@ -858,7 +858,25 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
   if (!spec || typeof spec !== 'object') return spec;
 
   let codeCandidate = null;
-  const localTemplate = blueprint?.pn_template || spec?._pn_template || null;
+  const localTemplate = (() => {
+    if (typeof blueprint?.pn_template === 'string') return blueprint.pn_template;
+
+    const cr = blueprint?.code_rules;
+    if (Array.isArray(cr)) {
+      const hit = cr.find((r) => r && typeof r === 'object' && typeof r.pn_template === 'string');
+      if (hit) return hit.pn_template;
+    } else if (cr && typeof cr === 'object' && typeof cr.pn_template === 'string') {
+      return cr.pn_template;
+    }
+
+    const io = blueprint?.ingestOptions || blueprint?.ingest_options;
+    if (io && typeof io === 'object' && typeof io.pn_template === 'string') {
+      return io.pn_template;
+    }
+
+    if (typeof spec?._pn_template === 'string') return spec._pn_template;
+    return null;
+  })();
   if (localTemplate) {
     try {
     const oi = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;

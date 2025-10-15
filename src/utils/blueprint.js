@@ -89,9 +89,14 @@ function ensureFamilyOverrides(blueprint, registryRow) {
     'operating_function',
     'packing_style',
     'insulation_resistance_mohm',
+    // legacy dimension keys (keep for backward compatibility)
     'dim_l_mm',
     'dim_w_mm',
     'dim_h_mm',
+        // normalized dimension keys (preferred)
+    'length_mm',
+    'width_mm',
+    'height_mm',
   ];
   blueprint.allowedKeys = Array.from(new Set([...allowed, ...variantKeys, ...generic]));
 

@@ -34,7 +34,21 @@ function normalizeVariantDomains(domains = {}, allowedKeys = []) {
     out[base] = values;
   }
   if (out.coil_voltage_vdc) {
-    out.coil_voltage_vdc = out.coil_voltage_vdc.map(decodeCoilVoltageVdcKeepBoth);
+    const flat = new Set();
+    for (const val of out.coil_voltage_vdc) {
+      const base = String(val ?? '').trim().toUpperCase();
+      if (base) {
+        flat.add(base);
+      }
+      const decoded = decodeCoilVoltageVdcKeepBoth(val);
+      if (decoded && typeof decoded === 'object' && decoded.vdc) {
+        const vdc = String(decoded.vdc ?? '').trim();
+        if (vdc) {
+          flat.add(vdc);
+        }
+      }
+    }
+    out.coil_voltage_vdc = Array.from(flat);
   }
   return out;
 }

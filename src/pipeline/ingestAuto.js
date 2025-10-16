@@ -178,18 +178,10 @@ const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
 const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
 
 function getBlueprintAllowedKeys(blueprint) {
-  const direct = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
-  if (direct.length) {
-    return Array.from(
-      new Set(
-        direct
-          .map((k) => String(k || '').trim())
-          .filter(Boolean)
-      )
-    );
-  }
   if (blueprint?.fields && typeof blueprint.fields === 'object') {
-    return Object.keys(blueprint.fields);
+    return Object.keys(blueprint.fields)
+      .map((k) => String(k || '').trim())
+      .filter(Boolean);
   }
   return [];
 }

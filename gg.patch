@@ -1,8 +1,16 @@
 diff --git a/src/services/vertex.js b/src/services/vertex.js
-index 2e8aa394eabe1b960ba02cdb64311865afc2fa2e..773c56592257147fd6094bc8f1f0752f3f5a049e 100644
+index 773c56592257147fd6094bc8f1f0752f3f5a049e..5763331d47f0f7034cee3388bed852abdf39072f 100644
 --- a/src/services/vertex.js
 +++ b/src/services/vertex.js
-@@ -86,50 +86,53 @@ function safeParseJson(text) {
+@@ -78,53 +78,51 @@ function safeParseJson(text) {
+   let start = -1;
+   for (let i = 0; i < stripped.length; i += 1) {
+     const ch = stripped[i];
+     if (ch === '{') {
+       if (depth === 0) start = i;
+       depth += 1;
+     } else if (ch === '}') {
+       depth -= 1;
        if (depth === 0 && start >= 0) {
          const slice = stripped.slice(start, i + 1);
          try {
@@ -20,17 +28,18 @@ index 2e8aa394eabe1b960ba02cdb64311865afc2fa2e..773c56592257147fd6094bc8f1f0752f
    const parts = Array.isArray(response?.response?.candidates?.[0]?.content?.parts)
      ? response.response.candidates[0].content.parts
      : [];
-   const text = parts
-     .map((part) => (typeof part?.text === 'string' ? part.text : ''))
-     .join('');
+-  const text = parts
+-    .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+-    .join('');
++  const text = parts.map((part) => part?.text || '').join('');
    if (!text || !text.trim()) {
      return { text: '', data: null };
    }
    const data = safeParseJson(text);
    if (!data) {
-+    if (process.env.DEBUG_ORDERING === '1') {
-+      console.warn('[vertex:not-json]', text.slice(0, 300));
-+    }
+     if (process.env.DEBUG_ORDERING === '1') {
+       console.warn('[vertex:not-json]', text.slice(0, 300));
+     }
      const err = new Error('VERTEX_NOT_JSON');
      err.sample = text.slice(0, 500);
      throw err;
@@ -48,11 +57,3 @@ index 2e8aa394eabe1b960ba02cdb64311865afc2fa2e..773c56592257147fd6094bc8f1f0752f
      modelName: MODEL_CLASSIFY,
      contents: [
        {
-         role: 'user',
-         parts: [
-           { fileData: { fileUri: gcsUri, mimeType: 'application/pdf' } },
-           { text: prompt },
-         ],
-       },
-     ],
-     generationConfig: { responseMimeType: 'application/json' },

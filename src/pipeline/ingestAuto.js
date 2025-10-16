@@ -78,6 +78,8 @@ const VARIANT_MAX_CARDINALITY = Number.isFinite(VARIANT_MAX_CARDINALITY_INPUT)
   ? Math.max(2, VARIANT_MAX_CARDINALITY_INPUT)
   : 120;
 
+let rowsGlobalRef = null;
+
   // ── Auto-alias learning: unknown spec keys → extraction_recipe.key_alias ──
 const AUTO_ALIAS_LEARN = /^(1|true|on)$/i.test(process.env.AUTO_ALIAS_LEARN || '1');
 const AUTO_ALIAS_MIN_CONF = Math.max(0, Math.min(1, Number(process.env.AUTO_ALIAS_MIN_CONF || 0.8)));
@@ -193,34 +195,62 @@ function getBlueprintAllowedKeys(blueprint) {
   return Array.from(set);
 }
 
-// 통일된 안전 래퍼: (런타임키 ∩ 허용키)만 DB 함수로 보낸다
-async function addColumnsSafe(family, keys, blueprint) {
+async function addColumnsSafeForTable(qualifiedTable, family, keys, blueprint) {
+  if (!qualifiedTable || !family) return;
+
   const allow = new Set(
-    getBlueprintAllowedKeys(blueprint)
-      .map((k) => String(k || '').trim().toLowerCase())
-      .filter(Boolean),
+    (blueprint?.fields && typeof blueprint.fields === 'object'
+      ? Object.keys(blueprint.fields)
+      : []
+    ).map((k) => String(k || '').trim().toLowerCase()),
   );
 
-  const isNoisy = (keyLower) =>
-    /_(code|text|value)$/.test(keyLower) && !allow.has(keyLower);
+  if (!allow.size) return;
+
+  const isNoisy = (k) => /_(code|text|value)$/.test(k) && !allow.has(k);
+
+  let existing = new Set();
+  try {
+    const cols = await getColumnsOf(qualifiedTable);
+    if (cols && typeof cols.size === 'number') {
+      existing = new Set(
+        Array.from(cols).map((c) => String(c || '').trim().toLowerCase()),
+      );
+    }
+  } catch (_) {}
 
   const uniq = Array.from(new Set((keys || []).map((k) => String(k || '').trim())));
   const toCreate = uniq
     .filter((k) => k && allow.has(k.toLowerCase()))
+    .filter((k) => !existing.has(k.toLowerCase()))
     .filter((k) => !isNoisy(k.toLowerCase()));
+
   if (!toCreate.length) return;
-  try {
-    const { rows } = await db.query(
-      'SELECT public.ensure_dynamic_spec_columns($1,$2::jsonb) AS created',
-      [family, JSON.stringify(toCreate)],
-    );
-    const created = rows?.[0]?.created;
-    if (Array.isArray(created) && created.length) {
-      console.log('[schema] added columns', created);
-    }
-  } catch (err) {
-    console.warn('[schema] ensure_dynamic_spec_columns failed:', err?.message || err);
+
+  const sample = {};
+  for (const k of toCreate) {
+    const v = tryPickSampleValue(rowsGlobalRef || [], k);
+    if (v !== undefined) sample[k] = v;
   }
+
+  try {
+    await ensureSpecColumnsForKeys(qualifiedTable, toCreate, sample);
+    console.log('[schema] added columns', toCreate);
+  } catch (err) {
+    console.warn('[schema] addColumnsSafeForTable failed:', err?.message || err);
+  }
+}
+
+function tryPickSampleValue(rows, key) {
+  if (!Array.isArray(rows)) return undefined;
+  const lower = String(key || '').trim().toLowerCase();
+  for (const r of rows) {
+    if (!r || typeof r !== 'object') continue;
+    for (const [kk, vv] of Object.entries(r)) {
+      if (String(kk || '').trim().toLowerCase() === lower) return vv;
+    }
+  }
+  return undefined;
 }
 
 function gatherRuntimeSpecKeys(rows) {
@@ -239,9 +269,10 @@ function gatherRuntimeSpecKeys(rows) {
   return set;
 }
 
-async function ensureDynamicColumnsForRows(family, blueprint, rows, allowedKeys = []) {
+async function ensureDynamicColumnsForRows(qualifiedTable, family, blueprint, rows, allowedKeys = []) {
   if (!AUTO_ADD_FIELDS || !AUTO_ADD_FIELDS_LIMIT) return;
   if (!family) return;
+  if (!qualifiedTable) return;
 
   let keys = Array.from(gatherRuntimeSpecKeys(rows));
   let allowList = Array.isArray(allowedKeys) && allowedKeys.length
@@ -266,10 +297,16 @@ async function ensureDynamicColumnsForRows(family, blueprint, rows, allowedKeys 
 
   if (!keys.length) return;
 
+  const prevRowsRef = rowsGlobalRef;
+  if (Array.isArray(rows)) {
+    rowsGlobalRef = rows;
+  }
   try {
-    await addColumnsSafe(family, keys, blueprint);
+    await addColumnsSafeForTable(qualifiedTable, family, keys, blueprint);
   } catch (err) {
     console.warn('[schema] ensureDynamicColumnsForRows failed:', err?.message || err);
+  } finally {
+    rowsGlobalRef = prevRowsRef;
   }
 }
 
@@ -3053,8 +3090,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
 
   // 블루프린트 허용 키
-  const allowedForDomains = getBlueprintAllowedKeys(blueprint);
-  let allowedKeys = allowedForDomains.slice();
+  const allowed = getBlueprintAllowedKeys(blueprint);
+  let allowedKeys = allowed.slice();
 
   let variantKeys = [];
   if (USE_VARIANT_KEYS) {
@@ -3381,6 +3418,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     extracted.rows = sanitizeSpecRows(extracted.rows);
   }
 
+  rowsGlobalRef = Array.isArray(extracted?.rows) ? extracted.rows : null;
+
   const autoAddKeys = Array.from(canonicalRuntimeSpecKeys);
   const allowed = new Set(
     (Array.isArray(allowedKeys) && allowedKeys.length
@@ -3395,7 +3434,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     .filter((k) => k && allowed.has(k.toLowerCase()));
 
   if (process.env.AUTO_ADD_FIELDS === '1' && family && toCreate.length) {
-    await addColumnsSafe(family, toCreate, blueprint);
+    await addColumnsSafeForTable(qualified, family, toCreate, blueprint);
   }
 
   // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
@@ -3816,7 +3855,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           orderingLegendRecipe = recipe || orderingLegendRecipe;
           const variantDomains = normalizeVariantDomains(
             recipe?.variant_domains,
-            allowedForDomains,
+            allowed,
           );
           if (Object.keys(variantDomains).length) {
             orderingDomains = variantDomains;
@@ -3831,7 +3870,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-  orderingDomains = normalizeVariantDomains(orderingDomains || {}, allowedForDomains) || {};
+  orderingDomains = normalizeVariantDomains(orderingDomains || {}, allowed) || {};
   const orderingDomainKeys = Object.keys(orderingDomains || {});
   if (USE_VARIANT_KEYS) {
     let aiVariantKeys = [];
@@ -3843,7 +3882,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           rawText: detectionInput,
           family,
           blueprintVariantKeys: blueprint?.variant_keys,
-          allowedKeys: allowedForDomains,
+          allowedKeys: allowed,
         });
       } catch (err) {
         console.warn('[variant] runtime detect failed:', err?.message || err);
@@ -4048,7 +4087,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-  let legendVariantDomains = normalizeVariantDomains(orderingDomains || {}, allowedForDomains) || {};
+  let legendDomains = normalizeVariantDomains(orderingDomains || {}, allowed) || {};
   const orderingTextForRecipe = Array.isArray(orderingTextSources)
     ? orderingTextSources
         .map((txt) => (typeof txt === 'string' ? txt : String(txt ?? '')))
@@ -4066,28 +4105,28 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
   const recipeDomains = normalizeVariantDomains(
     (orderingLegendRecipe && orderingLegendRecipe.variant_domains) || {},
-    allowedForDomains,
+    allowed,
   );
 
   if (process.env.DEBUG_ORDERING === '1') {
     const len = (obj) => Object.fromEntries(
       Object.entries(obj || {}).map(([k, v]) => [k, Array.isArray(v) ? v.length : 0]),
     );
-    console.log('[ordering/domains]', len(legendVariantDomains), len(recipeDomains));
+    console.log('[ordering/domains]', len(legendDomains), len(recipeDomains));
     console.log('[ordering/vkeys]', variantKeys);
   }
 
   if (Object.keys(recipeDomains).length) {
-    if (!legendVariantDomains || !Object.keys(legendVariantDomains).length) {
-      legendVariantDomains = { ...recipeDomains };
+    if (!legendDomains || !Object.keys(legendDomains).length) {
+      legendDomains = { ...recipeDomains };
     } else {
       for (const [domainKey, domainValues] of Object.entries(recipeDomains)) {
         const key = String(domainKey || '').trim();
         if (!key) continue;
         if (!Array.isArray(domainValues) || !domainValues.length) continue;
-        const existing = Array.isArray(legendVariantDomains[key]) ? legendVariantDomains[key] : [];
+        const existing = Array.isArray(legendDomains[key]) ? legendDomains[key] : [];
         if (!existing.length) {
-          legendVariantDomains[key] = domainValues.slice();
+          legendDomains[key] = domainValues.slice();
           continue;
         }
         const seen = new Set(existing.map((val) => String(val).trim().toLowerCase()));
@@ -4099,12 +4138,12 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           seen.add(marker);
           merged.push(trimmed);
         }
-        legendVariantDomains[key] = merged;
+        legendDomains[key] = merged;
       }
     }
   }
 
-  legendVariantDomains = normalizeVariantDomains(legendVariantDomains || {}, allowedForDomains) || {};
+  legendDomains = normalizeVariantDomains(legendDomains || {}, allowed) || {};
   if (USE_PN_TEMPLATE && !pnTemplate) {
     const recipeTemplate = String(orderingLegendRecipe?.pn_template || '').trim();
     if (recipeTemplate) {
@@ -4114,9 +4153,9 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       if (blueprintTemplate) pnTemplate = blueprintTemplate;
     }
   }
-  const variantDomainEntries = Object.entries(legendVariantDomains || {});
+  const variantDomainEntries = Object.entries(legendDomains || {});
   if (variantDomainEntries.length) {
-    orderingDomains = legendVariantDomains;
+    orderingDomains = legendDomains;
   }
   if (variantDomainEntries.length && Array.isArray(rawRows) && rawRows.length) {
     for (const row of rawRows) {
@@ -4180,10 +4219,10 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
 
       if (pending.length) {
-        await addColumnsSafe(family, pending, blueprint);
+        await addColumnsSafeForTable(qualified, family, pending, blueprint);
       }
     } catch (err) {
-      console.warn('[schema] addColumnsSafe pending failed:', err?.message || err);
+      console.warn('[schema] addColumnsSafeForTable pending failed:', err?.message || err);
     }
   }
 
@@ -4277,7 +4316,10 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
       if (process.env.AUTO_ADD_FIELDS === '1' && newCanonKeys.length) {
         const known = new Set(
-          getBlueprintAllowedKeys(blueprint)
+          (blueprint?.fields && typeof blueprint.fields === 'object'
+            ? Object.keys(blueprint.fields)
+            : []
+          )
             .map((k) => String(k || '').trim().toLowerCase())
             .filter(Boolean),
         );
@@ -4290,7 +4332,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
         const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : uniqueNew.length;
         const target = uniqueNew.slice(0, limit);
         if (target.length) {
-          await addColumnsSafe(family, target, blueprint);
+          await addColumnsSafeForTable(qualified, family, target, blueprint);
 
           for (const key of target) {
             if (!key) continue;
@@ -4302,8 +4344,6 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
           if (Array.isArray(blueprint?.allowedKeys)) {
             blueprint.allowedKeys = Array.from(new Set([...blueprint.allowedKeys, ...target]));
-          } else {
-            blueprint.allowedKeys = [...target];
           }
         }
       }
@@ -4433,6 +4473,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
     try {
       await ensureDynamicColumnsForRows(
+        qualified,
         family,
         blueprint,
         explodedRows,
@@ -4474,6 +4515,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       if (llmTargets.length) {
         try {
           await ensureDynamicColumnsForRows(
+            qualified,
             family,
             blueprint,
             explodedRows,
@@ -5286,6 +5328,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
 
       if (Array.isArray(processedRowsInput) && processedRowsInput.length) {
         await ensureDynamicColumnsForRows(
+          qualified,
           family,
           blueprint,
           processedRowsInput,
@@ -5293,6 +5336,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         );
       }
       await ensureDynamicColumnsForRows(
+        qualified,
         family,
         blueprint,
         schemaEnsureRows,
@@ -5301,6 +5345,7 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
       records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
       await ensureDynamicColumnsForRows(
+        qualified,
         family,
         blueprint,
         records,

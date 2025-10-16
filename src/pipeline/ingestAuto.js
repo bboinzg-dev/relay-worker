@@ -3831,9 +3831,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-  const normalizedOrderingDomains = normalizeVariantDomains(orderingDomains || {}, allowedForDomains) || {};
-  orderingDomains = normalizedOrderingDomains;
-  const orderingDomainKeys = Object.keys(normalizedOrderingDomains || {});
+  orderingDomains = normalizeVariantDomains(orderingDomains || {}, allowedForDomains) || {};
+  const orderingDomainKeys = Object.keys(orderingDomains || {});
   if (USE_VARIANT_KEYS) {
     let aiVariantKeys = [];
     const rawOrderingText = orderingTextSources.length ? orderingTextSources.join('\n') : '';
@@ -4049,7 +4048,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-  let legendVariantDomains = { ...normalizedOrderingDomains };
+  let legendVariantDomains = normalizeVariantDomains(orderingDomains || {}, allowedForDomains) || {};
   const orderingTextForRecipe = Array.isArray(orderingTextSources)
     ? orderingTextSources
         .map((txt) => (typeof txt === 'string' ? txt : String(txt ?? '')))
@@ -4104,6 +4103,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
     }
   }
+
+  legendVariantDomains = normalizeVariantDomains(legendVariantDomains || {}, allowedForDomains) || {};
   if (USE_PN_TEMPLATE && !pnTemplate) {
     const recipeTemplate = String(orderingLegendRecipe?.pn_template || '').trim();
     if (recipeTemplate) {

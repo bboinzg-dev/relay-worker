@@ -1,33 +1,58 @@
 diff --git a/src/services/vertex.js b/src/services/vertex.js
-index 565cd249dfc8b6fb2a5658171546c2c486eccb4a..8eeacd9295b7bad9a623440f143299862bbe3e36 100644
+index 2e8aa394eabe1b960ba02cdb64311865afc2fa2e..773c56592257147fd6094bc8f1f0752f3f5a049e 100644
 --- a/src/services/vertex.js
 +++ b/src/services/vertex.js
-@@ -157,26 +157,26 @@ async function extractValuesByGcs(gcsUri, family) {
+@@ -86,50 +86,53 @@ function safeParseJson(text) {
+       if (depth === 0 && start >= 0) {
+         const slice = stripped.slice(start, i + 1);
+         try {
+           return JSON.parse(slice);
+         } catch (_) {}
+         start = -1;
+       }
+     }
+   }
+ 
+   return null;
+ }
+ 
+ function extractCandidateJson(response) {
+   const parts = Array.isArray(response?.response?.candidates?.[0]?.content?.parts)
+     ? response.response.candidates[0].content.parts
+     : [];
+   const text = parts
+     .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+     .join('');
+   if (!text || !text.trim()) {
+     return { text: '', data: null };
+   }
+   const data = safeParseJson(text);
+   if (!data) {
++    if (process.env.DEBUG_ORDERING === '1') {
++      console.warn('[vertex:not-json]', text.slice(0, 300));
++    }
+     const err = new Error('VERTEX_NOT_JSON');
+     err.sample = text.slice(0, 500);
+     throw err;
+   }
+   return { text, data };
+ }
+ 
+ async function classifyByGcs(gcsUri, filename = 'datasheet.pdf') {
+   const fams = await getFamilies();
+   const prompt = [
+     `PDF 전체를 읽고 {"family_slug","brand","code","series"} JSON만 반환. 파일명: ${filename}`,
+     `- family_slug는 반드시 다음 중 하나: ${fams.map((f) => `"${f}"`).join(', ')}`,
+   ].join('\n');
    const resp = await callGemini({
-     modelName: MODEL_EXTRACT,
+     modelName: MODEL_CLASSIFY,
      contents: [
        {
          role: 'user',
          parts: [
-           { text: prompt },
            { fileData: { fileUri: gcsUri, mimeType: 'application/pdf' } },
+           { text: prompt },
          ],
        },
      ],
      generationConfig: { responseMimeType: 'application/json' },
-   });
-   const { text: raw, data } = extractCandidateJson(resp);
-   if (!raw) return {};
-   const parsed = data;
-   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-     return parsed.values || {};
-   }
-   if (raw) {
-     console.warn('[vertex] extract parse failed: invalid JSON payload');
-   }
-   return {};
- }
- 
--module.exports = { classifyByGcs, extractValuesByGcs, safeParseJson };
-\ No newline at end of file
-+module.exports = { classifyByGcs, extractValuesByGcs, safeParseJson, extractCandidateJson };

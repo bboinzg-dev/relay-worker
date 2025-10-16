@@ -3348,11 +3348,23 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
 
   const autoAddKeys = Array.from(canonicalRuntimeSpecKeys);
-  if (process.env.AUTO_ADD_FIELDS === '1' && family && autoAddKeys.length) {
+  const allowed = new Set(
+    (Array.isArray(allowedKeys) && allowedKeys.length
+      ? allowedKeys
+      : getBlueprintAllowedKeys(blueprint)
+    )
+      .map((k) => String(k || '').trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const toCreate = autoAddKeys
+    .map((k) => String(k || '').trim())
+    .filter((k) => k && allowed.has(k.toLowerCase()));
+
+  if (process.env.AUTO_ADD_FIELDS === '1' && family && toCreate.length) {
     try {
       const { rows } = await db.query(
         'SELECT public.ensure_dynamic_spec_columns($1, $2::jsonb) AS created',
-        [family, JSON.stringify(autoAddKeys)]
+        [family, JSON.stringify(toCreate)]
       );
       const created = rows?.[0]?.created;
       if (Array.isArray(created) && created.length) {
@@ -3893,6 +3905,17 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           .join('\n');
       }
 
+            if (process.env.DEBUG_ORDERING === '1') {
+        const domainSummary = Object.fromEntries(
+          Object.entries(orderingDomains || {}).map(([key, values]) => [
+            key,
+            Array.isArray(values) ? values.length : values,
+          ]),
+        );
+        console.log('[ordering/domains]', domainSummary);
+        console.log('[ordering/variantKeys]', Array.isArray(variantKeys) ? variantKeys : []);
+      }
+
       const sampleStats = { attempted: 0, accepted: 0 };
       const sampleLimitRaw = Number(process.env.ORDERING_TEMPLATE_SAMPLE_LIMIT ?? 25);
       const sampleLimit = Number.isFinite(sampleLimitRaw) && sampleLimitRaw > 0
@@ -4234,7 +4257,11 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
 
       if (process.env.AUTO_ADD_FIELDS === '1' && newCanonKeys.length) {
-        const uniqueNew = Array.from(new Set(newCanonKeys.filter(Boolean)));
+        const uniqueNew = Array.from(new Set(
+          newCanonKeys
+            .map((k) => String(k || '').trim())
+            .filter((k) => k && knownLower.has(k.toLowerCase()))
+        ));
         const limitRaw = Number(process.env.AUTO_ADD_FIELDS_LIMIT || '50');
         const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : uniqueNew.length;
         const target = uniqueNew.slice(0, limit);
@@ -5324,13 +5351,15 @@ async function persistProcessedData(processed = {}, overrides = {}) {
   const fallbackBrand = overrides.brand || brandName || processedEffective || extractedBrand || null;
   const primaryRecord = records[0] || null;
   const finalBrand = primaryRecord?.brand || fallbackBrand;
-  const finalCode =
+  let finalCode =
     persistedList[0] ||
     primaryRecord?.pn ||
     primaryRecord?.code ||
     overrides.code ||
     null;
 
+  if (finalCode && /^[a-f0-9]{20,}_\d{10,}/i.test(finalCode)) finalCode = null;
+  
   const response = {
     ok,
     ms,

@@ -177,6 +177,23 @@ const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().#]{3,63}[0-9A-Z)#]/gi;
 const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
 const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
 
+function getBlueprintAllowedKeys(blueprint) {
+  const direct = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
+  if (direct.length) {
+    return Array.from(
+      new Set(
+        direct
+          .map((k) => String(k || '').trim())
+          .filter(Boolean)
+      )
+    );
+  }
+  if (blueprint?.fields && typeof blueprint.fields === 'object') {
+    return Object.keys(blueprint.fields);
+  }
+  return [];
+}
+
   function gatherRuntimeSpecKeys(rows) {
   const set = new Set();
   const list = Array.isArray(rows) ? rows : [];
@@ -195,7 +212,7 @@ const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
 
 async function ensureDynamicColumnsForRows(qualifiedTable, rows, allowedKeys = []) {
   if (!AUTO_ADD_FIELDS || !AUTO_ADD_FIELDS_LIMIT) return;
-  let keys = Array.from(gatherRuntimeSpecKeys(rows)).slice(0, AUTO_ADD_FIELDS_LIMIT);
+  let keys = Array.from(gatherRuntimeSpecKeys(rows));
   if (Array.isArray(allowedKeys) && allowedKeys.length) {
     const allow = new Set(
       allowedKeys
@@ -206,6 +223,7 @@ async function ensureDynamicColumnsForRows(qualifiedTable, rows, allowedKeys = [
       keys = keys.filter((k) => allow.has(String(k || '').trim().toLowerCase()));
     }
   }
+  keys = keys.slice(0, AUTO_ADD_FIELDS_LIMIT);
   if (!keys.length) return;
   const sample = {};
   if (Array.isArray(rows)) {
@@ -2992,9 +3010,6 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
   let blueprint = await getBlueprint(family);
 
-    const getBlueprintAllowedKeys = () =>
-    (Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : []);
-
   if (!vertexExtractValues && family) {
     try {
       vertexExtractValues = await extractValuesByGcs(gcsUri, family);
@@ -3004,17 +3019,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
 
   // 블루프린트 허용 키
-  let allowedKeys = getBlueprintAllowedKeys().slice();
-  if ((!allowedKeys || !allowedKeys.length) && blueprint?.fields && typeof blueprint.fields === 'object') {
-    allowedKeys = Object.keys(blueprint.fields);
-  }
-  allowedKeys = Array.from(
-    new Set(
-      (allowedKeys || [])
-        .map((k) => String(k || '').trim())
-        .filter(Boolean)
-    )
-  );
+  let allowedKeys = getBlueprintAllowedKeys(blueprint).slice();
 
   let variantKeys = [];
   if (USE_VARIANT_KEYS) {
@@ -3775,7 +3780,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           orderingLegendRecipe = recipe || orderingLegendRecipe;
           const variantDomains = normalizeVariantDomains(
             recipe?.variant_domains,
-            getBlueprintAllowedKeys(),
+            getBlueprintAllowedKeys(blueprint),
           );
           if (Object.keys(variantDomains).length) {
             orderingDomains = variantDomains;
@@ -3801,7 +3806,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           rawText: detectionInput,
           family,
           blueprintVariantKeys: blueprint?.variant_keys,
-          allowedKeys: getBlueprintAllowedKeys(),
+          allowedKeys: getBlueprintAllowedKeys(blueprint),
         });
       } catch (err) {
         console.warn('[variant] runtime detect failed:', err?.message || err);
@@ -3995,7 +4000,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-  const allowedForDomains = getBlueprintAllowedKeys();
+  const allowedForDomains = getBlueprintAllowedKeys(blueprint);
   let legendVariantDomains = normalizeVariantDomains(orderingDomains, allowedForDomains);
   const orderingTextForRecipe = Array.isArray(orderingTextSources)
     ? orderingTextSources
@@ -4387,7 +4392,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       await ensureDynamicColumnsForRows(
         qualified,
         explodedRows,
-        getBlueprintAllowedKeys(),
+        getBlueprintAllowedKeys(blueprint),
       );
     } catch (err) {
       console.warn('[schema] ensureDynamicColumnsForRows explodedRows failed:', err?.message || err);
@@ -4427,7 +4432,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           await ensureDynamicColumnsForRows(
             qualified,
             explodedRows,
-            getBlueprintAllowedKeys(),
+            getBlueprintAllowedKeys(blueprint),
           );
         } catch (err) {
           console.warn('[schema] ensureDynamicColumnsForRows llm failed:', err?.message || err);
@@ -5239,20 +5244,20 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         await ensureDynamicColumnsForRows(
           qualified,
           processedRowsInput,
-          getBlueprintAllowedKeys(),
+          getBlueprintAllowedKeys(blueprint),
         );
       }
       await ensureDynamicColumnsForRows(
         qualified,
         schemaEnsureRows,
-        getBlueprintAllowedKeys(),
+        getBlueprintAllowedKeys(blueprint),
       );
       // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
       records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
       await ensureDynamicColumnsForRows(
         qualified,
         records,
-        getBlueprintAllowedKeys(),
+        getBlueprintAllowedKeys(blueprint),
       );
       try {
         persistResult = await saveExtractedSpecs({

@@ -3813,8 +3813,9 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-  orderingDomains = normalizeVariantDomains(orderingDomains || {}, allowedForDomains);
-  const orderingDomainKeys = Object.keys(orderingDomains || {});
+  const normalizedOrderingDomains = normalizeVariantDomains(orderingDomains || {}, allowedForDomains) || {};
+  orderingDomains = normalizedOrderingDomains;
+  const orderingDomainKeys = Object.keys(normalizedOrderingDomains || {});
   if (USE_VARIANT_KEYS) {
     let aiVariantKeys = [];
     const rawOrderingText = orderingTextSources.length ? orderingTextSources.join('\n') : '';
@@ -4030,7 +4031,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-  let legendVariantDomains = normalizeVariantDomains(orderingDomains || {}, allowedForDomains);
+  let legendVariantDomains = { ...normalizedOrderingDomains };
   const orderingTextForRecipe = Array.isArray(orderingTextSources)
     ? orderingTextSources
         .map((txt) => (typeof txt === 'string' ? txt : String(txt ?? '')))

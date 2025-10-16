@@ -1,8 +1,107 @@
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d044a2670c 100644
+index de17c452f73b39c5e04611ffadd5f6a57af05b94..45728cb26a7b9990882ebb47e0c834ede517b076 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -2970,62 +2970,63 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+@@ -155,79 +155,97 @@ const MERGE_SKIP_KEYS = new Set([
+   'mpn',
+   'mpn_list',
+   'codes',
+   'candidates',
+   '_doc_text',
+   'last_error',
+   'run_id',
+   'job_id',
+   'runid',
+   'jobid',
+ ]);
+ 
+ const SPEC_MERGE_OVERRIDES = new Set(['code', 'code_norm', 'pn', 'pn_norm', 'series', 'series_code']);
+ 
+ const DOC_AI_CODE_HEADER_RE =
+   /(part\s*(?:no\.?|number|name)|type\s*(?:no\.?|number)?|model|品番|型式|型番|品號|部品番号|품번|형명|주문\s*번호|order(?:ing)?\s*code)/i;
+ const DOC_TABLE_ORDERING_HINT_RE =
+   /(ordering|order\s*info|order\s*code|types?\b|type\s*(?:no\.?|number)|selection|品番|型式|型番|형명)/i;
+ const DOC_TABLE_HEADER_FOOTER_RE = /(header|footer|page\s*\d+)/i;
+ const PN_CANON_KEY_RE = /(^|_)(part|pn|code|model|type)(_|$)/;
+ const PN_HEADER_LABEL_RE = /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|catalog\s*(?:no\.?|number)|model|品番|型式|형名|型番)/i;
+ const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().#]{3,63}[0-9A-Z)#]/gi;
+ const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
+ const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
+ 
++function getBlueprintAllowedKeys(blueprint) {
++  const direct = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
++  if (direct.length) {
++    return Array.from(
++      new Set(
++        direct
++          .map((k) => String(k || '').trim())
++          .filter(Boolean)
++      )
++    );
++  }
++  if (blueprint?.fields && typeof blueprint.fields === 'object') {
++    return Object.keys(blueprint.fields);
++  }
++  return [];
++}
++
+   function gatherRuntimeSpecKeys(rows) {
+   const set = new Set();
+   const list = Array.isArray(rows) ? rows : [];
+   for (const row of list) {
+     if (!row || typeof row !== 'object') continue;
+     for (const rawKey of Object.keys(row)) {
+       const trimmed = String(rawKey || '').trim();
+       if (!trimmed) continue;
+       const lower = trimmed.toLowerCase();
+       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
+       set.add(trimmed);
+     }
+   }
+   return set;
+ }
+ 
+ async function ensureDynamicColumnsForRows(qualifiedTable, rows, allowedKeys = []) {
+   if (!AUTO_ADD_FIELDS || !AUTO_ADD_FIELDS_LIMIT) return;
+-  let keys = Array.from(gatherRuntimeSpecKeys(rows)).slice(0, AUTO_ADD_FIELDS_LIMIT);
++  let keys = Array.from(gatherRuntimeSpecKeys(rows));
+   if (Array.isArray(allowedKeys) && allowedKeys.length) {
+     const allow = new Set(
+       allowedKeys
+         .map((s) => String(s || '').trim().toLowerCase())
+         .filter(Boolean),
+     );
+     if (allow.size) {
+       keys = keys.filter((k) => allow.has(String(k || '').trim().toLowerCase()));
+     }
+   }
++  keys = keys.slice(0, AUTO_ADD_FIELDS_LIMIT);
+   if (!keys.length) return;
+   const sample = {};
+   if (Array.isArray(rows)) {
+     const remaining = new Set(keys);
+     for (const row of rows) {
+       if (!row || typeof row !== 'object') continue;
+       for (const key of keys) {
+         if (!remaining.has(key)) continue;
+         if (Object.prototype.hasOwnProperty.call(row, key)) {
+           sample[key] = row[key];
+           remaining.delete(key);
+         }
+       }
+       if (!remaining.size) break;
+     }
+   }
+   try {
+     await ensureSpecColumnsForKeys(qualifiedTable, keys, sample);
+   } catch (err) {
+     console.warn('[schema] ensureDynamicColumnsForRows failed:', err?.message || err);
+   }
+ }
+ 
+ function quoteIdentifier(name) {
+   const trimmed = String(name || '').trim();
+@@ -2970,73 +2988,60 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
  
    if (!explicitFamily) {
      if (previewGuess && (!family || family === 'relay_power' || family === vertexFamily)) {
@@ -28,9 +127,9 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
  
    let blueprint = await getBlueprint(family);
  
-+  const getBlueprintAllowedKeys = () =>
-+    (Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : []);
-+
+-    const getBlueprintAllowedKeys = () =>
+-    (Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : []);
+-
    if (!vertexExtractValues && family) {
      try {
        vertexExtractValues = await extractValuesByGcs(gcsUri, family);
@@ -40,20 +139,18 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
    }
  
    // 블루프린트 허용 키
--  let allowedKeys = Array.isArray(blueprint?.allowedKeys)
--    ? [...blueprint.allowedKeys]
--    : [];
-+  let allowedKeys = getBlueprintAllowedKeys().slice();
-   if ((!allowedKeys || !allowedKeys.length) && blueprint?.fields && typeof blueprint.fields === 'object') {
-     allowedKeys = Object.keys(blueprint.fields);
-   }
-   allowedKeys = Array.from(
-     new Set(
-       (allowedKeys || [])
-         .map((k) => String(k || '').trim())
-         .filter(Boolean)
-     )
-   );
+-  let allowedKeys = getBlueprintAllowedKeys().slice();
+-  if ((!allowedKeys || !allowedKeys.length) && blueprint?.fields && typeof blueprint.fields === 'object') {
+-    allowedKeys = Object.keys(blueprint.fields);
+-  }
+-  allowedKeys = Array.from(
+-    new Set(
+-      (allowedKeys || [])
+-        .map((k) => String(k || '').trim())
+-        .filter(Boolean)
+-    )
+-  );
++  let allowedKeys = getBlueprintAllowedKeys(blueprint).slice();
  
    let variantKeys = [];
    if (USE_VARIANT_KEYS) {
@@ -69,7 +166,17 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
      );
    }
  
-@@ -3752,79 +3753,77 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+   let pnTemplate = USE_PN_TEMPLATE
+     ? (blueprint?.ingestOptions?.pn_template || blueprint?.ingestOptions?.pnTemplate || null)
+     : null;
+   const requiredFields = [];
+   if (blueprint?.fields && typeof blueprint.fields === 'object') {
+     for (const [fieldKey, meta] of Object.entries(blueprint.fields)) {
+       const isRequired = meta && typeof meta === 'object' && Boolean(meta.required);
+       if (!isRequired) continue;
+       const normalized = String(fieldKey || '')
+         .trim()
+@@ -3753,77 +3758,77 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
      if (!orderingDomains) {
        orderingOverride = buildTyOrderingFallback({
          baseSeries,
@@ -95,10 +202,8 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
            orderingLegendRecipe = recipe || orderingLegendRecipe;
            const variantDomains = normalizeVariantDomains(
              recipe?.variant_domains,
--            Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
--              ? blueprint.allowedKeys
--              : allowedKeys,
-+            getBlueprintAllowedKeys(),
+-            getBlueprintAllowedKeys(),
++            getBlueprintAllowedKeys(blueprint),
            );
            if (Object.keys(variantDomains).length) {
              orderingDomains = variantDomains;
@@ -124,8 +229,8 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
            rawText: detectionInput,
            family,
            blueprintVariantKeys: blueprint?.variant_keys,
--          allowedKeys: Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [],
-+          allowedKeys: getBlueprintAllowedKeys(),
+-          allowedKeys: getBlueprintAllowedKeys(),
++          allowedKeys: getBlueprintAllowedKeys(blueprint),
          });
        } catch (err) {
          console.warn('[variant] runtime detect failed:', err?.message || err);
@@ -151,7 +256,7 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
    });
  
    if (orderingDomains) {
-@@ -3974,53 +3973,51 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+@@ -3973,51 +3978,51 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
          if (appendedRows.length) {
            if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
              extracted.rows = rawRows;
@@ -177,10 +282,8 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
      }
    }
  
--  const allowedForDomains = Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
--    ? blueprint.allowedKeys
--    : allowedKeys;
-+  const allowedForDomains = getBlueprintAllowedKeys();
+-  const allowedForDomains = getBlueprintAllowedKeys();
++  const allowedForDomains = getBlueprintAllowedKeys(blueprint);
    let legendVariantDomains = normalizeVariantDomains(orderingDomains, allowedForDomains);
    const orderingTextForRecipe = Array.isArray(orderingTextSources)
      ? orderingTextSources
@@ -206,7 +309,7 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
        if (!legendVariantDomains || !Object.keys(legendVariantDomains).length) {
          legendVariantDomains = { ...recipeDomains };
        } else {
-@@ -4368,95 +4365,91 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+@@ -4365,91 +4370,91 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
        const usedRecords = new Set();
        const canonicalRefs = new Set(canonRecs);
        for (const row of explodedRows) {
@@ -232,10 +335,8 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
        await ensureDynamicColumnsForRows(
          qualified,
          explodedRows,
--        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
--          ? blueprint.allowedKeys
--          : allowedKeys,
-+        getBlueprintAllowedKeys(),
+-        getBlueprintAllowedKeys(),
++        getBlueprintAllowedKeys(blueprint),
        );
      } catch (err) {
        console.warn('[schema] ensureDynamicColumnsForRows explodedRows failed:', err?.message || err);
@@ -275,10 +376,8 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
            await ensureDynamicColumnsForRows(
              qualified,
              explodedRows,
--            Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
--              ? blueprint.allowedKeys
--              : allowedKeys,
-+            getBlueprintAllowedKeys(),
+-            getBlueprintAllowedKeys(),
++            getBlueprintAllowedKeys(blueprint),
            );
          } catch (err) {
            console.warn('[schema] ensureDynamicColumnsForRows llm failed:', err?.message || err);
@@ -304,7 +403,7 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
          variantKeys: variantKeyUnion,
          seriesHints: [baseSeries, series, row.series, row.series_code],
          brand: row.brand || brandName,
-@@ -5224,70 +5217,64 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+@@ -5217,64 +5222,64 @@ async function persistProcessedData(processed = {}, overrides = {}) {
            try {
              const { map } = await aiCanonicalizeKeys(family, unknownKeys, knownList);
              const widened = new Set(knownList);
@@ -330,29 +429,23 @@ index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d0
          await ensureDynamicColumnsForRows(
            qualified,
            processedRowsInput,
--          Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
--            ? blueprint.allowedKeys
--            : allowedKeys,
-+          getBlueprintAllowedKeys(),
+-          getBlueprintAllowedKeys(),
++          getBlueprintAllowedKeys(blueprint),
          );
        }
        await ensureDynamicColumnsForRows(
          qualified,
          schemaEnsureRows,
--        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
--          ? blueprint.allowedKeys
--          : allowedKeys,
-+        getBlueprintAllowedKeys(),
+-        getBlueprintAllowedKeys(),
++        getBlueprintAllowedKeys(blueprint),
        );
        // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
        records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
        await ensureDynamicColumnsForRows(
          qualified,
          records,
--        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
--          ? blueprint.allowedKeys
--          : allowedKeys,
-+        getBlueprintAllowedKeys(),
+-        getBlueprintAllowedKeys(),
++        getBlueprintAllowedKeys(blueprint),
        );
        try {
          persistResult = await saveExtractedSpecs({

@@ -1,7 +1,6 @@
 'use strict';
 
 const { VertexAI } = require('@google-cloud/vertexai');
-const { safeJsonParse } = require('./safe-json');
 const env = require('../config/env');
 
 const DEFAULT_MODEL_ID = env.GEMINI_MODEL_EXTRACT || env.VERTEX_MODEL_ID;
@@ -26,6 +25,32 @@ function getModel(systemText, modelId = DEFAULT_MODEL_ID) {
   return getVertex().getGenerativeModel(cfg);
 }
 
+// 안전 JSON 파서 (코드블록/설명 섞인 답도 복구)
+function safeParseJson(text) {
+  try { return JSON.parse(text); } catch (_) {}
+  const stripped = String(text ?? '')
+    .replace(/```(?:json)?/gi, '')
+    .trim();
+  try { return JSON.parse(stripped); } catch (_) {}
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < stripped.length; i += 1) {
+    const ch = stripped[i];
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        const slice = stripped.slice(start, i + 1);
+        try { return JSON.parse(slice); } catch (_) {}
+        start = -1;
+      }
+    }
+  }
+  return null;
+}
+
 async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
   const model = getModel(systemText, modelId);
   const req = {
@@ -38,13 +63,18 @@ async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 
     },
   };
   const resp = await model.generateContent(req);
-  const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  try {
-    const parsed = safeJsonParse(txt);
-    return parsed ?? {};
-  } catch {
-    throw new Error(`Vertex output is not JSON: ${String(txt).slice(0, 300)}`);
+  const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  const parsed = safeParseJson(txt);
+  if (!parsed) {
+    const sample = String(txt).slice(0, 300);
+    if (process.env.DEBUG_ORDERING === '1') {
+      console.warn('[vertex] callModelJson not-json sample=', sample);
+    }
+    const err = new Error('VERTEX_NOT_JSON');
+    err.sample = sample;
+    throw err;
   }
+  return parsed;
 }
 
 async function extractOrderingRecipe(gcsUriOrText) {
@@ -67,6 +97,9 @@ async function extractOrderingRecipe(gcsUriOrText) {
   try {
     out = await callModelJson(sys, JSON.stringify({ source: payload }), { maxOutputTokens: 2048 });
   } catch (err) {
+    if (process.env.DEBUG_ORDERING === '1' && err?.sample) {
+      console.warn('[vertex] extractOrderingRecipe sample=', err.sample);
+    }
     console.warn('[vertex] extractOrderingRecipe failed:', err?.message || err);
     return { variant_domains: {}, pn_template: null };
   }
@@ -81,4 +114,4 @@ async function extractOrderingRecipe(gcsUriOrText) {
   return { variant_domains: domains, pn_template: tpl };
 }
 
-module.exports = { getVertex, getModel, callModelJson, extractOrderingRecipe };
+module.exports = { getVertex, getModel, callModelJson, extractOrderingRecipe, safeParseJson };

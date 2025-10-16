@@ -1,72 +1,43 @@
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 9f1ad8bfcdd4d8a01b3a1a9cd0ea6fec1d7cdfc8..96eac57735b06e95050483e2dd4676656b96d635 100644
+index 96eac57735b06e95050483e2dd4676656b96d635..f4003781b131b87457e0e56b5375556e9cebe49f 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -3759,51 +3759,51 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
-     if (!orderingDomains) {
-       orderingOverride = buildTyOrderingFallback({
-         baseSeries,
-         orderingInfo: extracted?.ordering_info,
-         previewText,
-         docAiText,
-       });
-       if (orderingOverride) orderingDomains = orderingOverride.domains;
-     }
-     if (!orderingDomains) {
-       const orderingWindowText = typeof extracted?.ordering_info?.text === 'string'
-         ? extracted.ordering_info.text
-         : '';
-       const orderingHaystack = [orderingWindowText, previewText, docAiText]
-         .filter((chunk) => typeof chunk === 'string' && chunk.trim())
-         .join('\n');
-       if (orderingWindowText.trim() || (orderingHaystack && ORDERING_SECTION_RE.test(orderingHaystack))) {
-         try {
-           const recipeInput = orderingWindowText.trim().length >= 40
-             ? orderingWindowText
-             : (gcsUri || orderingWindowText);
-           const recipe = await extractOrderingRecipe(recipeInput);
-           orderingLegendRecipe = recipe || orderingLegendRecipe;
-           const variantDomains = normalizeVariantDomains(
-             recipe?.variant_domains,
--            getBlueprintAllowedKeys(blueprint),
-+            allowedForDomains,
-           );
-           if (Object.keys(variantDomains).length) {
-             orderingDomains = variantDomains;
-             if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
-               pnTemplate = recipe.pn_template.trim();
-             }
+@@ -5202,56 +5202,55 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+           try {
+             blueprint = await getBlueprint(family);
+           } catch (err) {
+             console.warn('[persist] blueprint fetch failed for key widening:', err?.message || err);
            }
-         } catch (err) {
-           console.warn('[ordering] recipe extract failed:', err?.message || err);
          }
-       }
-     }
-   }
- 
-   const orderingDomainKeys = Object.keys(orderingDomains || {});
-   if (USE_VARIANT_KEYS) {
-     let aiVariantKeys = [];
-     const rawOrderingText = orderingTextSources.length ? orderingTextSources.join('\n') : '';
-     const detectionInput = rawOrderingText || extractedText || '';
-     if (detectionInput.trim()) {
-       try {
-         aiVariantKeys = await detectVariantKeys({
-           rawText: detectionInput,
-           family,
-           blueprintVariantKeys: blueprint?.variant_keys,
-@@ -5222,64 +5222,64 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+         const knownList = Array.isArray(blueprint?.allowedKeys) ? [...blueprint.allowedKeys] : [];
+         allowedKeys = knownList.length ? [...knownList] : allowedKeys;
+         const knownLower = new Set(
+           knownList.map((key) => String(key || '').trim().toLowerCase()).filter(Boolean),
+         );
+         const runtimeKeys = Array.from(gatherRuntimeSpecKeys(schemaEnsureRows));
+         const unknownKeys = Array.from(
+           new Set(
+             runtimeKeys
+               .map((key) => String(key || '').trim())
+               .filter((key) => key && !knownLower.has(key.toLowerCase())),
+           ),
+         );
+         if (unknownKeys.length) {
            try {
              const { map } = await aiCanonicalizeKeys(family, unknownKeys, knownList);
              const widened = new Set(knownList);
              for (const key of unknownKeys) {
                const rec = map?.[key] || {};
-               let target = String(rec.canonical || '').trim();
-               if (!target || rec.action !== 'map') target = key;
+-              let target = String(rec.canonical || '').trim();
+-              if (!target || rec.action !== 'map') target = key;
++              const target = rec.action === 'map' ? String(rec.canonical || '').trim() : '';
++              if (!target) continue;
                const lower = target.toLowerCase();
-               if (!lower || knownLower.has(lower)) continue;
-               knownLower.add(lower);
-               widened.add(target);
+-              if (!lower || knownLower.has(lower)) continue;
+-              knownLower.add(lower);
+-              widened.add(target);
++              if (!lower || !knownLower.has(lower)) continue;
++              if (!widened.has(target)) widened.add(target);
              }
              blueprint = blueprint && typeof blueprint === 'object' ? blueprint : {};
              blueprint.allowedKeys = Array.from(widened);
@@ -81,45 +52,14 @@ index 9f1ad8bfcdd4d8a01b3a1a9cd0ea6fec1d7cdfc8..96eac57735b06e95050483e2dd467665
          await ensureDynamicColumnsForRows(
            qualified,
            processedRowsInput,
--            allowedKeys,
-+          allowedKeys,
+           allowedKeys,
          );
        }
        await ensureDynamicColumnsForRows(
          qualified,
          schemaEnsureRows,
--            allowedKeys,
-+        allowedKeys,
+         allowedKeys,
        );
        // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
        records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
        await ensureDynamicColumnsForRows(
-         qualified,
-         records,
--            allowedKeys,
-+        allowedKeys,
-       );
-       try {
-         persistResult = await saveExtractedSpecs({
-           qualifiedTable: qualified,
-           family,
-           brand: brandOverride,
-           records,
-           pnTemplate,
-           requiredKeys: effectiveRequired,
-           coreSpecKeys: effectiveRequired,
-           blueprint,
-           mpnList,
-           runId,
-           run_id: runId,
-           jobId,
-           job_id: jobId,
-           gcsUri,
-           orderingInfo: processed?.ordering_info,
-           docType: processed?.doc_type,
-         }) || persistResult;
-       } catch (e) {
-         console.warn('[persist] saveExtractedSpecs failed:', e?.message || e);
-         if (!persistResult || typeof persistResult !== 'object') {
-           persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
-         }

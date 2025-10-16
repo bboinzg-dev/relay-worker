@@ -1,68 +1,105 @@
-diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 84f5d4be9ba38bf93d4f5da0a4fe0b6fdf021df2..e1f88ca45228d2486ffd95263af3d61e3854622a 100644
---- a/src/pipeline/ingestAuto.js
-+++ b/src/pipeline/ingestAuto.js
-@@ -3399,61 +3399,61 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
-           if (!Object.prototype.hasOwnProperty.call(out, metaKey) || existing == null || existing === '') {
-             out[metaKey] = rawValue;
-           }
-           continue;
-         }
-         const canon = normalizeSpecKeyName(key);
-         if (!canon) continue;
-         const mapped = SPEC_KEY_ALIAS_MAP.get(canon) || canon;
-         canonicalRuntimeSpecKeys.add(mapped);
-         const existing = Object.prototype.hasOwnProperty.call(out, mapped) ? out[mapped] : undefined;
-         if (!Object.prototype.hasOwnProperty.call(out, mapped) || existing == null || existing === '') {
-           out[mapped] = rawValue;
-         }
+diff --git a/src/utils/vertex.js b/src/utils/vertex.js
+index fbda77320edad05afc6ee327cd21c542ea2cba82..d759f5797895b1e2399575af2050d4eca5ddd26c 100644
+--- a/src/utils/vertex.js
++++ b/src/utils/vertex.js
+@@ -1,88 +1,91 @@
+ 'use strict';
+ 
+ const { VertexAI } = require('@google-cloud/vertexai');
+ const env = require('../config/env');
+ 
+ const DEFAULT_MODEL_ID = env.GEMINI_MODEL_EXTRACT || env.VERTEX_MODEL_ID;
+ 
+ 
+ let vertexInstance;
+ 
+ function getVertex() {
+   if (!vertexInstance) {
+     vertexInstance = new VertexAI({ project: env.PROJECT_ID, location: env.VERTEX_LOCATION });
+   }
+   return vertexInstance;
+ }
+ 
+ // Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용
+-function getModel(systemText, modelId = DEFAULT_MODEL_ID) {
++function getModel(systemText, modelId = DEFAULT_MODEL_ID, generationConfig) {
+   const cfg = { model: modelId };
+   if (systemText && String(systemText).trim()) {
+     cfg.systemInstruction = { parts: [{ text: String(systemText) }] };
+   }
+-  cfg.generationConfig = { responseMimeType: 'application/json' };
++  const baseGenerationConfig = generationConfig && typeof generationConfig === 'object'
++    ? generationConfig
++    : { responseMimeType: 'application/json' };
++  cfg.generationConfig = baseGenerationConfig;
+   return getVertex().getGenerativeModel(cfg);
+ }
+ 
+ // 안전 JSON 파서 (코드블록/설명 섞인 답도 복구)
+ function safeParseJson(text) {
+   try { return JSON.parse(text); } catch (_) {}
+   const stripped = String(text ?? '')
+     .replace(/```(?:json)?/gi, '')
+     .trim();
+   try { return JSON.parse(stripped); } catch (_) {}
+   let depth = 0;
+   let start = -1;
+   for (let i = 0; i < stripped.length; i += 1) {
+     const ch = stripped[i];
+     if (ch === '{') {
+       if (depth === 0) start = i;
+       depth += 1;
+     } else if (ch === '}') {
+       depth -= 1;
+       if (depth === 0 && start >= 0) {
+         const slice = stripped.slice(start, i + 1);
+         try { return JSON.parse(slice); } catch (_) {}
+         start = -1;
        }
-       return out;
-     });
+     }
+   }
+   return null;
+ }
+ 
+ async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
+-  const model = getModel(systemText, modelId);
++  const generationConfig = {
++    temperature,
++    topP,
++    maxOutputTokens,
++    responseMimeType: 'application/json',
++  };
++  const model = getModel(systemText, modelId, generationConfig);
+   const req = {
+     contents: [{ role: 'user', parts: [{ text: String(userText || '') }]}],
+-    generationConfig: {
+-      responseMimeType: 'application/json',
+-      temperature,
+-      topP,
+-      maxOutputTokens,
+-    },
    };
- 
-   if (Array.isArray(extracted?.rows) && extracted.rows.length) {
-     extracted.rows = sanitizeSpecRows(extracted.rows);
+   const resp = await model.generateContent(req);
+   const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+   const parsed = safeParseJson(txt);
+   if (!parsed) {
+     const sample = String(txt).slice(0, 300);
+     if (process.env.DEBUG_ORDERING === '1') {
+       console.warn('[vertex] callModelJson not-json sample=', sample);
+     }
+     const err = new Error('VERTEX_NOT_JSON');
+     err.sample = sample;
+     throw err;
    }
+   return parsed;
+ }
  
-   rowsGlobalRef = Array.isArray(extracted?.rows) ? extracted.rows : null;
+ async function extractOrderingRecipe(gcsUriOrText) {
+   const source = String(gcsUriOrText || '');
+   if (!source) return { variant_domains: {}, pn_template: null };
  
-   const autoAddKeys = Array.from(canonicalRuntimeSpecKeys);
--  const allowed = new Set(
-+  const allowedSet = new Set(
-     (Array.isArray(allowedKeys) && allowedKeys.length
-       ? allowedKeys
-       : getBlueprintAllowedKeys(blueprint)
-     )
-       .map((k) => String(k || '').trim().toLowerCase())
-       .filter(Boolean)
-   );
-   const toCreate = autoAddKeys
-     .map((k) => String(k || '').trim())
--    .filter((k) => k && allowed.has(k.toLowerCase()));
-+    .filter((k) => k && allowedSet.has(k.toLowerCase()));
- 
-   if (process.env.AUTO_ADD_FIELDS === '1' && family && toCreate.length) {
-     await addColumnsSafeForTable(qualified, family, toCreate, blueprint);
-   }
- 
-   // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
-   let codes = [];
-   if (!code) {
-     const skuFromTable = pickSkuListFromTables(extracted);
-     const docText = extracted?.text || previewText || '';
-     codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint, docText);
-     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
-     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
-     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
-   }
- 
-   // 🔹 후보(candidates)가 아직 비었고, 방금 수집한 codes가 있으면 candidates로 승격
-   if (!candidates.length && codes.length) {
-     const merged = [];
-     const seen = new Set();
-     for (const raw of codes) {
-       const trimmed = typeof raw === 'string' ? raw.trim() : String(raw || '');
-       if (!trimmed) continue;
-       const norm = normalizeCode(trimmed);
-       if (seen.has(norm)) continue;
+   const sys = [
+     'You analyze ORDERING INFORMATION / HOW TO ORDER sections from electronic component datasheets.',
+     'Return strict JSON with shape: {"variant_domains": {"key": ["values"]}, "pn_template": "string or null"}.',
+     'Keys must be concise machine-readable snake_case identifiers.',
+     'If an option is blank/"Nil", represent it with an empty string "".',

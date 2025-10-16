@@ -1712,6 +1712,10 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
   const variantKeys = Object.keys(orderingDomains)
     .map((key) => String(key || '').trim())
     .filter(Boolean);
+  const orderingSnippet = typeof orderingInfo?.text === 'string' ? orderingInfo.text : '';
+  const orderingHaystack = [tablePreview, orderingSnippet, fullText]
+    .filter((chunk) => typeof chunk === 'string' && chunk.trim())
+    .join('\n');
   if (variantKeys.length) {
     for (const key of variantKeys) ensureAllowedKey(key);
     const baseSeries = orderingDomains.series_code?.[0] || orderingDomains.series?.[0] || null;
@@ -1721,7 +1725,21 @@ async function extractPartsAndSpecsFromPdf({ gcsUri, allowedKeys, family = null,
       series_code: baseSeries,
       values: orderingDomains,
     };
-    const generatedRows = explodeToRows(orderingBase, { variantKeys, pnTemplate }) || [];
+    const generatedRows = explodeToRows(orderingBase, {
+      variantKeys,
+      pnTemplate,
+      haystack: orderingHaystack,
+      textContainsExact: (text, pn) => {
+        const normalize = (value) => String(value ?? '')
+          .replace(/[\s\-_/()]/g, '')
+          .toUpperCase()
+          .replace(/VDC$/, 'V');
+        const candidate = normalize(pn);
+        if (!candidate) return false;
+        const corpus = normalize(text);
+        return corpus.includes(candidate);
+      },
+    }) || [];
     const beforeCount = out.length;
     for (const generated of generatedRows) {
       if (!generated || typeof generated !== 'object') continue;

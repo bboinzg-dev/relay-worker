@@ -4732,7 +4732,11 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     records,
     rows: records,
     explodedRows,
-    mpnList: Array.isArray(extracted?.mpn_list) ? extracted.mpn_list : [],
+    mpnList: Array.isArray(extracted?.mpn_list)
+      ? extracted.mpn_list
+      : Array.isArray(extracted?.codes)
+        ? extracted.codes
+        : [],
     extractedBrand: extracted?.brand || null,
     brandName,
     baseSeries,

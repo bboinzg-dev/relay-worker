@@ -100,9 +100,7 @@ function extractCandidateJson(response) {
   const parts = Array.isArray(response?.response?.candidates?.[0]?.content?.parts)
     ? response.response.candidates[0].content.parts
     : [];
-  const text = parts
-    .map((part) => (typeof part?.text === 'string' ? part.text : ''))
-    .join('');
+  const text = parts.map((part) => part?.text || '').join('');
   if (!text || !text.trim()) {
     return { text: '', data: null };
   }

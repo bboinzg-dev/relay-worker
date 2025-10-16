@@ -3781,7 +3781,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           orderingLegendRecipe = recipe || orderingLegendRecipe;
           const variantDomains = normalizeVariantDomains(
             recipe?.variant_domains,
-            getBlueprintAllowedKeys(blueprint),
+            allowedForDomains,
           );
           if (Object.keys(variantDomains).length) {
             orderingDomains = variantDomains;
@@ -5244,20 +5244,20 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         await ensureDynamicColumnsForRows(
           qualified,
           processedRowsInput,
-            allowedKeys,
+          allowedKeys,
         );
       }
       await ensureDynamicColumnsForRows(
         qualified,
         schemaEnsureRows,
-            allowedKeys,
+        allowedKeys,
       );
       // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
       records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
       await ensureDynamicColumnsForRows(
         qualified,
         records,
-            allowedKeys,
+        allowedKeys,
       );
       try {
         persistResult = await saveExtractedSpecs({

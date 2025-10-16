@@ -1,71 +1,380 @@
-diff --git a/src/utils/variant-normalize.js b/src/utils/variant-normalize.js
-new file mode 100644
-index 0000000000000000000000000000000000000000..f5500b597ec32e7da448ffc602f821a48020db28
---- /dev/null
-+++ b/src/utils/variant-normalize.js
-@@ -0,0 +1,65 @@
-+// @ts-check
-+'use strict';
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 6603ad7744f8347800ef2983c63bf50e870abfbd..6fd128f913418ebbbf8cddb26f8f00d044a2670c 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -2970,62 +2970,63 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+ 
+   if (!explicitFamily) {
+     if (previewGuess && (!family || family === 'relay_power' || family === vertexFamily)) {
+       family = previewGuess;
+     }
+     if ((!family || family === 'relay_power') && /subminiature\s+signal\s+relay|signal\s+relay/i.test(previewText)) {
+       family = 'relay_signal';
+     }
+   }
+ 
+   if (!family) family = 'relay_power';
+ 
+   const overrideBrandLog = overridesBrand ?? brand ?? '';
+   console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''}`);
+ 
+ // 목적 테이블
+   const reg = await db.query(
+     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
+     [family]
+   );
+   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
+   const qualified = table.startsWith('public.')? table : `public.${table}`;
+ 
+   let blueprint = await getBlueprint(family);
+ 
++  const getBlueprintAllowedKeys = () =>
++    (Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : []);
 +
-+const CANON = {
-+  coil_voltage: 'coil_voltage_vdc',
-+  rated_coil_voltage: 'coil_voltage_vdc',
-+  rated_coil_voltage_dc: 'coil_voltage_vdc',
-+  coil_voltage_value: 'coil_voltage_vdc',
-+  coil_voltage_code: 'coil_voltage_vdc',
-+  terminal_shape: 'mount_type',
-+  contact_current_code: 'contact_rating_dc_a',
-+  construction: 'package',
-+  poles: 'contact_form',
-+};
-+
-+/**
-+ * @param {Record<string, unknown>} [domains]
-+ * @param {string[]} [allowedKeys]
-+ */
-+function normalizeVariantDomains(domains = {}, allowedKeys = []) {
-+  const allow = new Set(
-+    (Array.isArray(allowedKeys) ? allowedKeys : [])
-+      .map((s) => String(s).toLowerCase())
-+      .filter(Boolean),
-+  );
-+  const out = {};
-+  for (const [rawKey, rawValue] of Object.entries(domains || {})) {
-+    const key = String(rawKey || '').trim();
-+    if (!key) continue;
-+    const lower = key.toLowerCase();
-+    const base = CANON[lower] || (lower.includes('coil_voltage') ? 'coil_voltage_vdc' : lower);
-+    if (allow.size && !allow.has(base)) continue;
-+    const values = Array.isArray(rawValue) ? rawValue.slice() : [rawValue];
-+    out[base] = values;
-+  }
-+  if (out.coil_voltage_vdc) {
-+    out.coil_voltage_vdc = out.coil_voltage_vdc.map(decodeCoilVoltageVdcKeepBoth);
-+  }
-+  return out;
-+}
-+
-+function decodeCoilVoltageVdcKeepBoth(value) {
-+  const raw = String(value ?? '').toUpperCase().trim();
-+  if (!raw) return raw;
-+  const match = raw.match(/^(\d{2,3}|[14]H)$/);
-+  if (!match) return raw;
-+  const token = match[1];
-+  let val = token;
-+  if (token === '1H') {
-+    val = 1.5;
-+  } else if (token === '4H') {
-+    val = 4.5;
-+  } else if (/^\d{2,3}$/.test(token)) {
-+    const num = Number(token);
-+    if (Number.isFinite(num)) {
-+      val = num >= 100 ? (num % 10 === 0 ? num / 10 : num) : num;
-+    }
-+  }
-+  return { raw, vdc: String(val) };
-+}
-+
-+module.exports = {
-+  normalizeVariantDomains,
-+  decodeCoilVoltageVdcKeepBoth,
-+};
+   if (!vertexExtractValues && family) {
+     try {
+       vertexExtractValues = await extractValuesByGcs(gcsUri, family);
+     } catch (err) {
+       console.warn('[vertex] extract failed:', err?.message || err);
+     }
+   }
+ 
+   // 블루프린트 허용 키
+-  let allowedKeys = Array.isArray(blueprint?.allowedKeys)
+-    ? [...blueprint.allowedKeys]
+-    : [];
++  let allowedKeys = getBlueprintAllowedKeys().slice();
+   if ((!allowedKeys || !allowedKeys.length) && blueprint?.fields && typeof blueprint.fields === 'object') {
+     allowedKeys = Object.keys(blueprint.fields);
+   }
+   allowedKeys = Array.from(
+     new Set(
+       (allowedKeys || [])
+         .map((k) => String(k || '').trim())
+         .filter(Boolean)
+     )
+   );
+ 
+   let variantKeys = [];
+   if (USE_VARIANT_KEYS) {
+     variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+       ? blueprint.ingestOptions.variant_keys
+       : (Array.isArray(blueprint?.variant_keys) ? blueprint.variant_keys : []);
+     variantKeys = Array.from(
+       new Set(
+         variantKeys
+           .map((k) => String(k || '').trim().toLowerCase())
+           .filter(Boolean),
+       ),
+     );
+   }
+ 
+@@ -3752,79 +3753,77 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+     if (!orderingDomains) {
+       orderingOverride = buildTyOrderingFallback({
+         baseSeries,
+         orderingInfo: extracted?.ordering_info,
+         previewText,
+         docAiText,
+       });
+       if (orderingOverride) orderingDomains = orderingOverride.domains;
+     }
+     if (!orderingDomains) {
+       const orderingWindowText = typeof extracted?.ordering_info?.text === 'string'
+         ? extracted.ordering_info.text
+         : '';
+       const orderingHaystack = [orderingWindowText, previewText, docAiText]
+         .filter((chunk) => typeof chunk === 'string' && chunk.trim())
+         .join('\n');
+       if (orderingWindowText.trim() || (orderingHaystack && ORDERING_SECTION_RE.test(orderingHaystack))) {
+         try {
+           const recipeInput = orderingWindowText.trim().length >= 40
+             ? orderingWindowText
+             : (gcsUri || orderingWindowText);
+           const recipe = await extractOrderingRecipe(recipeInput);
+           orderingLegendRecipe = recipe || orderingLegendRecipe;
+           const variantDomains = normalizeVariantDomains(
+             recipe?.variant_domains,
+-            Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+-              ? blueprint.allowedKeys
+-              : allowedKeys,
++            getBlueprintAllowedKeys(),
+           );
+           if (Object.keys(variantDomains).length) {
+             orderingDomains = variantDomains;
+             if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
+               pnTemplate = recipe.pn_template.trim();
+             }
+           }
+         } catch (err) {
+           console.warn('[ordering] recipe extract failed:', err?.message || err);
+         }
+       }
+     }
+   }
+ 
+   const orderingDomainKeys = Object.keys(orderingDomains || {});
+   if (USE_VARIANT_KEYS) {
+     let aiVariantKeys = [];
+     const rawOrderingText = orderingTextSources.length ? orderingTextSources.join('\n') : '';
+     const detectionInput = rawOrderingText || extractedText || '';
+     if (detectionInput.trim()) {
+       try {
+         aiVariantKeys = await detectVariantKeys({
+           rawText: detectionInput,
+           family,
+           blueprintVariantKeys: blueprint?.variant_keys,
+-          allowedKeys: Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [],
++          allowedKeys: getBlueprintAllowedKeys(),
+         });
+       } catch (err) {
+         console.warn('[variant] runtime detect failed:', err?.message || err);
+       }
+     }
+     runtimeVariantKeys = mergeVariantKeyLists(
+       VARIANT_MAX_CARDINALITY,
+       Array.isArray(aiVariantKeys) ? aiVariantKeys : [],
+       orderingDomainKeys,
+       blueprintVariantKeys,
+     );
+   } else {
+     runtimeVariantKeys = [];
+   }
+ 
+   console.log('[PATH] brand resolved', {
+     runId,
+     family,
+     hint: brandHintSeed || null,
+     effective: brandEffectiveResolved,
+     source: brandSource,
+     vkeys_runtime: runtimeVariantKeys,
+   });
+ 
+   if (orderingDomains) {
+@@ -3974,53 +3973,51 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+         if (appendedRows.length) {
+           if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
+             extracted.rows = rawRows;
+           }
+           const lowerOrderingKeys = orderingKeys
+             .map((k) => String(k).trim().toLowerCase())
+             .filter(Boolean);
+           const allowedLower = new Set(
+             (allowedKeys || []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
+           );
+           for (const key of lowerOrderingKeys) {
+             if (!variantKeys.includes(key)) variantKeys.push(key);
+             if (!allowedLower.has(key)) {
+               allowedKeys.push(key);
+               allowedLower.add(key);
+             }
+             if (Array.isArray(runtimeVariantKeys) && !runtimeVariantKeys.includes(key)) {
+               runtimeVariantKeys.push(key);
+             }
+           }
+         }
+       }
+     }
+   }
+ 
+-  const allowedForDomains = Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+-    ? blueprint.allowedKeys
+-    : allowedKeys;
++  const allowedForDomains = getBlueprintAllowedKeys();
+   let legendVariantDomains = normalizeVariantDomains(orderingDomains, allowedForDomains);
+   const orderingTextForRecipe = Array.isArray(orderingTextSources)
+     ? orderingTextSources
+         .map((txt) => (typeof txt === 'string' ? txt : String(txt ?? '')))
+         .map((txt) => txt.trim())
+         .filter(Boolean)
+         .join('\n')
+     : '';
+   if (orderingTextForRecipe) {
+     try {
+       const recipe = await extractOrderingRecipe(orderingTextForRecipe);
+       if (recipe) orderingLegendRecipe = recipe;
+     } catch (err) {
+       console.warn('[ordering] legend recipe extract failed:', err?.message || err);
+     }
+   }
+   if (orderingLegendRecipe && orderingLegendRecipe.variant_domains) {
+     const recipeDomains = normalizeVariantDomains(
+       orderingLegendRecipe.variant_domains,
+       allowedForDomains,
+     );
+     if (Object.keys(recipeDomains).length) {
+       if (!legendVariantDomains || !Object.keys(legendVariantDomains).length) {
+         legendVariantDomains = { ...recipeDomains };
+       } else {
+@@ -4368,95 +4365,91 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+       const usedRecords = new Set();
+       const canonicalRefs = new Set(canonRecs);
+       for (const row of explodedRows) {
+         if (!row || typeof row !== 'object') continue;
+         let match = null;
+         if (canonRecs.length) {
+           match =
+             bestRowMatchToSpec(row, canonRecs, usedRecords, { tokenStats: docAiTokenStats }) ||
+             bestAttributeMatchToSpec(row, canonRecs, variantKeys);
+         }
+         if (!match && String(family || '').toLowerCase() === 'relay_signal') {
+           match = findCoilRowMatchForRelaySignal(row, flatRecs);
+         }
+         if (match && match.values) {
+           Object.assign(row, safeMergeSpec(row, match.values));
+           if (canonicalRefs.has(match)) {
+             usedRecords.add(match);
+           }
+         }
+       }
+     }
+     try {
+       await ensureDynamicColumnsForRows(
+         qualified,
+         explodedRows,
+-        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+-          ? blueprint.allowedKeys
+-          : allowedKeys,
++        getBlueprintAllowedKeys(),
+       );
+     } catch (err) {
+       console.warn('[schema] ensureDynamicColumnsForRows explodedRows failed:', err?.message || err);
+     }
+   }
+   if (
+     Array.isArray(explodedRows) &&
+     explodedRows.length &&
+     blueprint?.fields &&
+     Object.keys(blueprint.fields).length
+   ) {
+     const docTextForLlm = String(docAiText || previewText || '').slice(0, 60000);
+     if (docTextForLlm) {
+       const llmTargets = explodedRows
+         .map((row, index) => ({ row, index }))
+         .filter(({ row }) => !hasCoreSpec(row))
+         .slice(0, 3);
+       for (const target of llmTargets) {
+         try {
+           const llmValues = await extractFields(
+             docTextForLlm,
+             target.row?.pn || target.row?.code || '',
+             blueprint.fields,
+           );
+           if (llmValues && typeof llmValues === 'object') {
+             const patch = safeMergeSpec(target.row, llmValues);
+             if (patch && Object.keys(patch).length) {
+               Object.assign(target.row, patch);
+             }
+           }
+         } catch (err) {
+           console.warn('[llm] extractFields backfill failed:', err?.message || err);
+         }
+       }
+       if (llmTargets.length) {
+         try {
+           await ensureDynamicColumnsForRows(
+             qualified,
+             explodedRows,
+-            Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+-              ? blueprint.allowedKeys
+-              : allowedKeys,
++            getBlueprintAllowedKeys(),
+           );
+         } catch (err) {
+           console.warn('[schema] ensureDynamicColumnsForRows llm failed:', err?.message || err);
+         }
+       }
+     }
+   }
+   if (docPnCandidatesInfo?.map instanceof Map && docPnCandidatesInfo.map.size && explodedRows.length) {
+     const variantKeyUnion = Array.from(
+       new Set([
+         ...(Array.isArray(variantKeys) ? variantKeys : []),
+         ...(Array.isArray(runtimeVariantKeys) ? runtimeVariantKeys : []),
+       ])
+     );
+     for (const row of explodedRows) {
+       if (!row || typeof row !== 'object') continue;
+       const hints = [row.pn, row.code, row.part_number, row.part_no, row.code_norm, code]
+         .map((value) => (value == null ? null : String(value)))
+         .filter((value) => value && value.trim());
+       const bestPn = pickOrderingPreferredPn(row, {
+         candidateInfo: docPnCandidatesInfo,
+         hints,
+         variantKeys: variantKeyUnion,
+         seriesHints: [baseSeries, series, row.series, row.series_code],
+         brand: row.brand || brandName,
+@@ -5224,70 +5217,64 @@ async function persistProcessedData(processed = {}, overrides = {}) {
+           try {
+             const { map } = await aiCanonicalizeKeys(family, unknownKeys, knownList);
+             const widened = new Set(knownList);
+             for (const key of unknownKeys) {
+               const rec = map?.[key] || {};
+               let target = String(rec.canonical || '').trim();
+               if (!target || rec.action !== 'map') target = key;
+               const lower = target.toLowerCase();
+               if (!lower || knownLower.has(lower)) continue;
+               knownLower.add(lower);
+               widened.add(target);
+             }
+             blueprint = blueprint && typeof blueprint === 'object' ? blueprint : {};
+             blueprint.allowedKeys = Array.from(widened);
+             allowedKeys = Array.from(blueprint.allowedKeys);
+           } catch (err) {
+             console.warn('[persist] aiCanonicalizeKeys failed:', err?.message || err);
+           }
+         }
+       }
+ 
+       if (Array.isArray(processedRowsInput) && processedRowsInput.length) {
+         await ensureDynamicColumnsForRows(
+           qualified,
+           processedRowsInput,
+-          Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+-            ? blueprint.allowedKeys
+-            : allowedKeys,
++          getBlueprintAllowedKeys(),
+         );
+       }
+       await ensureDynamicColumnsForRows(
+         qualified,
+         schemaEnsureRows,
+-        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+-          ? blueprint.allowedKeys
+-          : allowedKeys,
++        getBlueprintAllowedKeys(),
+       );
+       // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
+       records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
+       await ensureDynamicColumnsForRows(
+         qualified,
+         records,
+-        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+-          ? blueprint.allowedKeys
+-          : allowedKeys,
++        getBlueprintAllowedKeys(),
+       );
+       try {
+         persistResult = await saveExtractedSpecs({
+           qualifiedTable: qualified,
+           family,
+           brand: brandOverride,
+           records,
+           pnTemplate,
+           requiredKeys: effectiveRequired,
+           coreSpecKeys: effectiveRequired,
+           blueprint,
+           mpnList,
+           runId,
+           run_id: runId,
+           jobId,
+           job_id: jobId,
+           gcsUri,
+           orderingInfo: processed?.ordering_info,
+           docType: processed?.doc_type,
+         }) || persistResult;
+       } catch (e) {
+         console.warn('[persist] saveExtractedSpecs failed:', e?.message || e);
+         if (!persistResult || typeof persistResult !== 'object') {
+           persistResult = { upserts: 0, written: [], skipped: [], warnings: [] };
+         }

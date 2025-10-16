@@ -46,7 +46,6 @@ const { explodeToRows, splitAndCarryPrefix, normalizeContactForm } = require('..
 const { extractOrderingRecipe } = require('../utils/vertex');
 const {
   ensureSpecColumnsForBlueprint,
-  ensureSpecColumnsForKeys,
   getColumnsOf,
 } = require('./ensure-spec-columns');
 const { normalizeVariantDomains } = require('../utils/variant-normalize');
@@ -178,21 +177,26 @@ const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
 const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
 
 function getBlueprintAllowedKeys(blueprint) {
-  if (blueprint?.fields && typeof blueprint.fields === 'object') {
-    return Object.keys(blueprint.fields)
-      .map((k) => String(k || '').trim())
-      .filter(Boolean);
+  const set = new Set();
+  if (Array.isArray(blueprint?.allowedKeys)) {
+    for (const key of blueprint.allowedKeys) {
+      const trimmed = String(key || '').trim();
+      if (trimmed) set.add(trimmed);
+    }
   }
-  return [];
+  if (blueprint?.fields && typeof blueprint.fields === 'object') {
+    for (const key of Object.keys(blueprint.fields)) {
+      const trimmed = String(key || '').trim();
+      if (trimmed) set.add(trimmed);
+    }
+  }
+  return Array.from(set);
 }
 
 // 통일된 안전 래퍼: (런타임키 ∩ 허용키)만 DB 함수로 보낸다
 async function addColumnsSafe(family, keys, blueprint) {
   const allow = new Set(
-    (blueprint?.fields && typeof blueprint.fields === 'object'
-      ? Object.keys(blueprint.fields)
-      : getBlueprintAllowedKeys(blueprint)
-    )
+    getBlueprintAllowedKeys(blueprint)
       .map((k) => String(k || '').trim().toLowerCase())
       .filter(Boolean),
   );
@@ -235,12 +239,18 @@ function gatherRuntimeSpecKeys(rows) {
   return set;
 }
 
-async function ensureDynamicColumnsForRows(qualifiedTable, rows, allowedKeys = []) {
+async function ensureDynamicColumnsForRows(family, blueprint, rows, allowedKeys = []) {
   if (!AUTO_ADD_FIELDS || !AUTO_ADD_FIELDS_LIMIT) return;
+  if (!family) return;
+
   let keys = Array.from(gatherRuntimeSpecKeys(rows));
-  if (Array.isArray(allowedKeys) && allowedKeys.length) {
+  let allowList = Array.isArray(allowedKeys) && allowedKeys.length
+    ? allowedKeys
+    : getBlueprintAllowedKeys(blueprint);
+
+  if (Array.isArray(allowList) && allowList.length) {
     const allow = new Set(
-      allowedKeys
+      allowList
         .map((s) => String(s || '').trim().toLowerCase())
         .filter(Boolean),
     );
@@ -248,25 +258,16 @@ async function ensureDynamicColumnsForRows(qualifiedTable, rows, allowedKeys = [
       keys = keys.filter((k) => allow.has(String(k || '').trim().toLowerCase()));
     }
   }
-  keys = keys.slice(0, AUTO_ADD_FIELDS_LIMIT);
+
+  keys = keys
+    .map((k) => String(k || '').trim())
+    .filter(Boolean)
+    .slice(0, AUTO_ADD_FIELDS_LIMIT);
+
   if (!keys.length) return;
-  const sample = {};
-  if (Array.isArray(rows)) {
-    const remaining = new Set(keys);
-    for (const row of rows) {
-      if (!row || typeof row !== 'object') continue;
-      for (const key of keys) {
-        if (!remaining.has(key)) continue;
-        if (Object.prototype.hasOwnProperty.call(row, key)) {
-          sample[key] = row[key];
-          remaining.delete(key);
-        }
-      }
-      if (!remaining.size) break;
-    }
-  }
+
   try {
-    await ensureSpecColumnsForKeys(qualifiedTable, keys, sample);
+    await addColumnsSafe(family, keys, blueprint);
   } catch (err) {
     console.warn('[schema] ensureDynamicColumnsForRows failed:', err?.message || err);
   }
@@ -4178,24 +4179,10 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
 
       if (pending.length) {
-        const remaining = new Set(pending);
-        const sample = {};
-        for (const row of rawRows) {
-          if (!row || typeof row !== 'object') continue;
-          for (const key of pending) {
-            if (!remaining.has(key)) continue;
-            if (Object.prototype.hasOwnProperty.call(row, key)) {
-              sample[key] = row[key];
-              remaining.delete(key);
-            }
-          }
-          if (!remaining.size) break;
-        }
-
-        await ensureSpecColumnsForKeys(qualified, pending, sample);
+        await addColumnsSafe(family, pending, blueprint);
       }
     } catch (err) {
-      console.warn('[schema] ensureSpecColumnsForKeys failed:', err?.message || err);
+      console.warn('[schema] addColumnsSafe pending failed:', err?.message || err);
     }
   }
 
@@ -4445,7 +4432,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
     try {
       await ensureDynamicColumnsForRows(
-        qualified,
+        family,
+        blueprint,
         explodedRows,
         allowedKeys,
       );
@@ -4485,7 +4473,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       if (llmTargets.length) {
         try {
           await ensureDynamicColumnsForRows(
-            qualified,
+            family,
+            blueprint,
             explodedRows,
             allowedKeys,
           );
@@ -5296,20 +5285,23 @@ async function persistProcessedData(processed = {}, overrides = {}) {
 
       if (Array.isArray(processedRowsInput) && processedRowsInput.length) {
         await ensureDynamicColumnsForRows(
-          qualified,
+          family,
+          blueprint,
           processedRowsInput,
           allowedKeys,
         );
       }
       await ensureDynamicColumnsForRows(
-        qualified,
+        family,
+        blueprint,
         schemaEnsureRows,
         allowedKeys,
       );
       // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
       records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
       await ensureDynamicColumnsForRows(
-        qualified,
+        family,
+        blueprint,
         records,
         allowedKeys,
       );

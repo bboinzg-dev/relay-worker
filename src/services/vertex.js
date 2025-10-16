@@ -179,4 +179,4 @@ async function extractValuesByGcs(gcsUri, family) {
   return {};
 }
 
-module.exports = { classifyByGcs, extractValuesByGcs, safeParseJson };
+module.exports = { classifyByGcs, extractValuesByGcs, safeParseJson, extractCandidateJson };

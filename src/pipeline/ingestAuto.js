@@ -194,7 +194,7 @@ function getBlueprintAllowedKeys(blueprint) {
   return [];
 }
 
-  function gatherRuntimeSpecKeys(rows) {
+function gatherRuntimeSpecKeys(rows) {
   const set = new Set();
   const list = Array.isArray(rows) ? rows : [];
   for (const row of list) {
@@ -3019,7 +3019,8 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
 
   // 블루프린트 허용 키
-  let allowedKeys = getBlueprintAllowedKeys(blueprint).slice();
+  const allowedForDomains = getBlueprintAllowedKeys(blueprint);
+  let allowedKeys = allowedForDomains.slice();
 
   let variantKeys = [];
   if (USE_VARIANT_KEYS) {
@@ -3806,7 +3807,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           rawText: detectionInput,
           family,
           blueprintVariantKeys: blueprint?.variant_keys,
-          allowedKeys: getBlueprintAllowedKeys(blueprint),
+          allowedKeys: allowedForDomains,
         });
       } catch (err) {
         console.warn('[variant] runtime detect failed:', err?.message || err);
@@ -4000,7 +4001,6 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-  const allowedForDomains = getBlueprintAllowedKeys(blueprint);
   let legendVariantDomains = normalizeVariantDomains(orderingDomains, allowedForDomains);
   const orderingTextForRecipe = Array.isArray(orderingTextSources)
     ? orderingTextSources
@@ -4392,7 +4392,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       await ensureDynamicColumnsForRows(
         qualified,
         explodedRows,
-        getBlueprintAllowedKeys(blueprint),
+        allowedKeys,
       );
     } catch (err) {
       console.warn('[schema] ensureDynamicColumnsForRows explodedRows failed:', err?.message || err);
@@ -4432,7 +4432,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           await ensureDynamicColumnsForRows(
             qualified,
             explodedRows,
-            getBlueprintAllowedKeys(blueprint),
+            allowedKeys,
           );
         } catch (err) {
           console.warn('[schema] ensureDynamicColumnsForRows llm failed:', err?.message || err);
@@ -5244,20 +5244,20 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         await ensureDynamicColumnsForRows(
           qualified,
           processedRowsInput,
-          getBlueprintAllowedKeys(blueprint),
+            allowedKeys,
         );
       }
       await ensureDynamicColumnsForRows(
         qualified,
         schemaEnsureRows,
-        getBlueprintAllowedKeys(blueprint),
+            allowedKeys,
       );
       // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
       records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
       await ensureDynamicColumnsForRows(
         qualified,
         records,
-        getBlueprintAllowedKeys(blueprint),
+            allowedKeys,
       );
       try {
         persistResult = await saveExtractedSpecs({

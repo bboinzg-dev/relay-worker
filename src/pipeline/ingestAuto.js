@@ -2992,6 +2992,9 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
 
   let blueprint = await getBlueprint(family);
 
+    const getBlueprintAllowedKeys = () =>
+    (Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : []);
+
   if (!vertexExtractValues && family) {
     try {
       vertexExtractValues = await extractValuesByGcs(gcsUri, family);
@@ -3001,9 +3004,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
 
   // 블루프린트 허용 키
-  let allowedKeys = Array.isArray(blueprint?.allowedKeys)
-    ? [...blueprint.allowedKeys]
-    : [];
+  let allowedKeys = getBlueprintAllowedKeys().slice();
   if ((!allowedKeys || !allowedKeys.length) && blueprint?.fields && typeof blueprint.fields === 'object') {
     allowedKeys = Object.keys(blueprint.fields);
   }
@@ -3774,9 +3775,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           orderingLegendRecipe = recipe || orderingLegendRecipe;
           const variantDomains = normalizeVariantDomains(
             recipe?.variant_domains,
-            Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
-              ? blueprint.allowedKeys
-              : allowedKeys,
+            getBlueprintAllowedKeys(),
           );
           if (Object.keys(variantDomains).length) {
             orderingDomains = variantDomains;
@@ -3802,7 +3801,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           rawText: detectionInput,
           family,
           blueprintVariantKeys: blueprint?.variant_keys,
-          allowedKeys: Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [],
+          allowedKeys: getBlueprintAllowedKeys(),
         });
       } catch (err) {
         console.warn('[variant] runtime detect failed:', err?.message || err);
@@ -3996,9 +3995,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-  const allowedForDomains = Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
-    ? blueprint.allowedKeys
-    : allowedKeys;
+  const allowedForDomains = getBlueprintAllowedKeys();
   let legendVariantDomains = normalizeVariantDomains(orderingDomains, allowedForDomains);
   const orderingTextForRecipe = Array.isArray(orderingTextSources)
     ? orderingTextSources
@@ -4390,9 +4387,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       await ensureDynamicColumnsForRows(
         qualified,
         explodedRows,
-        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
-          ? blueprint.allowedKeys
-          : allowedKeys,
+        getBlueprintAllowedKeys(),
       );
     } catch (err) {
       console.warn('[schema] ensureDynamicColumnsForRows explodedRows failed:', err?.message || err);
@@ -4432,9 +4427,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           await ensureDynamicColumnsForRows(
             qualified,
             explodedRows,
-            Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
-              ? blueprint.allowedKeys
-              : allowedKeys,
+            getBlueprintAllowedKeys(),
           );
         } catch (err) {
           console.warn('[schema] ensureDynamicColumnsForRows llm failed:', err?.message || err);
@@ -5246,26 +5239,20 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         await ensureDynamicColumnsForRows(
           qualified,
           processedRowsInput,
-          Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
-            ? blueprint.allowedKeys
-            : allowedKeys,
+          getBlueprintAllowedKeys(),
         );
       }
       await ensureDynamicColumnsForRows(
         qualified,
         schemaEnsureRows,
-        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
-          ? blueprint.allowedKeys
-          : allowedKeys,
+        getBlueprintAllowedKeys(),
       );
       // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
       records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
       await ensureDynamicColumnsForRows(
         qualified,
         records,
-        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
-          ? blueprint.allowedKeys
-          : allowedKeys,
+        getBlueprintAllowedKeys(),
       );
       try {
         persistResult = await saveExtractedSpecs({

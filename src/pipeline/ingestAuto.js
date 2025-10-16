@@ -189,12 +189,21 @@ function getBlueprintAllowedKeys(blueprint) {
 // 통일된 안전 래퍼: (런타임키 ∩ 허용키)만 DB 함수로 보낸다
 async function addColumnsSafe(family, keys, blueprint) {
   const allow = new Set(
-    getBlueprintAllowedKeys(blueprint)
+    (blueprint?.fields && typeof blueprint.fields === 'object'
+      ? Object.keys(blueprint.fields)
+      : getBlueprintAllowedKeys(blueprint)
+    )
       .map((k) => String(k || '').trim().toLowerCase())
       .filter(Boolean),
   );
+
+  const isNoisy = (keyLower) =>
+    /_(code|text|value)$/.test(keyLower) && !allow.has(keyLower);
+
   const uniq = Array.from(new Set((keys || []).map((k) => String(k || '').trim())));
-  const toCreate = uniq.filter((k) => k && allow.has(k.toLowerCase()));
+  const toCreate = uniq
+    .filter((k) => k && allow.has(k.toLowerCase()))
+    .filter((k) => !isNoisy(k.toLowerCase()));
   if (!toCreate.length) return;
   try {
     const { rows } = await db.query(

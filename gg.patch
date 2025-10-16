@@ -1,18 +1,8 @@
 diff --git a/src/services/vertex.js b/src/services/vertex.js
-index 80a7a1d8a495b0f7f1975b04c3f16b2df98c2273..40c2f36a5d7b8efa027a27c26a9374eadb55869d 100644
+index 40c2f36a5d7b8efa027a27c26a9374eadb55869d..565cd249dfc8b6fb2a5658171546c2c486eccb4a 100644
 --- a/src/services/vertex.js
 +++ b/src/services/vertex.js
-@@ -74,92 +74,103 @@ function safeParseJson(text) {
-     return JSON.parse(stripped);
-   } catch (_) {}
- 
-   let depth = 0;
-   let start = -1;
-   for (let i = 0; i < stripped.length; i += 1) {
-     const ch = stripped[i];
-     if (ch === '{') {
-       if (depth === 0) start = i;
-       depth += 1;
+@@ -84,51 +84,57 @@ function safeParseJson(text) {
      } else if (ch === '}') {
        depth -= 1;
        if (depth === 0 && start >= 0) {
@@ -28,19 +18,26 @@ index 80a7a1d8a495b0f7f1975b04c3f16b2df98c2273..40c2f36a5d7b8efa027a27c26a9374ea
    return null;
  }
  
-+function extractCandidateJson(response) {
-+  const parts = Array.isArray(response?.response?.candidates?.[0]?.content?.parts)
-+    ? response.response.candidates[0].content.parts
-+    : [];
-+  const text = parts
-+    .map((part) => (typeof part?.text === 'string' ? part.text : ''))
-+    .join('');
-+  if (!text || !text.trim()) {
-+    return { text: '', data: null };
+ function extractCandidateJson(response) {
+   const parts = Array.isArray(response?.response?.candidates?.[0]?.content?.parts)
+     ? response.response.candidates[0].content.parts
+     : [];
+   const text = parts
+     .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+     .join('');
+   if (!text || !text.trim()) {
+     return { text: '', data: null };
+   }
+-  return { text, data: safeParseJson(text) };
++  const data = safeParseJson(text);
++  if (!data) {
++    const err = new Error('VERTEX_NOT_JSON');
++    err.sample = text.slice(0, 500);
++    throw err;
 +  }
-+  return { text, data: safeParseJson(text) };
-+}
-+
++  return { text, data };
+ }
+ 
  async function classifyByGcs(gcsUri, filename = 'datasheet.pdf') {
    const fams = await getFamilies();
    const prompt = [
@@ -60,56 +57,7 @@ index 80a7a1d8a495b0f7f1975b04c3f16b2df98c2273..40c2f36a5d7b8efa027a27c26a9374ea
      ],
      generationConfig: { responseMimeType: 'application/json' },
    });
--  const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
--  const text = parts.map((p) => p.text || '').join('');
-+  const { text, data } = extractCandidateJson(resp);
+   const { text, data } = extractCandidateJson(resp);
    if (!text) return {};
--  const parsed = safeParseJson(text);
-+  const parsed = data;
+   const parsed = data;
    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-     return parsed;
-   }
-   if (text) {
-     console.warn('[vertex] classify parse failed: invalid JSON payload');
-   }
-   return {};
- }
- 
- async function extractValuesByGcs(gcsUri, family) {
-   const fields = await getFields(family);
-   const prompt = [
-     `다음 PDF에서 ${family} 부품의 스펙을 추출합니다.`,
-     '아래 DB 컬럼만 채우고 없으면 null.',
-     '반드시 {"values":{ "<컬럼명>": 값 }} 만 출력.',
-     `columns: ${JSON.stringify(fields)}`,
-   ].join('\n');
-   const resp = await callGemini({
-     modelName: MODEL_EXTRACT,
-     contents: [
-       {
-         role: 'user',
-         parts: [
-           { text: prompt },
-           { fileData: { fileUri: gcsUri, mimeType: 'application/pdf' } },
-         ],
-       },
-     ],
-     generationConfig: { responseMimeType: 'application/json' },
-   });
--  const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
--  const raw = parts.map((p) => p.text || '').join('');
-+  const { text: raw, data } = extractCandidateJson(resp);
-   if (!raw) return {};
--  const parsed = safeParseJson(raw);
-+  const parsed = data;
-   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-     return parsed.values || {};
-   }
-   if (raw) {
-     console.warn('[vertex] extract parse failed: invalid JSON payload');
-   }
-   return {};
- }
- 
- module.exports = { classifyByGcs, extractValuesByGcs, safeParseJson };
-\ No newline at end of file

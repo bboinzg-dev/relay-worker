@@ -1308,6 +1308,14 @@ const SPEC_KEY_ALIAS_MAP = new Map([
   ['contactform', 'contact_arrangement'],
 ]);
 
+SPEC_KEY_ALIAS_MAP.set('coil_voltage', 'coil_voltage_vdc');
+SPEC_KEY_ALIAS_MAP.set('nominal_coil_voltage', 'coil_voltage_vdc');
+SPEC_KEY_ALIAS_MAP.set('rated_coil_voltage', 'coil_voltage_vdc');
+SPEC_KEY_ALIAS_MAP.set('coil_voltage_text', 'coil_voltage_vdc');
+SPEC_KEY_ALIAS_MAP.set('mounting_type', 'mount_type');
+SPEC_KEY_ALIAS_MAP.set('terminal_form', 'terminal_type');
+SPEC_KEY_ALIAS_MAP.set('contact_current_code', 'contact_rating_dc_a');
+
 const TERMINAL_SHAPE_TOKENS = new Set([
   'S',
   'SL',

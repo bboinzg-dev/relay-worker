@@ -16,12 +16,15 @@ function getVertex() {
 }
 
 // Vertex는 "role: system" 메시지를 허용하지 않는다 → systemInstruction 사용
-function getModel(systemText, modelId = DEFAULT_MODEL_ID) {
+function getModel(systemText, modelId = DEFAULT_MODEL_ID, generationConfig) {
   const cfg = { model: modelId };
   if (systemText && String(systemText).trim()) {
     cfg.systemInstruction = { parts: [{ text: String(systemText) }] };
   }
-  cfg.generationConfig = { responseMimeType: 'application/json' };
+  const baseGenerationConfig = generationConfig && typeof generationConfig === 'object'
+    ? generationConfig
+    : { responseMimeType: 'application/json' };
+  cfg.generationConfig = baseGenerationConfig;
   return getVertex().getGenerativeModel(cfg);
 }
 
@@ -52,15 +55,15 @@ function safeParseJson(text) {
 }
 
 async function callModelJson(systemText, userText, { modelId, maxOutputTokens = 4096, temperature = 0.2, topP = 0.8 } = {}) {
-  const model = getModel(systemText, modelId);
+  const generationConfig = {
+    temperature,
+    topP,
+    maxOutputTokens,
+    responseMimeType: 'application/json',
+  };
+  const model = getModel(systemText, modelId, generationConfig);
   const req = {
     contents: [{ role: 'user', parts: [{ text: String(userText || '') }]}],
-    generationConfig: {
-      responseMimeType: 'application/json',
-      temperature,
-      topP,
-      maxOutputTokens,
-    },
   };
   const resp = await model.generateContent(req);
   const txt = resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text || '';

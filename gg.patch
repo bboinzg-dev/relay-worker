@@ -1,115 +1,35 @@
 diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
-index 45728cb26a7b9990882ebb47e0c834ede517b076..70cf53857fd26631b8de7a982e1b8d04a9529fe7 100644
+index 9f1ad8bfcdd4d8a01b3a1a9cd0ea6fec1d7cdfc8..96eac57735b06e95050483e2dd4676656b96d635 100644
 --- a/src/pipeline/ingestAuto.js
 +++ b/src/pipeline/ingestAuto.js
-@@ -172,51 +172,51 @@ const DOC_TABLE_ORDERING_HINT_RE =
-   /(ordering|order\s*info|order\s*code|types?\b|type\s*(?:no\.?|number)|selection|品番|型式|型番|형명)/i;
- const DOC_TABLE_HEADER_FOOTER_RE = /(header|footer|page\s*\d+)/i;
- const PN_CANON_KEY_RE = /(^|_)(part|pn|code|model|type)(_|$)/;
- const PN_HEADER_LABEL_RE = /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|catalog\s*(?:no\.?|number)|model|品番|型式|형名|型番)/i;
- const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().#]{3,63}[0-9A-Z)#]/gi;
- const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
- const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
- 
- function getBlueprintAllowedKeys(blueprint) {
-   const direct = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
-   if (direct.length) {
-     return Array.from(
-       new Set(
-         direct
-           .map((k) => String(k || '').trim())
-           .filter(Boolean)
-       )
-     );
-   }
-   if (blueprint?.fields && typeof blueprint.fields === 'object') {
-     return Object.keys(blueprint.fields);
-   }
-   return [];
- }
- 
--  function gatherRuntimeSpecKeys(rows) {
-+function gatherRuntimeSpecKeys(rows) {
-   const set = new Set();
-   const list = Array.isArray(rows) ? rows : [];
-   for (const row of list) {
-     if (!row || typeof row !== 'object') continue;
-     for (const rawKey of Object.keys(row)) {
-       const trimmed = String(rawKey || '').trim();
-       if (!trimmed) continue;
-       const lower = trimmed.toLowerCase();
-       if (META_KEYS.has(lower) || BASE_KEYS.has(lower)) continue;
-       set.add(trimmed);
+@@ -3759,51 +3759,51 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+     if (!orderingDomains) {
+       orderingOverride = buildTyOrderingFallback({
+         baseSeries,
+         orderingInfo: extracted?.ordering_info,
+         previewText,
+         docAiText,
+       });
+       if (orderingOverride) orderingDomains = orderingOverride.domains;
      }
-   }
-   return set;
- }
- 
- async function ensureDynamicColumnsForRows(qualifiedTable, rows, allowedKeys = []) {
-   if (!AUTO_ADD_FIELDS || !AUTO_ADD_FIELDS_LIMIT) return;
-   let keys = Array.from(gatherRuntimeSpecKeys(rows));
-   if (Array.isArray(allowedKeys) && allowedKeys.length) {
-     const allow = new Set(
-       allowedKeys
-         .map((s) => String(s || '').trim().toLowerCase())
-         .filter(Boolean),
-     );
-     if (allow.size) {
-@@ -2997,51 +2997,52 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
- 
-   if (!family) family = 'relay_power';
- 
-   const overrideBrandLog = overridesBrand ?? brand ?? '';
-   console.log(`[PATH] overrides.brand=${overrideBrandLog || ''} family=${family} runId=${runId || ''}`);
- 
- // 목적 테이블
-   const reg = await db.query(
-     `SELECT specs_table FROM public.component_registry WHERE family_slug=$1 LIMIT 1`,
-     [family]
-   );
-   const table = reg.rows[0]?.specs_table || 'relay_power_specs';
-   const qualified = table.startsWith('public.')? table : `public.${table}`;
- 
-   let blueprint = await getBlueprint(family);
- 
-   if (!vertexExtractValues && family) {
-     try {
-       vertexExtractValues = await extractValuesByGcs(gcsUri, family);
-     } catch (err) {
-       console.warn('[vertex] extract failed:', err?.message || err);
-     }
-   }
- 
-   // 블루프린트 허용 키
--  let allowedKeys = getBlueprintAllowedKeys(blueprint).slice();
-+  const allowedForDomains = getBlueprintAllowedKeys(blueprint);
-+  let allowedKeys = allowedForDomains.slice();
- 
-   let variantKeys = [];
-   if (USE_VARIANT_KEYS) {
-     variantKeys = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-       ? blueprint.ingestOptions.variant_keys
-       : (Array.isArray(blueprint?.variant_keys) ? blueprint.variant_keys : []);
-     variantKeys = Array.from(
-       new Set(
-         variantKeys
-           .map((k) => String(k || '').trim().toLowerCase())
-           .filter(Boolean),
-       ),
-     );
-   }
- 
-   let pnTemplate = USE_PN_TEMPLATE
-     ? (blueprint?.ingestOptions?.pn_template || blueprint?.ingestOptions?.pnTemplate || null)
-     : null;
-   const requiredFields = [];
-   if (blueprint?.fields && typeof blueprint.fields === 'object') {
-     for (const [fieldKey, meta] of Object.entries(blueprint.fields)) {
-       const isRequired = meta && typeof meta === 'object' && Boolean(meta.required);
-       if (!isRequired) continue;
-       const normalized = String(fieldKey || '')
-         .trim()
-@@ -3784,51 +3785,51 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+     if (!orderingDomains) {
+       const orderingWindowText = typeof extracted?.ordering_info?.text === 'string'
+         ? extracted.ordering_info.text
+         : '';
+       const orderingHaystack = [orderingWindowText, previewText, docAiText]
+         .filter((chunk) => typeof chunk === 'string' && chunk.trim())
+         .join('\n');
+       if (orderingWindowText.trim() || (orderingHaystack && ORDERING_SECTION_RE.test(orderingHaystack))) {
+         try {
+           const recipeInput = orderingWindowText.trim().length >= 40
+             ? orderingWindowText
+             : (gcsUri || orderingWindowText);
+           const recipe = await extractOrderingRecipe(recipeInput);
+           orderingLegendRecipe = recipe || orderingLegendRecipe;
+           const variantDomains = normalizeVariantDomains(
+             recipe?.variant_domains,
+-            getBlueprintAllowedKeys(blueprint),
++            allowedForDomains,
            );
            if (Object.keys(variantDomains).length) {
              orderingDomains = variantDomains;
@@ -135,179 +55,6 @@ index 45728cb26a7b9990882ebb47e0c834ede517b076..70cf53857fd26631b8de7a982e1b8d04
            rawText: detectionInput,
            family,
            blueprintVariantKeys: blueprint?.variant_keys,
--          allowedKeys: getBlueprintAllowedKeys(blueprint),
-+          allowedKeys: allowedForDomains,
-         });
-       } catch (err) {
-         console.warn('[variant] runtime detect failed:', err?.message || err);
-       }
-     }
-     runtimeVariantKeys = mergeVariantKeyLists(
-       VARIANT_MAX_CARDINALITY,
-       Array.isArray(aiVariantKeys) ? aiVariantKeys : [],
-       orderingDomainKeys,
-       blueprintVariantKeys,
-     );
-   } else {
-     runtimeVariantKeys = [];
-   }
- 
-   console.log('[PATH] brand resolved', {
-     runId,
-     family,
-     hint: brandHintSeed || null,
-     effective: brandEffectiveResolved,
-     source: brandSource,
-     vkeys_runtime: runtimeVariantKeys,
-   });
- 
-   if (orderingDomains) {
-@@ -3978,51 +3979,50 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
-         if (appendedRows.length) {
-           if (!Array.isArray(extracted.rows) || !extracted.rows.length) {
-             extracted.rows = rawRows;
-           }
-           const lowerOrderingKeys = orderingKeys
-             .map((k) => String(k).trim().toLowerCase())
-             .filter(Boolean);
-           const allowedLower = new Set(
-             (allowedKeys || []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean)
-           );
-           for (const key of lowerOrderingKeys) {
-             if (!variantKeys.includes(key)) variantKeys.push(key);
-             if (!allowedLower.has(key)) {
-               allowedKeys.push(key);
-               allowedLower.add(key);
-             }
-             if (Array.isArray(runtimeVariantKeys) && !runtimeVariantKeys.includes(key)) {
-               runtimeVariantKeys.push(key);
-             }
-           }
-         }
-       }
-     }
-   }
- 
--  const allowedForDomains = getBlueprintAllowedKeys(blueprint);
-   let legendVariantDomains = normalizeVariantDomains(orderingDomains, allowedForDomains);
-   const orderingTextForRecipe = Array.isArray(orderingTextSources)
-     ? orderingTextSources
-         .map((txt) => (typeof txt === 'string' ? txt : String(txt ?? '')))
-         .map((txt) => txt.trim())
-         .filter(Boolean)
-         .join('\n')
-     : '';
-   if (orderingTextForRecipe) {
-     try {
-       const recipe = await extractOrderingRecipe(orderingTextForRecipe);
-       if (recipe) orderingLegendRecipe = recipe;
-     } catch (err) {
-       console.warn('[ordering] legend recipe extract failed:', err?.message || err);
-     }
-   }
-   if (orderingLegendRecipe && orderingLegendRecipe.variant_domains) {
-     const recipeDomains = normalizeVariantDomains(
-       orderingLegendRecipe.variant_domains,
-       allowedForDomains,
-     );
-     if (Object.keys(recipeDomains).length) {
-       if (!legendVariantDomains || !Object.keys(legendVariantDomains).length) {
-         legendVariantDomains = { ...recipeDomains };
-       } else {
-@@ -4370,91 +4370,91 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
-       const usedRecords = new Set();
-       const canonicalRefs = new Set(canonRecs);
-       for (const row of explodedRows) {
-         if (!row || typeof row !== 'object') continue;
-         let match = null;
-         if (canonRecs.length) {
-           match =
-             bestRowMatchToSpec(row, canonRecs, usedRecords, { tokenStats: docAiTokenStats }) ||
-             bestAttributeMatchToSpec(row, canonRecs, variantKeys);
-         }
-         if (!match && String(family || '').toLowerCase() === 'relay_signal') {
-           match = findCoilRowMatchForRelaySignal(row, flatRecs);
-         }
-         if (match && match.values) {
-           Object.assign(row, safeMergeSpec(row, match.values));
-           if (canonicalRefs.has(match)) {
-             usedRecords.add(match);
-           }
-         }
-       }
-     }
-     try {
-       await ensureDynamicColumnsForRows(
-         qualified,
-         explodedRows,
--        getBlueprintAllowedKeys(blueprint),
-+        allowedKeys,
-       );
-     } catch (err) {
-       console.warn('[schema] ensureDynamicColumnsForRows explodedRows failed:', err?.message || err);
-     }
-   }
-   if (
-     Array.isArray(explodedRows) &&
-     explodedRows.length &&
-     blueprint?.fields &&
-     Object.keys(blueprint.fields).length
-   ) {
-     const docTextForLlm = String(docAiText || previewText || '').slice(0, 60000);
-     if (docTextForLlm) {
-       const llmTargets = explodedRows
-         .map((row, index) => ({ row, index }))
-         .filter(({ row }) => !hasCoreSpec(row))
-         .slice(0, 3);
-       for (const target of llmTargets) {
-         try {
-           const llmValues = await extractFields(
-             docTextForLlm,
-             target.row?.pn || target.row?.code || '',
-             blueprint.fields,
-           );
-           if (llmValues && typeof llmValues === 'object') {
-             const patch = safeMergeSpec(target.row, llmValues);
-             if (patch && Object.keys(patch).length) {
-               Object.assign(target.row, patch);
-             }
-           }
-         } catch (err) {
-           console.warn('[llm] extractFields backfill failed:', err?.message || err);
-         }
-       }
-       if (llmTargets.length) {
-         try {
-           await ensureDynamicColumnsForRows(
-             qualified,
-             explodedRows,
--            getBlueprintAllowedKeys(blueprint),
-+            allowedKeys,
-           );
-         } catch (err) {
-           console.warn('[schema] ensureDynamicColumnsForRows llm failed:', err?.message || err);
-         }
-       }
-     }
-   }
-   if (docPnCandidatesInfo?.map instanceof Map && docPnCandidatesInfo.map.size && explodedRows.length) {
-     const variantKeyUnion = Array.from(
-       new Set([
-         ...(Array.isArray(variantKeys) ? variantKeys : []),
-         ...(Array.isArray(runtimeVariantKeys) ? runtimeVariantKeys : []),
-       ])
-     );
-     for (const row of explodedRows) {
-       if (!row || typeof row !== 'object') continue;
-       const hints = [row.pn, row.code, row.part_number, row.part_no, row.code_norm, code]
-         .map((value) => (value == null ? null : String(value)))
-         .filter((value) => value && value.trim());
-       const bestPn = pickOrderingPreferredPn(row, {
-         candidateInfo: docPnCandidatesInfo,
-         hints,
-         variantKeys: variantKeyUnion,
-         seriesHints: [baseSeries, series, row.series, row.series_code],
-         brand: row.brand || brandName,
 @@ -5222,64 +5222,64 @@ async function persistProcessedData(processed = {}, overrides = {}) {
            try {
              const { map } = await aiCanonicalizeKeys(family, unknownKeys, knownList);
@@ -334,14 +81,14 @@ index 45728cb26a7b9990882ebb47e0c834ede517b076..70cf53857fd26631b8de7a982e1b8d04
          await ensureDynamicColumnsForRows(
            qualified,
            processedRowsInput,
--          getBlueprintAllowedKeys(blueprint),
+-            allowedKeys,
 +          allowedKeys,
          );
        }
        await ensureDynamicColumnsForRows(
          qualified,
          schemaEnsureRows,
--        getBlueprintAllowedKeys(blueprint),
+-            allowedKeys,
 +        allowedKeys,
        );
        // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
@@ -349,7 +96,7 @@ index 45728cb26a7b9990882ebb47e0c834ede517b076..70cf53857fd26631b8de7a982e1b8d04
        await ensureDynamicColumnsForRows(
          qualified,
          records,
--        getBlueprintAllowedKeys(blueprint),
+-            allowedKeys,
 +        allowedKeys,
        );
        try {

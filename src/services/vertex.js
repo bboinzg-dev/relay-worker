@@ -108,6 +108,9 @@ function extractCandidateJson(response) {
   }
   const data = safeParseJson(text);
   if (!data) {
+    if (process.env.DEBUG_ORDERING === '1') {
+      console.warn('[vertex:not-json]', text.slice(0, 300));
+    }
     const err = new Error('VERTEX_NOT_JSON');
     err.sample = text.slice(0, 500);
     throw err;

@@ -4567,7 +4567,6 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
   const physicalCols = new Set(colTypes ? [...colTypes.keys()] : []);
-  const allowedSet = new Set((allowedKeys || []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
   const variantSet = new Set(variantKeys);
 
   const seenCodes = new Set();
@@ -4645,7 +4644,11 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       const mapped = aiCanonicalMap.get(key) || aiCanonicalMapLower.get(lower);
       const target = mapped?.canonical || lower;
       if (!target || META_KEYS.has(target) || BASE_KEYS.has(target)) continue;
-      if (physicalCols.has(target) || allowedSet.has(target) || variantSet.has(target)) {
+      if (
+        physicalCols.has(target)
+        || allowedKeySet.has(typeof target === 'string' ? target.toLowerCase() : target)
+        || variantSet.has(target)
+      ) {
         rec[target] = rawValue;
       }
     }

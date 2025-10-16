@@ -49,6 +49,7 @@ const {
   ensureSpecColumnsForKeys,
   getColumnsOf,
 } = require('./ensure-spec-columns');
+const { normalizeVariantDomains } = require('../utils/variant-normalize');
 const { ensureSpecsTable } = tryRequire([
   path.join(__dirname, '../utils/schema'),
   path.join(__dirname, '../../utils/schema'),
@@ -313,28 +314,6 @@ function flattenDocAiTablesForMerge(tables) {
     }
   }
   return records;
-}
-
-function normalizeVariantDomains(domains) {
-  const normalized = {};
-  if (!domains || typeof domains !== 'object') return normalized;
-  for (const [rawKey, rawValue] of Object.entries(domains)) {
-    const key = String(rawKey || '').trim();
-    if (!key) continue;
-    const values = Array.isArray(rawValue) ? rawValue : [rawValue];
-    const seen = new Set();
-    const list = [];
-    for (const candidate of values) {
-      if (candidate == null) continue;
-      const str = String(candidate).trim();
-      const marker = str === '' ? '__EMPTY__' : str.toLowerCase();
-      if (seen.has(marker)) continue;
-      seen.add(marker);
-      list.push(str);
-    }
-    if (list.length) normalized[key] = list;
-  }
-  return normalized;
 }
 
 async function canonicalizeDocAiRecords(family, allowedKeys, records) {
@@ -1126,6 +1105,7 @@ async function expandRowsWithVariants(baseRows, options = {}) {
   const pnTemplate = typeof options.pnTemplate === 'string' ? options.pnTemplate : null;
   const defaultBrand = typeof options.defaultBrand === 'string' ? options.defaultBrand : null;
   const defaultSeries = options.defaultSeries ?? null;
+  const recipeAllowedKeys = Array.isArray(options.allowedKeys) ? options.allowedKeys : [];
 
   const orderingChunks = [];
   for (const row of rows) {
@@ -1151,7 +1131,7 @@ async function expandRowsWithVariants(baseRows, options = {}) {
     try {
       const orderingText = orderingChunks.join('\n');
       const { variant_domains, pn_template } = await extractOrderingRecipe(orderingText);
-      recipeDomains = normalizeVariantDomains(variant_domains);
+      recipeDomains = normalizeVariantDomains(variant_domains, recipeAllowedKeys);
       recipePnTemplate = typeof pn_template === 'string' && pn_template.trim() ? pn_template.trim() : null;
     } catch (err) {
       console.warn('[variant] ordering recipe expand failed:', err?.message || err);
@@ -3792,7 +3772,12 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
             : (gcsUri || orderingWindowText);
           const recipe = await extractOrderingRecipe(recipeInput);
           orderingLegendRecipe = recipe || orderingLegendRecipe;
-          const variantDomains = normalizeVariantDomains(recipe?.variant_domains);
+          const variantDomains = normalizeVariantDomains(
+            recipe?.variant_domains,
+            Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+              ? blueprint.allowedKeys
+              : allowedKeys,
+          );
           if (Object.keys(variantDomains).length) {
             orderingDomains = variantDomains;
             if (!pnTemplate && typeof recipe?.pn_template === 'string' && recipe.pn_template.trim()) {
@@ -3817,7 +3802,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
           rawText: detectionInput,
           family,
           blueprintVariantKeys: blueprint?.variant_keys,
-          allowedKeys,
+          allowedKeys: Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [],
         });
       } catch (err) {
         console.warn('[variant] runtime detect failed:', err?.message || err);
@@ -4011,7 +3996,10 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-    let legendVariantDomains = normalizeVariantDomains(orderingDomains);
+  const allowedForDomains = Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+    ? blueprint.allowedKeys
+    : allowedKeys;
+  let legendVariantDomains = normalizeVariantDomains(orderingDomains, allowedForDomains);
   const orderingTextForRecipe = Array.isArray(orderingTextSources)
     ? orderingTextSources
         .map((txt) => (typeof txt === 'string' ? txt : String(txt ?? '')))
@@ -4028,7 +4016,10 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
   if (orderingLegendRecipe && orderingLegendRecipe.variant_domains) {
-    const recipeDomains = normalizeVariantDomains(orderingLegendRecipe.variant_domains);
+    const recipeDomains = normalizeVariantDomains(
+      orderingLegendRecipe.variant_domains,
+      allowedForDomains,
+    );
     if (Object.keys(recipeDomains).length) {
       if (!legendVariantDomains || !Object.keys(legendVariantDomains).length) {
         legendVariantDomains = { ...recipeDomains };
@@ -4340,6 +4331,9 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
         pnTemplate,
         defaultBrand: brandName,
         defaultSeries: baseSeries,
+        allowedKeys: Array.isArray(blueprint?.allowedKeys)
+          ? blueprint.allowedKeys
+          : allowedKeys,
       });
       if (expanded && typeof expanded === 'object') {
         const { rows: expandedRows, variantKeys: expandedVariantKeys, pnTemplate: expandedTemplate } = expanded;
@@ -4393,7 +4387,13 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
     }
     try {
-      await ensureDynamicColumnsForRows(qualified, explodedRows, allowedKeys);
+      await ensureDynamicColumnsForRows(
+        qualified,
+        explodedRows,
+        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+          ? blueprint.allowedKeys
+          : allowedKeys,
+      );
     } catch (err) {
       console.warn('[schema] ensureDynamicColumnsForRows explodedRows failed:', err?.message || err);
     }
@@ -4429,7 +4429,13 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
       if (llmTargets.length) {
         try {
-          await ensureDynamicColumnsForRows(qualified, explodedRows, allowedKeys);
+          await ensureDynamicColumnsForRows(
+            qualified,
+            explodedRows,
+            Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+              ? blueprint.allowedKeys
+              : allowedKeys,
+          );
         } catch (err) {
           console.warn('[schema] ensureDynamicColumnsForRows llm failed:', err?.message || err);
         }
@@ -5237,12 +5243,30 @@ async function persistProcessedData(processed = {}, overrides = {}) {
       }
 
       if (Array.isArray(processedRowsInput) && processedRowsInput.length) {
-        await ensureDynamicColumnsForRows(qualified, processedRowsInput, allowedKeys);
+        await ensureDynamicColumnsForRows(
+          qualified,
+          processedRowsInput,
+          Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+            ? blueprint.allowedKeys
+            : allowedKeys,
+        );
       }
-      await ensureDynamicColumnsForRows(qualified, schemaEnsureRows, allowedKeys);
+      await ensureDynamicColumnsForRows(
+        qualified,
+        schemaEnsureRows,
+        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+          ? blueprint.allowedKeys
+          : allowedKeys,
+      );
       // 폭발/병합이 끝났다면 이걸 저장 대상으로 사용
       records = Array.isArray(explodedRows) && explodedRows.length ? explodedRows : records;
-      await ensureDynamicColumnsForRows(qualified, records, allowedKeys);
+      await ensureDynamicColumnsForRows(
+        qualified,
+        records,
+        Array.isArray(blueprint?.allowedKeys) && blueprint.allowedKeys.length
+          ? blueprint.allowedKeys
+          : allowedKeys,
+      );
       try {
         persistResult = await saveExtractedSpecs({
           qualifiedTable: qualified,

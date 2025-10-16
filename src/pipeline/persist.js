@@ -76,6 +76,16 @@ function codeForRelaySignal(spec) {
     .replace(/--+/g, '-');
 }
 
+function looksLikeGarbageCode(value) {
+  const text = String(value ?? '');
+  if (!text) return false;
+  return (
+    /^[a-f0-9]{20,}_\d{10,}/i.test(text)
+    || /(^|_)(mech|doc|pdf)[-_]/i.test(text)
+    || /pdf:|\.pdf$/i.test(text)
+  );
+}
+
 const META_KEYS = new Set([
   'family_slug',
   'brand',
@@ -1436,6 +1446,14 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       buildPnIfMissing(rec, pnTemplate);
 
       buildBestIdentifiers(familySlug, rec, blueprintMeta);
+      if (!rec.verified_in_doc) {
+        if (rec.code && looksLikeGarbageCode(rec.code)) {
+          rec.code = null;
+        }
+        if (rec.pn && looksLikeGarbageCode(rec.pn)) {
+          rec.pn = null;
+        }
+      }
       if (!STRICT_CODE_RULES && rec._warn_invalid_code) {
         console.warn(
           '[WARN] invalid_code (soft) family=%s pn=%s code=%s',

@@ -1,192 +1,71 @@
-diff --git a/src/utils/mpn-exploder.js b/src/utils/mpn-exploder.js
-index cecdff3cbdd1dc1068a4e12d982c00394480182c..7ddc0390898dd5f3e7e1253e86c4214c576dae42 100644
---- a/src/utils/mpn-exploder.js
-+++ b/src/utils/mpn-exploder.js
-@@ -1,27 +1,36 @@
- 'use strict';
- 
-+const rawPerKeyLimit = Number(process.env.VARIANT_DOMAIN_MAX_PER_KEY);
-+const PER_KEY_DOMAIN_MAX = Number.isFinite(rawPerKeyLimit) && rawPerKeyLimit > 0
-+  ? Math.floor(rawPerKeyLimit)
-+  : 8;
-+const rawMaxCombos = Number(process.env.VARIANT_COMBOS_MAX);
-+const MAX_COMBOS = Number.isFinite(rawMaxCombos) && rawMaxCombos > 0
-+  ? Math.floor(rawMaxCombos)
-+  : 5000;
+diff --git a/src/utils/variant-normalize.js b/src/utils/variant-normalize.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5500b597ec32e7da448ffc602f821a48020db28
+--- /dev/null
++++ b/src/utils/variant-normalize.js
+@@ -0,0 +1,65 @@
++// @ts-check
++'use strict';
 +
- const LIST_SEP = /[\s,;/|·•]+/;
- const VOLTAGE_UNIT_RE = /\d\s*(?:V|VAC|VDC)\b/i;
- // 패턴리스 정규화기: 1A/1B/1C/2A/2B/2C/1A1B/2AB 등 조합 처리
- function normalizeContactForm(value) {
-   if (value == null) return null;
-   const raw = Array.isArray(value) ? value[0] : value;
-   if (raw == null) return null;
-   let s = String(raw).normalize('NFKC').toLowerCase();
-   if (!s.trim()) return null;
-   s = s.replace(/[\s\-_/]/g, '');
-   // 동의어 치환
-   s = s
-     .replace(/spstnc/g, '1b')
-     .replace(/spst(no)?/g, '1a')
-     .replace(/dpst(no)?/g, '2a')
-     .replace(/spdt/g, '1c')
-     .replace(/dpdt/g, '2c')
-     .replace(/form/g, '');
-   // (\d+)?[abc]+ 블록들을 누적 카운트
-   let a = 0;
-   let b = 0;
-   let c = 0;
-   const re = /(\d+)?([abc]+)/g;
-   let m;
-   while ((m = re.exec(s)) !== null) {
-@@ -131,54 +140,64 @@ function splitAndCarryPrefix(raw) {
- 
-   const seen = new Set();
-   const deduped = [];
-   for (const token of out) {
-     const norm = token.toLowerCase();
-     if (seen.has(norm)) continue;
-     seen.add(norm);
-     deduped.push(token);
-   }
-   return deduped;
- }
- 
- function normalizeList(value) {
-   if (value == null) return [];
-   if (Array.isArray(value)) return value.flatMap(normalizeList);
-   if (typeof value === 'string') {
-     return value
-       .split(LIST_SEP)
-       .map((s) => s.trim())
-       .filter(Boolean);
-   }
-   return [value];
- }
- 
- function cartesian(lists) {
--  return lists.reduce(
--    (acc, list) => acc.flatMap((a) => list.map((b) => a.concat([b]))),
--    [[]]
--  );
-+  const limit = Number.isFinite(MAX_COMBOS) && MAX_COMBOS > 0 ? MAX_COMBOS : Infinity;
-+  let out = [[]];
-+  for (const list of lists) {
-+    const next = [];
-+    for (const a of out) {
-+      for (const b of list) {
-+        if (next.length >= limit) return next;
-+        next.push(a.concat([b]));
-+      }
-+    }
-+    out = next;
-+    if (!out.length) break;
++const CANON = {
++  coil_voltage: 'coil_voltage_vdc',
++  rated_coil_voltage: 'coil_voltage_vdc',
++  rated_coil_voltage_dc: 'coil_voltage_vdc',
++  coil_voltage_value: 'coil_voltage_vdc',
++  coil_voltage_code: 'coil_voltage_vdc',
++  terminal_shape: 'mount_type',
++  contact_current_code: 'contact_rating_dc_a',
++  construction: 'package',
++  poles: 'contact_form',
++};
++
++/**
++ * @param {Record<string, unknown>} [domains]
++ * @param {string[]} [allowedKeys]
++ */
++function normalizeVariantDomains(domains = {}, allowedKeys = []) {
++  const allow = new Set(
++    (Array.isArray(allowedKeys) ? allowedKeys : [])
++      .map((s) => String(s).toLowerCase())
++      .filter(Boolean),
++  );
++  const out = {};
++  for (const [rawKey, rawValue] of Object.entries(domains || {})) {
++    const key = String(rawKey || '').trim();
++    if (!key) continue;
++    const lower = key.toLowerCase();
++    const base = CANON[lower] || (lower.includes('coil_voltage') ? 'coil_voltage_vdc' : lower);
++    if (allow.size && !allow.has(base)) continue;
++    const values = Array.isArray(rawValue) ? rawValue.slice() : [rawValue];
++    out[base] = values;
++  }
++  if (out.coil_voltage_vdc) {
++    out.coil_voltage_vdc = out.coil_voltage_vdc.map(decodeCoilVoltageVdcKeepBoth);
 +  }
 +  return out;
- }
- 
- function __applyOps(val, ops = []) {
-   const first = Array.isArray(val) ? val[0] : val;
-   let s = first == null ? '' : String(first);
-   for (const rawOp of ops) {
-     if (!rawOp) continue;
-     const opToken = rawOp.includes('=') ? rawOp.replace('=', ':') : rawOp;
-     const op = opToken.trim();
-     if (!op) continue;
-     const lower = op.toLowerCase();
-     if (lower === 'upper') {
-       s = s.toUpperCase();
-       continue;
-     }
-     if (lower === 'lower') {
-       s = s.toLowerCase();
-       continue;
-     }
-     if (lower === 'first') {
-       s = s.split(',')[0].trim();
-       continue;
-     }
-     if (lower === 'alnum') {
-       s = s.replace(/[^0-9A-Z]/gi, '');
-@@ -303,76 +322,78 @@ function collectMpnSeeds(base) {
-   };
- 
-   push(base?.mpn);
-   if (base?.code) push(base.code);
- 
-   const extraKeys = ['mpn', 'part_number', 'part_no', 'code'];
-   const values = base && typeof base.values === 'object' ? base.values : {};
-   for (const key of extraKeys) push(values[key]);
-   return seeds;
- }
- 
- function explodeToRows(base, options = {}) {
-   const variantKeys = Array.isArray(options.variantKeys)
-     ? options.variantKeys.map((k) => String(k || '').trim()).filter(Boolean)
-     : [];
-   const pnTemplate = options.pnTemplate || null;
-   const haystackInput = options.haystack;
-   const haystack = Array.isArray(haystackInput)
-     ? haystackInput.filter((chunk) => typeof chunk === 'string' && chunk.trim()).join('\n')
-     : typeof haystackInput === 'string'
-       ? haystackInput
-       : '';
-   const textContainsExactFn =
-     typeof options.textContainsExact === 'function' ? options.textContainsExact : defaultTextContainsExact;
-   const previewOnly = Boolean(options.previewOnly);
--  const maxTemplateAttemptsRaw = Number(options.maxTemplateAttempts);
-+  const maxTemplateAttemptsSource =
-+    options.maxTemplateAttempts ?? process.env.MAX_TEMPLATE_ATTEMPTS ?? 200;
-+  const maxTemplateAttemptsRaw = Number(maxTemplateAttemptsSource);
-   const maxTemplateAttempts = Number.isFinite(maxTemplateAttemptsRaw) && maxTemplateAttemptsRaw > 0
-     ? Math.floor(maxTemplateAttemptsRaw)
-     : null;
-   const onTemplateRender = typeof options.onTemplateRender === 'function' ? options.onTemplateRender : null;
- 
-   const values = {};
-   if (base && typeof base.values === 'object') {
-     for (const [rawKey, rawValue] of Object.entries(base.values)) {
-       const key = String(rawKey || '').trim();
-       if (!key) continue;
-       assignValue(values, key, rawValue);
-     }
-   }
-   if (base?.series && values.series == null) assignValue(values, 'series', base.series);
-   if (base?.series_code && values.series_code == null) assignValue(values, 'series_code', base.series_code);
- 
-   const lists = variantKeys.map((key) => {
-     const fromExact = values[key];
-     if (fromExact != null) {
--      const normed = normalizeList(fromExact);
-+      const normed = normalizeList(fromExact).slice(0, PER_KEY_DOMAIN_MAX);
-       return normed.length ? normed : [fromExact];
-     }
-     const lower = key.toLowerCase();
-     if (values[lower] != null) {
--      const normed = normalizeList(values[lower]);
-+      const normed = normalizeList(values[lower]).slice(0, PER_KEY_DOMAIN_MAX);
-       return normed.length ? normed : [values[lower]];
-     }
-     return [null];
-   });
- 
-   const combos = lists.length ? cartesian(lists) : [[]];
-   const mpnCandidates = collectMpnSeeds(base);
- 
-   const rows = [];
-   let templateAttempts = 0;
-   for (let idx = 0; idx < combos.length; idx += 1) {
-     if (maxTemplateAttempts && templateAttempts >= maxTemplateAttempts) break;
-     const combo = combos[idx];
-     const rowValues = { ...values };
-     variantKeys.forEach((key, keyIdx) => {
-       const val = combo[keyIdx];
-       if (val == null || val === '') return;
-       assignValue(rowValues, key, val);
-     });
- 
-     const normalizedSeries = normalizeSeriesCode(
-       rowValues.series_code
-         ?? rowValues.series
-         ?? base?.series_code
-         ?? base?.series
++}
++
++function decodeCoilVoltageVdcKeepBoth(value) {
++  const raw = String(value ?? '').toUpperCase().trim();
++  if (!raw) return raw;
++  const match = raw.match(/^(\d{2,3}|[14]H)$/);
++  if (!match) return raw;
++  const token = match[1];
++  let val = token;
++  if (token === '1H') {
++    val = 1.5;
++  } else if (token === '4H') {
++    val = 4.5;
++  } else if (/^\d{2,3}$/.test(token)) {
++    const num = Number(token);
++    if (Number.isFinite(num)) {
++      val = num >= 100 ? (num % 10 === 0 ? num / 10 : num) : num;
++    }
++  }
++  return { raw, vdc: String(val) };
++}
++
++module.exports = {
++  normalizeVariantDomains,
++  decodeCoilVoltageVdcKeepBoth,
++};

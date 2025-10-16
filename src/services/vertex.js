@@ -106,7 +106,13 @@ function extractCandidateJson(response) {
   if (!text || !text.trim()) {
     return { text: '', data: null };
   }
-  return { text, data: safeParseJson(text) };
+  const data = safeParseJson(text);
+  if (!data) {
+    const err = new Error('VERTEX_NOT_JSON');
+    err.sample = text.slice(0, 500);
+    throw err;
+  }
+  return { text, data };
 }
 
 async function classifyByGcs(gcsUri, filename = 'datasheet.pdf') {

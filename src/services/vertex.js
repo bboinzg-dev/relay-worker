@@ -96,6 +96,19 @@ function safeParseJson(text) {
   return null;
 }
 
+function extractCandidateJson(response) {
+  const parts = Array.isArray(response?.response?.candidates?.[0]?.content?.parts)
+    ? response.response.candidates[0].content.parts
+    : [];
+  const text = parts
+    .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+    .join('');
+  if (!text || !text.trim()) {
+    return { text: '', data: null };
+  }
+  return { text, data: safeParseJson(text) };
+}
+
 async function classifyByGcs(gcsUri, filename = 'datasheet.pdf') {
   const fams = await getFamilies();
   const prompt = [
@@ -115,10 +128,9 @@ async function classifyByGcs(gcsUri, filename = 'datasheet.pdf') {
     ],
     generationConfig: { responseMimeType: 'application/json' },
   });
-  const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
-  const text = parts.map((p) => p.text || '').join('');
+  const { text, data } = extractCandidateJson(resp);
   if (!text) return {};
-  const parsed = safeParseJson(text);
+  const parsed = data;
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
     return parsed;
   }
@@ -149,10 +161,9 @@ async function extractValuesByGcs(gcsUri, family) {
     ],
     generationConfig: { responseMimeType: 'application/json' },
   });
-  const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
-  const raw = parts.map((p) => p.text || '').join('');
+  const { text: raw, data } = extractCandidateJson(resp);
   if (!raw) return {};
-  const parsed = safeParseJson(raw);
+  const parsed = data;
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
     return parsed.values || {};
   }

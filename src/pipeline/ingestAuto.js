@@ -186,6 +186,30 @@ function getBlueprintAllowedKeys(blueprint) {
   return [];
 }
 
+// 통일된 안전 래퍼: (런타임키 ∩ 허용키)만 DB 함수로 보낸다
+async function addColumnsSafe(family, keys, blueprint) {
+  const allow = new Set(
+    getBlueprintAllowedKeys(blueprint)
+      .map((k) => String(k || '').trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const uniq = Array.from(new Set((keys || []).map((k) => String(k || '').trim())));
+  const toCreate = uniq.filter((k) => k && allow.has(k.toLowerCase()));
+  if (!toCreate.length) return;
+  try {
+    const { rows } = await db.query(
+      'SELECT public.ensure_dynamic_spec_columns($1,$2::jsonb) AS created',
+      [family, JSON.stringify(toCreate)],
+    );
+    const created = rows?.[0]?.created;
+    if (Array.isArray(created) && created.length) {
+      console.log('[schema] added columns', created);
+    }
+  } catch (err) {
+    console.warn('[schema] ensure_dynamic_spec_columns failed:', err?.message || err);
+  }
+}
+
 function gatherRuntimeSpecKeys(rows) {
   const set = new Set();
   const list = Array.isArray(rows) ? rows : [];
@@ -3353,18 +3377,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     .filter((k) => k && allowed.has(k.toLowerCase()));
 
   if (process.env.AUTO_ADD_FIELDS === '1' && family && toCreate.length) {
-    try {
-      const { rows } = await db.query(
-        'SELECT public.ensure_dynamic_spec_columns($1, $2::jsonb) AS created',
-        [family, JSON.stringify(toCreate)]
-      );
-      const created = rows?.[0]?.created;
-      if (Array.isArray(created) && created.length) {
-        console.log('[schema] added columns', created);
-      }
-    } catch (err) {
-      console.warn('[schema] ensure_dynamic_spec_columns failed:', err?.message || err);
-    }
+    await addColumnsSafe(family, toCreate, blueprint);
   }
 
   // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
@@ -3800,6 +3813,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
+  orderingDomains = normalizeVariantDomains(orderingDomains || {}, allowedForDomains);
   const orderingDomainKeys = Object.keys(orderingDomains || {});
   if (USE_VARIANT_KEYS) {
     let aiVariantKeys = [];
@@ -4016,7 +4030,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     }
   }
 
-  let legendVariantDomains = normalizeVariantDomains(orderingDomains, allowedForDomains);
+  let legendVariantDomains = normalizeVariantDomains(orderingDomains || {}, allowedForDomains);
   const orderingTextForRecipe = Array.isArray(orderingTextSources)
     ? orderingTextSources
         .map((txt) => (typeof txt === 'string' ? txt : String(txt ?? '')))
@@ -4032,35 +4046,42 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       console.warn('[ordering] legend recipe extract failed:', err?.message || err);
     }
   }
-  if (orderingLegendRecipe && orderingLegendRecipe.variant_domains) {
-    const recipeDomains = normalizeVariantDomains(
-      orderingLegendRecipe.variant_domains,
-      allowedForDomains,
+  const recipeDomains = normalizeVariantDomains(
+    (orderingLegendRecipe && orderingLegendRecipe.variant_domains) || {},
+    allowedForDomains,
+  );
+
+  if (process.env.DEBUG_ORDERING === '1') {
+    const len = (obj) => Object.fromEntries(
+      Object.entries(obj || {}).map(([k, v]) => [k, Array.isArray(v) ? v.length : 0]),
     );
-    if (Object.keys(recipeDomains).length) {
-      if (!legendVariantDomains || !Object.keys(legendVariantDomains).length) {
-        legendVariantDomains = { ...recipeDomains };
-      } else {
-        for (const [domainKey, domainValues] of Object.entries(recipeDomains)) {
-          const key = String(domainKey || '').trim();
-          if (!key) continue;
-          if (!Array.isArray(domainValues) || !domainValues.length) continue;
-          const existing = Array.isArray(legendVariantDomains[key]) ? legendVariantDomains[key] : [];
-          if (!existing.length) {
-            legendVariantDomains[key] = domainValues.slice();
-            continue;
-          }
-          const seen = new Set(existing.map((val) => String(val).trim().toLowerCase()));
-          const merged = existing.slice();
-          for (const val of domainValues) {
-            const trimmed = String(val || '').trim();
-            const marker = trimmed.toLowerCase();
-            if (seen.has(marker)) continue;
-            seen.add(marker);
-            merged.push(trimmed);
-          }
-          legendVariantDomains[key] = merged;
+    console.log('[ordering/domains]', len(legendVariantDomains), len(recipeDomains));
+    console.log('[ordering/vkeys]', variantKeys);
+  }
+
+  if (Object.keys(recipeDomains).length) {
+    if (!legendVariantDomains || !Object.keys(legendVariantDomains).length) {
+      legendVariantDomains = { ...recipeDomains };
+    } else {
+      for (const [domainKey, domainValues] of Object.entries(recipeDomains)) {
+        const key = String(domainKey || '').trim();
+        if (!key) continue;
+        if (!Array.isArray(domainValues) || !domainValues.length) continue;
+        const existing = Array.isArray(legendVariantDomains[key]) ? legendVariantDomains[key] : [];
+        if (!existing.length) {
+          legendVariantDomains[key] = domainValues.slice();
+          continue;
         }
+        const seen = new Set(existing.map((val) => String(val).trim().toLowerCase()));
+        const merged = existing.slice();
+        for (const val of domainValues) {
+          const trimmed = String(val || '').trim();
+          const marker = trimmed.toLowerCase();
+          if (seen.has(marker)) continue;
+          seen.add(marker);
+          merged.push(trimmed);
+        }
+        legendVariantDomains[key] = merged;
       }
     }
   }
@@ -4249,24 +4270,21 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
       }
 
       if (process.env.AUTO_ADD_FIELDS === '1' && newCanonKeys.length) {
+        const known = new Set(
+          getBlueprintAllowedKeys(blueprint)
+            .map((k) => String(k || '').trim().toLowerCase())
+            .filter(Boolean),
+        );
         const uniqueNew = Array.from(new Set(
           newCanonKeys
             .map((k) => String(k || '').trim())
-            .filter((k) => k && knownLower.has(k.toLowerCase()))
+            .filter((k) => k && known.has(k.toLowerCase())),
         ));
         const limitRaw = Number(process.env.AUTO_ADD_FIELDS_LIMIT || '50');
         const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : uniqueNew.length;
         const target = uniqueNew.slice(0, limit);
         if (target.length) {
-          try {
-            const { rows } = await db.query(
-              'SELECT public.ensure_dynamic_spec_columns($1,$2::jsonb) AS created',
-              [family, JSON.stringify(target)]
-            );
-            console.log('[schema] added columns', rows?.[0]?.created);
-          } catch (err) {
-            console.warn('[schema] ensure_dynamic_spec_columns failed:', err?.message || err);
-          }
+          await addColumnsSafe(family, target, blueprint);
 
           for (const key of target) {
             if (!key) continue;

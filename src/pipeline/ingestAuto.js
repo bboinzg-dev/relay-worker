@@ -3421,7 +3421,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   rowsGlobalRef = Array.isArray(extracted?.rows) ? extracted.rows : null;
 
   const autoAddKeys = Array.from(canonicalRuntimeSpecKeys);
-  const allowed = new Set(
+  const allowedSet = new Set(
     (Array.isArray(allowedKeys) && allowedKeys.length
       ? allowedKeys
       : getBlueprintAllowedKeys(blueprint)
@@ -3431,7 +3431,7 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   );
   const toCreate = autoAddKeys
     .map((k) => String(k || '').trim())
-    .filter((k) => k && allowed.has(k.toLowerCase()));
+    .filter((k) => k && allowedSet.has(k.toLowerCase()));
 
   if (process.env.AUTO_ADD_FIELDS === '1' && family && toCreate.length) {
     await addColumnsSafeForTable(qualified, family, toCreate, blueprint);

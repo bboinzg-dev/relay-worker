@@ -1,59 +1,68 @@
-diff --git a/src/services/vertex.js b/src/services/vertex.js
-index 773c56592257147fd6094bc8f1f0752f3f5a049e..5763331d47f0f7034cee3388bed852abdf39072f 100644
---- a/src/services/vertex.js
-+++ b/src/services/vertex.js
-@@ -78,53 +78,51 @@ function safeParseJson(text) {
-   let start = -1;
-   for (let i = 0; i < stripped.length; i += 1) {
-     const ch = stripped[i];
-     if (ch === '{') {
-       if (depth === 0) start = i;
-       depth += 1;
-     } else if (ch === '}') {
-       depth -= 1;
-       if (depth === 0 && start >= 0) {
-         const slice = stripped.slice(start, i + 1);
-         try {
-           return JSON.parse(slice);
-         } catch (_) {}
-         start = -1;
+diff --git a/src/pipeline/ingestAuto.js b/src/pipeline/ingestAuto.js
+index 84f5d4be9ba38bf93d4f5da0a4fe0b6fdf021df2..e1f88ca45228d2486ffd95263af3d61e3854622a 100644
+--- a/src/pipeline/ingestAuto.js
++++ b/src/pipeline/ingestAuto.js
+@@ -3399,61 +3399,61 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
+           if (!Object.prototype.hasOwnProperty.call(out, metaKey) || existing == null || existing === '') {
+             out[metaKey] = rawValue;
+           }
+           continue;
+         }
+         const canon = normalizeSpecKeyName(key);
+         if (!canon) continue;
+         const mapped = SPEC_KEY_ALIAS_MAP.get(canon) || canon;
+         canonicalRuntimeSpecKeys.add(mapped);
+         const existing = Object.prototype.hasOwnProperty.call(out, mapped) ? out[mapped] : undefined;
+         if (!Object.prototype.hasOwnProperty.call(out, mapped) || existing == null || existing === '') {
+           out[mapped] = rawValue;
+         }
        }
-     }
+       return out;
+     });
+   };
+ 
+   if (Array.isArray(extracted?.rows) && extracted.rows.length) {
+     extracted.rows = sanitizeSpecRows(extracted.rows);
    }
  
-   return null;
- }
+   rowsGlobalRef = Array.isArray(extracted?.rows) ? extracted.rows : null;
  
- function extractCandidateJson(response) {
-   const parts = Array.isArray(response?.response?.candidates?.[0]?.content?.parts)
-     ? response.response.candidates[0].content.parts
-     : [];
--  const text = parts
--    .map((part) => (typeof part?.text === 'string' ? part.text : ''))
--    .join('');
-+  const text = parts.map((part) => part?.text || '').join('');
-   if (!text || !text.trim()) {
-     return { text: '', data: null };
-   }
-   const data = safeParseJson(text);
-   if (!data) {
-     if (process.env.DEBUG_ORDERING === '1') {
-       console.warn('[vertex:not-json]', text.slice(0, 300));
-     }
-     const err = new Error('VERTEX_NOT_JSON');
-     err.sample = text.slice(0, 500);
-     throw err;
-   }
-   return { text, data };
- }
+   const autoAddKeys = Array.from(canonicalRuntimeSpecKeys);
+-  const allowed = new Set(
++  const allowedSet = new Set(
+     (Array.isArray(allowedKeys) && allowedKeys.length
+       ? allowedKeys
+       : getBlueprintAllowedKeys(blueprint)
+     )
+       .map((k) => String(k || '').trim().toLowerCase())
+       .filter(Boolean)
+   );
+   const toCreate = autoAddKeys
+     .map((k) => String(k || '').trim())
+-    .filter((k) => k && allowed.has(k.toLowerCase()));
++    .filter((k) => k && allowedSet.has(k.toLowerCase()));
  
- async function classifyByGcs(gcsUri, filename = 'datasheet.pdf') {
-   const fams = await getFamilies();
-   const prompt = [
-     `PDF 전체를 읽고 {"family_slug","brand","code","series"} JSON만 반환. 파일명: ${filename}`,
-     `- family_slug는 반드시 다음 중 하나: ${fams.map((f) => `"${f}"`).join(', ')}`,
-   ].join('\n');
-   const resp = await callGemini({
-     modelName: MODEL_CLASSIFY,
-     contents: [
-       {
+   if (process.env.AUTO_ADD_FIELDS === '1' && family && toCreate.length) {
+     await addColumnsSafeForTable(qualified, family, toCreate, blueprint);
+   }
+ 
+   // 🔹 이 변수가 "데이터시트 분석에서 바로 뽑은 MPN 리스트"가 됨
+   let codes = [];
+   if (!code) {
+     const skuFromTable = pickSkuListFromTables(extracted);
+     const docText = extracted?.text || previewText || '';
+     codes = skuFromTable.length ? skuFromTable : expandFromCodeSystem(extracted, blueprint, docText);
+     const maxEnv = Number(process.env.FIRST_PASS_CODES || FIRST_PASS_CODES || 20);
+     const maxCodes = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 20;
+     if (codes.length > maxCodes) codes = codes.slice(0, maxCodes);
+   }
+ 
+   // 🔹 후보(candidates)가 아직 비었고, 방금 수집한 codes가 있으면 candidates로 승격
+   if (!candidates.length && codes.length) {
+     const merged = [];
+     const seen = new Set();
+     for (const raw of codes) {
+       const trimmed = typeof raw === 'string' ? raw.trim() : String(raw || '');
+       if (!trimmed) continue;
+       const norm = normalizeCode(trimmed);
+       if (seen.has(norm)) continue;

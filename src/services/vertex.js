@@ -19,14 +19,26 @@ async function callGemini({ modelName, contents, generationConfig, safetySetting
     throw new Error('GCP_PROJECT_ID (or GOOGLE_CLOUD_PROJECT) is required for VertexAI');
   }
   const vertex = new VertexAI({ project: PROJECT_ID, location: VERTEX_LOCATION });
-  let gm = vertex.getGenerativeModel({ model: modelName });
+  let gm = vertex.getGenerativeModel({
+    model: modelName,
+    generationConfig: {
+      responseMimeType: 'application/json',
+      response_mime_type: 'application/json',
+    },
+  });
   console.info('[vertex] model=%s region=%s', modelName, VERTEX_LOCATION);
   try {
     return await gm.generateContent({ contents, generationConfig, safetySettings });
   } catch (e) {
     if (isNotFound(e) && modelName !== 'gemini-1.5-flash-002') {
       console.warn('[vertex] 404 on', modelName, '→ fallback gemini-1.5-flash-002');
-      gm = vertex.getGenerativeModel({ model: 'gemini-1.5-flash-002' });
+      gm = vertex.getGenerativeModel({
+        model: 'gemini-1.5-flash-002',
+        generationConfig: {
+          responseMimeType: 'application/json',
+          response_mime_type: 'application/json',
+        },
+      });
       return await gm.generateContent({ contents, generationConfig, safetySettings });
     }
     throw e;
@@ -47,6 +59,41 @@ async function getFields(family) {
   );
   if (!r.rows[0]) throw new Error(`Blueprint not found: ${family}`);
   return r.rows[0].fields_json;
+}
+
+function safeParseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_) {}
+
+  const stripped = String(text ?? '')
+    .replace(/```(?:json)?/gi, '')
+    .trim();
+
+  try {
+    return JSON.parse(stripped);
+  } catch (_) {}
+
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < stripped.length; i += 1) {
+    const ch = stripped[i];
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        const slice = stripped.slice(start, i + 1);
+        try {
+          return JSON.parse(slice);
+        } catch (_) {}
+        start = -1;
+      }
+    }
+  }
+
+  return null;
 }
 
 async function classifyByGcs(gcsUri, filename = 'datasheet.pdf') {
@@ -71,12 +118,14 @@ async function classifyByGcs(gcsUri, filename = 'datasheet.pdf') {
   const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
   const text = parts.map((p) => p.text || '').join('');
   if (!text) return {};
-  try {
-    return JSON.parse(text);
-  } catch (err) {
-    console.warn('[vertex] classify parse failed:', err?.message || err);
-    return {};
+  const parsed = safeParseJson(text);
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return parsed;
   }
+  if (text) {
+    console.warn('[vertex] classify parse failed: invalid JSON payload');
+  }
+  return {};
 }
 
 async function extractValuesByGcs(gcsUri, family) {
@@ -103,13 +152,14 @@ async function extractValuesByGcs(gcsUri, family) {
   const parts = resp.response?.candidates?.[0]?.content?.parts ?? [];
   const raw = parts.map((p) => p.text || '').join('');
   if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
+  const parsed = safeParseJson(raw);
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
     return parsed.values || {};
-  } catch (err) {
-    console.warn('[vertex] extract parse failed:', err?.message || err);
-    return {};
   }
+  if (raw) {
+    console.warn('[vertex] extract parse failed: invalid JSON payload');
+  }
+  return {};
 }
 
-module.exports = { classifyByGcs, extractValuesByGcs };
+module.exports = { classifyByGcs, extractValuesByGcs, safeParseJson };

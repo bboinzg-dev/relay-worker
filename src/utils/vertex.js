@@ -22,6 +22,7 @@ function getModel(systemText, modelId = DEFAULT_MODEL_ID) {
   if (systemText && String(systemText).trim()) {
     cfg.systemInstruction = { parts: [{ text: String(systemText) }] };
   }
+  cfg.generationConfig = { responseMimeType: 'application/json' };
   return getVertex().getGenerativeModel(cfg);
 }
 

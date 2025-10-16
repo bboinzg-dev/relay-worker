@@ -1,13 +1,17 @@
 'use strict';
 
-const rawPerKeyLimit = Number(process.env.VARIANT_DOMAIN_MAX_PER_KEY);
+const rawPerKeyLimit = Number(process.env.VARIANT_DOMAIN_MAX_PER_KEY || 8);
 const PER_KEY_DOMAIN_MAX = Number.isFinite(rawPerKeyLimit) && rawPerKeyLimit > 0
   ? Math.floor(rawPerKeyLimit)
   : 8;
-const rawMaxCombos = Number(process.env.VARIANT_COMBOS_MAX);
+const rawMaxCombos = Number(process.env.VARIANT_COMBOS_MAX || 5000);
 const MAX_COMBOS = Number.isFinite(rawMaxCombos) && rawMaxCombos > 0
   ? Math.floor(rawMaxCombos)
   : 5000;
+const rawMaxTemplateAttempts = Number(process.env.MAX_TEMPLATE_ATTEMPTS || 200);
+const MAX_TEMPLATE_ATTEMPTS = Number.isFinite(rawMaxTemplateAttempts) && rawMaxTemplateAttempts > 0
+  ? Math.floor(rawMaxTemplateAttempts)
+  : 200;
 
 const LIST_SEP = /[\s,;/|·•]+/;
 const VOLTAGE_UNIT_RE = /\d\s*(?:V|VAC|VDC)\b/i;
@@ -161,14 +165,16 @@ function normalizeList(value) {
   return [value];
 }
 
-function cartesian(lists) {
-  const limit = Number.isFinite(MAX_COMBOS) && MAX_COMBOS > 0 ? MAX_COMBOS : Infinity;
+function cartesianCapped(lists, limitRaw = MAX_COMBOS) {
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0
+    ? Math.floor(limitRaw)
+    : MAX_COMBOS;
   let out = [[]];
   for (const list of lists) {
     const next = [];
     for (const a of out) {
       for (const b of list) {
-        if (next.length >= limit) return next;
+        if (limit && next.length >= limit) return next;
         next.push(a.concat([b]));
       }
     }
@@ -176,6 +182,10 @@ function cartesian(lists) {
     if (!out.length) break;
   }
   return out;
+}
+
+function cartesian(lists) {
+  return cartesianCapped(lists, MAX_COMBOS);
 }
 
 function __applyOps(val, ops = []) {
@@ -344,12 +354,11 @@ function explodeToRows(base, options = {}) {
   const textContainsExactFn =
     typeof options.textContainsExact === 'function' ? options.textContainsExact : defaultTextContainsExact;
   const previewOnly = Boolean(options.previewOnly);
-  const maxTemplateAttemptsSource =
-    options.maxTemplateAttempts ?? process.env.MAX_TEMPLATE_ATTEMPTS ?? 200;
+  const maxTemplateAttemptsSource = options.maxTemplateAttempts;
   const maxTemplateAttemptsRaw = Number(maxTemplateAttemptsSource);
   const maxTemplateAttempts = Number.isFinite(maxTemplateAttemptsRaw) && maxTemplateAttemptsRaw > 0
     ? Math.floor(maxTemplateAttemptsRaw)
-    : null;
+    : MAX_TEMPLATE_ATTEMPTS;
   const onTemplateRender = typeof options.onTemplateRender === 'function' ? options.onTemplateRender : null;
 
   const values = {};
@@ -377,13 +386,13 @@ function explodeToRows(base, options = {}) {
     return [null];
   });
 
-  const combos = lists.length ? cartesian(lists) : [[]];
+  const combos = lists.length ? cartesianCapped(lists, MAX_COMBOS) : [[]];
   const mpnCandidates = collectMpnSeeds(base);
 
   const rows = [];
   let templateAttempts = 0;
-  for (let idx = 0; idx < combos.length; idx += 1) {
-    if (maxTemplateAttempts && templateAttempts >= maxTemplateAttempts) break;
+  const maxAttempts = Math.min(combos.length, maxTemplateAttempts);
+  for (let idx = 0; idx < maxAttempts; idx += 1) {
     const combo = combos[idx];
     const rowValues = { ...values };
     variantKeys.forEach((key, keyIdx) => {
@@ -533,7 +542,7 @@ function explodeToRows(base, options = {}) {
       });
     }
 
-    if (maxTemplateAttempts && attempted && templateAttempts >= maxTemplateAttempts) break;
+    if (templateAttempts >= maxAttempts) break;
   }
 
   return rows;
@@ -545,6 +554,7 @@ module.exports = {
   splitAndCarryPrefix,
   normalizeList,
   cartesian,
+  cartesianCapped,
   renderTemplate,
   explodeToRows,
   normalizeContactForm,

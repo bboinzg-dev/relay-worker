@@ -5224,12 +5224,11 @@ async function persistProcessedData(processed = {}, overrides = {}) {
             const widened = new Set(knownList);
             for (const key of unknownKeys) {
               const rec = map?.[key] || {};
-              let target = String(rec.canonical || '').trim();
-              if (!target || rec.action !== 'map') target = key;
+              const target = rec.action === 'map' ? String(rec.canonical || '').trim() : '';
+              if (!target) continue;
               const lower = target.toLowerCase();
-              if (!lower || knownLower.has(lower)) continue;
-              knownLower.add(lower);
-              widened.add(target);
+              if (!lower || !knownLower.has(lower)) continue;
+              if (!widened.has(target)) widened.add(target);
             }
             blueprint = blueprint && typeof blueprint === 'object' ? blueprint : {};
             blueprint.allowedKeys = Array.from(widened);

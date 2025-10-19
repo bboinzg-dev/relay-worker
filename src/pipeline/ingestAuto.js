@@ -4751,6 +4751,14 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     doc_type: typeof extracted?.doc_type === 'string' ? extracted.doc_type : null,
   };
 
+  const hasOrderingCodes = Array.isArray(processedPayload?.ordering_info?.codes)
+    && processedPayload.ordering_info.codes.length > 0;
+  if (!hasOrderingCodes
+    && Array.isArray(processedPayload.mpnList)
+    && processedPayload.mpnList.length) {
+    processedPayload.ordering_info = { codes: processedPayload.mpnList.slice(0, 500) };
+  }
+
   console.log(
     '[DIAG] processedPayload recs=%d mpnList=%d docType=%s ordering=%s',
     Array.isArray(records) ? records.length : -1,

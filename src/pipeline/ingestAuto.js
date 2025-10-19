@@ -175,7 +175,8 @@ const DOC_TABLE_HEADER_FOOTER_RE = /(header|footer|page\s*\d+)/i;
 const PN_CANON_KEY_RE = /(^|_)(part|pn|code|model|type)(_|$)/;
 const PN_HEADER_LABEL_RE = /(part\s*(?:no\.?|number)|type\s*(?:no\.?|number)?|catalog\s*(?:no\.?|number)|model|品番|型式|형名|型番)/i;
 const PN_CANDIDATE_RE = /[0-9A-Z][0-9A-Z\-_/().#]{3,63}[0-9A-Z)#]/gi;
-const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff)/i;
+// drop common PDF noise + Panasonic catalog doc-ids like ASCTB203E
+const PN_BLACKLIST_RE = /(pdf|font|xref|object|type0|ffff|ASCTB\d{3,4}[A-Z])/i;
 const PN_STRICT = /^[A-Z0-9][A-Z0-9\-_.()/#]{1,62}[A-Z0-9)#]$/i;
 
 function getBlueprintAllowedKeys(blueprint) {
@@ -805,6 +806,11 @@ function scoreOrderingPnCandidate(entry, sample, ctx = {}) {
   for (const token of Array.isArray(ctx.brandTokens) ? ctx.brandTokens : []) {
     if (token && pnUpper.includes(token)) score += 2;
   }
+  // Prefer Panasonic LZ series (ALZ...) when series tokens include LZ/ALZ
+  const hasLzHint = Array.isArray(ctx.seriesTokens) && ctx.seriesTokens.some((t) => /^(LZ|ALZ)$/i.test(String(t)));
+  if (hasLzHint && /^ALZ/.test(pnUpper)) score += 10;
+  // Penalize common Panasonic catalog doc-id pattern
+  if (/^ASCTB\d{3,4}[A-Z]$/.test(pnUpper)) score -= 50;
   return score;
 }
 

@@ -67,9 +67,9 @@ function decodeCoilVoltageVdcKeepBoth(value) {
   } else if (/^\d{2,3}$/.test(token)) {
     const num = Number(token);
     if (Number.isFinite(num)) {
-      val = num >= 100 ? (num % 10 === 0 ? num / 10 : num) : num;
+      val = num;
     }
-   } else if (/^\d$/.test(token)) {
+  } else if (/^\d$/.test(token)) {
     val = Number(token);
   }
   return { raw, vdc: String(val) };

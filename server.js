@@ -3,6 +3,7 @@
 
 // ───────── 외부콜 차단 플래그 (배포 시 EXT_CALLS_OFF=1 이면 부팅 중 외부 HTTPS 호출 스킵)
 const EXT_CALLS_OFF = process.env.EXT_CALLS_OFF === '1';
+const DEBUG_ROUTES = process.env.DEBUG_ROUTES === '1';
 const { randomUUID } = require('node:crypto');
 // ---- run-id safe import (fallback to UUID) ----
 let generateRunId;
@@ -559,46 +560,52 @@ try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/li
 try { app.use(require('./server.retail')); console.log('[BOOT] mounted /api/retail/*'); } catch (e) { console.error(e); }
 try { app.use(require('./server.retail.import')); console.log('[BOOT] mounted /api/retail/import'); } catch {}
 try { app.use(require('./src/routes/vision.upload')); console.log('[BOOT] mounted /api/vision/guess (upload)'); } catch {}
-try { app.use(require('./server.ingest.status')); console.log('[BOOT] mounted /api/ingest/:id'); } catch {}
+if (DEBUG_ROUTES) {
+  try {
+    app.use(require('./server.ingest.status'));
+    console.log('[BOOT] mounted /api/ingest/:id');
+  } catch {}
+}
 
 // 인라인 AI 라우터(간소 버전)는 제거 — server.ai.js 하나만 유지
 
 /* NOTE: The parts router already exists in your repo; keep it mounted. */
 try { app.use('/api/parts', require('./src/routes/parts')); } catch {}
 
-// ✅ ALWAYS-ON 디버그 엔드포인트 (환경변수와 무관하게 항상 열림)
-app.get('/_routes', (req, res) => {
-  try {
-    const list = [];
-    app._router.stack.forEach((m) => {
-      if (m.route && m.route.path) {
-        const methods = Object.keys(m.route.methods).join(',').toUpperCase();
-        list.push(`${methods.padEnd(6)} ${m.route.path}`);
-      } else if (m.name === 'router' && m.handle?.stack) {
-        m.handle.stack.forEach((h) => {
-          const p = h.route?.path;
-          const ms = h.route ? Object.keys(h.route.methods).join(',').toUpperCase() : '';
-          if (p) list.push(`${ms.padEnd(6)} ${m.regexp?.toString() || ''}${p}`);
-        });
-      }
-    });
-    res.type('text/plain').send(list.join('\n') || 'no-routes');
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-console.log('[BOOT] ALWAYS-ON route debug at /_routes');
+if (DEBUG_ROUTES) {
+  app.get('/_routes', (req, res) => {
+    try {
+      const list = [];
+      app._router.stack.forEach((m) => {
+        if (m.route && m.route.path) {
+          const methods = Object.keys(m.route.methods).join(',').toUpperCase();
+          list.push(`${methods.padEnd(6)} ${m.route.path}`);
+        } else if (m.name === 'router' && m.handle?.stack) {
+          m.handle.stack.forEach((h) => {
+            const p = h.route?.path;
+            const ms = h.route ? Object.keys(h.route.methods).join(',').toUpperCase() : '';
+            if (p) list.push(`${ms.padEnd(6)} ${m.regexp?.toString() || ''}${p}`);
+          });
+        }
+      });
+      res.type('text/plain').send(list.join('\n') || 'no-routes');
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+  console.log('[BOOT] route debug at /_routes');
 
-// 🔍 컨테이너 내 파일 확인: server*.js 포함 여부 즉시 점검
-app.get('/_ls', (_req, res) => {
-  try {
-    const here = fs.readdirSync(__dirname).sort();
-    res.json({ dir: __dirname, files: here.filter(f => f.startsWith('server')) });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: String(e?.message || e) });
-  }
-});
-console.log('[BOOT] ALWAYS-ON file lister at /_ls');
+  // 🔍 컨테이너 내 파일 확인: server*.js 포함 여부 즉시 점검
+  app.get('/_ls', (_req, res) => {
+    try {
+      const here = fs.readdirSync(__dirname).sort();
+      res.json({ dir: __dirname, files: here.filter((f) => f.startsWith('server')) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e?.message || e) });
+    }
+  });
+  console.log('[BOOT] file lister at /_ls');
+}
 
 
 /* ---------------- Upload ---------------- */

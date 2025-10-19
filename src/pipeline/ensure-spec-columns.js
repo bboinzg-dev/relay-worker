@@ -1,24 +1,29 @@
 'use strict';
 
 const path = require('node:path');
+const tryRequire = require('../utils/try-require');
 
-function tryRequire(paths) {
-  const errors = [];
-  for (const p of paths) {
-    try {
-      return require(p);
-    } catch (err) {
-      if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
-        errors.push(err);
-        continue;
-      }
-      throw err;
-    }
+let normalizeSpecKey = (value) => {
+  if (value == null) return '';
+  let str = String(value || '').trim();
+  if (!str) return '';
+  let prefix = '';
+  const leading = str.match(/^_+/);
+  if (leading) {
+    prefix = leading[0];
+    str = str.slice(prefix.length);
   }
-  const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
-  error.code = 'MODULE_NOT_FOUND';
-  error.attempts = errors.map((e) => e?.message || String(e));
-  throw error;
+  if (!str) return prefix.toLowerCase();
+  const camelConverted = str.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
+  const sanitized = camelConverted.replace(/[^a-zA-Z0-9_]/g, '_');
+  const collapsed = sanitized.replace(/__+/g, '_').replace(/^_+|_+$/g, '');
+  const final = collapsed ? `${prefix}${collapsed}` : prefix;
+  return final.toLowerCase();
+};
+try {
+  ({ normalizeSpecKey } = require('../utils/key-normalize'));
+} catch (e) {
+  // optional
 }
 
 const db = tryRequire([
@@ -66,6 +71,12 @@ async function getColumnsOf(qualified) {
 
 async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
   const have = await getColumnsOf(qualifiedTable);
+  const haveNormalized = new Set(
+    [...have]
+      .map((col) => normalizeSpecKey(col) || normKey(col))
+      .filter((col) => col)
+      .map((col) => String(col).toLowerCase()),
+  );
 
   const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
   const variants = Array.isArray(blueprint?.ingestOptions?.variant_keys)
@@ -76,19 +87,32 @@ async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
   const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
   const fieldKeys = Object.keys(fieldMeta);
 
-  const wantedList = [
-    ...new Set(
-      [...allowed, ...variants, ...fieldKeys]
-        .map(normKey)
-        .filter(Boolean)
-    ),
-  ];
+  const desired = new Map();
+  for (const rawKey of [...allowed, ...variants, ...fieldKeys]) {
+    const normalized = normalizeSpecKey(rawKey) || normKey(rawKey);
+    if (!normalized) continue;
+    const lower = String(normalized).toLowerCase();
+    if (haveNormalized.has(lower) || desired.has(lower)) continue;
+    let meta = null;
+    if (fieldMeta && typeof fieldMeta === 'object') {
+      if (Object.prototype.hasOwnProperty.call(fieldMeta, rawKey)) {
+        meta = fieldMeta[rawKey];
+      } else {
+        for (const [candidateKey, candidateMeta] of Object.entries(fieldMeta)) {
+          if ((normalizeSpecKey(candidateKey) || normKey(candidateKey)) === normalized) {
+            meta = candidateMeta;
+            break;
+          }
+        }
+      }
+    }
+    desired.set(lower, { key: normalized, meta });
+  }
 
   const toAdd = [];
-  for (const key of wantedList) {
-    if (have.has(key)) continue;
-    const rawType = fieldMeta[key]?.type ?? fieldMeta[key] ?? 'text';
-    const pgType = TYPE_MAP[String(rawType).toLowerCase()] || 'text';
+  for (const { key, meta } of desired.values()) {
+    const rawType = meta && typeof meta === 'object' ? meta.type : meta;
+    const pgType = TYPE_MAP[String(rawType || '').toLowerCase()] || 'text';
     toAdd.push({ key, pgType });
   }
 
@@ -104,16 +128,33 @@ async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
 
 async function ensureSpecColumnsForKeys(qualifiedTable, keys = [], sample = {}) {
   const have = await getColumnsOf(qualifiedTable);
+  const haveNormalized = new Set(
+    [...have]
+      .map((col) => normalizeSpecKey(col) || normKey(col))
+      .filter((col) => col)
+      .map((col) => String(col).toLowerCase()),
+  );
   const toAdd = [];
 
   const list = Array.isArray(keys) ? keys : [];
   for (const rawKey of list) {
-    const key = normKey(rawKey);
-    if (!key || have.has(key)) continue;
+    const normalized = normalizeSpecKey(rawKey) || normKey(rawKey);
+    if (!normalized) continue;
+    const lower = String(normalized).toLowerCase();
+    if (haveNormalized.has(lower)) continue;
 
-    let value = null;
-    if (sample && typeof sample === 'object' && Object.prototype.hasOwnProperty.call(sample, rawKey)) {
-      value = sample[rawKey];
+    let value = undefined;
+    if (sample && typeof sample === 'object') {
+      if (Object.prototype.hasOwnProperty.call(sample, normalized)) {
+        value = sample[normalized];
+      } else if (Object.prototype.hasOwnProperty.call(sample, rawKey)) {
+        value = sample[rawKey];
+      } else {
+        const matchKey = Object.keys(sample).find(
+          (candidate) => (normalizeSpecKey(candidate) || normKey(candidate)) === normalized,
+        );
+        if (matchKey) value = sample[matchKey];
+      }
     }
 
     let pgType = 'text';
@@ -128,7 +169,8 @@ async function ensureSpecColumnsForKeys(qualifiedTable, keys = [], sample = {}) 
       }
     }
 
-    toAdd.push({ key, pgType });
+    haveNormalized.add(lower);
+    toAdd.push({ key: normalized, pgType });
   }
 
   for (const { key, pgType } of toAdd) {

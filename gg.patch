@@ -1,184 +1,224 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index 3997ec4544fe9b2890f390785305f378ab3ea413..b98e4bc9bf0210ea48e7f64a23726950b81bbcad 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -20,93 +20,96 @@ function tryRequire(paths) {
-   const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
-   error.code = 'MODULE_NOT_FOUND';
-   error.attempts = errors.map((e) => e?.message || String(e));
-   throw error;
+diff --git a/src/pipeline/ensure-spec-columns.js b/src/pipeline/ensure-spec-columns.js
+index b8ca647951a9cfa32afeb24585d4634c7ad65755..2f120a3b75db3d41287587b09d8eba08d0d08a1b 100644
+--- a/src/pipeline/ensure-spec-columns.js
++++ b/src/pipeline/ensure-spec-columns.js
+@@ -1,141 +1,183 @@
+ 'use strict';
+ 
+ const path = require('node:path');
+-
+-function tryRequire(paths) {
+-  const errors = [];
+-  for (const p of paths) {
+-    try {
+-      return require(p);
+-    } catch (err) {
+-      if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
+-        errors.push(err);
+-        continue;
+-      }
+-      throw err;
+-    }
++const tryRequire = require('../utils/try-require');
++
++let normalizeSpecKey = (value) => {
++  if (value == null) return '';
++  let str = String(value || '').trim();
++  if (!str) return '';
++  let prefix = '';
++  const leading = str.match(/^_+/);
++  if (leading) {
++    prefix = leading[0];
++    str = str.slice(prefix.length);
+   }
+-  const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
+-  error.code = 'MODULE_NOT_FOUND';
+-  error.attempts = errors.map((e) => e?.message || String(e));
+-  throw error;
++  if (!str) return prefix.toLowerCase();
++  const camelConverted = str.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
++  const sanitized = camelConverted.replace(/[^a-zA-Z0-9_]/g, '_');
++  const collapsed = sanitized.replace(/__+/g, '_').replace(/^_+|_+$/g, '');
++  const final = collapsed ? `${prefix}${collapsed}` : prefix;
++  return final.toLowerCase();
++};
++try {
++  ({ normalizeSpecKey } = require('../utils/key-normalize'));
++} catch (e) {
++  // optional
  }
  
- const { pool } = tryRequire([
+ const db = tryRequire([
    path.join(__dirname, '../../db'),
    path.join(__dirname, '../db'),
    path.join(__dirname, './db'),
    path.join(process.cwd(), 'db'),
  ]);
- // bring normalizer for contact_form synonyms (e.g., "DPDT" → "2C")
- const { normalizeContactForm } = require('../utils/mpn-exploder');
- const { ensureSpecsTable } = tryRequire([
-   path.join(__dirname, '../utils/schema'),
-   path.join(__dirname, '../../utils/schema'),
-   path.join(__dirname, '../schema'),
-   path.join(process.cwd(), 'schema'),
- ]);
- const { getColumnsOf } = require('./ensure-spec-columns');
- const { normalizeValueLLM } = require('../utils/ai');
- let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
- const { PN_RE } = require('../utils/patterns');
- const { getBlueprintPnTemplate } = require('../utils/getBlueprintPnTemplate');
-+const { extractOrderingInfo } = require('../utils/ordering-sections');
  
- const STRICT_CODE_RULES = /^(1|true|on)$/i.test(process.env.STRICT_CODE_RULES || '1');
- const MIN_CORE_SPEC_COUNT = (() => {
-   const raw = Number(process.env.MIN_CORE_SPEC_COUNT ?? 2);
-   if (!Number.isFinite(raw) || raw <= 0) return 2;
-   return Math.min(Math.floor(raw), 10);
- })();
+ const TYPE_MAP = {
+   int: 'integer',
+   integer: 'integer',
+   numeric: 'numeric',
+   number: 'numeric',
+   float: 'double precision',
+   double: 'double precision',
+   'double precision': 'double precision',
+   decimal: 'numeric',
+   bool: 'boolean',
+   boolean: 'boolean',
+   text: 'text',
+   string: 'text',
+ };
  
- function norm(s) {
-   return String(s || '')
-     .replace(/[\s\-_/()]/g, '')
-     .toUpperCase();
+ function normKey(k) {
+   return String(k || '')
+     .trim()
+     .toLowerCase()
+     .replace(/[^a-z0-9_]/g, '');
  }
  
- function codeForRelaySignal(spec) {
-   const parts = [];
-   const base = spec.pn || spec.series_code || spec.series || '';
-   if (base) parts.push(base);
- 
-   const op = String(spec.operating_function || '').toLowerCase();
-   if (op.includes('latch')) parts.push('L');
- 
-   const suf = (spec.suffix || '').trim();
-   if (suf) parts.push(suf.toUpperCase());
- 
-   const cv = (spec.coil_voltage_vdc || spec.voltage || '')
-     .toString()
-     .replace(/\D/g, '');
-   if (cv) parts.push(`DC${cv}${/H$/i.test(suf) ? 'H' : ''}`); // 'V' 대신 접미 'H'까지 고려
- 
-   return parts
-     .filter(Boolean)
-     .join('-')
-     .replace(/--+/g, '-');
- }
- 
- function looksLikeGarbageCode(value) {
-   const text = String(value ?? '');
-   if (!text) return false;
-   return (
-     /^[a-f0-9]{20,}_\d{10,}/i.test(text)
-     || /(^|_)(mech|doc|pdf)[-_]/i.test(text)
-     || /pdf:|\.pdf$/i.test(text)
-+    || /^ASCTB\d{3,4}[A-Z]$/i.test(text)          // Panasonic catalog doc-id
-+    || /ASCTB\d{3,4}[A-Z]\s+\d{6}/i.test(text)    // with trailing yyyymm
+ async function getColumnsOf(qualified) {
+   const [schema, table] = qualified.includes('.')
+     ? qualified.split('.', 2)
+     : ['public', qualified];
+   const { rows } = await db.query(
+     `SELECT lower(column_name) AS col
+        FROM information_schema.columns
+       WHERE table_schema = $1
+         AND table_name   = $2`,
+     [schema, table]
    );
+   return new Set(rows.map((r) => r.col));
  }
  
- const META_KEYS = new Set([
-   'family_slug',
-   'brand',
-   'brand_norm',
-   'pn',
-   'pn_norm',
-   'code',
-   'code_norm',
-   'mfr_full',
-   'datasheet_uri',
-   'verified_in_doc',
-   'display_name',
-   'displayname',
-   'image_uri',
-   'cover',
-   'series',
-   'series_code',
-   'raw_json',
-   'last_error',
-   'created_at',
-   'updated_at',
- ]);
-@@ -856,72 +859,81 @@ const renderPnTemplate =
+ async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
+   const have = await getColumnsOf(qualifiedTable);
++  const haveNormalized = new Set(
++    [...have]
++      .map((col) => normalizeSpecKey(col) || normKey(col))
++      .filter((col) => col)
++      .map((col) => String(col).toLowerCase()),
++  );
  
- function buildPnIfMissing(record = {}, pnTemplate) {
-   const existing = String(record.pn || '').trim();
-   if (existing) return;
-   const fromTemplate = renderPnTemplate(pnTemplate, record);
-   // 본문 검증: 템플릿 결과가 실제 문서 텍스트에 존재할 때만 채택
-   const ctxText = String(record._doc_text || record.doc_text || '');
-   if (fromTemplate && ctxText && fuzzyContainsPn(ctxText, fromTemplate)) {
-     record.pn = fromTemplate;
-     if (!record.code) record.code = fromTemplate;
-     return;
-   }
-   const code = String(record.code || '').trim();
-   if (code) record.pn = code;
- }
+   const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
+   const variants = Array.isArray(blueprint?.ingestOptions?.variant_keys)
+     ? blueprint.ingestOptions.variant_keys
+       : Array.isArray(blueprint?.variant_keys)
+         ? blueprint.variant_keys
+         : [];
+   const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
+   const fieldKeys = Object.keys(fieldMeta);
  
- /**
-  * @param {string} family
-  * @param {import('../types/blueprint').Spec} spec
-  * @param {import('../types/blueprint').Blueprint} [blueprint]
-  */
- function buildBestIdentifiers(family, spec = {}, blueprint) {
-   if (!spec || typeof spec !== 'object') return spec;
- 
-   let codeCandidate = null;
-+  const docText = String(spec._doc_text || spec.doc_text || '');
-   const localTemplate = getBlueprintPnTemplate(blueprint || {}, spec);
-   if (localTemplate) {
-     try {
--      const orderingInfo = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
-+      let orderingInfo = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
-+      // 🔁 Fallback: if no ordering info from Vertex, derive from raw doc text
-+      if (!orderingInfo) {
-+        const parsed = docText ? extractOrderingInfo(docText, 200) : null;
-+        if (parsed) {
-+          orderingInfo = parsed;
-+          spec.ordering_info = parsed; // 다음 단계에서 템플릿/검증에 활용
-+          spec.orderingInfo = parsed;
+-  const wantedList = [
+-    ...new Set(
+-      [...allowed, ...variants, ...fieldKeys]
+-        .map(normKey)
+-        .filter(Boolean)
+-    ),
+-  ];
++  const desired = new Map();
++  for (const rawKey of [...allowed, ...variants, ...fieldKeys]) {
++    const normalized = normalizeSpecKey(rawKey) || normKey(rawKey);
++    if (!normalized) continue;
++    const lower = String(normalized).toLowerCase();
++    if (haveNormalized.has(lower) || desired.has(lower)) continue;
++    let meta = null;
++    if (fieldMeta && typeof fieldMeta === 'object') {
++      if (Object.prototype.hasOwnProperty.call(fieldMeta, rawKey)) {
++        meta = fieldMeta[rawKey];
++      } else {
++        for (const [candidateKey, candidateMeta] of Object.entries(fieldMeta)) {
++          if ((normalizeSpecKey(candidateKey) || normKey(candidateKey)) === normalized) {
++            meta = candidateMeta;
++            break;
++          }
 +        }
 +      }
-       const context = { ...spec };
-       if (orderingInfo && typeof orderingInfo === 'object') {
-         context.ordering_info = orderingInfo;
-         context.orderingInfo = orderingInfo;
-         if (context.codes == null && Array.isArray(orderingInfo.codes)) {
-           context.codes = orderingInfo.codes;
-         }
-       }
-       const rendered = renderPnTemplate(localTemplate, context);
-       if (rendered) {
-         codeCandidate = rendered;
-       }
-     } catch (_) {
-       // ignore template rendering errors for identifier derivation
-     }
++    }
++    desired.set(lower, { key: normalized, meta });
++  }
+ 
+   const toAdd = [];
+-  for (const key of wantedList) {
+-    if (have.has(key)) continue;
+-    const rawType = fieldMeta[key]?.type ?? fieldMeta[key] ?? 'text';
+-    const pgType = TYPE_MAP[String(rawType).toLowerCase()] || 'text';
++  for (const { key, meta } of desired.values()) {
++    const rawType = meta && typeof meta === 'object' ? meta.type : meta;
++    const pgType = TYPE_MAP[String(rawType || '').toLowerCase()] || 'text';
+     toAdd.push({ key, pgType });
    }
  
--  const docText = String(spec._doc_text || spec.doc_text || '');
-   if (!codeCandidate && family === 'relay_signal') {
-     const fallback = codeForRelaySignal(spec);
-     if (fallback && norm(docText).includes(norm(fallback))) {
-       codeCandidate = fallback;
+   if (!toAdd.length) return { added: 0 };
+ 
+   for (const { key, pgType } of toAdd) {
+     await db.query(
+       `ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`
+     );
+   }
+   return { added: toAdd.length, columns: toAdd };
+ }
+ 
+ async function ensureSpecColumnsForKeys(qualifiedTable, keys = [], sample = {}) {
+   const have = await getColumnsOf(qualifiedTable);
++  const haveNormalized = new Set(
++    [...have]
++      .map((col) => normalizeSpecKey(col) || normKey(col))
++      .filter((col) => col)
++      .map((col) => String(col).toLowerCase()),
++  );
+   const toAdd = [];
+ 
+   const list = Array.isArray(keys) ? keys : [];
+   for (const rawKey of list) {
+-    const key = normKey(rawKey);
+-    if (!key || have.has(key)) continue;
+-
+-    let value = null;
+-    if (sample && typeof sample === 'object' && Object.prototype.hasOwnProperty.call(sample, rawKey)) {
+-      value = sample[rawKey];
++    const normalized = normalizeSpecKey(rawKey) || normKey(rawKey);
++    if (!normalized) continue;
++    const lower = String(normalized).toLowerCase();
++    if (haveNormalized.has(lower)) continue;
++
++    let value = undefined;
++    if (sample && typeof sample === 'object') {
++      if (Object.prototype.hasOwnProperty.call(sample, normalized)) {
++        value = sample[normalized];
++      } else if (Object.prototype.hasOwnProperty.call(sample, rawKey)) {
++        value = sample[rawKey];
++      } else {
++        const matchKey = Object.keys(sample).find(
++          (candidate) => (normalizeSpecKey(candidate) || normKey(candidate)) === normalized,
++        );
++        if (matchKey) value = sample[matchKey];
++      }
      }
-   }
-   if (codeCandidate && norm(docText).includes(norm(codeCandidate))) {
-     spec.pn = codeCandidate;
-     spec.code = codeCandidate;
-     spec.verified_in_doc = true;
-   } else {
-     spec.code = spec.pn;
-     if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
-   }
-   if (!spec.verified_in_doc) {
-     const oi = spec.ordering_info || spec.orderingInfo || null;
-     const codes = Array.isArray(oi?.codes) ? oi.codes : null;
-     if (codes && codes.length) {
-       const me = String(spec.pn || spec.code || '').trim().toUpperCase();
-       if (me && codes.some((c) => String(c || '').trim().toUpperCase() === me)) {
-         spec.verified_in_doc = true;
+ 
+     let pgType = 'text';
+     if (typeof value === 'number' && Number.isFinite(value)) {
+       pgType = 'double precision';
+     } else if (typeof value === 'boolean') {
+       pgType = 'boolean';
+     } else if (typeof value === 'string') {
+       const trimmed = value.trim();
+       if (trimmed && /-?\d+(?:\.\d+)?$/.test(trimmed)) {
+         pgType = 'double precision';
        }
      }
+ 
+-    toAdd.push({ key, pgType });
++    haveNormalized.add(lower);
++    toAdd.push({ key: normalized, pgType });
    }
+ 
+   for (const { key, pgType } of toAdd) {
+     await db.query(`ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`);
+   }
+ 
+   return { added: toAdd.length, columns: toAdd };
+ }
+ 
+ module.exports = { ensureSpecColumnsForBlueprint, ensureSpecColumnsForKeys, getColumnsOf };
+\ No newline at end of file

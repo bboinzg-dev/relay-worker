@@ -10,10 +10,7 @@ function decodeCoilVoltageVdc(pnOrCode = '') {
     if (tok === '1H') return 1.5;
     if (tok === '4H') return 4.5;
     const n = Number(tok);
-    if (Number.isFinite(n)) {
-      if (n >= 100) return n % 10 === 0 ? n / 10 : n;
-      return n;
-    }
+    if (Number.isFinite(n)) return n;
   }
   return null;
 }

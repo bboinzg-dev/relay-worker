@@ -3,25 +3,7 @@
 'use strict';
 
 const path = require('node:path');
-
-function tryRequire(paths) {
-  const errors = [];
-  for (const p of paths) {
-    try {
-      return require(p);
-    } catch (err) {
-      if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
-        errors.push(err);
-        continue;
-      }
-      throw err;
-    }
-  }
-  const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
-  error.code = 'MODULE_NOT_FOUND';
-  error.attempts = errors.map((e) => e?.message || String(e));
-  throw error;
-}
+const tryRequire = require('../utils/try-require');
 
 const { pool } = tryRequire([
   path.join(__dirname, '../../db'),
@@ -30,7 +12,12 @@ const { pool } = tryRequire([
   path.join(process.cwd(), 'db'),
 ]);
 // bring normalizer for contact_form synonyms (e.g., "DPDT" → "2C")
-const { normalizeContactForm } = require('../utils/mpn-exploder');
+let normalizeContactForm = (value) => value;
+try {
+  ({ normalizeContactForm } = require('../utils/mpn-exploder'));
+} catch (e) {
+  // optional
+}
 const { ensureSpecsTable } = tryRequire([
   path.join(__dirname, '../utils/schema'),
   path.join(__dirname, '../../utils/schema'),
@@ -42,7 +29,40 @@ const { normalizeValueLLM } = require('../utils/ai');
 let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
 const { PN_RE } = require('../utils/patterns');
 const { getBlueprintPnTemplate } = require('../utils/getBlueprintPnTemplate');
-const { extractOrderingInfo } = require('../utils/ordering-sections');
+let extractOrderingInfo;
+try {
+  ({ extractOrderingInfo } = require('../utils/ordering-sections'));
+} catch (e) {
+  // optional
+}
+let collectPnCandidates;
+try {
+  ({ collectPnCandidates } = require('../utils/pn-candidates'));
+} catch (e) {
+  // optional
+}
+let normalizeSpecKey = (value) => {
+  if (value == null) return '';
+  let str = String(value || '').trim();
+  if (!str) return '';
+  let prefix = '';
+  const leading = str.match(/^_+/);
+  if (leading) {
+    prefix = leading[0];
+    str = str.slice(prefix.length);
+  }
+  if (!str) return prefix.toLowerCase();
+  const camelConverted = str.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
+  const sanitized = camelConverted.replace(/[^a-zA-Z0-9_]/g, '_');
+  const collapsed = sanitized.replace(/__+/g, '_').replace(/^_+|_+$/g, '');
+  const final = collapsed ? `${prefix}${collapsed}` : prefix;
+  return final.toLowerCase();
+};
+try {
+  ({ normalizeSpecKey } = require('../utils/key-normalize'));
+} catch (e) {
+  // optional fallback retains legacy behaviour
+}
 
 const STRICT_CODE_RULES = /^(1|true|on)$/i.test(process.env.STRICT_CODE_RULES || '1');
 const MIN_CORE_SPEC_COUNT = (() => {
@@ -230,28 +250,6 @@ function normKey(key) {
   return String(key || '')
     .trim()
     .toLowerCase();
-}
-
-function normalizeSpecKey(key) {
-  if (key == null) return '';
-  let str = String(key || '').trim();
-  if (!str) return '';
-
-  let prefix = '';
-  const leading = str.match(/^_+/);
-  if (leading) {
-    prefix = leading[0];
-    str = str.slice(prefix.length);
-  }
-
-  if (!str) return prefix.toLowerCase();
-
-  const camelConverted = str.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
-  const sanitized = camelConverted.replace(/[^a-zA-Z0-9_]/g, '_');
-  const collapsed = sanitized.replace(/__+/g, '_').replace(/^_+|_+$/g, '');
-  const final = collapsed ? `${prefix}${collapsed}` : prefix;
-
-  return final ? final.toLowerCase() : '';
 }
 
 function isMinimalFallbackPn(value) {
@@ -882,17 +880,41 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
 
   let codeCandidate = null;
   const docText = String(spec._doc_text || spec.doc_text || '');
+  let docai = null;
+  try {
+    const raw = spec.raw_json;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (parsed && typeof parsed === 'object') {
+      docai = parsed.docai || parsed.doc_ai || docai;
+    }
+  } catch (err) {
+    // ignore malformed raw_json payloads
+  }
+  if (!docai && spec && typeof spec === 'object' && spec.docai) {
+    docai = spec.docai;
+  }
   const localTemplate = getBlueprintPnTemplate(blueprint || {}, spec);
   if (localTemplate) {
     try {
       let orderingInfo = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
       // 🔁 Fallback: if no ordering info from Vertex, derive from raw doc text
-      if (!orderingInfo) {
+      if (!orderingInfo && typeof extractOrderingInfo === 'function') {
         const parsed = docText ? extractOrderingInfo(docText, 200) : null;
         if (parsed) {
           orderingInfo = parsed;
           spec.ordering_info = parsed; // 다음 단계에서 템플릿/검증에 활용
           spec.orderingInfo = parsed;
+          spec._ordering_info = parsed;
+        }
+      }
+      if ((!orderingInfo || !Array.isArray(orderingInfo.codes) || orderingInfo.codes.length === 0)
+          && typeof collectPnCandidates === 'function') {
+        const res = collectPnCandidates({ docText, docai, extractOrderingInfo });
+        if (res && Array.isArray(res.codes) && res.codes.length) {
+          orderingInfo = { codes: res.codes };
+          spec.ordering_info = orderingInfo;
+          spec.orderingInfo = orderingInfo;
+          spec._ordering_info = orderingInfo;
         }
       }
       const context = { ...spec };
@@ -918,7 +940,11 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
       codeCandidate = fallback;
     }
   }
-  if (codeCandidate && norm(docText).includes(norm(codeCandidate))) {
+  const docHit = docText
+    && (typeof fuzzyContainsPn === 'function'
+      ? fuzzyContainsPn(docText, codeCandidate)
+      : norm(docText).includes(norm(codeCandidate)));
+  if (codeCandidate && docHit) {
     spec.pn = codeCandidate;
     spec.code = codeCandidate;
     spec.verified_in_doc = true;
@@ -1474,6 +1500,18 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       buildBestIdentifiers(familySlug, rec, blueprintMeta);
+      // ◾ top-level key normalization to avoid duplicate columns like "terminal form"
+      const renames = [];
+      for (const key of Object.keys(rec)) {
+        const normalizedKey = normalizeSpecKey(key);
+        if (!normalizedKey || normalizedKey === key) continue;
+        if (Object.prototype.hasOwnProperty.call(rec, normalizedKey)) continue;
+        renames.push([key, normalizedKey]);
+      }
+      for (const [from, to] of renames) {
+        rec[to] = rec[from];
+        delete rec[from];
+      }
       // ◾ contact_form synonyms → contact_form
       if (!rec.contact_form) {
         const cf = normalizeContactForm(

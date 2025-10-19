@@ -30,11 +30,44 @@ function extractOrderingWindow(full, { before = 8000, after = 12000 } = {}) {
   if (!raw) {
     return { text: '', start: 0, end: 0, anchorIndex: -1 };
   }
-  const anchorMatch = raw.match(ORDERING_ANCHOR_RE);
-  if (anchorMatch && typeof anchorMatch.index === 'number') {
-    return clampWindow(raw, anchorMatch.index, before, after);
+
+  // 페이지 가구(헤더/푸터에 반복되는 토큰)를 제거해 ORDERING 앵커 탐색 안정화
+  const pages = raw.split(/\f/g);
+  const tok = (s) => (String(s || '').match(/[A-Z0-9][A-Z0-9\-_.:/]{5,}/g) || []);
+  const freq = new Map();
+  for (const page of pages) {
+    const uniques = new Set(tok(page));
+    for (const item of uniques) {
+      freq.set(item, (freq.get(item) || 0) + 1);
+    }
   }
-  return { text: raw.slice(0, Math.min(raw.length, before + after)), start: 0, end: Math.min(raw.length, before + after), anchorIndex: -1 };
+  const threshold = Math.max(2, Math.floor(pages.length * 0.6));
+  const furniture = new Set(
+    [...freq.entries()]
+      .filter(([, count]) => count >= threshold)
+      .map(([token]) => token),
+  );
+  let clean = raw;
+  if (furniture.size) {
+    for (const page of pages) {
+      const head = page.slice(0, Math.floor(page.length * 0.15));
+      const foot = page.slice(Math.floor(page.length * 0.85));
+      for (const token of furniture) {
+        if (!token) continue;
+        if (head.includes(token) || foot.includes(token)) {
+          const pattern = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          clean = clean.replace(new RegExp(pattern, 'g'), ' ');
+        }
+      }
+    }
+  }
+
+  const anchorMatch = clean.match(ORDERING_ANCHOR_RE);
+  if (anchorMatch && typeof anchorMatch.index === 'number') {
+    return clampWindow(clean, anchorMatch.index, before, after);
+  }
+  const span = Math.min(clean.length, before + after);
+  return { text: clean.slice(0, span), start: 0, end: span, anchorIndex: -1 };
 }
 
 function rankCodesInWindow(windowText, limit = 50) {

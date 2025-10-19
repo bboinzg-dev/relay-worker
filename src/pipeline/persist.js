@@ -1113,7 +1113,7 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
     if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
   }
   if (!spec.verified_in_doc) {
-    const oi = spec.ordering_info || spec.orderingInfo || null;
+    const oi = spec._ordering_info || spec.ordering_info || spec.orderingInfo || null;
     const codes = Array.isArray(oi?.codes) ? oi.codes : null;
     if (codes && codes.length) {
       const me = String(spec.pn || spec.code || '').trim().toUpperCase();
@@ -1631,9 +1631,8 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       } else if (Object.prototype.hasOwnProperty.call(rec, '_ordering_info')) {
         delete rec._ordering_info;
       }
-      if (Object.prototype.hasOwnProperty.call(rec, 'ordering_info')) {
-        delete rec.ordering_info;
-      }
+      // buildBestIdentifiers/shouldInsert가 ordering 정보를 참조하므로 이 단계에서는 유지한다.
+      // (필요시 INSERT 직전에 정리하도록 한다.)
       if (Object.prototype.hasOwnProperty.call(rec, 'doc_type')) {
         delete rec.doc_type;
       }

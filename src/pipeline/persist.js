@@ -1398,6 +1398,24 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   try {
     for (const [rowIndex, row] of rows.entries()) {
       result.processed += 1;
+
+      const originalPnValue = resolveTemplateValue(row, 'pn');
+      const originalCodeValue = resolveTemplateValue(row, 'code');
+      const originalPnString =
+        originalPnValue == null
+          ? ''
+          : String(originalPnValue).trim();
+      const originalCodeString =
+        originalCodeValue == null
+          ? ''
+          : String(originalCodeValue).trim();
+      const originalPnIsTemplate = looksLikeTemplate(originalPnString);
+      const originalCodeIsTemplate = looksLikeTemplate(originalCodeString);
+      const originalPnIsValid =
+        !originalPnIsTemplate && isValidCode(originalPnString);
+      const originalCodeIsValid =
+        !originalCodeIsTemplate && isValidCode(originalCodeString);
+
       const rec = {};
       for (const [key, value] of Object.entries(row || {})) {
         const norm = normKey(key);
@@ -1516,6 +1534,14 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
         const renderedCode = renderAnyTemplate(templateContext.code, contextForCode, ctxText);
         rec.code = renderedCode ?? null;
+      }
+
+            if (!isValidCode(rec.pn) && originalPnIsValid) {
+        rec.pn = originalPnString;
+      }
+
+      if (!isValidCode(rec.code) && (originalCodeIsValid || originalPnIsValid)) {
+        rec.code = originalCodeIsValid ? originalCodeString : originalPnString;
       }
 
       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {

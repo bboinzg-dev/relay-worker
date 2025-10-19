@@ -878,6 +878,17 @@ function buildPnIfMissing(record = {}, pnTemplate) {
 function buildBestIdentifiers(family, spec = {}, blueprint) {
   if (!spec || typeof spec !== 'object') return spec;
 
+  // ① 문서 본문 텍스트 확보 (DocAI 텍스트 → _doc_text/doc_text)
+  try {
+    const raw = spec.raw_json;
+    const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const docaiText = obj?.docai?.text || '';
+    if (docaiText) {
+      if (!spec._doc_text) spec._doc_text = docaiText;
+      if (!spec.doc_text) spec.doc_text = docaiText;
+    }
+  } catch (_) {}
+
   let codeCandidate = null;
   const docText = String(spec._doc_text || spec.doc_text || '');
   let docai = null;
@@ -1500,6 +1511,14 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       buildBestIdentifiers(familySlug, rec, blueprintMeta);
+      
+      // ② verified_in_doc 폴백: pn/code가 본문에 실제 존재하면 true
+      if (!rec.verified_in_doc) {
+        const hay = String(rec._doc_text || rec.doc_text || '');
+        const hasPn = rec.pn && fuzzyContainsPn && fuzzyContainsPn(hay, rec.pn);
+        const hasCode = !hasPn && rec.code && fuzzyContainsPn && fuzzyContainsPn(hay, rec.code);
+        if (hasPn || hasCode) rec.verified_in_doc = true;
+      }
       // ◾ top-level key normalization to avoid duplicate columns like "terminal form"
       const renames = [];
       for (const key of Object.keys(rec)) {

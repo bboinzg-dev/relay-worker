@@ -1220,6 +1220,17 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
     verified = Boolean(verified);
   }
   row.verified_in_doc = verified;
+    if (!verified) {
+    const ord = row._ordering_info;
+    const ordList = Array.isArray(ord?.codes) ? ord.codes : [];
+    const ordHit =
+      isValidCode(pn) &&
+      ordList.some((code) => String(code ?? '').trim().toUpperCase() === pn.toUpperCase());
+    if (ordHit) {
+      verified = true;
+      row.verified_in_doc = true;
+    }
+  }
   if (!verified) {
     row.last_error = row.last_error || 'unverified_in_doc';
     return { ok: false, reason: 'unverified_in_doc' };
@@ -1728,10 +1739,10 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       if (!rec.verified_in_doc) {
-        if (rec.code && looksLikeGarbageCode(rec.code)) {
+        if (rec.code && !isValidCode(rec.code) && looksLikeGarbageCode(rec.code)) {
           rec.code = null;
         }
-        if (rec.pn && looksLikeGarbageCode(rec.pn)) {
+        if (rec.pn && !isValidCode(rec.pn) && looksLikeGarbageCode(rec.pn)) {
           rec.pn = null;
         }
       }

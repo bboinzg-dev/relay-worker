@@ -3,26 +3,18 @@
 function decodeCoilVoltageVdc(pnOrCode = '') {
   const s = String(pnOrCode ?? '').trim();
   if (!s) return null;
-
-  const matchNumericTail = /([0-9]{2,3})$/.exec(s);
-  if (matchNumericTail) {
-    const n = Number(matchNumericTail[1]);
+  // anywhere matcher: 1~3 digits or 1H/4H, optional V/VDC around it
+  const m = s.match(/(?:^|[^0-9A-Za-z])((?:[14]H)|(?:\d{1,3}(?:\.\d+)?))\s*(?:V(?:DC)?)?(?:$|[^0-9A-Za-z])/i);
+  if (m) {
+    const tok = String(m[1] || '').toUpperCase();
+    if (tok === '1H') return 1.5;
+    if (tok === '4H') return 4.5;
+    const n = Number(tok);
     if (Number.isFinite(n)) {
-      if (n >= 100) {
-        return n % 10 === 0 ? n / 10 : n;
-      }
-      if (n === 45) return 4.5;
-      if (n === 15) return 1.5;
-      if (n === 48) return 48;
+      if (n >= 100) return n % 10 === 0 ? n / 10 : n;
       return n;
     }
   }
-
-  const hMatch = /([14])H$/i.exec(s);
-  if (hMatch) {
-    return hMatch[1] === '1' ? 1.5 : 4.5;
-  }
-
   return null;
 }
 

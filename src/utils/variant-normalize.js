@@ -56,9 +56,9 @@ function normalizeVariantDomains(domains = {}, allowedKeys = []) {
 function decodeCoilVoltageVdcKeepBoth(value) {
   const raw = String(value ?? '').toUpperCase().trim();
   if (!raw) return raw;
-  const match = raw.match(/^(\d{2,3}|[14]H)$/);
-  if (!match) return raw;
-  const token = match[1];
+  // allow DC prefix and V/VDC suffix; allow 1~3 digits and 1H/4H
+  const m = raw.match(/^(?:DC)?\s*((?:\d{1,3}(?:\.\d+)?)|[14]H)\s*(?:V(?:DC)?)?$/i);
+  const token = (m ? m[1] : null) || raw;
   let val = token;
   if (token === '1H') {
     val = 1.5;
@@ -69,6 +69,8 @@ function decodeCoilVoltageVdcKeepBoth(value) {
     if (Number.isFinite(num)) {
       val = num >= 100 ? (num % 10 === 0 ? num / 10 : num) : num;
     }
+   } else if (/^\d$/.test(token)) {
+    val = Number(token);
   }
   return { raw, vdc: String(val) };
 }

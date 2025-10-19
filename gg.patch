@@ -1,65 +1,44 @@
-diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index d7ee1fdb439754588f463094caffb2a63262b64a..8e1f75a503350b0efe05c8e44b8f6543ea139bd8 100644
---- a/src/pipeline/persist.js
-+++ b/src/pipeline/persist.js
-@@ -1428,50 +1428,60 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
-         const renderedPn = renderAnyTemplate(templateContext.pn, templateContext, ctxText);
-         rec.pn = renderedPn ?? null;
-       }
+diff --git a/src/utils/coil-voltage.js b/src/utils/coil-voltage.js
+index e9d1498d0e5d975cdacb93d44307d68365389454..df7e6f7c7c8260a88652b08724c8fbfedeeb8d7e 100644
+--- a/src/utils/coil-voltage.js
++++ b/src/utils/coil-voltage.js
+@@ -1,29 +1,21 @@
+ 'use strict';
  
-       if (codeWasTemplate) {
-         const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
-         const renderedCode = renderAnyTemplate(templateContext.code, contextForCode, ctxText);
-         rec.code = renderedCode ?? null;
-       }
+ function decodeCoilVoltageVdc(pnOrCode = '') {
+   const s = String(pnOrCode ?? '').trim();
+   if (!s) return null;
+-
+-  const matchNumericTail = /([0-9]{2,3})$/.exec(s);
+-  if (matchNumericTail) {
+-    const n = Number(matchNumericTail[1]);
++  // anywhere matcher: 1~3 digits or 1H/4H, optional V/VDC around it
++  const m = s.match(/(?:^|[^0-9A-Za-z])((?:[14]H)|(?:\d{1,3}(?:\.\d+)?))\s*(?:V(?:DC)?)?(?:$|[^0-9A-Za-z])/i);
++  if (m) {
++    const tok = String(m[1] || '').toUpperCase();
++    if (tok === '1H') return 1.5;
++    if (tok === '4H') return 4.5;
++    const n = Number(tok);
+     if (Number.isFinite(n)) {
+-      if (n >= 100) {
+-        return n % 10 === 0 ? n / 10 : n;
+-      }
+-      if (n === 45) return 4.5;
+-      if (n === 15) return 1.5;
+-      if (n === 48) return 48;
++      if (n >= 100) return n % 10 === 0 ? n / 10 : n;
+       return n;
+     }
+   }
+-
+-  const hMatch = /([14])H$/i.exec(s);
+-  if (hMatch) {
+-    return hMatch[1] === '1' ? 1.5 : 4.5;
+-  }
+-
+   return null;
+ }
  
-       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
-         rec.pn = rec.code;
-       }
- 
-       if (!isValidCode(rec.pn)) {
-         rec.pn = null;
-       }
- 
-       if (!rec.pn && rec.code) {
-         rec.pn = rec.code;
-       }
- 
-       buildPnIfMissing(rec, pnTemplate);
- 
-       buildBestIdentifiers(familySlug, rec, blueprintMeta);
-+
-+      // 🔎 Fallback verification:
-+      // ORDERING 추출이 실패하더라도 본문 텍스트에 pn/code가 실제로 존재하면 verified_in_doc 인정
-+      if (!rec.verified_in_doc) {
-+        const hay = String(docTextRaw || '');
-+        if ((rec.pn && fuzzyContainsPn(hay, rec.pn)) || (rec.code && fuzzyContainsPn(hay, rec.code))) {
-+          rec.verified_in_doc = true;
-+        }
-+      }
-+
-       if (!rec.verified_in_doc) {
-         if (rec.code && looksLikeGarbageCode(rec.code)) {
-           rec.code = null;
-         }
-         if (rec.pn && looksLikeGarbageCode(rec.pn)) {
-           rec.pn = null;
-         }
-       }
-       if (!STRICT_CODE_RULES && rec._warn_invalid_code) {
-         console.warn(
-           '[WARN] invalid_code (soft) family=%s pn=%s code=%s',
-           familySlug,
-           rec.pn,
-           rec.code,
-         );
-       }
- 
-       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
-         rec.pn = rec.code;
-       }
- 
-       // 🔹 템플릿 미치환 차단: 아직 { } 가 남아있다면 유효 PN 아님
-       if (looksLikeTemplate(rec.pn) || looksLikeTemplate(rec.code)) {
-         if (physicalCols.has('last_error')) rec.last_error = 'template_unresolved';
-         result.skipped.push({ reason: 'invalid_code', detail: 'template_unresolved' });
+-module.exports = { decodeCoilVoltageVdc };
+\ No newline at end of file
++module.exports = { decodeCoilVoltageVdc };

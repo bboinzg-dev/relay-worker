@@ -29,6 +29,8 @@ const { pool } = tryRequire([
   path.join(__dirname, './db'),
   path.join(process.cwd(), 'db'),
 ]);
+// bring normalizer for contact_form synonyms (e.g., "DPDT" → "2C")
+const { normalizeContactForm } = require('../utils/mpn-exploder');
 const { ensureSpecsTable } = tryRequire([
   path.join(__dirname, '../utils/schema'),
   path.join(__dirname, '../../utils/schema'),
@@ -1460,6 +1462,28 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       buildBestIdentifiers(familySlug, rec, blueprintMeta);
+      // ◾ contact_form synonyms → contact_form
+      if (!rec.contact_form) {
+        const cf = normalizeContactForm(
+          rec.contact_form ?? rec.contact_arrangement ?? rec.configuration ?? null,
+        );
+        if (cf) rec.contact_form = cf;
+      }
+      // ◾ terminal_shape -> mount_type heuristic
+      if (!rec.mount_type && rec.terminal_shape) {
+        const t = String(rec.terminal_shape).toLowerCase();
+        if (/pc\s*pin|through|dip/.test(t)) rec.mount_type = 'Through-Hole';
+      }
+      // ◾ poles만 온 경우 보조 추론
+      if (!rec.contact_form && Number.isFinite(rec.poles)) {
+        if (Number(rec.poles) === 2) rec.contact_form = '2C';
+        else if (Number(rec.poles) === 1) rec.contact_form = '1C';
+      }
+      // ◾ packing_style은 텍스트로 유지(“50 pcs” 숫자 오인 방지)
+      if (typeof rec.packing_style === 'number') {
+        rec.packing_style = String(rec.packing_style);
+      }
+
       if (!rec.verified_in_doc) {
         if (rec.code && looksLikeGarbageCode(rec.code)) {
           rec.code = null;

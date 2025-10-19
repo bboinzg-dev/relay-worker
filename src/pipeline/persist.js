@@ -1067,6 +1067,9 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   if (row.code == null || String(row.code).trim() === '') row.code = pn;
   const hasCore = hasCoreSpec(row, coreSpecKeys, candidateSpecKeys);
   if (!hasCore) {
+     if (docType === 'ordering' || allowMinimal) {
+      return { ok: true };
+    }
     row.last_error = row.last_error || 'missing_core_spec';
     return { ok: false, reason: 'missing_core_spec' };
   }
@@ -1358,6 +1361,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           rec.brand = options?.brand || brandKey;
         }
         rec.brand_norm = brandKey;
+
       } else if (physicalCols.has('brand_norm')) {
         rec.brand_norm = null;
       }

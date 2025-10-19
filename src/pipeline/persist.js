@@ -958,10 +958,14 @@ function fuzzyContainsPn(text, pn) {
   const raw = String(pn || '').trim();
   if (!raw || !hay) return false;
   // 영문/숫자/그 외 기호로 토큰화 후, 토큰 사이에는 항상 [-\s]* 허용
+  // 유니코드 대시(– — ―)와 수학용 마이너스(−)까지 허용하도록 확장
+  const glue = '[-–—―−\\s]*';
   const toks = raw.match(/[A-Za-z]+|\d+|[^A-Za-z0-9]+/g) || [];
   const piece = toks
-    .map((t) => (/^[A-Za-z0-9]+$/.test(t) ? t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : '[-\\s]*'))
-    .join('[-\\s]*');
+    .map((t) => (/^[A-Za-z0-9]+$/.test(t)
+      ? t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      : glue))
+    .join(glue);
   // 'V' vs 'VDC' 허용 + 끝에 붙는 접미 문자 앞 공백 허용
   const pattern = piece.replace(/V$/i, 'V(?:DC)?') + '(?:\\s*[A-Z])?$';
   const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}`, 'i');
@@ -1769,7 +1773,12 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         rec?.mpn_list,
         rec?.mpnList,
       );
-
+      if (!rec.verified_in_doc && rowMpnSet && rowMpnSet.size) {
+        const me = String(rec.pn || rec.code || '').trim().toUpperCase();
+        if (me && rowMpnSet.has(me)) {
+          rec.verified_in_doc = true;
+        }
+      }
             if (!isValidCode(rec.pn) && !isValidCode(rec.code)) {
         const orderingCandidates = [];
         if (Array.isArray(orderingPayload?.codes)) orderingCandidates.push(...orderingPayload.codes);

@@ -135,7 +135,11 @@ const META_KEYS = new Set([
 ]);
 
 const CONFLICT_KEYS = ['brand', 'pn'];
-const NEVER_INSERT = new Set(['id', 'brand_norm', 'code_norm', 'pn_norm', 'created_at', 'updated_at']);
+const NEVER_INSERT = new Set([
+  'id','brand_norm','code_norm','pn_norm','created_at','updated_at',
+  // 본문/검증 보조 필드는 DB에 저장하지 않음
+  'text','doc_text','_doc_text'
+]);
 
 const FORBIDDEN_RE = /(pdf|font|xref|object|type0|ffff)/i;
 const BANNED_PREFIX = /^(pdf|page|figure|table|sheet|rev|ver|draft)\b/i;
@@ -860,7 +864,7 @@ function buildPnIfMissing(record = {}, pnTemplate) {
   if (existing) return;
   const fromTemplate = renderPnTemplate(pnTemplate, record);
   // 본문 검증: 템플릿 결과가 실제 문서 텍스트에 존재할 때만 채택
-  const ctxText = String(record._doc_text || record.doc_text || '');
+  const ctxText = String(record._doc_text || record.doc_text || record.text || '');
   if (fromTemplate && ctxText && fuzzyContainsPn(ctxText, fromTemplate)) {
     record.pn = fromTemplate;
     if (!record.code) record.code = fromTemplate;
@@ -1511,10 +1515,9 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       buildBestIdentifiers(familySlug, rec, blueprintMeta);
-      
-      // ② verified_in_doc 폴백: pn/code가 본문에 실제 존재하면 true
+      // 본문에 실제 PN/코드가 보이면 verified_in_doc = true
       if (!rec.verified_in_doc) {
-        const hay = String(rec._doc_text || rec.doc_text || '');
+        const hay = String(rec._doc_text || rec.doc_text || rec.text || '');
         const hasPn = rec.pn && fuzzyContainsPn && fuzzyContainsPn(hay, rec.pn);
         const hasCode = !hasPn && rec.code && fuzzyContainsPn && fuzzyContainsPn(hay, rec.code);
         if (hasPn || hasCode) rec.verified_in_doc = true;

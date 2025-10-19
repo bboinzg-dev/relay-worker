@@ -1003,14 +1003,58 @@ function buildPnIfMissing(record = {}, pnTemplate) {
 
 // (2) 어디서 들어왔든 pn/code가 본문에 있으면 verified_in_doc 보강
 function verifyInDocIfPresent(record = {}) {
-  const hay = String(record._doc_text || record.doc_text || record.text || '');
-  if (!hay) return;
-  if (!record.verified_in_doc) {
-    const hasPn =
-      record.pn && typeof fuzzyContainsPn === 'function' && fuzzyContainsPn(hay, record.pn);
-    const hasCode =
-      !hasPn && record.code && typeof fuzzyContainsPn === 'function' && fuzzyContainsPn(hay, record.code);
-    if (hasPn || hasCode) record.verified_in_doc = true;
+  if (record.verified_in_doc) return;
+  const docText = String(record._doc_text || record.doc_text || record.text || '');
+  if (!docText) return;
+  let orderingInfo = record._ordering_info || record.ordering_info || record.orderingInfo || null;
+  const store = (value) => {
+    if (!value || typeof value !== 'object') return;
+    orderingInfo = { ...(orderingInfo && typeof orderingInfo === 'object' ? orderingInfo : {}), ...value };
+    record._ordering_info = orderingInfo;
+    record.ordering_info = orderingInfo;
+    record.orderingInfo = orderingInfo;
+  };
+  if (!orderingInfo && typeof extractOrderingInfo === 'function') {
+    const parsed = extractOrderingInfo(docText, 200);
+    if (parsed) store(parsed);
+  }
+  if (!orderingInfo) return;
+
+  const textSource = orderingInfo.text;
+  const orderingText = Array.isArray(textSource) ? textSource.join('\n') : String(textSource || '');
+  const candidates = [];
+  if (record.pn) candidates.push(record.pn);
+  if (record.code && record.code !== record.pn) candidates.push(record.code);
+  const validCandidates = candidates.filter((cand) => isValidCode(cand) && !looksLikeGarbageCode(cand));
+  if (!validCandidates.length) return;
+
+  const codes = Array.isArray(orderingInfo.codes) ? orderingInfo.codes : null;
+  if (codes && codes.length) {
+    const codeSet = new Set(
+      codes
+        .map((c) => String(c || '').trim().toUpperCase())
+        .filter((c) => c && isValidCode(c) && !looksLikeGarbageCode(c)),
+    );
+    if (codeSet.size) {
+      for (const cand of validCandidates) {
+        if (codeSet.has(String(cand).trim().toUpperCase())) {
+          record.verified_in_doc = true;
+          return;
+        }
+      }
+    }
+  }
+
+  if (!orderingText) return;
+  for (const cand of validCandidates) {
+    if (typeof fuzzyContainsPn === 'function' && fuzzyContainsPn(orderingText, cand)) {
+      record.verified_in_doc = true;
+      return;
+    }
+    if (norm(orderingText).includes(norm(cand))) {
+      record.verified_in_doc = true;
+      return;
+    }
   }
 }
 
@@ -1035,6 +1079,19 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
 
   let codeCandidate = null;
   const docText = String(spec._doc_text || spec.doc_text || '');
+  let orderingInfo = spec._ordering_info || spec.ordering_info || spec.orderingInfo || null;
+  const storeOrderingInfo = (value) => {
+    if (!value || typeof value !== 'object') return;
+    const base = orderingInfo && typeof orderingInfo === 'object' ? orderingInfo : {};
+    orderingInfo = { ...base, ...value };
+    spec.ordering_info = orderingInfo;
+    spec.orderingInfo = orderingInfo;
+    spec._ordering_info = orderingInfo;
+  };
+  if (orderingInfo && typeof orderingInfo === 'object') {
+    // ensure shared reference for downstream consumers
+    storeOrderingInfo(orderingInfo);
+  }
   let docai = null;
   try {
     const raw = spec.raw_json;
@@ -1048,30 +1105,21 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
   if (!docai && spec && typeof spec === 'object' && spec.docai) {
     docai = spec.docai;
   }
+  if (!orderingInfo && docText && typeof extractOrderingInfo === 'function') {
+    const parsed = extractOrderingInfo(docText, 200);
+    if (parsed) storeOrderingInfo(parsed);
+  }
+  if ((!orderingInfo || !Array.isArray(orderingInfo.codes) || orderingInfo.codes.length === 0)
+      && typeof collectPnCandidates === 'function') {
+    const res = collectPnCandidates({ docText, docai, extractOrderingInfo });
+    if (res && Array.isArray(res.codes) && res.codes.length) {
+      storeOrderingInfo({ codes: res.codes });
+    }
+  }
+
   const localTemplate = getBlueprintPnTemplate(blueprint || {}, spec);
   if (localTemplate) {
     try {
-      let orderingInfo = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
-      // 🔁 Fallback: if no ordering info from Vertex, derive from raw doc text
-      if (!orderingInfo && typeof extractOrderingInfo === 'function') {
-        const parsed = docText ? extractOrderingInfo(docText, 200) : null;
-        if (parsed) {
-          orderingInfo = parsed;
-          spec.ordering_info = parsed; // 다음 단계에서 템플릿/검증에 활용
-          spec.orderingInfo = parsed;
-          spec._ordering_info = parsed;
-        }
-      }
-      if ((!orderingInfo || !Array.isArray(orderingInfo.codes) || orderingInfo.codes.length === 0)
-          && typeof collectPnCandidates === 'function') {
-        const res = collectPnCandidates({ docText, docai, extractOrderingInfo });
-        if (res && Array.isArray(res.codes) && res.codes.length) {
-          orderingInfo = { codes: res.codes };
-          spec.ordering_info = orderingInfo;
-          spec.orderingInfo = orderingInfo;
-          spec._ordering_info = orderingInfo;
-        }
-      }
       const context = { ...spec };
       if (orderingInfo && typeof orderingInfo === 'object') {
         context.ordering_info = orderingInfo;
@@ -1095,31 +1143,63 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
       codeCandidate = fallback;
     }
   }
-  const docHit = docText
-    && (typeof fuzzyContainsPn === 'function'
-      ? fuzzyContainsPn(docText, codeCandidate)
-      : norm(docText).includes(norm(codeCandidate)));
-  if (codeCandidate && docHit) {
+  let docHit = false;
+  const candidate = String(codeCandidate || '').trim();
+  if (candidate && isValidCode(candidate) && !looksLikeGarbageCode(candidate)) {
+    const candidateUpper = candidate.toUpperCase();
+    const codes = Array.isArray(orderingInfo?.codes) ? orderingInfo.codes : null;
+    if (codes && codes.length) {
+      docHit = codes.some((c) => {
+        const cc = String(c || '').trim();
+        if (!cc || !isValidCode(cc) || looksLikeGarbageCode(cc)) return false;
+        return cc.toUpperCase() === candidateUpper;
+      });
+    }
+    if (!docHit) {
+      const textSource = orderingInfo?.text;
+      const orderingText = Array.isArray(textSource) ? textSource.join('\n') : String(textSource || '');
+      if (orderingText) {
+        docHit = typeof fuzzyContainsPn === 'function'
+          ? fuzzyContainsPn(orderingText, candidate)
+          : norm(orderingText).includes(norm(candidate));
+      }
+    }
+  }
+  if (candidate && docHit) {
     spec.pn = codeCandidate;
     spec.code = codeCandidate;
     spec.verified_in_doc = true;
-  } else {
-    // 유효한 쪽을 보존: 한쪽만 살아있으면 상호 보완하고,
-    // 둘 다 있으면 아무 것도 덮어쓰지 않는다.
-    const pnOk = isValidCode(spec.pn);
-    const codeOk = isValidCode(spec.code);
-    if (!codeOk && pnOk) spec.code = spec.pn;
-    if (!pnOk && codeOk) spec.pn = spec.code;
-    if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
   }
+  // 유효한 쪽을 보존: 한쪽만 살아있으면 상호 보완하고,
+  // 둘 다 있으면 아무 것도 덮어쓰지 않는다.
+  const pnOk = isValidCode(spec.pn) && !looksLikeGarbageCode(spec.pn);
+  const codeOk = isValidCode(spec.code) && !looksLikeGarbageCode(spec.code);
+  if (!codeOk && pnOk) spec.code = spec.pn;
+  if (!pnOk && codeOk) spec.pn = spec.code;
+
   if (!spec.verified_in_doc) {
-    const oi = spec._ordering_info || spec.ordering_info || spec.orderingInfo || null;
-    const codes = Array.isArray(oi?.codes) ? oi.codes : null;
+    const codes = Array.isArray(orderingInfo?.codes) ? orderingInfo.codes : null;
     if (codes && codes.length) {
       const me = String(spec.pn || spec.code || '').trim().toUpperCase();
-      if (me && codes.some((c) => String(c || '').trim().toUpperCase() === me)) {
-        spec.verified_in_doc = true;
+      if (me && isValidCode(me) && !looksLikeGarbageCode(me)) {
+        const matched = codes.some((c) => {
+          const cc = String(c || '').trim().toUpperCase();
+          if (!cc) return false;
+          if (!isValidCode(cc) || looksLikeGarbageCode(cc)) return false;
+          return cc === me;
+        });
+        if (matched) spec.verified_in_doc = true;
       }
+    }
+  }
+
+  if (!STRICT_CODE_RULES) {
+    const finalPnOk = isValidCode(spec.pn) && !looksLikeGarbageCode(spec.pn);
+    const finalCodeOk = isValidCode(spec.code) && !looksLikeGarbageCode(spec.code);
+    if (!finalPnOk && !finalCodeOk && (spec.pn || spec.code)) {
+      spec._warn_invalid_code = true;
+    } else if (spec._warn_invalid_code && (finalPnOk || finalCodeOk)) {
+      delete spec._warn_invalid_code;
     }
   }
 

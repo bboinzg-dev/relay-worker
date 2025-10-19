@@ -175,7 +175,7 @@ async function processWithDocAI(gcsUri) {
 
   const doc = res?.document;
   if (!doc) return null;
-  const fullText = doc.text || '';
+  let fullText = doc.text || '';
   const pages = doc.pages || [];
 
   const getTxt = (layout) => {
@@ -195,6 +195,7 @@ async function processWithDocAI(gcsUri) {
       tables.push({ headers, rows });
     }
   }
+  fullText = stripPageFurniture(fullText);
   return { tables, fullText };
 }
 
@@ -204,7 +205,48 @@ async function parseTextWithPdfParse(gcsUri) {
   const { bucket, name } = parseGcsUri(gcsUri);
   const [buf] = await storage.bucket(bucket).file(name).download();
   const out = await pdfParse(buf);
-  return out?.text || '';
+  return stripPageFurniture(out?.text || '');
+}
+
+function stripPageFurniture(fullText) {
+  const raw = String(fullText || '');
+  if (!raw) return raw;
+  try {
+    const pages = raw.split(/\f/g);
+    if (!pages.length) return raw;
+    const tokenize = (input) => (String(input || '').match(/[A-Z0-9][A-Z0-9\-_.:/]{5,}/g) || []);
+    const freq = new Map();
+    for (const page of pages) {
+      const uniques = new Set(tokenize(page));
+      for (const token of uniques) {
+        freq.set(token, (freq.get(token) || 0) + 1);
+      }
+    }
+    const threshold = Math.max(2, Math.floor(pages.length * 0.6));
+    const furniture = Array.from(freq.entries())
+      .filter(([, count]) => count >= threshold)
+      .map(([token]) => token)
+      .filter(Boolean);
+    if (!furniture.length) return raw;
+    const cleanedPages = pages.map((page) => {
+      if (!page) return page;
+      const len = page.length;
+      const headIdx = Math.floor(len * 0.15);
+      const footIdx = Math.floor(len * 0.85);
+      let head = page.slice(0, headIdx);
+      const body = page.slice(headIdx, footIdx);
+      let foot = page.slice(footIdx);
+      for (const token of furniture) {
+        const pattern = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        head = head.replace(new RegExp(pattern, 'g'), ' ');
+        foot = foot.replace(new RegExp(pattern, 'g'), ' ');
+      }
+      return head + body + foot;
+    });
+    return cleanedPages.join('\f');
+  } catch (_) {
+    return raw;
+  }
 }
 
 /* -------------------- code extraction -------------------- */
@@ -214,6 +256,8 @@ function looksLikeCode(x) {
   if (!/\d/.test(s)) return false;
   if (!/[A-Za-z]/.test(s) && !/[-_/]/.test(s)) return false;
   if (/\b(OHM|Ω|VDC|VAC|AMP|A|V|W|HZ|MS|SEC|UL|ROHS|REACH|DATE|PAGE)\b/i.test(s)) return false;
+  if (/^(ASCTB\d{3,4}[A-Z])$/i.test(s)) return false;
+  if (/^(W\d{3,5}-E\d-?\d{2})$/i.test(s)) return false;
   return true;
 }
 function mapHeaderToKey(h) {

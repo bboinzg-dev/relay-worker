@@ -436,6 +436,122 @@ function repairPn(raw) {
   return s.length >= 3 ? s : null;
 }
 
+function toCandidateArray(input) {
+  if (!input) return [];
+  if (Array.isArray(input)) return input;
+  if (input instanceof Set) return Array.from(input);
+  return [input];
+}
+
+function normalizeCandidatePnValue(raw) {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      const normalized = normalizeCandidatePnValue(entry);
+      if (normalized) return normalized;
+    }
+    return null;
+  }
+  if (typeof raw === 'object') {
+    if (raw && typeof raw.code === 'string') return normalizeCandidatePnValue(raw.code);
+    if (raw && typeof raw.value === 'string') return normalizeCandidatePnValue(raw.value);
+    if (raw && typeof raw.text === 'string') return normalizeCandidatePnValue(raw.text);
+    if (raw && typeof raw.pn === 'string') return normalizeCandidatePnValue(raw.pn);
+    return null;
+  }
+  let str = String(raw || '').trim();
+  if (!str) return null;
+  if (looksLikeTemplate(str)) return null;
+  if (looksLikeGarbageCode(str)) return null;
+  const repaired = repairPn(str) || str.replace(/\s+/g, '');
+  const cleaned = String(repaired || '').trim();
+  if (!cleaned) return null;
+  if (!isValidCode(cleaned)) return null;
+  return cleaned;
+}
+
+function collectCandidateEntries(sources = []) {
+  const entries = new Map();
+  const list = Array.isArray(sources) ? sources : [];
+  for (const source of list) {
+    if (!source) continue;
+    const {
+      values,
+      priority = 10,
+      requireDocHit = false,
+      allowNoDoc = false,
+      fallbackVerified = false,
+    } = source;
+    const label = source.source || source.label || 'candidate';
+    const rawValues = [];
+    for (const value of toCandidateArray(values)) {
+      if (value == null) continue;
+      if (Array.isArray(value)) rawValues.push(...value);
+      else rawValues.push(value);
+    }
+    if (!rawValues.length) continue;
+    const seenLocal = new Set();
+    const normalizedList = [];
+    for (const raw of rawValues) {
+      const normalized = normalizeCandidatePnValue(raw);
+      if (!normalized) continue;
+      const upper = normalized.toUpperCase();
+      if (seenLocal.has(upper)) continue;
+      seenLocal.add(upper);
+      normalizedList.push({ value: normalized, upper });
+    }
+    if (!normalizedList.length) continue;
+    const allowFallback = allowNoDoc || (!requireDocHit && normalizedList.length === 1);
+    for (const candidate of normalizedList) {
+      const existing = entries.get(candidate.upper);
+      const next = {
+        value: candidate.value,
+        upper: candidate.upper,
+        priority,
+        requireDocHit,
+        allowNoDoc: allowFallback,
+        fallbackVerified: allowFallback && fallbackVerified,
+        source: label,
+      };
+      if (!existing || next.priority < existing.priority) {
+        entries.set(candidate.upper, next);
+      } else if (existing && next.priority === existing.priority && candidate.value.length > existing.value.length) {
+        entries.set(candidate.upper, { ...existing, value: candidate.value });
+      }
+    }
+  }
+  return Array.from(entries.values());
+}
+
+function selectBestCandidate(entries, docText) {
+  if (!Array.isArray(entries) || !entries.length) return null;
+  const haystack = typeof docText === 'string' ? docText : String(docText ?? '');
+  const docMatches = [];
+  const fallbacks = [];
+  for (const entry of entries) {
+    if (!entry || !entry.value) continue;
+    const inDoc = haystack && typeof fuzzyContainsPn === 'function' && fuzzyContainsPn(haystack, entry.value);
+    if (inDoc) {
+      docMatches.push(entry);
+      continue;
+    }
+    if (!entry.requireDocHit && entry.allowNoDoc) {
+      fallbacks.push(entry);
+    }
+  }
+  if (docMatches.length) {
+    docMatches.sort((a, b) => a.priority - b.priority || b.value.length - a.value.length);
+    const chosen = docMatches[0];
+    return { value: chosen.value, verified: true, source: chosen.source };
+  }
+  if (fallbacks.length) {
+    fallbacks.sort((a, b) => a.priority - b.priority || b.value.length - a.value.length);
+    const chosen = fallbacks[0];
+    return { value: chosen.value, verified: Boolean(chosen.fallbackVerified), source: chosen.source };
+  }
+  return null;
+}
+
 function isNumericType(type = '') {
   const t = String(type || '').toLowerCase();
   return (
@@ -1655,6 +1771,78 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         rec?.mpn_list,
         rec?.mpnList,
       );
+
+            if (!isValidCode(rec.pn) && !isValidCode(rec.code)) {
+        const orderingCandidates = [];
+        if (Array.isArray(orderingPayload?.codes)) orderingCandidates.push(...orderingPayload.codes);
+        if (Array.isArray(orderingPayload?.scored)) {
+          for (const scored of orderingPayload.scored) {
+            if (!scored || typeof scored !== 'object') continue;
+            if (typeof scored.code === 'string') orderingCandidates.push(scored.code);
+          }
+        }
+
+        const candidateKeys = [
+          'pn_candidates',
+          'candidate_pns',
+          'candidate_codes',
+          'candidates',
+          'codes',
+          'code_list',
+          'codeList',
+          'mpn_candidates',
+          'mpnCandidates',
+        ];
+        const rowCandidateValues = [];
+        for (const key of candidateKeys) {
+          const value = Object.prototype.hasOwnProperty.call(row || {}, key) ? row[key] : null;
+          if (value == null) continue;
+          if (Array.isArray(value)) rowCandidateValues.push(...value);
+          else rowCandidateValues.push(value);
+        }
+        if (Array.isArray(rec?.candidates)) rowCandidateValues.push(...rec.candidates);
+        if (Array.isArray(options?.candidates)) rowCandidateValues.push(...options.candidates);
+
+        const sharedLists = [];
+        if (Array.isArray(options?.mpnList)) sharedLists.push(...options.mpnList);
+        if (Array.isArray(options?.mpn_list)) sharedLists.push(...options.mpn_list);
+
+        const candidateEntries = collectCandidateEntries([
+          orderingCandidates.length
+            ? { values: orderingCandidates, source: 'ordering', priority: 0, fallbackVerified: true }
+            : null,
+          rowCandidateValues.length
+            ? { values: rowCandidateValues, source: 'row', priority: 1 }
+            : null,
+          rowMpnSet && rowMpnSet.size
+            ? { values: Array.from(rowMpnSet), source: 'row_mpn', priority: 1 }
+            : null,
+          sharedMpnSet && sharedMpnSet.size
+            ? { values: Array.from(sharedMpnSet), source: 'shared_mpn', priority: 2, requireDocHit: true }
+            : null,
+          sharedLists.length
+            ? { values: sharedLists, source: 'shared_list', priority: 2, requireDocHit: true }
+            : null,
+        ]);
+
+        const pick = selectBestCandidate(candidateEntries, docTextRaw);
+        if (pick && pick.value) {
+          rec.pn = pick.value;
+          if (!rec.code) rec.code = pick.value;
+          if (!rec.verified_in_doc && pick.verified) {
+            rec.verified_in_doc = true;
+          }
+          if (!rec.verified_in_doc) {
+            const upper = pick.value.toUpperCase();
+            if ((sharedMpnSet && sharedMpnSet.has(upper)) || (rowMpnSet && rowMpnSet.has(upper))) {
+              rec.verified_in_doc = true;
+            }
+          }
+          if (rec._warn_invalid_code && rec.verified_in_doc) {
+            delete rec._warn_invalid_code;
+          }
+        }
+      }
 
       if (!rec.verified_in_doc) {
         const pnCandidate = String(rec.pn || rec.code || '').trim();

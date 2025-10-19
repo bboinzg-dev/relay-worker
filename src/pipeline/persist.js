@@ -27,7 +27,7 @@ const { ensureSpecsTable } = tryRequire([
 const { getColumnsOf } = require('./ensure-spec-columns');
 const { normalizeValueLLM } = require('../utils/ai');
 let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
-const { PN_RE } = require('../utils/patterns');
+const { isValidCode } = require('../utils/code-validation');
 const { getBlueprintPnTemplate } = require('../utils/getBlueprintPnTemplate');
 let extractOrderingInfo;
 try {
@@ -258,14 +258,6 @@ function normKey(key) {
 
 function isMinimalFallbackPn(value) {
   return typeof value === 'string' && value.startsWith('pdf:');
-}
-
-function isValidCode(value) {
-  const trimmed = String(value || '').trim();
-  if (!trimmed) return false;
-  if (isMinimalFallbackPn(trimmed)) return false;
-  if (/\{[^}]*\}/.test(trimmed)) return false;
-  return PN_RE.test(trimmed);
 }
 
 function pickFiniteNumber(...candidates) {
@@ -961,18 +953,19 @@ function renderPnTemplateLocal(template, record = {}) {
 const renderPnTemplate =
   typeof renderPnTemplateFromOrdering === 'function' ? renderPnTemplateFromOrdering : renderPnTemplateLocal;
 
-  function fuzzyContainsPn(text, pn) {
-  if (!pn) return false;
-  const template = String(pn || '').trim();
-  if (!template) return false;
-  const haystack = typeof text === 'string' ? text : String(text ?? '');
-  if (!haystack) return false;
-  const pattern = template
-    .replace(/[-\s]+/g, '[-\\s]*')
-    .replace(/V$/i, 'V(?:DC)?');
-  if (!pattern) return false;
-  const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}(?=$|[^A-Za-z0-9])`, 'i');
-  return re.test(haystack);
+function fuzzyContainsPn(text, pn) {
+  const hay = typeof text === 'string' ? text : String(text ?? '');
+  const raw = String(pn || '').trim();
+  if (!raw || !hay) return false;
+  // 영문/숫자/그 외 기호로 토큰화 후, 토큰 사이에는 항상 [-\s]* 허용
+  const toks = raw.match(/[A-Za-z]+|\d+|[^A-Za-z0-9]+/g) || [];
+  const piece = toks
+    .map((t) => (/^[A-Za-z0-9]+$/.test(t) ? t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : '[-\\s]*'))
+    .join('[-\\s]*');
+  // 'V' vs 'VDC' 허용 + 끝에 붙는 접미 문자 앞 공백 허용
+  const pattern = piece.replace(/V$/i, 'V(?:DC)?') + '(?:\\s*[A-Z])?$';
+  const re = new RegExp(`(^|[^A-Za-z0-9])${pattern}`, 'i');
+  return re.test(hay);
 }
 
 function buildPnIfMissing(record = {}, pnTemplate) {
@@ -1107,7 +1100,12 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
     spec.code = codeCandidate;
     spec.verified_in_doc = true;
   } else {
-    spec.code = spec.pn;
+    // 유효한 쪽을 보존: 한쪽만 살아있으면 상호 보완하고,
+    // 둘 다 있으면 아무 것도 덮어쓰지 않는다.
+    const pnOk = isValidCode(spec.pn);
+    const codeOk = isValidCode(spec.code);
+    if (!codeOk && pnOk) spec.code = spec.pn;
+    if (!pnOk && codeOk) spec.pn = spec.code;
     if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
   }
   if (!spec.verified_in_doc) {

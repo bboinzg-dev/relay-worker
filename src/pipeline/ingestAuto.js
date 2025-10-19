@@ -49,6 +49,7 @@ const {
   getColumnsOf,
 } = require('./ensure-spec-columns');
 const { normalizeVariantDomains } = require('../utils/variant-normalize');
+const { isValidCode } = require('../utils/code-validation');
 const { ensureSpecsTable } = tryRequire([
   path.join(__dirname, '../utils/schema'),
   path.join(__dirname, '../../utils/schema'),
@@ -1840,16 +1841,6 @@ function textContainsExact(text, pn) {
 }
 
 function normLower(s){ return String(s||'').trim().toLowerCase(); }
-
-function isValidCode(s) {
-  const v = String(s || '').trim();
-  if (!v) return false;
-  if (v.length < 2 || v.length > 64) return false;
-  if (!/[0-9A-Za-z]/.test(v)) return false;
-  if (/\s{2,}/.test(v)) return false;
-  if (/^pdf-?1(\.\d+)?$/i.test(v)) return false;
-  return true;
-}
 
 const KEY_ALIASES = {
   form: ['form', 'contact_form', 'contact_arrangement', 'configuration', 'arrangement', 'poles_form'],

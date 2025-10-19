@@ -1909,7 +1909,9 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           rec.verified_in_doc = true;
         }
       }
-      const orderingPrefixes = buildOrderingPrefixes(rec);
+      const orderingPrefixes =
+        buildOrderingPrefixes(rec)
+        || (orderingPayload ? buildOrderingPrefixes({ ordering_info: orderingPayload }) : null);
       if (!isValidCode(rec.pn) && !isValidCode(rec.code)) {
         const orderingCandidates = [];
         if (Array.isArray(orderingPayload?.codes)) orderingCandidates.push(...orderingPayload.codes);
@@ -1963,7 +1965,15 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
             : null,
         ], orderingPrefixes);
 
-        const pick = selectBestCandidate(candidateEntries, docTextRaw);
+        let pick = selectBestCandidate(candidateEntries, docTextRaw);
+        if (
+          pick
+          && pick.value
+          && orderingPrefixes
+          && !sharesAnyPrefix(pick.value.toUpperCase(), orderingPrefixes)
+        ) {
+          pick = null;
+        }
         if (pick && pick.value) {
           rec.pn = pick.value;
           if (!rec.code) rec.code = pick.value;
@@ -1997,7 +2007,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
                   : null;
               if (normalized) orderingCodes.add(normalized);
             }
-                        if (!orderingCodes.size && Array.isArray(orderingPayload.scored)) {
+            if (!orderingCodes.size && Array.isArray(orderingPayload.scored)) {
               for (const scored of orderingPayload.scored) {
                 if (!scored || typeof scored !== 'object') continue;
                 const normalized = typeof scored.code === 'string'
@@ -2007,6 +2017,18 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
               }
             }
             if (orderingCodes.has(pnUpper)) {
+              rec.verified_in_doc = true;
+            }
+          }
+                    if (
+            !rec.verified_in_doc
+            && orderingPayload?.text
+            && typeof fuzzyContainsPn === 'function'
+          ) {
+            const win = Array.isArray(orderingPayload.text)
+              ? orderingPayload.text.join('\n')
+              : String(orderingPayload.text || '');
+            if (win && fuzzyContainsPn(win, pnCandidate)) {
               rec.verified_in_doc = true;
             }
           }

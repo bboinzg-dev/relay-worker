@@ -860,6 +860,20 @@ const renderPnTemplate =
 }
 
 function buildPnIfMissing(record = {}, pnTemplate) {
+    // (1) 본문 텍스트 하이드레이션: raw_json.docai.text → _doc_text/doc_text
+  try {
+    if (!record._doc_text && !record.doc_text && record.raw_json) {
+      const obj = typeof record.raw_json === 'string' ? JSON.parse(record.raw_json) : record.raw_json;
+      const t = obj?.docai?.text || null;
+      if (t) {
+        record._doc_text = t;
+        record.doc_text = t;
+      }
+    }
+  } catch (err) {
+    // ignore malformed raw_json payloads
+  }
+
   const existing = String(record.pn || '').trim();
   if (existing) return;
   const fromTemplate = renderPnTemplate(pnTemplate, record);
@@ -872,6 +886,19 @@ function buildPnIfMissing(record = {}, pnTemplate) {
   }
   const code = String(record.code || '').trim();
   if (code) record.pn = code;
+}
+
+// (2) 어디서 들어왔든 pn/code가 본문에 있으면 verified_in_doc 보강
+function verifyInDocIfPresent(record = {}) {
+  const hay = String(record._doc_text || record.doc_text || record.text || '');
+  if (!hay) return;
+  if (!record.verified_in_doc) {
+    const hasPn =
+      record.pn && typeof fuzzyContainsPn === 'function' && fuzzyContainsPn(hay, record.pn);
+    const hasCode =
+      !hasPn && record.code && typeof fuzzyContainsPn === 'function' && fuzzyContainsPn(hay, record.code);
+    if (hasPn || hasCode) record.verified_in_doc = true;
+  }
 }
 
 /**
@@ -1504,7 +1531,8 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       buildPnIfMissing(rec, pnTemplate);
-
+      verifyInDocIfPresent(rec);
+      
       // 🔎 Fallback verification:
       // ORDERING 추출이 실패하더라도 본문 텍스트에 pn/code가 실제로 존재하면 verified_in_doc 인정
       if (!rec.verified_in_doc) {

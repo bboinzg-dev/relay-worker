@@ -1,58 +1,65 @@
 diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
-index c76abc5ace2c126831328618f10797d200c85186..fde958740fa64bca0e94488519d09877f969801a 100644
+index d7ee1fdb439754588f463094caffb2a63262b64a..8e1f75a503350b0efe05c8e44b8f6543ea139bd8 100644
 --- a/src/pipeline/persist.js
 +++ b/src/pipeline/persist.js
-@@ -1045,50 +1045,53 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
-       } else {
-         row.last_error = 'invalid_code';
-         return { ok: false, reason: 'invalid_code' };
+@@ -1428,50 +1428,60 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+         const renderedPn = renderAnyTemplate(templateContext.pn, templateContext, ctxText);
+         rec.pn = renderedPn ?? null;
        }
-     } else {
-       row.last_error = 'invalid_code';
-       return { ok: false, reason: 'invalid_code' };
-     }
-   } else {
-     if (FORBIDDEN_RE.test(pn) || BANNED_PREFIX.test(pn) || BANNED_EXACT.test(pn)) {
-       const fixed = repairPn(pn);
-       if (fixed && isValidCode(fixed) && !FORBIDDEN_RE.test(fixed) && !BANNED_PREFIX.test(fixed) && !BANNED_EXACT.test(fixed)) {
-         console.warn('[persist] pn repaired', { original: pn, fixed });
-         row.last_error = row.last_error || 'invalid_code_fixed';
-         pn = fixed;
-       } else {
-         row.last_error = 'invalid_code';
-         return { ok: false, reason: 'invalid_code' };
+ 
+       if (codeWasTemplate) {
+         const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
+         const renderedCode = renderAnyTemplate(templateContext.code, contextForCode, ctxText);
+         rec.code = renderedCode ?? null;
        }
-     }
-   }
-   row.pn = pn;
-   if (row.code == null || String(row.code).trim() === '') row.code = pn;
-   const hasCore = hasCoreSpec(row, coreSpecKeys, candidateSpecKeys);
-   if (!hasCore) {
-+    if (docType === 'ordering' || allowMinimal) {
-+      return { ok: true };
-+    }
-     row.last_error = row.last_error || 'missing_core_spec';
-     return { ok: false, reason: 'missing_core_spec' };
-   }
-   return { ok: true };
- }
  
- async function getColumnTypes(targetTable) {
-   const [schema, table] = targetTable.includes('.')
-     ? targetTable.split('.', 2)
-     : ['public', targetTable];
+       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
+         rec.pn = rec.code;
+       }
  
-   const { rows } = await pool.query(
-     `SELECT lower(column_name) AS column, data_type
-        FROM information_schema.columns
-       WHERE table_schema = $1
-         AND table_name   = $2`,
-     [schema, table],
-   );
+       if (!isValidCode(rec.pn)) {
+         rec.pn = null;
+       }
  
-   const map = new Map();
-   for (const row of rows) {
-     map.set(row.column, String(row.data_type || '').toLowerCase());
-   }
-   return map;
- }
+       if (!rec.pn && rec.code) {
+         rec.pn = rec.code;
+       }
+ 
+       buildPnIfMissing(rec, pnTemplate);
+ 
+       buildBestIdentifiers(familySlug, rec, blueprintMeta);
++
++      // 🔎 Fallback verification:
++      // ORDERING 추출이 실패하더라도 본문 텍스트에 pn/code가 실제로 존재하면 verified_in_doc 인정
++      if (!rec.verified_in_doc) {
++        const hay = String(docTextRaw || '');
++        if ((rec.pn && fuzzyContainsPn(hay, rec.pn)) || (rec.code && fuzzyContainsPn(hay, rec.code))) {
++          rec.verified_in_doc = true;
++        }
++      }
++
+       if (!rec.verified_in_doc) {
+         if (rec.code && looksLikeGarbageCode(rec.code)) {
+           rec.code = null;
+         }
+         if (rec.pn && looksLikeGarbageCode(rec.pn)) {
+           rec.pn = null;
+         }
+       }
+       if (!STRICT_CODE_RULES && rec._warn_invalid_code) {
+         console.warn(
+           '[WARN] invalid_code (soft) family=%s pn=%s code=%s',
+           familySlug,
+           rec.pn,
+           rec.code,
+         );
+       }
+ 
+       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
+         rec.pn = rec.code;
+       }
+ 
+       // 🔹 템플릿 미치환 차단: 아직 { } 가 남아있다면 유효 PN 아님
+       if (looksLikeTemplate(rec.pn) || looksLikeTemplate(rec.code)) {
+         if (physicalCols.has('last_error')) rec.last_error = 'template_unresolved';
+         result.skipped.push({ reason: 'invalid_code', detail: 'template_unresolved' });

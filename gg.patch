@@ -1,224 +1,294 @@
-diff --git a/src/pipeline/ensure-spec-columns.js b/src/pipeline/ensure-spec-columns.js
-index b8ca647951a9cfa32afeb24585d4634c7ad65755..2f120a3b75db3d41287587b09d8eba08d0d08a1b 100644
---- a/src/pipeline/ensure-spec-columns.js
-+++ b/src/pipeline/ensure-spec-columns.js
-@@ -1,141 +1,183 @@
- 'use strict';
- 
- const path = require('node:path');
--
--function tryRequire(paths) {
--  const errors = [];
--  for (const p of paths) {
--    try {
--      return require(p);
--    } catch (err) {
--      if (err?.code === 'MODULE_NOT_FOUND' && typeof err?.message === 'string' && err.message.includes(p)) {
--        errors.push(err);
--        continue;
--      }
--      throw err;
--    }
-+const tryRequire = require('../utils/try-require');
-+
-+let normalizeSpecKey = (value) => {
-+  if (value == null) return '';
-+  let str = String(value || '').trim();
-+  if (!str) return '';
-+  let prefix = '';
-+  const leading = str.match(/^_+/);
-+  if (leading) {
-+    prefix = leading[0];
-+    str = str.slice(prefix.length);
+diff --git a/src/pipeline/persist.js b/src/pipeline/persist.js
+index e7dcae1cf31d48d2987c9feb0de530eb8213e33b..56f0acae38e3c5412d4e7e182a1274fcb39587ca 100644
+--- a/src/pipeline/persist.js
++++ b/src/pipeline/persist.js
+@@ -414,50 +414,166 @@ function normalizeCodeCandidateList(list) {
    }
--  const error = new Error(`MODULE_NOT_FOUND: ${paths.join(' | ')}`);
--  error.code = 'MODULE_NOT_FOUND';
--  error.attempts = errors.map((e) => e?.message || String(e));
--  throw error;
-+  if (!str) return prefix.toLowerCase();
-+  const camelConverted = str.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
-+  const sanitized = camelConverted.replace(/[^a-zA-Z0-9_]/g, '_');
-+  const collapsed = sanitized.replace(/__+/g, '_').replace(/^_+|_+$/g, '');
-+  const final = collapsed ? `${prefix}${collapsed}` : prefix;
-+  return final.toLowerCase();
-+};
-+try {
-+  ({ normalizeSpecKey } = require('../utils/key-normalize'));
-+} catch (e) {
-+  // optional
+   return normalized;
  }
  
- const db = tryRequire([
-   path.join(__dirname, '../../db'),
-   path.join(__dirname, '../db'),
-   path.join(__dirname, './db'),
-   path.join(process.cwd(), 'db'),
- ]);
- 
- const TYPE_MAP = {
-   int: 'integer',
-   integer: 'integer',
-   numeric: 'numeric',
-   number: 'numeric',
-   float: 'double precision',
-   double: 'double precision',
-   'double precision': 'double precision',
-   decimal: 'numeric',
-   bool: 'boolean',
-   boolean: 'boolean',
-   text: 'text',
-   string: 'text',
- };
- 
- function normKey(k) {
-   return String(k || '')
-     .trim()
-     .toLowerCase()
-     .replace(/[^a-z0-9_]/g, '');
+ function buildCandidateCodeSet(...lists) {
+   const set = new Set();
+   for (const list of lists) {
+     const normalized = normalizeCodeCandidateList(list);
+     for (const code of normalized) set.add(code);
+   }
+   return set.size ? set : null;
  }
  
- async function getColumnsOf(qualified) {
-   const [schema, table] = qualified.includes('.')
-     ? qualified.split('.', 2)
-     : ['public', qualified];
-   const { rows } = await db.query(
-     `SELECT lower(column_name) AS col
-        FROM information_schema.columns
-       WHERE table_schema = $1
-         AND table_name   = $2`,
-     [schema, table]
+ function repairPn(raw) {
+   if (!raw) return null;
+   let s = String(raw).trim();
+   if (!s) return null;
+   if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
+   s = s.replace(/[–—―]/g, '-');
+   s = s.replace(/\s+/g, '');
+   s = s.replace(/[^0-9A-Za-z\-_/().#]/g, '');
+   if (BANNED_PREFIX.test(s) || BANNED_EXACT.test(s)) return null;
+   return s.length >= 3 ? s : null;
+ }
+ 
++function toCandidateArray(input) {
++  if (!input) return [];
++  if (Array.isArray(input)) return input;
++  if (input instanceof Set) return Array.from(input);
++  return [input];
++}
++
++function normalizeCandidatePnValue(raw) {
++  if (raw == null) return null;
++  if (Array.isArray(raw)) {
++    for (const entry of raw) {
++      const normalized = normalizeCandidatePnValue(entry);
++      if (normalized) return normalized;
++    }
++    return null;
++  }
++  if (typeof raw === 'object') {
++    if (raw && typeof raw.code === 'string') return normalizeCandidatePnValue(raw.code);
++    if (raw && typeof raw.value === 'string') return normalizeCandidatePnValue(raw.value);
++    if (raw && typeof raw.text === 'string') return normalizeCandidatePnValue(raw.text);
++    if (raw && typeof raw.pn === 'string') return normalizeCandidatePnValue(raw.pn);
++    return null;
++  }
++  let str = String(raw || '').trim();
++  if (!str) return null;
++  if (looksLikeTemplate(str)) return null;
++  if (looksLikeGarbageCode(str)) return null;
++  const repaired = repairPn(str) || str.replace(/\s+/g, '');
++  const cleaned = String(repaired || '').trim();
++  if (!cleaned) return null;
++  if (!isValidCode(cleaned)) return null;
++  return cleaned;
++}
++
++function collectCandidateEntries(sources = []) {
++  const entries = new Map();
++  const list = Array.isArray(sources) ? sources : [];
++  for (const source of list) {
++    if (!source) continue;
++    const {
++      values,
++      priority = 10,
++      requireDocHit = false,
++      allowNoDoc = false,
++      fallbackVerified = false,
++    } = source;
++    const label = source.source || source.label || 'candidate';
++    const rawValues = [];
++    for (const value of toCandidateArray(values)) {
++      if (value == null) continue;
++      if (Array.isArray(value)) rawValues.push(...value);
++      else rawValues.push(value);
++    }
++    if (!rawValues.length) continue;
++    const seenLocal = new Set();
++    const normalizedList = [];
++    for (const raw of rawValues) {
++      const normalized = normalizeCandidatePnValue(raw);
++      if (!normalized) continue;
++      const upper = normalized.toUpperCase();
++      if (seenLocal.has(upper)) continue;
++      seenLocal.add(upper);
++      normalizedList.push({ value: normalized, upper });
++    }
++    if (!normalizedList.length) continue;
++    const allowFallback = allowNoDoc || (!requireDocHit && normalizedList.length === 1);
++    for (const candidate of normalizedList) {
++      const existing = entries.get(candidate.upper);
++      const next = {
++        value: candidate.value,
++        upper: candidate.upper,
++        priority,
++        requireDocHit,
++        allowNoDoc: allowFallback,
++        fallbackVerified: allowFallback && fallbackVerified,
++        source: label,
++      };
++      if (!existing || next.priority < existing.priority) {
++        entries.set(candidate.upper, next);
++      } else if (existing && next.priority === existing.priority && candidate.value.length > existing.value.length) {
++        entries.set(candidate.upper, { ...existing, value: candidate.value });
++      }
++    }
++  }
++  return Array.from(entries.values());
++}
++
++function selectBestCandidate(entries, docText) {
++  if (!Array.isArray(entries) || !entries.length) return null;
++  const haystack = typeof docText === 'string' ? docText : String(docText ?? '');
++  const docMatches = [];
++  const fallbacks = [];
++  for (const entry of entries) {
++    if (!entry || !entry.value) continue;
++    const inDoc = haystack && typeof fuzzyContainsPn === 'function' && fuzzyContainsPn(haystack, entry.value);
++    if (inDoc) {
++      docMatches.push(entry);
++      continue;
++    }
++    if (!entry.requireDocHit && entry.allowNoDoc) {
++      fallbacks.push(entry);
++    }
++  }
++  if (docMatches.length) {
++    docMatches.sort((a, b) => a.priority - b.priority || b.value.length - a.value.length);
++    const chosen = docMatches[0];
++    return { value: chosen.value, verified: true, source: chosen.source };
++  }
++  if (fallbacks.length) {
++    fallbacks.sort((a, b) => a.priority - b.priority || b.value.length - a.value.length);
++    const chosen = fallbacks[0];
++    return { value: chosen.value, verified: Boolean(chosen.fallbackVerified), source: chosen.source };
++  }
++  return null;
++}
++
+ function isNumericType(type = '') {
+   const t = String(type || '').toLowerCase();
+   return (
+     t.includes('int') ||
+     t.includes('numeric') ||
+     t.includes('decimal') ||
+     t.includes('real') ||
+     t.includes('double')
    );
-   return new Set(rows.map((r) => r.col));
  }
  
- async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
-   const have = await getColumnsOf(qualifiedTable);
-+  const haveNormalized = new Set(
-+    [...have]
-+      .map((col) => normalizeSpecKey(col) || normKey(col))
-+      .filter((col) => col)
-+      .map((col) => String(col).toLowerCase()),
-+  );
+ function parseNumberToken(token, suffix) {
+   if (!token) return null;
+   const cleaned = token.replace(/,/g, '');
+   const base = Number(cleaned);
+   if (!Number.isFinite(base)) return null;
+   if (!suffix) return base;
+   const trimmedSuffix = String(suffix).trim();
+   if (!trimmedSuffix) return base;
+   const direct = SCALE_MAP[trimmedSuffix];
+   if (direct != null) return base * direct;
+   const scale = SCALE_MAP[trimmedSuffix.toLowerCase()];
+   return scale != null ? base * scale : base;
+ }
  
-   const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
-   const variants = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-     ? blueprint.ingestOptions.variant_keys
-       : Array.isArray(blueprint?.variant_keys)
-         ? blueprint.variant_keys
-         : [];
-   const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
-   const fieldKeys = Object.keys(fieldMeta);
+@@ -1634,50 +1750,122 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options =
+       // 🔹 템플릿 미치환 차단: 아직 { } 가 남아있다면 유효 PN 아님
+       if (looksLikeTemplate(rec.pn) || looksLikeTemplate(rec.code)) {
+         if (physicalCols.has('last_error')) rec.last_error = 'template_unresolved';
+         result.skipped.push({ reason: 'invalid_code', detail: 'template_unresolved' });
+         continue;
+       }
  
--  const wantedList = [
--    ...new Set(
--      [...allowed, ...variants, ...fieldKeys]
--        .map(normKey)
--        .filter(Boolean)
--    ),
--  ];
-+  const desired = new Map();
-+  for (const rawKey of [...allowed, ...variants, ...fieldKeys]) {
-+    const normalized = normalizeSpecKey(rawKey) || normKey(rawKey);
-+    if (!normalized) continue;
-+    const lower = String(normalized).toLowerCase();
-+    if (haveNormalized.has(lower) || desired.has(lower)) continue;
-+    let meta = null;
-+    if (fieldMeta && typeof fieldMeta === 'object') {
-+      if (Object.prototype.hasOwnProperty.call(fieldMeta, rawKey)) {
-+        meta = fieldMeta[rawKey];
-+      } else {
-+        for (const [candidateKey, candidateMeta] of Object.entries(fieldMeta)) {
-+          if ((normalizeSpecKey(candidateKey) || normKey(candidateKey)) === normalized) {
-+            meta = candidateMeta;
-+            break;
+       const pnMissing = !isValidCode(rec.pn);
+       if (pnMissing && (pnWasTemplate || codeWasTemplate)) {
+         if (physicalCols.has('last_error')) rec.last_error = 'template_render_failed';
+         result.skipped.push({ reason: 'invalid_code', detail: 'template_render_failed' });
+         continue;
+       }
+ 
+       if (!isValidCode(rec.code) && isValidCode(rec.pn)) {
+         rec.code = rec.pn;
+       }
+ 
+       const rowMpnSet = buildCandidateCodeSet(
+         row?.mpn_list,
+         row?.mpnList,
+         rec?.mpn_list,
+         rec?.mpnList,
+       );
+ 
++      if (!isValidCode(rec.pn) && !isValidCode(rec.code)) {
++        const orderingCandidates = [];
++        if (Array.isArray(orderingPayload?.codes)) orderingCandidates.push(...orderingPayload.codes);
++        if (Array.isArray(orderingPayload?.scored)) {
++          for (const scored of orderingPayload.scored) {
++            if (!scored || typeof scored !== 'object') continue;
++            if (typeof scored.code === 'string') orderingCandidates.push(scored.code);
++          }
++        }
++
++        const candidateKeys = [
++          'pn_candidates',
++          'candidate_pns',
++          'candidate_codes',
++          'candidates',
++          'codes',
++          'code_list',
++          'codeList',
++          'mpn_candidates',
++          'mpnCandidates',
++        ];
++        const rowCandidateValues = [];
++        for (const key of candidateKeys) {
++          const value = Object.prototype.hasOwnProperty.call(row || {}, key) ? row[key] : null;
++          if (value == null) continue;
++          if (Array.isArray(value)) rowCandidateValues.push(...value);
++          else rowCandidateValues.push(value);
++        }
++        if (Array.isArray(rec?.candidates)) rowCandidateValues.push(...rec.candidates);
++        if (Array.isArray(options?.candidates)) rowCandidateValues.push(...options.candidates);
++
++        const sharedLists = [];
++        if (Array.isArray(options?.mpnList)) sharedLists.push(...options.mpnList);
++        if (Array.isArray(options?.mpn_list)) sharedLists.push(...options.mpn_list);
++
++        const candidateEntries = collectCandidateEntries([
++          orderingCandidates.length
++            ? { values: orderingCandidates, source: 'ordering', priority: 0, fallbackVerified: true }
++            : null,
++          rowCandidateValues.length
++            ? { values: rowCandidateValues, source: 'row', priority: 1 }
++            : null,
++          rowMpnSet && rowMpnSet.size
++            ? { values: Array.from(rowMpnSet), source: 'row_mpn', priority: 1 }
++            : null,
++          sharedMpnSet && sharedMpnSet.size
++            ? { values: Array.from(sharedMpnSet), source: 'shared_mpn', priority: 2, requireDocHit: true }
++            : null,
++          sharedLists.length
++            ? { values: sharedLists, source: 'shared_list', priority: 2, requireDocHit: true }
++            : null,
++        ]);
++
++        const pick = selectBestCandidate(candidateEntries, docTextRaw);
++        if (pick && pick.value) {
++          rec.pn = pick.value;
++          if (!rec.code) rec.code = pick.value;
++          if (!rec.verified_in_doc && pick.verified) {
++            rec.verified_in_doc = true;
++          }
++          if (!rec.verified_in_doc) {
++            const upper = pick.value.toUpperCase();
++            if ((sharedMpnSet && sharedMpnSet.has(upper)) || (rowMpnSet && rowMpnSet.has(upper))) {
++              rec.verified_in_doc = true;
++            }
++          }
++          if (rec._warn_invalid_code && rec.verified_in_doc) {
++            delete rec._warn_invalid_code;
 +          }
 +        }
 +      }
-+    }
-+    desired.set(lower, { key: normalized, meta });
-+  }
- 
-   const toAdd = [];
--  for (const key of wantedList) {
--    if (have.has(key)) continue;
--    const rawType = fieldMeta[key]?.type ?? fieldMeta[key] ?? 'text';
--    const pgType = TYPE_MAP[String(rawType).toLowerCase()] || 'text';
-+  for (const { key, meta } of desired.values()) {
-+    const rawType = meta && typeof meta === 'object' ? meta.type : meta;
-+    const pgType = TYPE_MAP[String(rawType || '').toLowerCase()] || 'text';
-     toAdd.push({ key, pgType });
-   }
- 
-   if (!toAdd.length) return { added: 0 };
- 
-   for (const { key, pgType } of toAdd) {
-     await db.query(
-       `ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`
-     );
-   }
-   return { added: toAdd.length, columns: toAdd };
- }
- 
- async function ensureSpecColumnsForKeys(qualifiedTable, keys = [], sample = {}) {
-   const have = await getColumnsOf(qualifiedTable);
-+  const haveNormalized = new Set(
-+    [...have]
-+      .map((col) => normalizeSpecKey(col) || normKey(col))
-+      .filter((col) => col)
-+      .map((col) => String(col).toLowerCase()),
-+  );
-   const toAdd = [];
- 
-   const list = Array.isArray(keys) ? keys : [];
-   for (const rawKey of list) {
--    const key = normKey(rawKey);
--    if (!key || have.has(key)) continue;
--
--    let value = null;
--    if (sample && typeof sample === 'object' && Object.prototype.hasOwnProperty.call(sample, rawKey)) {
--      value = sample[rawKey];
-+    const normalized = normalizeSpecKey(rawKey) || normKey(rawKey);
-+    if (!normalized) continue;
-+    const lower = String(normalized).toLowerCase();
-+    if (haveNormalized.has(lower)) continue;
 +
-+    let value = undefined;
-+    if (sample && typeof sample === 'object') {
-+      if (Object.prototype.hasOwnProperty.call(sample, normalized)) {
-+        value = sample[normalized];
-+      } else if (Object.prototype.hasOwnProperty.call(sample, rawKey)) {
-+        value = sample[rawKey];
-+      } else {
-+        const matchKey = Object.keys(sample).find(
-+          (candidate) => (normalizeSpecKey(candidate) || normKey(candidate)) === normalized,
-+        );
-+        if (matchKey) value = sample[matchKey];
-+      }
-     }
- 
-     let pgType = 'text';
-     if (typeof value === 'number' && Number.isFinite(value)) {
-       pgType = 'double precision';
-     } else if (typeof value === 'boolean') {
-       pgType = 'boolean';
-     } else if (typeof value === 'string') {
-       const trimmed = value.trim();
-       if (trimmed && /-?\d+(?:\.\d+)?$/.test(trimmed)) {
-         pgType = 'double precision';
-       }
-     }
- 
--    toAdd.push({ key, pgType });
-+    haveNormalized.add(lower);
-+    toAdd.push({ key: normalized, pgType });
-   }
- 
-   for (const { key, pgType } of toAdd) {
-     await db.query(`ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`);
-   }
- 
-   return { added: toAdd.length, columns: toAdd };
- }
- 
- module.exports = { ensureSpecColumnsForBlueprint, ensureSpecColumnsForKeys, getColumnsOf };
-\ No newline at end of file
+       if (!rec.verified_in_doc) {
+         const pnCandidate = String(rec.pn || rec.code || '').trim();
+         if (pnCandidate) {
+           const pnUpper = pnCandidate.toUpperCase();
+           if (orderingPayload?.codes?.length) {
+             const orderingCodes = new Set();
+             for (const entry of orderingPayload.codes) {
+               if (!entry) continue;
+               const normalized = typeof entry === 'string'
+                 ? entry.trim().toUpperCase()
+                 : typeof entry === 'object' && entry.code != null
+                   ? String(entry.code).trim().toUpperCase()
+                   : null;
+               if (normalized) orderingCodes.add(normalized);
+             }
+                         if (!orderingCodes.size && Array.isArray(orderingPayload.scored)) {
+               for (const scored of orderingPayload.scored) {
+                 if (!scored || typeof scored !== 'object') continue;
+                 const normalized = typeof scored.code === 'string'
+                   ? scored.code.trim().toUpperCase()
+                   : null;
+                 if (normalized) orderingCodes.add(normalized);
+               }
+             }
+             if (orderingCodes.has(pnUpper)) {

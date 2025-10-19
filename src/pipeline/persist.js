@@ -1069,7 +1069,8 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   if (!hasCore) {
      if (docType === 'ordering' || allowMinimal) {
       return { ok: true };
-    }
+    }src/pipeline/persist.js
+
     row.last_error = row.last_error || 'missing_core_spec';
     return { ok: false, reason: 'missing_core_spec' };
   }
@@ -1448,6 +1449,15 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       buildPnIfMissing(rec, pnTemplate);
+
+      // 🔎 Fallback verification:
+      // ORDERING 추출이 실패하더라도 본문 텍스트에 pn/code가 실제로 존재하면 verified_in_doc 인정
+      if (!rec.verified_in_doc) {
+        const hay = String(docTextRaw || '');
+        if ((rec.pn && fuzzyContainsPn(hay, rec.pn)) || (rec.code && fuzzyContainsPn(hay, rec.code))) {
+          rec.verified_in_doc = true;
+        }
+      }
 
       buildBestIdentifiers(familySlug, rec, blueprintMeta);
       if (!rec.verified_in_doc) {

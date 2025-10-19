@@ -116,7 +116,7 @@ const BASE_KEYS = new Set([
 ]);
 const SKIP_SPEC_KEYS = new Set([
   'raw_json',
-  'text',
+  // 'text', // ← persist 본문검증에 필요하므로 통과시킨다
   'tables',
   'mpn_list',
   'mpn',
@@ -151,13 +151,13 @@ const MERGE_SKIP_KEYS = new Set([
   'cover',
   'verified_in_doc',
   'raw_json',
-  'text',
+  // 'text',      // ← 통과
   'tables',
   'mpn',
   'mpn_list',
   'codes',
   'candidates',
-  '_doc_text',
+  // '_doc_text', // ← 통과 (검증용, DB에는 저장하지 않을 것)
   'last_error',
   'run_id',
   'job_id',

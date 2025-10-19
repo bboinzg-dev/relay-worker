@@ -42,6 +42,7 @@ const { normalizeValueLLM } = require('../utils/ai');
 let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
 const { PN_RE } = require('../utils/patterns');
 const { getBlueprintPnTemplate } = require('../utils/getBlueprintPnTemplate');
+const { extractOrderingInfo } = require('../utils/ordering-sections');
 
 const STRICT_CODE_RULES = /^(1|true|on)$/i.test(process.env.STRICT_CODE_RULES || '1');
 const MIN_CORE_SPEC_COUNT = (() => {
@@ -85,6 +86,8 @@ function looksLikeGarbageCode(value) {
     /^[a-f0-9]{20,}_\d{10,}/i.test(text)
     || /(^|_)(mech|doc|pdf)[-_]/i.test(text)
     || /pdf:|\.pdf$/i.test(text)
+    || /^ASCTB\d{3,4}[A-Z]$/i.test(text)          // Panasonic catalog doc-id
+    || /ASCTB\d{3,4}[A-Z]\s+\d{6}/i.test(text)    // with trailing yyyymm
   );
 }
 
@@ -878,10 +881,20 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
   if (!spec || typeof spec !== 'object') return spec;
 
   let codeCandidate = null;
+  const docText = String(spec._doc_text || spec.doc_text || '');
   const localTemplate = getBlueprintPnTemplate(blueprint || {}, spec);
   if (localTemplate) {
     try {
-      const orderingInfo = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
+      let orderingInfo = spec.ordering_info || spec.orderingInfo || spec._ordering_info || null;
+      // 🔁 Fallback: if no ordering info from Vertex, derive from raw doc text
+      if (!orderingInfo) {
+        const parsed = docText ? extractOrderingInfo(docText, 200) : null;
+        if (parsed) {
+          orderingInfo = parsed;
+          spec.ordering_info = parsed; // 다음 단계에서 템플릿/검증에 활용
+          spec.orderingInfo = parsed;
+        }
+      }
       const context = { ...spec };
       if (orderingInfo && typeof orderingInfo === 'object') {
         context.ordering_info = orderingInfo;
@@ -899,7 +912,6 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
     }
   }
 
-  const docText = String(spec._doc_text || spec.doc_text || '');
   if (!codeCandidate && family === 'relay_signal') {
     const fallback = codeForRelaySignal(spec);
     if (fallback && norm(docText).includes(norm(fallback))) {

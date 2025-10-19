@@ -111,6 +111,42 @@ function looksLikeGarbageCode(value) {
   );
 }
 
+// leading letters from a code (e.g., ALZ, JS, NKB)
+function leadingLetters(s) {
+  const m = String(s || '')
+    .trim()
+    .toUpperCase()
+    .match(/^[A-Z]{2,}/);
+  return m ? m[0] : null;
+}
+
+// Build set of series prefixes from ordering_info.codes
+function buildOrderingPrefixes(spec) {
+  const oi = spec?._ordering_info || spec?.ordering_info || spec?.orderingInfo;
+  const codes = Array.isArray(oi?.codes) ? oi.codes : null;
+  const set = new Set();
+  if (codes && codes.length) {
+    for (const raw of codes) {
+      const p = leadingLetters(typeof raw === 'object' && raw != null ? raw.code ?? raw.value : raw);
+      if (p) set.add(p);
+    }
+  }
+  const scored = Array.isArray(oi?.scored) ? oi.scored : null;
+  if (scored && scored.length) {
+    for (const entry of scored) {
+      const p = leadingLetters(entry && typeof entry === 'object' ? entry.code ?? entry.value : entry);
+      if (p) set.add(p);
+    }
+  }
+  return set.size ? set : null;
+}
+
+function sharesAnyPrefix(upper, prefixes) {
+  if (!upper || !prefixes) return true; // no guard available → don’t block
+  const p = leadingLetters(upper);
+  return p ? prefixes.has(p) : false;
+}
+
 const META_KEYS = new Set([
   'family_slug',
   'brand',
@@ -462,7 +498,7 @@ function normalizeCandidatePnValue(raw) {
   return cleaned;
 }
 
-function collectCandidateEntries(sources = []) {
+function collectCandidateEntries(sources = [], orderingPrefixes = null) {
   const entries = new Map();
   const list = Array.isArray(sources) ? sources : [];
   for (const source of list) {
@@ -483,7 +519,7 @@ function collectCandidateEntries(sources = []) {
     }
     if (!rawValues.length) continue;
     const seenLocal = new Set();
-    const normalizedList = [];
+    let normalizedList = [];
     for (const raw of rawValues) {
       const normalized = normalizeCandidatePnValue(raw);
       if (!normalized) continue;
@@ -493,6 +529,10 @@ function collectCandidateEntries(sources = []) {
       normalizedList.push({ value: normalized, upper });
     }
     if (!normalizedList.length) continue;
+    if (orderingPrefixes && orderingPrefixes.size) {
+      normalizedList = normalizedList.filter((c) => sharesAnyPrefix(c.upper, orderingPrefixes));
+      if (!normalizedList.length) continue;
+    }
     const allowFallback = allowNoDoc || (!requireDocHit && normalizedList.length === 1);
     for (const candidate of normalizedList) {
       const existing = entries.get(candidate.upper);
@@ -1869,7 +1909,8 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           rec.verified_in_doc = true;
         }
       }
-            if (!isValidCode(rec.pn) && !isValidCode(rec.code)) {
+      const orderingPrefixes = buildOrderingPrefixes(rec);
+      if (!isValidCode(rec.pn) && !isValidCode(rec.code)) {
         const orderingCandidates = [];
         if (Array.isArray(orderingPayload?.codes)) orderingCandidates.push(...orderingPayload.codes);
         if (Array.isArray(orderingPayload?.scored)) {
@@ -1920,7 +1961,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           sharedLists.length
             ? { values: sharedLists, source: 'shared_list', priority: 2, requireDocHit: true }
             : null,
-        ]);
+        ], orderingPrefixes);
 
         const pick = selectBestCandidate(candidateEntries, docTextRaw);
         if (pick && pick.value) {

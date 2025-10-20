@@ -6,6 +6,10 @@ const { DIM_KEYS } = require('../types/blueprint.js');
 const CACHE = new Map();
 const TTL = Number(process.env.BLUEPRINT_CACHE_TTL_MS || 60_000);
 
+function cacheKeyFor(familySlug) {
+  return `bp:${familySlug}`;
+}
+
 function now() {
   return Date.now();
 }
@@ -159,6 +163,120 @@ function computeFastKeys(blueprint) {
   return Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
 }
 
+function extractBlueprintValue(source, ...keys) {
+  if (!source || typeof source !== 'object') return undefined;
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) {
+      return source[key];
+    }
+  }
+  return undefined;
+}
+
+function normalizeBlueprintPayload(input = {}) {
+  const payload = input && typeof input === 'object' ? input : {};
+  const rawFamily = extractBlueprintValue(payload, 'family_slug', 'familySlug');
+  const familySlug = rawFamily != null ? String(rawFamily).trim() : '';
+  if (!familySlug) throw new Error('family_slug required');
+
+  const columns = [];
+
+  const fieldsJson = extractBlueprintValue(payload, 'fields_json', 'fieldsJson', 'fields');
+  if (fieldsJson !== undefined) columns.push(['fields_json', fieldsJson]);
+
+  const ingestOptions = extractBlueprintValue(payload, 'ingest_options', 'ingestOptions');
+  if (ingestOptions !== undefined) columns.push(['ingest_options', ingestOptions]);
+
+  const aliasesJson = extractBlueprintValue(payload, 'aliases_json', 'aliasesJson', 'aliases');
+  if (aliasesJson !== undefined) columns.push(['aliases_json', aliasesJson]);
+
+  const codeRules = extractBlueprintValue(payload, 'code_rules', 'codeRules');
+  if (codeRules !== undefined) columns.push(['code_rules', codeRules]);
+
+  const promptTemplate = extractBlueprintValue(
+    payload,
+    'prompt_template',
+    'promptTemplate',
+  );
+  if (promptTemplate !== undefined) columns.push(['prompt_template', promptTemplate]);
+
+  return {
+    family_slug: familySlug,
+    columns,
+    defaults: {
+      fields_json: {},
+      ingest_options: {},
+      aliases_json: {},
+      code_rules: [],
+      prompt_template: null,
+    },
+  };
+}
+
+async function saveBlueprint(clientOrPayload, maybePayload) {
+  let client = pool;
+  let payload = clientOrPayload;
+
+  if (clientOrPayload && typeof clientOrPayload.query === 'function') {
+    client = clientOrPayload;
+    payload = maybePayload;
+  }
+
+  const normalized = normalizeBlueprintPayload(payload);
+  const { family_slug: familySlug, columns, defaults } = normalized;
+
+  const updateAssignments = ['updated_at=now()'];
+  const updateParams = [familySlug];
+  for (const [col, value] of columns) {
+    updateAssignments.push(`${col}=$${updateParams.length + 1}`);
+    updateParams.push(value);
+  }
+
+  const updateSql = `
+      UPDATE public.component_spec_blueprint
+         SET ${updateAssignments.join(', ')}
+       WHERE family_slug=$1
+    `;
+  const updateRes = await client.query(updateSql, updateParams);
+  if (updateRes.rowCount > 0) {
+    CACHE.delete(cacheKeyFor(familySlug));
+    return updateRes;
+  }
+
+  const insertCols = ['family_slug'];
+  const placeholders = ['$1'];
+  const insertParams = [familySlug];
+  const provided = new Set();
+
+  for (const [col, value] of columns) {
+    provided.add(col);
+    insertCols.push(col);
+    insertParams.push(value);
+    placeholders.push(`$${insertParams.length}`);
+  }
+
+  for (const [col, defaultValue] of Object.entries(defaults)) {
+    if (provided.has(col)) continue;
+    insertCols.push(col);
+    insertParams.push(defaultValue);
+    placeholders.push(`$${insertParams.length}`);
+  }
+
+  const insertSql = `
+    INSERT INTO public.component_spec_blueprint
+      (${insertCols.join(', ')})
+    VALUES (${placeholders.join(', ')})
+  `;
+  const insertRes = await client.query(insertSql, insertParams);
+  CACHE.delete(cacheKeyFor(familySlug));
+  return insertRes;
+}
+
+function clearBlueprintCache(familySlug) {
+  if (!familySlug) return false;
+  return CACHE.delete(cacheKeyFor(String(familySlug).trim()));
+}
+
 async function getBlueprint(poolOrFamily, maybeFamily) {
   let familySlug = null;
   let client = pool;
@@ -172,7 +290,7 @@ async function getBlueprint(poolOrFamily, maybeFamily) {
 
   if (!familySlug) throw new Error('familySlug required');
 
-  const cacheKey = `bp:${familySlug}`;
+  const cacheKey = cacheKeyFor(familySlug);
   const hit = CACHE.get(cacheKey);
   if (hit && now() - hit.t < TTL) return hit.v;
 
@@ -198,4 +316,4 @@ async function getBlueprint(poolOrFamily, maybeFamily) {
   return blueprint;
 }
 
-module.exports = { getBlueprint, computeFastKeys };
+module.exports = { getBlueprint, computeFastKeys, saveBlueprint, clearBlueprintCache };

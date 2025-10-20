@@ -1334,13 +1334,22 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
   const allowMinimal = isMinimalInsertEnabled();
   const docType = String(row.doc_type || '').trim().toLowerCase();
   let verified = row.verified_in_doc;
-  if (typeof verified === 'string') {
+  const hasVerifiedValue =
+    !(verified == null || (typeof verified === 'string' && verified.trim() === ''));
+  if (!hasVerifiedValue) {
+    if (Object.prototype.hasOwnProperty.call(row, 'verified_in_doc')) {
+      delete row.verified_in_doc;
+    }
+    verified = null;
+  } else if (typeof verified === 'string') {
     verified = verified.trim().toLowerCase() === 'true';
+    row.verified_in_doc = verified;
   } else {
     verified = Boolean(verified);
+    row.verified_in_doc = verified;
   }
-  row.verified_in_doc = verified;
-    if (!verified) {
+
+  if (verified !== true) {
     const ord = row._ordering_info;
     const ordList = Array.isArray(ord?.codes) ? ord.codes : [];
     const ordHit =
@@ -1351,7 +1360,8 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
       row.verified_in_doc = true;
     }
   }
-  if (!verified) {
+
+  if (verified === false) {
     row.last_error = row.last_error || 'unverified_in_doc';
     return { ok: false, reason: 'unverified_in_doc' };
   }
@@ -1622,21 +1632,21 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
   const insertCols = colList.filter((col) => !NEVER_INSERT.has(col));
   const placeholders = insertCols.map((_, i) => `$${i + 1}`).join(',');
 
-  const updateCols = insertCols.filter((col) => !CONFLICT_KEYS.includes(col));
-  const updateSql = updateCols.length
-    ? updateCols.map((col) => `"${col}" = EXCLUDED."${col}"`).join(', ') + `, "updated_at" = now()`
-    : null;
+  const updateAssignments = insertCols
+    .filter((col) => !CONFLICT_KEYS.includes(col))
+    .map((col) => `"${col}" = EXCLUDED."${col}"`);
+  updateAssignments.push('"updated_at" = now()');
+  const updateSql = updateAssignments.join(', ');
 
   // Spec tables enforce uniqueness via the expression index (lower(brand), lower(pn)).
   // In production this exists only as an expression index, so we must always
   // reference the raw expression instead of a constraint name.
-  const conflict = 'ON CONFLICT ((lower(brand)), (lower(pn)))';
+  const conflict = 'ON CONFLICT ((lower(brand)), (lower(pn))) DO UPDATE SET';
 
   const sql = [
     `INSERT INTO ${targetTable} (${insertCols.map((c) => `"${c}"`).join(',')})`,
     `VALUES (${placeholders})`,
-    conflict,
-    updateSql ? `DO UPDATE SET ${updateSql}` : 'DO NOTHING',
+    `${conflict} ${updateSql}`,
     'RETURNING pn',
   ].join('\n');
 
@@ -1697,7 +1707,14 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           '',
       );
       const docTextLower = docTextRaw.toLowerCase();
-      const brandCandidates = [options?.brand, rec.brand, rec.brand_norm];
+      const existingBrandNorm = Object.prototype.hasOwnProperty.call(rec, 'brand_norm')
+        ? rec.brand_norm
+        : null;
+      for (const generated of ['brand_norm', 'pn_norm', 'code_norm']) {
+        if (Object.prototype.hasOwnProperty.call(rec, generated)) delete rec[generated];
+      }
+
+      const brandCandidates = [options?.brand, rec.brand, existingBrandNorm];
       let brandKey = null;
       for (const candidate of brandCandidates) {
         if (!candidate) continue;
@@ -1710,10 +1727,8 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         if (!rec.brand || !String(rec.brand).trim()) {
           rec.brand = options?.brand || brandKey;
         }
-        rec.brand_norm = brandKey;
-
-      } else if (physicalCols.has('brand_norm')) {
-        rec.brand_norm = null;
+      } else if (existingBrandNorm && !rec.brand) {
+        rec.brand = String(existingBrandNorm).trim() || rec.brand;
       }
       if (physicalCols.has('last_error')) rec.last_error = null;
 
@@ -2077,17 +2092,17 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         result.skipped.push({ reason: 'missing_pn', last_error: 'missing_pn' });
         continue;
       }
-      if (physicalCols.has('pn_norm')) rec.pn_norm = pnNorm;
-
       const codeNorm = normKey(rec.code);
       if (!codeNorm) {
         if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
         result.skipped.push({ reason: 'invalid_code', last_error: 'invalid_code' });
         continue;
       }
-      if (physicalCols.has('code_norm')) rec.code_norm = codeNorm;
-
-      const brandNatural = normKey(rec.brand) || rec.brand_norm || '';
+      const brandNatural =
+        normKey(rec.brand) ||
+        normKey(existingBrandNorm) ||
+        (brandKey ? String(brandKey).trim().toLowerCase() : '') ||
+        '';
       const naturalKey = `${brandNatural}::${pnNorm}`;
       if (seenNatural.has(naturalKey)) {
         result.skipped.push({ reason: 'duplicate_code' });

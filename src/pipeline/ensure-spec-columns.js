@@ -69,61 +69,85 @@ async function getColumnsOf(qualified) {
   return new Set(rows.map((r) => r.col));
 }
 
-async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
-  const have = await getColumnsOf(qualifiedTable);
-  const haveNormalized = new Set(
-    [...have]
-      .map((col) => normalizeSpecKey(col) || normKey(col))
-      .filter((col) => col)
-      .map((col) => String(col).toLowerCase()),
+function toNormalizedKeyList(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((value) => normalizeSpecKey(value) || normKey(value))
+    .filter(Boolean)
+    .map((value) => String(value).toLowerCase());
+}
+
+async function ensureSpecColumnsForFamily(dbOrFamily, maybeFamilySlug, fieldsInput = {}, ingestInput = {}) {
+  let client = db;
+  let familySlug = null;
+  let fieldSource = fieldsInput;
+  let ingestSource = ingestInput;
+
+  if (dbOrFamily && typeof dbOrFamily.query === 'function') {
+    client = dbOrFamily;
+    familySlug = maybeFamilySlug;
+  } else {
+    familySlug = dbOrFamily;
+    fieldSource = maybeFamilySlug || {};
+    ingestSource = fieldsInput || {};
+  }
+
+  if (!familySlug) throw new Error('familySlug required');
+
+  const allowedKeys = Object.keys(fieldSource || {})
+    .map((key) => String(key || '').trim())
+    .filter(Boolean);
+
+  const fieldKeys = Array.from(
+    new Set(
+      allowedKeys
+        .map((key) => normalizeSpecKey(key) || normKey(key))
+        .filter(Boolean)
+        .map((key) => String(key).toLowerCase()),
+    ),
   );
 
-  const allowed = Array.isArray(blueprint?.allowedKeys) ? blueprint.allowedKeys : [];
-  const variants = Array.isArray(blueprint?.ingestOptions?.variant_keys)
-    ? blueprint.ingestOptions.variant_keys
-      : Array.isArray(blueprint?.variant_keys)
-        ? blueprint.variant_keys
-        : [];
-  const fieldMeta = blueprint?.fields || blueprint?.fields_json || {};
-  const fieldKeys = Object.keys(fieldMeta);
+  const variantSource =
+    (ingestSource && ingestSource.variant_keys) ||
+    (ingestSource && ingestSource.variantKeys) ||
+    [];
+  const variantKeys = Array.from(
+    new Set(
+      toNormalizedKeyList(Array.isArray(variantSource) ? variantSource : [])
+        .map((key) => String(key).toLowerCase()),
+    ),
+  );
 
-  const desired = new Map();
-  for (const rawKey of [...allowed, ...variants, ...fieldKeys]) {
-    const normalized = normalizeSpecKey(rawKey) || normKey(rawKey);
-    if (!normalized) continue;
-    const lower = String(normalized).toLowerCase();
-    if (haveNormalized.has(lower) || desired.has(lower)) continue;
-    let meta = null;
-    if (fieldMeta && typeof fieldMeta === 'object') {
-      if (Object.prototype.hasOwnProperty.call(fieldMeta, rawKey)) {
-        meta = fieldMeta[rawKey];
-      } else {
-        for (const [candidateKey, candidateMeta] of Object.entries(fieldMeta)) {
-          if ((normalizeSpecKey(candidateKey) || normKey(candidateKey)) === normalized) {
-            meta = candidateMeta;
-            break;
-          }
-        }
-      }
-    }
-    desired.set(lower, { key: normalized, meta });
+  await client.query(
+    `SELECT public.ensure_blueprint_fields_columns($1, $2)`,
+    [familySlug, fieldKeys],
+  );
+
+  await client.query(
+    `SELECT public.ensure_blueprint_variant_columns($1, $2)`,
+    [familySlug, variantKeys],
+  );
+
+  return { fieldKeys, variantKeys, allowedKeys };
+}
+
+async function ensureSpecColumnsForBlueprint(qualifiedTable, blueprint) {
+  const familySlug = blueprint?.family_slug || blueprint?.familySlug || null;
+  const fieldsJson =
+    (blueprint?.fields && typeof blueprint.fields === 'object' && blueprint.fields) ||
+    blueprint?.fields_json ||
+    {};
+  const ingestOptions =
+    (blueprint?.ingestOptions && typeof blueprint.ingestOptions === 'object' && blueprint.ingestOptions) ||
+    (blueprint?.ingest_options && typeof blueprint.ingest_options === 'object' && blueprint.ingest_options) ||
+    {};
+
+  if (familySlug) {
+    await ensureSpecColumnsForFamily(familySlug, fieldsJson, ingestOptions);
   }
 
-  const toAdd = [];
-  for (const { key, meta } of desired.values()) {
-    const rawType = meta && typeof meta === 'object' ? meta.type : meta;
-    const pgType = TYPE_MAP[String(rawType || '').toLowerCase()] || 'text';
-    toAdd.push({ key, pgType });
-  }
-
-  if (!toAdd.length) return { added: 0 };
-
-  for (const { key, pgType } of toAdd) {
-    await db.query(
-      `ALTER TABLE ${qualifiedTable} ADD COLUMN IF NOT EXISTS "${key}" ${pgType}`
-    );
-  }
-  return { added: toAdd.length, columns: toAdd };
+  // 호환성: 호출부가 기존 반환값을 기대할 수 있으므로 구조 유지
+  return { added: 0, columns: [] };
 }
 
 async function ensureSpecColumnsForKeys(qualifiedTable, keys = [], sample = {}) {
@@ -180,4 +204,9 @@ async function ensureSpecColumnsForKeys(qualifiedTable, keys = [], sample = {}) 
   return { added: toAdd.length, columns: toAdd };
 }
 
-module.exports = { ensureSpecColumnsForBlueprint, ensureSpecColumnsForKeys, getColumnsOf };
+module.exports = {
+  ensureSpecColumnsForFamily,
+  ensureSpecColumnsForBlueprint,
+  ensureSpecColumnsForKeys,
+  getColumnsOf,
+};

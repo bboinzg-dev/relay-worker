@@ -35,13 +35,14 @@ const db = tryRequire([
 ]);
 const { storage, parseGcsUri, readText, canonicalCoverPath } = require('../utils/gcs');
 const { extractText } = require('../utils/extract');
-const { getBlueprint } = require('../utils/blueprint');
+const { getBlueprint, saveBlueprint } = require('../utils/blueprint');
 const { resolveBrand } = require('../utils/brand');
 const { detectVariantKeys } = require('../utils/ordering');
 const { extractPartsAndSpecsFromPdf } = require('../ai/datasheetExtract');
 const { extractFields } = require('./extractByBlueprint');
 const { aiCanonicalizeKeys } = require('./ai/canonKeys');
 const { saveExtractedSpecs, looksLikeTemplate, renderAnyTemplate } = require('./persist');
+const log = console;
 const { explodeToRows, splitAndCarryPrefix, normalizeContactForm } = require('../utils/mpn-exploder');
 const { extractOrderingRecipe } = require('../utils/vertex');
 const {
@@ -4565,6 +4566,14 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
   }
   const physicalCols = new Set(colTypes ? [...colTypes.keys()] : []);
   const variantSet = new Set(variantKeys);
+  const allowedKeySet = new Set(
+    [
+      ...(Array.isArray(allowedKeys) ? allowedKeys : []),
+      ...(Array.isArray(variantKeys) ? variantKeys : []),
+    ]
+      .map((key) => String(key || '').trim().toLowerCase())
+      .filter(Boolean),
+  );
 
   const seenCodes = new Set();
   for (const row of explodedRows) {
@@ -4608,17 +4617,19 @@ async function doIngestPipeline(input = {}, runIdParam = null) {
     rec.datasheet_uri = row.datasheet_uri || gcsUri;
     rec.datasheet_url = pickDatasheetUrl(row.datasheet_url, rec.datasheet_uri);
     if (row.mfr_full != null) rec.mfr_full = row.mfr_full;
-    let verified;
+    let verified = null;
     if (row.verified_in_doc != null) {
       if (typeof row.verified_in_doc === 'string') {
         verified = row.verified_in_doc.trim().toLowerCase() === 'true';
       } else {
         verified = Boolean(row.verified_in_doc);
       }
-    } else {
+    } else if (candidateNormSet.size || mpnNormFromDoc.size) {
       verified = candidateNormSet.has(mpnNorm) || mpnNormFromDoc.has(mpnNorm);
     }
-    rec.verified_in_doc = Boolean(verified);
+    if (verified !== null) {
+      rec.verified_in_doc = Boolean(verified);
+    }
     rec.image_uri = row.image_uri || coverUri || null;
     if (coverUri && rec.cover == null) rec.cover = coverUri;
     const displayName = row.display_name || row.displayname || `${rec.brand} ${mpn}`;
@@ -4944,6 +4955,54 @@ async function persistProcessedData(processed = {}, overrides = {}) {
     overrides?.family,
     overrides?.family_slug,
   );
+
+  const blueprintUpdates = [
+    processed?.blueprint,
+    processed?.blueprint_update,
+    processed?.blueprintUpsert,
+    processed?.blueprintPayload,
+    processedMeta?.blueprint,
+  ];
+  let blueprintUpdate = null;
+  for (const candidate of blueprintUpdates) {
+    if (candidate && typeof candidate === 'object') {
+      blueprintUpdate = candidate;
+      break;
+    }
+  }
+
+  if (family && blueprintUpdate) {
+    const blueprintPayload = { family_slug: family };
+    const fieldsJson =
+      blueprintUpdate.fields_json ?? blueprintUpdate.fieldsJson ?? blueprintUpdate.fields;
+    if (fieldsJson !== undefined) blueprintPayload.fields_json = fieldsJson;
+
+    const ingestOptions =
+      blueprintUpdate.ingest_options ?? blueprintUpdate.ingestOptions ?? undefined;
+    if (ingestOptions !== undefined) blueprintPayload.ingest_options = ingestOptions;
+
+    const aliasesJson =
+      blueprintUpdate.aliases_json ??
+      blueprintUpdate.aliasesJson ??
+      blueprintUpdate.aliases ??
+      undefined;
+    if (aliasesJson !== undefined) blueprintPayload.aliases_json = aliasesJson;
+
+    const codeRules = blueprintUpdate.code_rules ?? blueprintUpdate.codeRules ?? undefined;
+    if (codeRules !== undefined) blueprintPayload.code_rules = codeRules;
+
+    const promptTemplate =
+      blueprintUpdate.prompt_template ?? blueprintUpdate.promptTemplate ?? undefined;
+    if (promptTemplate !== undefined) blueprintPayload.prompt_template = promptTemplate;
+
+    if (Object.keys(blueprintPayload).length > 1) {
+      try {
+        await saveBlueprint(db, blueprintPayload);
+      } catch (err) {
+        console.warn('[persist] saveBlueprint failed:', err?.message || err);
+      }
+    }
+  }
 
   const sanitizePart = (value) => String(value || '').replace(/[^a-zA-Z0-9_]/g, '');
   const sanitizeIdentifier = (value) => {
@@ -5363,6 +5422,24 @@ async function persistProcessedData(processed = {}, overrides = {}) {
         records,
         allowedKeys,
       );
+      if (Array.isArray(records) && records.length) {
+        const filtered = [];
+        for (const rec of records) {
+          if (!rec || typeof rec !== 'object') continue;
+          const brandValue = rec.brand != null ? String(rec.brand).trim() : '';
+          const pnValue = rec.pn != null ? String(rec.pn).trim() : '';
+          if (!brandValue || !pnValue) {
+            log.warn('[SKIP] missing brand/pn', { family, row: rec });
+            continue;
+          }
+          filtered.push(rec);
+        }
+        if (filtered.length !== records.length) {
+          records.length = 0;
+          records.push(...filtered);
+        }
+      }
+
       try {
         persistResult = await saveExtractedSpecs({
           qualifiedTable: qualified,

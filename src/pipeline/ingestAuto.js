@@ -47,6 +47,7 @@ const { explodeToRows, splitAndCarryPrefix, normalizeContactForm } = require('..
 const { extractOrderingRecipe } = require('../utils/vertex');
 const {
   ensureSpecColumnsForBlueprint,
+  ensureSpecColumnsForKeys,
   getColumnsOf,
 } = require('./ensure-spec-columns');
 const { normalizeVariantDomains } = require('../utils/variant-normalize');

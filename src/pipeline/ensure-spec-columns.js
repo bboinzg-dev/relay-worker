@@ -118,10 +118,16 @@ async function ensureSpecColumnsForFamily(dbOrFamily, maybeFamilySlug, fieldsInp
     ),
   );
 
-  await client.query(
-    `SELECT public.ensure_blueprint_fields_columns($1, $2)`,
-    [familySlug, fieldKeys],
-  );
+  // 1) 블루프린트 정의(fields_json) 기반으로 기본 필드 컬럼 보장 (1-인자)
+  await client.query(`SELECT public.ensure_blueprint_fields_columns($1)`, [familySlug]);
+
+  // 2) 런타임 필드 키가 있으면 dynamic 보강 (2-인자: jsonb 배열)
+  if (Array.isArray(fieldKeys) && fieldKeys.length) {
+    await client.query(
+      `SELECT public.ensure_dynamic_spec_columns($1, $2::jsonb)`,
+      [familySlug, JSON.stringify(fieldKeys)],
+    );
+  }
 
   await client.query(
     `SELECT public.ensure_blueprint_variant_columns($1, $2)`,

@@ -200,9 +200,6 @@ async function upsertByBrandCode(tableName, values = {}) {
   let code = values?.code ?? null;
   let pn = values?.pn ?? values?.code ?? null;
   const rest = { ...values };
-  const brandNormInput = rest.brand_norm;
-  const codeNormInput = rest.code_norm;
-  const pnNormInput = rest.pn_norm;
   delete rest.brand;
   delete rest.code;
   delete rest.pn;
@@ -231,9 +228,6 @@ async function upsertByBrandCode(tableName, values = {}) {
     brand,
     code,
     pn,
-    brand_norm: brand ? String(brand).toLowerCase() : brandNormInput ?? null,
-    code_norm: code ? String(code).toLowerCase() : codeNormInput ?? null,
-    pn_norm: pn ? String(pn).toLowerCase() : pnNormInput ?? null,
     ...rest,
   });
 
@@ -271,13 +265,12 @@ async function upsertByBrandCode(tableName, values = {}) {
   // Spec tables enforce uniqueness via the expression index (lower(brand), lower(pn)).
   // The backing database creates this as an expression index (not a constraint),
   // therefore we must always target the raw expression in ON CONFLICT clauses.
-  const conflict = `ON CONFLICT ((lower(brand)), (lower(pn)))`;
+  const conflict = `ON CONFLICT ((lower(brand)), (lower(pn))) DO UPDATE SET`;
 
   const sql = `
     insert into ${qualified} (${insertCols.join(',')})
     values (${params.join(',')})
-    ${conflict}
-    do update set ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
+    ${conflict} ${updates.length ? `${updates.join(', ')}, ` : ''}updated_at=now()
     returning *`;
 
   const res = await db.query(sql, insertVals);

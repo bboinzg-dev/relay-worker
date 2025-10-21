@@ -1658,23 +1658,6 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
     for (const [rowIndex, row] of rows.entries()) {
       result.processed += 1;
 
-      const originalPnValue = resolveTemplateValue(row, 'pn');
-      const originalCodeValue = resolveTemplateValue(row, 'code');
-      const originalPnString =
-        originalPnValue == null
-          ? ''
-          : String(originalPnValue).trim();
-      const originalCodeString =
-        originalCodeValue == null
-          ? ''
-          : String(originalCodeValue).trim();
-      const originalPnIsTemplate = looksLikeTemplate(originalPnString);
-      const originalCodeIsTemplate = looksLikeTemplate(originalCodeString);
-      const originalPnIsValid =
-        !originalPnIsTemplate && isValidCode(originalPnString);
-      const originalCodeIsValid =
-        !originalCodeIsTemplate && isValidCode(originalCodeString);
-
       const rec = {};
       for (const [key, value] of Object.entries(row || {})) {
         const norm = normKey(key);
@@ -1693,6 +1676,16 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           rec[norm] = value;
         }
       }
+
+      // 1) Back up the incoming PN/code before any normalization.
+      let origPn = typeof rec.pn === 'string' ? rec.pn.trim() : '';
+      let origCode = typeof rec.code === 'string' ? rec.code.trim() : '';
+      if (origPn && looksLikeTemplate(origPn)) origPn = '';
+      if (origCode && looksLikeTemplate(origCode)) origCode = '';
+      origPn = origPn || null;
+      origCode = origCode || null;
+      const hadValidOrigPn = !!(origPn && isValidCode(origPn));
+      const hadValidOrigCode = !!(origCode && isValidCode(origCode));
 
       if (options?.brand) {
         rec.brand = options.brand;
@@ -1797,14 +1790,6 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         const contextForCode = { ...templateContext, pn: rec.pn ?? templateContext.pn };
         const renderedCode = renderAnyTemplate(templateContext.code, contextForCode, ctxText);
         rec.code = renderedCode ?? null;
-      }
-
-            if (!isValidCode(rec.pn) && originalPnIsValid) {
-        rec.pn = originalPnString;
-      }
-
-      if (!isValidCode(rec.code) && (originalCodeIsValid || originalPnIsValid)) {
-        rec.code = originalCodeIsValid ? originalCodeString : originalPnString;
       }
 
       if (!isValidCode(rec.pn) && isValidCode(rec.code)) {
@@ -1924,20 +1909,25 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           rec.verified_in_doc = true;
         }
       }
-      const orderingPrefixes =
-        buildOrderingPrefixes(rec)
-        || (orderingPayload ? buildOrderingPrefixes({ ordering_info: orderingPayload }) : null);
+
+      const orderingPayloadLocal =
+        normalizeOrderingInfoPayload(
+          rec?._ordering_info || rec?.ordering_info || rec?.orderingInfo,
+        ) || orderingPayload || null;
+      orderingPayload = orderingPayloadLocal;
+
       if (!isValidCode(rec.pn) && !isValidCode(rec.code)) {
         const orderingCandidates = [];
-        if (Array.isArray(orderingPayload?.codes)) orderingCandidates.push(...orderingPayload.codes);
-        if (Array.isArray(orderingPayload?.scored)) {
-          for (const scored of orderingPayload.scored) {
+        if (Array.isArray(orderingPayloadLocal?.codes)) orderingCandidates.push(...orderingPayloadLocal.codes);
+        if (Array.isArray(orderingPayloadLocal?.scored)) {
+          for (const scored of orderingPayloadLocal.scored) {
             if (!scored || typeof scored !== 'object') continue;
             if (typeof scored.code === 'string') orderingCandidates.push(scored.code);
           }
         }
 
-        const candidateKeys = [
+        const rowCandidateValues = [];
+        for (const key of [
           'pn_candidates',
           'candidate_pns',
           'candidate_codes',
@@ -1947,9 +1937,7 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           'codeList',
           'mpn_candidates',
           'mpnCandidates',
-        ];
-        const rowCandidateValues = [];
-        for (const key of candidateKeys) {
+        ]) {
           const value = Object.prototype.hasOwnProperty.call(row || {}, key) ? row[key] : null;
           if (value == null) continue;
           if (Array.isArray(value)) rowCandidateValues.push(...value);
@@ -1957,10 +1945,6 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
         }
         if (Array.isArray(rec?.candidates)) rowCandidateValues.push(...rec.candidates);
         if (Array.isArray(options?.candidates)) rowCandidateValues.push(...options.candidates);
-
-        const sharedLists = [];
-        if (Array.isArray(options?.mpnList)) sharedLists.push(...options.mpnList);
-        if (Array.isArray(options?.mpn_list)) sharedLists.push(...options.mpn_list);
 
         const candidateEntries = collectCandidateEntries([
           orderingCandidates.length
@@ -1975,36 +1959,60 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
           sharedMpnSet && sharedMpnSet.size
             ? { values: Array.from(sharedMpnSet), source: 'shared_mpn', priority: 2, requireDocHit: true }
             : null,
-          sharedLists.length
-            ? { values: sharedLists, source: 'shared_list', priority: 2, requireDocHit: true }
-            : null,
-        ], orderingPrefixes);
-
-        let pick = selectBestCandidate(candidateEntries, docTextRaw);
-        if (
-          pick
-          && pick.value
-          && orderingPrefixes
-          && !sharesAnyPrefix(pick.value.toUpperCase(), orderingPrefixes)
-        ) {
-          pick = null;
-        }
+        ]);
+        const pick = selectBestCandidate(candidateEntries, docTextRaw);
         if (pick && pick.value) {
           rec.pn = pick.value;
           if (!rec.code) rec.code = pick.value;
-          if (!rec.verified_in_doc && pick.verified) {
-            rec.verified_in_doc = true;
-          }
-          if (!rec.verified_in_doc) {
-            const upper = pick.value.toUpperCase();
-            if ((sharedMpnSet && sharedMpnSet.has(upper)) || (rowMpnSet && rowMpnSet.has(upper))) {
-              rec.verified_in_doc = true;
-            }
-          }
-          if (rec._warn_invalid_code && rec.verified_in_doc) {
-            delete rec._warn_invalid_code;
-          }
+          if (!rec.verified_in_doc && pick.verified) rec.verified_in_doc = true;
         }
+      }
+
+      // 2) Restore original identifiers if normalization cleared valid input.
+      const pnTrimmed = typeof rec.pn === 'string' ? rec.pn.trim() : '';
+      const codeTrimmed = typeof rec.code === 'string' ? rec.code.trim() : '';
+      if (pnTrimmed) {
+        rec.pn = pnTrimmed;
+      } else if (hadValidOrigPn) {
+        rec.pn = origPn;
+      } else {
+        rec.pn = null;
+      }
+
+      if (codeTrimmed) {
+        rec.code = codeTrimmed;
+      } else if (hadValidOrigCode) {
+        rec.code = origCode;
+      } else {
+        rec.code = null;
+      }
+
+      if ((!rec.code || !String(rec.code).trim()) && rec.pn && isValidCode(rec.pn)) {
+        rec.code = rec.pn;
+      }
+
+      // 3) Promote verification when ordering info confirms the identifier.
+      if (!rec.verified_in_doc) {
+        const oi = rec._ordering_info || rec.ordering_info || rec.orderingInfo;
+        const codes = Array.isArray(oi?.codes) ? oi.codes : null;
+        const scored = Array.isArray(oi?.scored) ? oi.scored : null;
+        const upper = String(rec.pn || rec.code || '').trim().toUpperCase();
+        if (upper) {
+          const hasInCodes = codes?.some((c) => String((c && c.code) || c).trim().toUpperCase() === upper);
+          const hasInScored = scored?.some((s) => String(s && s.code).trim().toUpperCase() === upper);
+          if (hasInCodes || hasInScored) rec.verified_in_doc = true;
+        }
+      }
+
+      if (rec._warn_invalid_code && rec.verified_in_doc) {
+        delete rec._warn_invalid_code;
+      }
+
+      // 4) Final guard: skip records still lacking PN/code after recovery attempts.
+      if (!rec.pn && !rec.code) {
+        if (physicalCols.has('last_error')) rec.last_error = 'invalid_code';
+        result.skipped.push({ reason: 'invalid_code', detail: 'empty_after_normalize' });
+        continue;
       }
 
       if (!rec.verified_in_doc) {

@@ -1,16 +1,11 @@
 const jwt = require('jsonwebtoken');
 
-function pick(h, k) {
-  if (!h) return undefined;
-  return h[k] || h[k.toLowerCase()] || h[k.toUpperCase()];
-}
-
 function parseAppActor(req) {
   const headers = req?.headers || {};
-  const hApp = pick(headers, 'x-app-auth');
-  const pickBearer = (hdr) => (hdr && hdr.startsWith('Bearer ')) ? hdr.slice(7) : null;
+  const hdr = headers['x-app-auth'] || headers['X-App-Auth'];
+  const pickBearer = (value) => (value && value.startsWith('Bearer ')) ? value.slice(7) : null;
 
-  const appToken = pickBearer(hApp);
+  const appToken = pickBearer(hdr);
   if (!appToken) {
     return { ok: false, reason: 'no_app_token' };
   }
@@ -24,6 +19,7 @@ function parseAppActor(req) {
     const dec = jwt.verify(appToken, secret, { algorithms: ['HS256'] });
     return { ok: true, user: dec };
   } catch (e) {
+    console.warn('[auth] app_jwt_verify_failed:', e?.message);
     return { ok: false, reason: e?.message || 'verify_failed' };
   }
 }

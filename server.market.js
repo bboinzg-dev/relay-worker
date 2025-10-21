@@ -16,6 +16,28 @@ app.use(bodyParser.json({ limit: '10mb' }));
 const pool = getPool();
 const query = (text, params) => pool.query(text, params);
 
+const mapListingRow = (row = {}) => ({
+  id: row.id,
+  seller_id: row.seller_id,
+  brand: row.brand,
+  code: row.code,
+  quantity_available: row.qty_available,
+  qty_available: row.qty_available,
+  unit_price: (row.unit_price_cents ?? 0) / 100,
+  unit_price_cents: row.unit_price_cents ?? 0,
+  currency: row.currency,
+  lead_time_days: row.lead_time_days ?? 0,
+  status: row.status,
+  note: row.note ?? null,
+  location: row.location ?? null,
+  condition: row.condition ?? null,
+  packaging: row.packaging ?? null,
+  moq: row.moq ?? null,
+  mpq: row.mpq ?? null,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+});
+
 function pick(h, k) { return h[k] || h[k.toLowerCase()] || h[k.toUpperCase()] || undefined; }
 function getTenant(req) {
   // tenant via header (can be empty for single-tenant)
@@ -128,95 +150,115 @@ app.post('/api/listings', async (req, res) => {
 app.get('/api/listings/:id', async (req, res) => {
   try {
     const id = (req.params.id || '').toString();
-    if (!id) return res.status(400).json({ error: 'id required' });
+    if (!id) return res.status(400).json({ ok: false, error: 'id required' });
     const r = await query(
       `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, created_at, updated_at
          FROM public.listings WHERE id = $1`,
       [id]
     );
-    if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
-    res.json(r.rows[0]);
+    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
+    res.json({ ok: true, item: mapListingRow(r.rows[0]) });
   } catch (e) {
     console.error(e);
-    res.status(400).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok: false, error: 'db_error' });
   }
 });
 
 // PATCH /api/listings/:id – 수량/상태/가격 등 수정
 app.patch('/api/listings/:id', async (req, res) => {
   try {
-    if (!requireAuth(req, res)) return;
-
     const id = (req.params.id || '').toString();
-    if (!id) return res.status(400).json({ error: 'id required' });
+    if (!id) return res.status(400).json({ ok: false, error: 'id required' });
 
     const body = req.body || {};
     const sets = [];
     const params = [];
 
-    if (Object.prototype.hasOwnProperty.call(body, 'qty_available')) {
-      sets.push(`qty_available = $${params.length + 1}`);
-      params.push(toOptionalInteger(body.qty_available, { min: 0 }) ?? 0);
-    }
-    if (Object.prototype.hasOwnProperty.call(body, 'moq')) {
+    const has = (key) => Object.prototype.hasOwnProperty.call(body, key);
+    const pickFirst = (...keys) => {
+      for (const key of keys) {
+        if (has(key)) return body[key];
+      }
+      return undefined;
+    };
+
+    if (has('moq')) {
       sets.push(`moq = $${params.length + 1}`);
       params.push(toOptionalInteger(body.moq, { min: 0 }));
     }
-    if (Object.prototype.hasOwnProperty.call(body, 'mpq')) {
+    if (has('mpq')) {
       sets.push(`mpq = $${params.length + 1}`);
       params.push(toOptionalInteger(body.mpq, { min: 0 }));
     }
-    if (Object.prototype.hasOwnProperty.call(body, 'unit_price')) {
-      sets.push(`unit_price_cents = $${params.length + 1}`);
-      params.push(toCents(body.unit_price) ?? 0);
-    } else if (Object.prototype.hasOwnProperty.call(body, 'unit_price_cents')) {
-      sets.push(`unit_price_cents = $${params.length + 1}`);
-      params.push(toOptionalInteger(body.unit_price_cents, { min: 0 }) ?? 0);
+
+    if (has('qty_available') || has('quantity_available')) {
+      const quantity = pickFirst('quantity_available', 'qty_available');
+      sets.push(`qty_available = $${params.length + 1}`);
+      params.push(toOptionalInteger(quantity, { min: 0 }) ?? 0);
     }
-    if (Object.prototype.hasOwnProperty.call(body, 'currency')) {
+
+    if (has('unit_price') || has('unit_price_cents')) {
+      const cents = has('unit_price')
+        ? (toCents(body.unit_price) ?? 0)
+        : toOptionalInteger(body.unit_price_cents, { min: 0 }) ?? 0;
+      sets.push(`unit_price_cents = $${params.length + 1}`);
+      params.push(cents);
+    }
+
+    if (has('currency')) {
       sets.push(`currency = $${params.length + 1}`);
       params.push(body.currency != null ? String(body.currency) : null);
     }
-    if (Object.prototype.hasOwnProperty.call(body, 'lead_time_days')) {
+
+    if (has('lead_time_days')) {
       sets.push(`lead_time_days = $${params.length + 1}`);
       params.push(toOptionalInteger(body.lead_time_days, { min: 0 }));
     }
-    if (Object.prototype.hasOwnProperty.call(body, 'location')) {
+
+    if (has('location')) {
       sets.push(`location = $${params.length + 1}`);
       params.push(body.location != null ? String(body.location) : null);
     }
-    if (Object.prototype.hasOwnProperty.call(body, 'condition')) {
+
+    if (has('condition')) {
       sets.push(`condition = $${params.length + 1}`);
       params.push(body.condition != null ? String(body.condition) : null);
     }
-    if (Object.prototype.hasOwnProperty.call(body, 'packaging')) {
+
+    if (has('packaging')) {
       sets.push(`packaging = $${params.length + 1}`);
       params.push(body.packaging != null ? String(body.packaging) : null);
     }
-    if (Object.prototype.hasOwnProperty.call(body, 'note')) {
+
+    if (has('note')) {
       sets.push(`note = $${params.length + 1}`);
       params.push(body.note != null ? String(body.note) : null);
     }
-    if (Object.prototype.hasOwnProperty.call(body, 'status')) {
+
+    if (has('status')) {
       const status = String(body.status || '').toLowerCase();
       if (!LISTING_STATUS.has(status)) {
-        return res.status(400).json({ error: 'invalid_status' });
+        return res.status(400).json({ ok: false, error: 'invalid_status' });
       }
       sets.push(`status = $${params.length + 1}`);
       params.push(status);
     }
+
     if (!sets.length) {
-      return res.status(400).json({ error: 'no_fields' });
+      return res.status(400).json({ ok: false, error: 'no_fields' });
     }
+
     sets.push('updated_at = now()');
     params.push(id);
-    const sql = `UPDATE public.listings SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING id, status, qty_available, unit_price_cents, currency, updated_at`;
+
+    const sql = `UPDATE public.listings SET ${sets.join(', ')} WHERE id = $${params.length}
+      RETURNING id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, created_at, updated_at`;
     const r = await query(sql, params);
-    if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
-    res.json(r.rows[0]);
+    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
+    res.json({ ok: true, item: mapListingRow(r.rows[0]) });
   } catch (e) {
     console.error(e);
-    res.status(400).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok: false, error: 'db_error' });
   }
 });
 

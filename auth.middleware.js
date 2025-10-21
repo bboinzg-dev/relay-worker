@@ -1,9 +1,13 @@
 const jwt = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
+
+const gclient = new OAuth2Client();
+
+const pickBearer = (value) => (value && value.startsWith('Bearer ')) ? value.slice(7) : null;
 
 function parseAppActor(req) {
   const headers = req?.headers || {};
   const hdr = headers['x-app-auth'] || headers['X-App-Auth'];
-  const pickBearer = (value) => (value && value.startsWith('Bearer ')) ? value.slice(7) : null;
 
   const appToken = pickBearer(hdr);
   if (!appToken) {
@@ -24,21 +28,55 @@ function parseAppActor(req) {
   }
 }
 
-function requireSeller(req, res, next) {
-  const result = parseAppActor(req);
-  if (!result.ok) {
-    return res.status(401).json({ ok: false, error: 'unauthorized_app_jwt', reason: result.reason });
+async function parseIdTokenAsSeller(req) {
+  const idToken = pickBearer(req.headers?.authorization);
+  if (!idToken) {
+    return null;
   }
 
-  const roles = Array.isArray(result.user?.roles)
-    ? result.user.roles.map((r) => String(r).toLowerCase())
+  try {
+    const audience = process.env.WORKER_AUDIENCE;
+    if (!audience) {
+      console.warn('[auth] missing_worker_audience_for_idtoken_fallback');
+      return null;
+    }
+    const ticket = await gclient.verifyIdToken({ idToken, audience });
+    const payload = ticket.getPayload() || {};
+    return { sub: payload.sub || 'idtoken', roles: ['seller'] };
+  } catch (err) {
+    console.warn('[auth] idtoken_fallback_failed:', err?.message);
+    return null;
+  }
+}
+
+function hasSellerRole(user) {
+  const roles = Array.isArray(user?.roles)
+    ? user.roles.map((r) => String(r).toLowerCase())
     : [];
-  if (!roles.includes('seller') && !roles.includes('admin')) {
-    return res.status(403).json({ ok: false, error: 'seller_role_required' });
-  }
+  return roles.includes('seller') || roles.includes('admin');
+}
 
-  req.actor = result.user;
-  return next();
+function requireSeller(req, res, next) {
+  (async () => {
+    const result = parseAppActor(req);
+    if (result.ok) {
+      if (!hasSellerRole(result.user)) {
+        return res.status(403).json({ ok: false, error: 'seller_role_required' });
+      }
+      req.actor = result.user;
+      return next();
+    }
+
+    if (process.env.ALLOW_IDTOKEN_AS_APP === '1') {
+      const fallbackUser = await parseIdTokenAsSeller(req);
+      if (fallbackUser) {
+        req.actor = fallbackUser;
+        return next();
+      }
+    }
+
+    return res.status(401).json({ ok: false, error: 'unauthorized_app_jwt', reason: result.reason });
+  })().catch(next);
 }
 
 module.exports = { parseAppActor, requireSeller };

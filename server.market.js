@@ -130,6 +130,7 @@ const mapListingRow = (row = {}) => ({
   packaging: row.packaging ?? null,
   moq: row.moq ?? null,
   mpq: row.mpq ?? null,
+  mpq_required_order: !!row.mpq_required_order,
   created_at: row.created_at,
   updated_at: row.updated_at,
 });
@@ -347,7 +348,7 @@ app.get('/api/listings', async (req, res) => {
     if (brand) { args.push(brand); where.push(`brand_norm = lower($${args.length})`); }
     if (code)  { args.push(code);  where.push(`code_norm  = lower($${args.length})`); }
     if (status) { args.push(status); where.push(`status = $${args.length}`); }
-    const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents, currency, lead_time_days, moq, mpq, location, condition, packaging, note, status, created_at
+    const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents, currency, lead_time_days, moq, mpq, mpq_required_order, location, condition, packaging, note, status, created_at
                  FROM public.listings
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY created_at DESC
@@ -372,8 +373,8 @@ app.post('/api/listings', requireSeller, async (req, res) => {
     const currency = (b.currency ? String(b.currency) : 'USD').toUpperCase();
     const fx = await enrichKRWDaily(client, currency, unitPriceCents);
     const sql = `INSERT INTO public.listings
-      (tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency, lead_time_days, location, condition, packaging, note, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13,'USD'),$14,$15,$16,$17,$18,COALESCE($19,'pending'))
+      (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency, lead_time_days, location, condition, packaging, note, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'))
       RETURNING id, status, created_at`;
     const r = await client.query(sql, [
       t,
@@ -383,6 +384,7 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       toOptionalInteger(b.qty_available, { min: 0 }) ?? 0,
       toOptionalInteger(b.moq, { min: 0 }),
       toOptionalInteger(b.mpq, { min: 0 }),
+      !!b.mpq_required_order,
       unitPriceCents,
       fx.krw_cents,
       fx.rate,
@@ -407,7 +409,7 @@ app.get('/api/listings/:id', async (req, res) => {
     const id = (req.params.id || '').toString();
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
     const r = await query(
-      `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, created_at, updated_at
+      `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, created_at, updated_at
          FROM public.listings WHERE id = $1`,
       [id]
     );
@@ -444,6 +446,10 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
     if (has('mpq')) {
       sets.push(`mpq = $${params.length + 1}`);
       params.push(toOptionalInteger(body.mpq, { min: 0 }));
+    }
+    if (has('mpq_required_order')) {
+      sets.push(`mpq_required_order = $${params.length + 1}`);
+      params.push(!!body.mpq_required_order);
     }
 
     if (has('qty_available') || has('quantity_available')) {
@@ -507,7 +513,7 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
     params.push(id);
 
     const sql = `UPDATE public.listings SET ${sets.join(', ')} WHERE id = $${params.length}
-      RETURNING id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, created_at, updated_at`;
+      RETURNING id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, created_at, updated_at`;
     const r = await query(sql, params);
     if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
     res.json({ ok: true, item: mapListingRow(r.rows[0]) });

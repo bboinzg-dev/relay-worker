@@ -5,6 +5,7 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const jwt = require('jsonwebtoken');
 const { getPool } = require('./db');
 const { parseActor, hasRole } = require('./src/utils/auth');
 
@@ -21,6 +22,46 @@ function getTenant(req) {
   const t = pick(req.headers || {}, 'x-actor-tenant') || null;
   return t;
 }
+
+function requireAuth(req, res) {
+  const hdr = req.headers?.authorization || '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+  if (!token) {
+    res.status(401).json({ error: 'unauthorized' });
+    return null;
+  }
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    console.error('[listings] missing JWT_SECRET');
+    res.status(500).json({ error: 'auth_not_configured' });
+    return null;
+  }
+  try {
+    return jwt.verify(token, secret);
+  } catch (err) {
+    console.warn('[listings] token verify failed', err?.message || err);
+    res.status(401).json({ error: 'unauthorized' });
+    return null;
+  }
+}
+
+function toOptionalInteger(value, { min } = {}) {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const int = Math.round(n);
+  if (Number.isFinite(min) && int < min) return min;
+  return int;
+}
+
+function toCents(unitPrice) {
+  if (unitPrice == null || unitPrice === '') return null;
+  const num = Number(unitPrice);
+  if (!Number.isFinite(num)) return null;
+  return Math.max(0, Math.round(num * 100));
+}
+
+const LISTING_STATUS = new Set(['pending', 'active', 'soldout', 'archived', 'inactive']);
 
 /* ---------------- Listings (정찰제/재고) ---------------- */
 
@@ -49,22 +90,134 @@ app.get('/api/listings', async (req, res) => {
 app.post('/api/listings', async (req, res) => {
   try {
     const actor = parseActor(req);
+    if (!requireAuth(req, res)) return;
     if (!hasRole(actor, 'seller', 'admin')) return res.status(403).json({ error: 'seller role required' });
     const t = getTenant(req);
     const b = req.body || {};
+    if (!b.brand || !b.code) {
+      return res.status(400).json({ error: 'brand, code required' });
+    }
+    const unitPriceCents =
+      toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
     const sql = `INSERT INTO public.listings
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,'USD'),$10,$11,$12,$13,$14,COALESCE($15,'pending'))
-      RETURNING *`;
+      RETURNING id, status, created_at`;
     const r = await query(sql, [
-      t, actor.id || null, b.brand, b.code, Number(b.qty_available||0),
-      b.moq || null, b.mpq || null,
-      Number(b.unit_price_cents||0), b.currency || 'USD',
-      b.lead_time_days || null, b.location || null, b.condition || null, b.packaging || null, b.note || null,
-      b.status || 'pending',
+      t,
+      b.seller_id != null ? String(b.seller_id) : actor.id || null,
+      String(b.brand),
+      String(b.code),
+      toOptionalInteger(b.qty_available, { min: 0 }) ?? 0,
+      toOptionalInteger(b.moq, { min: 0 }),
+      toOptionalInteger(b.mpq, { min: 0 }),
+      unitPriceCents,
+      b.currency ? String(b.currency) : 'USD',
+      toOptionalInteger(b.lead_time_days, { min: 0 }),
+      b.location != null ? String(b.location) : null,
+      b.condition != null ? String(b.condition) : null,
+      b.packaging != null ? String(b.packaging) : null,
+      b.note != null ? String(b.note) : null,
+      LISTING_STATUS.has(String(b.status || '').toLowerCase()) ? String(b.status).toLowerCase() : 'pending',
     ]);
-    res.json({ ok: true, item: r.rows[0] });
+    res.status(201).json(r.rows[0]);
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+});
+
+// GET /api/listings/:id – 단건 조회
+app.get('/api/listings/:id', async (req, res) => {
+  try {
+    const id = (req.params.id || '').toString();
+    if (!id) return res.status(400).json({ error: 'id required' });
+    const r = await query(
+      `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, created_at, updated_at
+         FROM public.listings WHERE id = $1`,
+      [id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// PATCH /api/listings/:id – 수량/상태/가격 등 수정
+app.patch('/api/listings/:id', async (req, res) => {
+  try {
+    if (!requireAuth(req, res)) return;
+
+    const id = (req.params.id || '').toString();
+    if (!id) return res.status(400).json({ error: 'id required' });
+
+    const body = req.body || {};
+    const sets = [];
+    const params = [];
+
+    if (Object.prototype.hasOwnProperty.call(body, 'qty_available')) {
+      sets.push(`qty_available = $${params.length + 1}`);
+      params.push(toOptionalInteger(body.qty_available, { min: 0 }) ?? 0);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'moq')) {
+      sets.push(`moq = $${params.length + 1}`);
+      params.push(toOptionalInteger(body.moq, { min: 0 }));
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'mpq')) {
+      sets.push(`mpq = $${params.length + 1}`);
+      params.push(toOptionalInteger(body.mpq, { min: 0 }));
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'unit_price')) {
+      sets.push(`unit_price_cents = $${params.length + 1}`);
+      params.push(toCents(body.unit_price) ?? 0);
+    } else if (Object.prototype.hasOwnProperty.call(body, 'unit_price_cents')) {
+      sets.push(`unit_price_cents = $${params.length + 1}`);
+      params.push(toOptionalInteger(body.unit_price_cents, { min: 0 }) ?? 0);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'currency')) {
+      sets.push(`currency = $${params.length + 1}`);
+      params.push(body.currency != null ? String(body.currency) : null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'lead_time_days')) {
+      sets.push(`lead_time_days = $${params.length + 1}`);
+      params.push(toOptionalInteger(body.lead_time_days, { min: 0 }));
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'location')) {
+      sets.push(`location = $${params.length + 1}`);
+      params.push(body.location != null ? String(body.location) : null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'condition')) {
+      sets.push(`condition = $${params.length + 1}`);
+      params.push(body.condition != null ? String(body.condition) : null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'packaging')) {
+      sets.push(`packaging = $${params.length + 1}`);
+      params.push(body.packaging != null ? String(body.packaging) : null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'note')) {
+      sets.push(`note = $${params.length + 1}`);
+      params.push(body.note != null ? String(body.note) : null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'status')) {
+      const status = String(body.status || '').toLowerCase();
+      if (!LISTING_STATUS.has(status)) {
+        return res.status(400).json({ error: 'invalid_status' });
+      }
+      sets.push(`status = $${params.length + 1}`);
+      params.push(status);
+    }
+    if (!sets.length) {
+      return res.status(400).json({ error: 'no_fields' });
+    }
+    sets.push('updated_at = now()');
+    params.push(id);
+    const sql = `UPDATE public.listings SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING id, status, qty_available, unit_price_cents, currency, updated_at`;
+    const r = await query(sql, params);
+    if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
 });
 
 // POST /api/listings/:id/purchase  → 주문 생성(간이)

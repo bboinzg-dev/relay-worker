@@ -6,6 +6,8 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const XLSX = require('xlsx');
 const { getPool } = require('./db');
 const { parseActor, hasRole } = require('./src/utils/auth');
 
@@ -15,6 +17,48 @@ app.use(bodyParser.json({ limit: '10mb' }));
 
 const pool = getPool();
 const query = (text, params) => pool.query(text, params);
+const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
+
+function prevYYYYMM(d = new Date()) {
+  const y = d.getFullYear();
+  const m = d.getMonth();
+  const pm = m === 0 ? 12 : m;
+  const py = m === 0 ? y - 1 : y;
+  return Number(`${py}${String(pm).padStart(2, '0')}`);
+}
+
+async function enrichKRW(client, currency, unitPriceCents) {
+  const curr = String(currency || 'USD').toUpperCase();
+  const cents = Number(unitPriceCents ?? 0);
+  if (!Number.isFinite(cents) || cents <= 0) {
+    return { krw_cents: null, rate: null, yyyymm: prevYYYYMM(), src: null };
+  }
+  if (curr === 'KRW') {
+    const won = Math.round((cents / 100) / 10) * 10;
+    return {
+      krw_cents: won * 100,
+      rate: 1,
+      yyyymm: prevYYYYMM(),
+      src: 'hana_first_avg',
+    };
+  }
+  const ym = prevYYYYMM();
+  const rr = await client.query(
+    `SELECT rate, source FROM public.fx_rates_monthly WHERE currency=$1 AND yyyymm=$2 LIMIT 1`,
+    [curr, ym]
+  );
+  const rate = Number(rr.rows?.[0]?.rate || 0);
+  if (!rate) {
+    return { krw_cents: null, rate: null, yyyymm: ym, src: null };
+  }
+  const won = Math.round(((cents / 100) * rate) / 10) * 10;
+  return {
+    krw_cents: won * 100,
+    rate,
+    yyyymm: ym,
+    src: rr.rows[0].source || 'hana_first_avg',
+  };
+}
 
 const mapListingRow = (row = {}) => ({
   id: row.id,
@@ -87,6 +131,37 @@ const LISTING_STATUS = new Set(['pending', 'active', 'soldout', 'archived', 'ina
 
 /* ---------------- Listings (정찰제/재고) ---------------- */
 
+app.get('/api/fx/latest', async (req, res) => {
+  try {
+    const curr = String((req.query.currency || req.query.curr || '')).toUpperCase();
+    const ym = prevYYYYMM();
+    if (!curr || curr === 'KRW') {
+      return res.json({
+        ok: true,
+        currency: 'KRW',
+        rate: 1,
+        yyyymm: ym,
+        source: 'hana_first_avg',
+      });
+    }
+    const r = await query(
+      `SELECT rate, source FROM public.fx_rates_monthly WHERE currency=$1 AND yyyymm=$2 LIMIT 1`,
+      [curr, ym]
+    );
+    const row = r.rows[0] || null;
+    res.json({
+      ok: true,
+      currency: curr,
+      rate: row?.rate || null,
+      yyyymm: ym,
+      source: row?.source || 'unknown',
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 // GET /api/listings?brand=&code=&status=active
 app.get('/api/listings', async (req, res) => {
   try {
@@ -110,6 +185,7 @@ app.get('/api/listings', async (req, res) => {
 
 // POST /api/listings  (seller 전용)
 app.post('/api/listings', async (req, res) => {
+  const client = await pool.connect();
   try {
     const actor = parseActor(req);
     if (!requireAuth(req, res)) return;
@@ -121,11 +197,13 @@ app.post('/api/listings', async (req, res) => {
     }
     const unitPriceCents =
       toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
+    const currency = (b.currency ? String(b.currency) : 'USD').toUpperCase();
+    const fx = await enrichKRW(client, currency, unitPriceCents);
     const sql = `INSERT INTO public.listings
-      (tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,'USD'),$10,$11,$12,$13,$14,COALESCE($15,'pending'))
+      (tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency, lead_time_days, location, condition, packaging, note, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13,'USD'),$14,$15,$16,$17,$18,COALESCE($19,'pending'))
       RETURNING id, status, created_at`;
-    const r = await query(sql, [
+    const r = await client.query(sql, [
       t,
       b.seller_id != null ? String(b.seller_id) : actor.id || null,
       String(b.brand),
@@ -134,7 +212,11 @@ app.post('/api/listings', async (req, res) => {
       toOptionalInteger(b.moq, { min: 0 }),
       toOptionalInteger(b.mpq, { min: 0 }),
       unitPriceCents,
-      b.currency ? String(b.currency) : 'USD',
+      fx.krw_cents,
+      fx.rate,
+      fx.yyyymm,
+      fx.src,
+      currency,
       toOptionalInteger(b.lead_time_days, { min: 0 }),
       b.location != null ? String(b.location) : null,
       b.condition != null ? String(b.condition) : null,
@@ -144,6 +226,7 @@ app.post('/api/listings', async (req, res) => {
     ]);
     res.status(201).json(r.rows[0]);
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+  finally { client.release(); }
 });
 
 // GET /api/listings/:id – 단건 조회
@@ -375,6 +458,7 @@ app.get('/api/bids', async (req, res) => {
 });
 
 app.post('/api/bids', async (req, res) => {
+  const client = await pool.connect();
   try {
     const actor = parseActor(req);
     if (!hasRole(actor, 'seller', 'admin')) return res.status(403).json({ error: 'seller role required' });
@@ -390,6 +474,8 @@ app.post('/api/bids', async (req, res) => {
       : (Number.isFinite(Number(body.unit_price))
           ? Math.max(0, Math.round(Number(body.unit_price) * 100))
           : 0);
+    const currency = (body.currency || 'USD').toUpperCase();
+    const fx = await enrichKRW(client, currency, unitPriceCents);
     const offerBrand = body.offer_brand ?? body.brand ?? null;
     const offerCode = body.offer_code ?? body.code ?? null;
     const isSubstitute = !!(
@@ -399,11 +485,11 @@ app.post('/api/bids', async (req, res) => {
 
     const sql = `INSERT INTO public.bids
       (tenant_id, purchase_request_id, seller_id, offer_brand, offer_code, offer_is_substitute,
-       offer_qty, unit_price_cents, currency, lead_time_days, note, quote_valid_until, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,'USD'),$10,$11,$12,'offered')
+       offer_qty, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency, lead_time_days, note, quote_valid_until, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13,'USD'),$14,$15,$16,'offered')
       RETURNING *`;
 
-    const r = await query(sql, [
+    const r = await client.query(sql, [
       tenantId,
       prId,
       actor.id || null,
@@ -412,7 +498,11 @@ app.post('/api/bids', async (req, res) => {
       isSubstitute,
       Number(offerQty || 0),
       unitPriceCents,
-      body.currency || 'USD',
+      fx.krw_cents,
+      fx.rate,
+      fx.yyyymm,
+      fx.src,
+      currency,
       body.lead_time_days || null,
       note,
       body.quote_valid_until || null,
@@ -421,6 +511,8 @@ app.post('/api/bids', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(400).json({ ok:false, error:String(e.message || e) });
+  } finally {
+    client.release();
   }
 });
 
@@ -471,6 +563,96 @@ app.get('/api/seller/items', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(400).json({ ok:false, error:String(e.message || e) });
+  }
+});
+
+app.post('/api/import/seller-items', upload.single('file'), async (req, res) => {
+  try {
+    const buf = req.file?.buffer;
+    const kind = String(req.body?.kind || 'stock');
+    if (!buf) return res.status(400).json({ ok: false, error: 'file_required' });
+
+    const wb = XLSX.read(buf, { type: 'buffer' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+
+    if (!rows.length) {
+      return res.json({ ok: true, items: [] });
+    }
+
+    const header = (rows[0] || []).map((h) => String(h).trim().toLowerCase());
+    const idx = (patterns) =>
+      header.findIndex((h) => patterns.some((p) => new RegExp(p, 'i').test(h)));
+
+    const map = {
+      brand: idx(['brand', '제조사']),
+      code: idx(['part', 'parts?\\s*no', '제품명', '부품번호', 'code']),
+      price: idx(['unit', '단가', 'price']),
+      currency: idx(['currency', '통화']),
+      qty: idx(['qty', '수량', '가용']),
+      moq: idx(['moq']),
+      lead: idx(['lead', '리드', '납기', 'days']),
+      status: idx(['status', '상태']),
+      offer_qty: idx(['offer', '견적\\s*수량']),
+      is_alt: idx(['substitute', '대체']),
+      valid_until: idx(['valid', '유효']),
+    };
+
+    const data = [];
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r] || [];
+      const brand = map.brand >= 0 ? row[map.brand] : row[0];
+      const code = map.code >= 0 ? row[map.code] : row[1];
+      const rawPrice = map.price >= 0 ? row[map.price] : null;
+      const price = Number(String(rawPrice || '').replace(/[^\d.]/g, '')) || 0;
+      if (!brand || !code || !price) continue;
+
+      const base = {
+        brand,
+        code,
+        unit_price: Number(price.toFixed(2)),
+        currency: (map.currency >= 0 ? row[map.currency] : 'KRW').toString().toUpperCase(),
+        lead_time_days:
+          map.lead >= 0
+            ? Number(String(row[map.lead]).replace(/[^\d]/g, '')) || null
+            : null,
+        status:
+          map.status >= 0 ? String(row[map.status] || '').toLowerCase() : undefined,
+        moq:
+          map.moq >= 0
+            ? Number(String(row[map.moq]).replace(/[^\d]/g, '')) || null
+            : null,
+      };
+
+      if (kind === 'quote') {
+        data.push({
+          ...base,
+          offer_qty:
+            map.offer_qty >= 0
+              ? Number(String(row[map.offer_qty]).replace(/[^\d]/g, '')) || 0
+              : 0,
+          offer_is_substitute:
+            map.is_alt >= 0
+              ? /y|1|true|대체/i.test(String(row[map.is_alt] || ''))
+              : false,
+          quote_valid_until:
+            map.valid_until >= 0 ? String(row[map.valid_until] || '') : null,
+        });
+      } else {
+        data.push({
+          ...base,
+          qty_available:
+            map.qty >= 0
+              ? Number(String(row[map.qty]).replace(/[^\d]/g, '')) || 0
+              : 0,
+        });
+      }
+    }
+
+    res.json({ ok: true, items: data });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
 

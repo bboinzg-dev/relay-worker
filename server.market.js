@@ -360,11 +360,18 @@ app.get('/api/listings', async (req, res) => {
 
 // POST /api/listings  (seller 전용)
 app.post('/api/listings', requireSeller, async (req, res) => {
+  const actor = req.actor || {};
+  const t = getTenant(req);
+  const b = req.body || {};
+  const merge = b.merge === true || b.merge === 'true';
+  const actorSeller = actor.id || actor.sub || null;
+  const sellerId = b.seller_id != null
+    ? String(b.seller_id)
+    : actorSeller != null
+      ? String(actorSeller)
+      : null;
   const client = await pool.connect();
   try {
-    const actor = req.actor || {};
-    const t = getTenant(req);
-    const b = req.body || {};
     if (!b.brand || !b.code) {
       return res.status(400).json({ error: 'brand, code required' });
     }
@@ -372,34 +379,9 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
     const currency = (b.currency ? String(b.currency) : 'USD').toUpperCase();
     const fx = await enrichKRWDaily(client, currency, unitPriceCents);
-    const sql = `INSERT INTO public.listings
-      (tenant_id, seller_id, brand, code, brand_norm, code_norm, qty_available, moq, mpq, mpq_required_order,
-       unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-       currency, lead_time_days, location, condition, packaging, note, status)
-      VALUES ($1,$2,$3,$4,lower($3),lower($4),$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'))
-      ON CONFLICT (seller_id, brand_norm, code_norm)
-      DO UPDATE SET
-        qty_available        = EXCLUDED.qty_available,
-        moq                  = EXCLUDED.moq,
-        mpq                  = EXCLUDED.mpq,
-        mpq_required_order   = EXCLUDED.mpq_required_order,
-        unit_price_cents     = EXCLUDED.unit_price_cents,
-        unit_price_krw_cents = EXCLUDED.unit_price_krw_cents,
-        unit_price_fx_rate   = EXCLUDED.unit_price_fx_rate,
-        unit_price_fx_yyyymm = EXCLUDED.unit_price_fx_yyyymm,
-        unit_price_fx_src    = EXCLUDED.unit_price_fx_src,
-        currency             = EXCLUDED.currency,
-        lead_time_days       = EXCLUDED.lead_time_days,
-        location             = EXCLUDED.location,
-        condition            = EXCLUDED.condition,
-        packaging            = EXCLUDED.packaging,
-        note                 = EXCLUDED.note,
-        status               = EXCLUDED.status,
-        updated_at           = now()
-      RETURNING id, status, created_at`;
-    const r = await client.query(sql, [
+    const params = [
       t,
-      b.seller_id != null ? String(b.seller_id) : (actor.id || actor.sub || null),
+      sellerId,
       String(b.brand),
       String(b.code),
       toOptionalInteger(b.qty_available, { min: 0 }) ?? 0,
@@ -418,9 +400,56 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       b.packaging != null ? String(b.packaging) : null,
       b.note != null ? String(b.note) : null,
       LISTING_STATUS.has(String(b.status || '').toLowerCase()) ? String(b.status).toLowerCase() : 'pending',
-    ]);
+    ];
+    const insertSql = `INSERT INTO public.listings
+      (tenant_id, seller_id, brand, code, brand_norm, code_norm, qty_available, moq, mpq, mpq_required_order,
+       unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+       currency, lead_time_days, location, condition, packaging, note, status)
+      VALUES ($1,$2,$3,$4,lower($3),lower($4),$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'))
+      RETURNING id, status, created_at`;
+    const mergeSql = `INSERT INTO public.listings
+      (tenant_id, seller_id, brand, code, brand_norm, code_norm, qty_available, moq, mpq, mpq_required_order,
+       unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+       currency, lead_time_days, location, condition, packaging, note, status)
+      VALUES ($1,$2,$3,$4,lower($3),lower($4),$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'))
+      ON CONFLICT (seller_id, brand_norm, code_norm)
+      DO UPDATE SET
+        qty_available        = EXCLUDED.qty_available,
+        unit_price_cents     = EXCLUDED.unit_price_cents,
+        unit_price_krw_cents = EXCLUDED.unit_price_krw_cents,
+        unit_price_fx_rate   = EXCLUDED.unit_price_fx_rate,
+        unit_price_fx_yyyymm = EXCLUDED.unit_price_fx_yyyymm,
+        unit_price_fx_src    = EXCLUDED.unit_price_fx_src,
+        currency             = EXCLUDED.currency,
+        lead_time_days       = EXCLUDED.lead_time_days,
+        status               = EXCLUDED.status,
+        updated_at           = now()
+      RETURNING id, status, created_at`;
+    const sql = merge ? mergeSql : insertSql;
+    const r = await client.query(sql, params);
     res.status(201).json(r.rows[0]);
-  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+  } catch (e) {
+    if (e?.code === '23505' && e?.constraint === 'ux_listings_seller_brand_code') {
+      try {
+        const { rows } = await client.query(
+          `SELECT id FROM public.listings
+            WHERE seller_id IS NOT DISTINCT FROM $1 AND brand_norm = lower($2) AND code_norm = lower($3)
+            ORDER BY created_at DESC LIMIT 1`,
+          [
+            sellerId,
+            String(b.brand),
+            String(b.code),
+          ]
+        );
+        const exists = rows?.[0]?.id || null;
+        return res.status(409).json({ ok: false, error: 'duplicate_listing', id: exists });
+      } catch (_) {
+        return res.status(409).json({ ok: false, error: 'duplicate_listing' });
+      }
+    }
+    console.error(e);
+    res.status(500).json({ ok: false, error: 'db_error' });
+  }
   finally { client.release(); }
 });
 

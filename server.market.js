@@ -378,20 +378,100 @@ app.post('/api/bids', async (req, res) => {
   try {
     const actor = parseActor(req);
     if (!hasRole(actor, 'seller', 'admin')) return res.status(403).json({ error: 'seller role required' });
-    const t = getTenant(req);
-    const b = req.body || {};
+
+    const tenantId = getTenant(req);
+    const body = req.body || {};
+
+    const prId = body.pr_id || body.purchase_request_id || body.pr || null;
+    const offerQty =
+      body.offer_qty ?? body.offer_quantity ?? body.qty_offer ?? null;
+    const unitPriceCents = Number.isFinite(Number(body.unit_price_cents))
+      ? Number(body.unit_price_cents)
+      : (Number.isFinite(Number(body.unit_price))
+          ? Math.max(0, Math.round(Number(body.unit_price) * 100))
+          : 0);
+    const offerBrand = body.offer_brand ?? body.brand ?? null;
+    const offerCode = body.offer_code ?? body.code ?? null;
+    const isSubstitute = !!(
+      body.offer_is_substitute ?? body.is_alternative ?? body.is_substitute
+    );
+    const note = body.note ?? body.notes ?? null;
+
     const sql = `INSERT INTO public.bids
-      (tenant_id, purchase_request_id, seller_id, offer_brand, offer_code, offer_is_substitute, offer_qty, unit_price_cents, currency, lead_time_days, note, status)
-      VALUES ($1,$2,$3,$4,$5,COALESCE($6,false),$7,$8,COALESCE($9,'USD'),$10,$11,'offered')
+      (tenant_id, purchase_request_id, seller_id, offer_brand, offer_code, offer_is_substitute,
+       offer_qty, unit_price_cents, currency, lead_time_days, note, quote_valid_until, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,'USD'),$10,$11,$12,'offered')
       RETURNING *`;
+
     const r = await query(sql, [
-      t, b.purchase_request_id, actor.id || null,
-      b.offer_brand || null, b.offer_code || null, !!b.offer_is_substitute,
-      Number(b.offer_qty || 0), Number(b.unit_price_cents || 0),
-      b.currency || 'USD', b.lead_time_days || null, b.note || null
+      tenantId,
+      prId,
+      actor.id || null,
+      offerBrand,
+      offerCode,
+      isSubstitute,
+      Number(offerQty || 0),
+      unitPriceCents,
+      body.currency || 'USD',
+      body.lead_time_days || null,
+      note,
+      body.quote_valid_until || null,
     ]);
     res.json({ ok: true, item: r.rows[0] });
-  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok:false, error:String(e.message || e) });
+  }
+});
+
+app.get('/api/seller/items', async (req, res) => {
+  try {
+    const actor = parseActor(req);
+    const sellerId = (req.query.seller_id || actor?.id || '').toString();
+    const status = (req.query.status || '').toString();
+    const requestedLimit = Number(req.query.limit || 50);
+    const limit = Math.min(
+      200,
+      Number.isFinite(requestedLimit) && requestedLimit > 0 ? requestedLimit : 50
+    );
+
+    const args = [];
+    const where = [];
+    if (sellerId) {
+      args.push(sellerId);
+      where.push(`seller_id = $${args.length}`);
+    }
+    if (status) {
+      args.push(status);
+      where.push(`status = $${args.length}`);
+    }
+    args.push(limit);
+
+    const sql = `SELECT * FROM public.seller_items_v
+                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                 ORDER BY created_at DESC
+                 LIMIT $${args.length}`;
+
+    const r = await query(sql, args);
+    const items = r.rows.map((row) => ({
+      id: row.id,
+      item_type: row.item_type,
+      brand: row.brand,
+      code: row.code,
+      quantity_available: row.quantity_available ?? 0,
+      unit_price: (row.unit_price_cents ?? 0) / 100,
+      currency: row.currency || 'USD',
+      lead_time_days: row.lead_time_days,
+      status: row.status,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    }));
+
+    res.json({ ok: true, items });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok:false, error:String(e.message || e) });
+  }
 });
 
 module.exports = app;

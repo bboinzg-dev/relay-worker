@@ -5,6 +5,20 @@ const { DIM_KEYS } = require('../types/blueprint.js');
 
 const CACHE = new Map();
 const TTL = Number(process.env.BLUEPRINT_CACHE_TTL_MS || 60_000);
+const JSON_COLUMNS = new Set([
+  'fields_json',
+  'ingest_options',
+  'aliases_json',
+  'synonyms_json',
+  'code_rules',
+]);
+
+function prepareColumnValue(column, value) {
+  if (JSON_COLUMNS.has(column) && value !== null && typeof value === 'object') {
+    return JSON.stringify(value);
+  }
+  return value;
+}
 
 function cacheKeyFor(familySlug) {
   return `bp:${familySlug}`;
@@ -228,8 +242,11 @@ async function saveBlueprint(clientOrPayload, maybePayload) {
   const updateAssignments = ['updated_at=now()'];
   const updateParams = [familySlug];
   for (const [col, value] of columns) {
-    updateAssignments.push(`${col}=$${updateParams.length + 1}`);
-    updateParams.push(value);
+    const isJsonCol = JSON_COLUMNS.has(col);
+    updateAssignments.push(
+      `${col}=$${updateParams.length + 1}${isJsonCol ? '::jsonb' : ''}`,
+    );
+    updateParams.push(prepareColumnValue(col, value));
   }
 
   const updateSql = `
@@ -251,15 +268,17 @@ async function saveBlueprint(clientOrPayload, maybePayload) {
   for (const [col, value] of columns) {
     provided.add(col);
     insertCols.push(col);
-    insertParams.push(value);
-    placeholders.push(`$${insertParams.length}`);
+    insertParams.push(prepareColumnValue(col, value));
+    const isJsonCol = JSON_COLUMNS.has(col);
+    placeholders.push(`$${insertParams.length}${isJsonCol ? '::jsonb' : ''}`);
   }
 
   for (const [col, defaultValue] of Object.entries(defaults)) {
     if (provided.has(col)) continue;
     insertCols.push(col);
-    insertParams.push(defaultValue);
-    placeholders.push(`$${insertParams.length}`);
+    insertParams.push(prepareColumnValue(col, defaultValue));
+    const isJsonCol = JSON_COLUMNS.has(col);
+    placeholders.push(`$${insertParams.length}${isJsonCol ? '::jsonb' : ''}`);
   }
 
   const insertSql = `

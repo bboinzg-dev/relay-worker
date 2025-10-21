@@ -122,16 +122,16 @@ async function ensureSpecColumnsForFamily(dbOrFamily, maybeFamilySlug, fieldsInp
   await client.query(`SELECT public.ensure_blueprint_fields_columns($1)`, [familySlug]);
 
   // 2) 런타임 필드 키가 있으면 dynamic 보강 (2-인자: jsonb 배열)
-  if (Array.isArray(fieldKeys) && fieldKeys.length) {
-    await client.query(
-      `SELECT public.ensure_dynamic_spec_columns($1, $2::jsonb)`,
-      [familySlug, JSON.stringify(fieldKeys)],
-    );
-  }
-
+  const fieldKeysJson = JSON.stringify(Array.isArray(fieldKeys) ? fieldKeys : []);
   await client.query(
-    `SELECT public.ensure_blueprint_variant_columns($1, $2)`,
-    [familySlug, variantKeys],
+    `SELECT public.ensure_dynamic_spec_columns($1, $2::jsonb)`,
+    [familySlug, fieldKeysJson],
+  );
+
+  const variantKeysJson = JSON.stringify(Array.isArray(variantKeys) ? variantKeys : []);
+  await client.query(
+    `SELECT public.ensure_blueprint_variant_columns($1, $2::jsonb)`,
+    [familySlug, variantKeysJson],
   );
 
   return { fieldKeys, variantKeys, allowedKeys };

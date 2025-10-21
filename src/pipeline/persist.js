@@ -27,7 +27,7 @@ const { ensureSpecsTable } = tryRequire([
 const { getColumnsOf } = require('./ensure-spec-columns');
 const { normalizeValueLLM } = require('../utils/ai');
 let { renderPnTemplate: renderPnTemplateFromOrdering } = require('../utils/ordering');
-const { isValidCode } = require('../utils/code-validation');
+const { isValidCode, looksLikeGarbageCode } = require('../utils/code-validation');
 const { getBlueprintPnTemplate } = require('../utils/getBlueprintPnTemplate');
 let extractOrderingInfo;
 try {
@@ -97,18 +97,6 @@ function codeForRelaySignal(spec) {
     .filter(Boolean)
     .join('-')
     .replace(/--+/g, '-');
-}
-
-function looksLikeGarbageCode(value) {
-  const text = String(value ?? '');
-  if (!text) return false;
-  return (
-    /^[a-f0-9]{20,}_\d{10,}/i.test(text)
-    || /(^|_)(mech|doc|pdf)[-_]/i.test(text)
-    || /pdf:|\.pdf$/i.test(text)
-    || /^ASCTB\d{3,4}[A-Z]$/i.test(text)          // Panasonic catalog doc-id
-    || /ASCTB\d{3,4}[A-Z]\s+\d{6}/i.test(text)    // with trailing yyyymm
-  );
 }
 
 // leading letters from a code (e.g., ALZ, JS, NKB)
@@ -1065,7 +1053,10 @@ function verifyInDocIfPresent(record = {}) {
   const candidates = [];
   if (record.pn) candidates.push(record.pn);
   if (record.code && record.code !== record.pn) candidates.push(record.code);
-  const validCandidates = candidates.filter((cand) => isValidCode(cand) && !looksLikeGarbageCode(cand));
+  const brand = record?.brand;
+  const validCandidates = candidates.filter(
+    (cand) => isValidCode(cand) && !looksLikeGarbageCode(cand, brand),
+  );
   if (!validCandidates.length) return;
 
   const codes = Array.isArray(orderingInfo.codes) ? orderingInfo.codes : null;
@@ -1073,7 +1064,7 @@ function verifyInDocIfPresent(record = {}) {
     const codeSet = new Set(
       codes
         .map((c) => String(c || '').trim().toUpperCase())
-        .filter((c) => c && isValidCode(c) && !looksLikeGarbageCode(c)),
+        .filter((c) => c && isValidCode(c) && !looksLikeGarbageCode(c, brand)),
     );
     if (codeSet.size) {
       for (const cand of validCandidates) {
@@ -1183,15 +1174,16 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
       codeCandidate = fallback;
     }
   }
+  const brand = spec?.brand || spec?.brand_norm;
   let docHit = false;
   const candidate = String(codeCandidate || '').trim();
-  if (candidate && isValidCode(candidate) && !looksLikeGarbageCode(candidate)) {
+  if (candidate && isValidCode(candidate) && !looksLikeGarbageCode(candidate, brand)) {
     const candidateUpper = candidate.toUpperCase();
     const codes = Array.isArray(orderingInfo?.codes) ? orderingInfo.codes : null;
     if (codes && codes.length) {
       docHit = codes.some((c) => {
         const cc = String(c || '').trim();
-        if (!cc || !isValidCode(cc) || looksLikeGarbageCode(cc)) return false;
+        if (!cc || !isValidCode(cc) || looksLikeGarbageCode(cc, brand)) return false;
         return cc.toUpperCase() === candidateUpper;
       });
     }
@@ -1223,11 +1215,11 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
     const codes = Array.isArray(orderingInfo?.codes) ? orderingInfo.codes : null;
     if (codes && codes.length) {
       const me = String(spec.pn || spec.code || '').trim().toUpperCase();
-      if (me && isValidCode(me) && !looksLikeGarbageCode(me)) {
+      if (me && isValidCode(me) && !looksLikeGarbageCode(me, brand)) {
         const matched = codes.some((c) => {
           const cc = String(c || '').trim().toUpperCase();
           if (!cc) return false;
-          if (!isValidCode(cc) || looksLikeGarbageCode(cc)) return false;
+          if (!isValidCode(cc) || looksLikeGarbageCode(cc, brand)) return false;
           return cc === me;
         });
         if (matched) spec.verified_in_doc = true;
@@ -1236,8 +1228,8 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
   }
 
   if (!STRICT_CODE_RULES) {
-    const finalPnOk = isValidCode(spec.pn) && !looksLikeGarbageCode(spec.pn);
-    const finalCodeOk = isValidCode(spec.code) && !looksLikeGarbageCode(spec.code);
+    const finalPnOk = isValidCode(spec.pn) && !looksLikeGarbageCode(spec.pn, brand);
+    const finalCodeOk = isValidCode(spec.code) && !looksLikeGarbageCode(spec.code, brand);
     if (!finalPnOk && !finalCodeOk && (spec.pn || spec.code)) {
       spec._warn_invalid_code = true;
     } else if (spec._warn_invalid_code && (finalPnOk || finalCodeOk)) {
@@ -1363,7 +1355,7 @@ function shouldInsert(row, { coreSpecKeys, candidateSpecKeys } = {}) {
     }
   }
 
-  if (verified === false) {
+  if (verified === false && docType !== 'ordering') {
     row.last_error = row.last_error || 'unverified_in_doc';
     return { ok: false, reason: 'unverified_in_doc' };
   }
@@ -1861,11 +1853,12 @@ async function saveExtractedSpecs(targetTable, familySlug, rows = [], options = 
       }
 
       if (!rec.verified_in_doc) {
-        if (rec.code && !isValidCode(rec.code) && looksLikeGarbageCode(rec.code)) {
-          rec.code = null;
+        const brandForWarn = rec.brand || rec.brand_norm;
+        if (rec.code && looksLikeGarbageCode(rec.code, brandForWarn)) {
+          rec._warn_doc_like_code = true;
         }
-        if (rec.pn && !isValidCode(rec.pn) && looksLikeGarbageCode(rec.pn)) {
-          rec.pn = null;
+        if (rec.pn && looksLikeGarbageCode(rec.pn, brandForWarn)) {
+          rec._warn_doc_like_pn = true;
         }
       }
       if (!STRICT_CODE_RULES && rec._warn_invalid_code) {

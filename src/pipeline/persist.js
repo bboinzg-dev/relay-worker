@@ -1209,13 +1209,15 @@ function buildBestIdentifiers(family, spec = {}, blueprint) {
     spec.pn = codeCandidate;
     spec.code = codeCandidate;
     spec.verified_in_doc = true;
+  } else {
+    // docHit 실패 시에는 가진 쪽을 보존: 한쪽만 유효하면 서로 보완하고,
+    // 둘 다 있으면 아무 것도 덮어쓰지 않는다.
+    const pnOk = isValidCode(spec.pn);
+    const codeOk = isValidCode(spec.code);
+    if (!codeOk && pnOk) spec.code = spec.pn;
+    if (!pnOk && codeOk) spec.pn = spec.code;
+    if (!STRICT_CODE_RULES) spec._warn_invalid_code = true;
   }
-  // 유효한 쪽을 보존: 한쪽만 살아있으면 상호 보완하고,
-  // 둘 다 있으면 아무 것도 덮어쓰지 않는다.
-  const pnOk = isValidCode(spec.pn) && !looksLikeGarbageCode(spec.pn);
-  const codeOk = isValidCode(spec.code) && !looksLikeGarbageCode(spec.code);
-  if (!codeOk && pnOk) spec.code = spec.pn;
-  if (!pnOk && codeOk) spec.pn = spec.code;
 
   if (!spec.verified_in_doc) {
     const codes = Array.isArray(orderingInfo?.codes) ? orderingInfo.codes : null;

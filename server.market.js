@@ -5,11 +5,11 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const XLSX = require('xlsx');
 const { getPool } = require('./db');
-const { parseActor, hasRole } = require('./src/utils/auth');
+const { parseActor } = require('./src/utils/auth');
+const { requireSeller } = require('./auth.middleware');
 
 const app = express();
 app.use(cors());
@@ -139,28 +139,6 @@ function getTenant(req) {
   // tenant via header (can be empty for single-tenant)
   const t = pick(req.headers || {}, 'x-actor-tenant') || null;
   return t;
-}
-
-function requireAuth(req, res) {
-  const hdr = req.headers?.authorization || '';
-  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
-  if (!token) {
-    res.status(401).json({ error: 'unauthorized' });
-    return null;
-  }
-  const secret = process.env.JWT_SECRET;
-  if (!secret) {
-    console.error('[listings] missing JWT_SECRET');
-    res.status(500).json({ error: 'auth_not_configured' });
-    return null;
-  }
-  try {
-    return jwt.verify(token, secret);
-  } catch (err) {
-    console.warn('[listings] token verify failed', err?.message || err);
-    res.status(401).json({ error: 'unauthorized' });
-    return null;
-  }
 }
 
 function toOptionalInteger(value, { min } = {}) {
@@ -380,12 +358,10 @@ app.get('/api/listings', async (req, res) => {
 });
 
 // POST /api/listings  (seller 전용)
-app.post('/api/listings', async (req, res) => {
+app.post('/api/listings', requireSeller, async (req, res) => {
   const client = await pool.connect();
   try {
-    const actor = parseActor(req);
-    if (!requireAuth(req, res)) return;
-    if (!hasRole(actor, 'seller', 'admin')) return res.status(403).json({ error: 'seller role required' });
+    const actor = req.actor || {};
     const t = getTenant(req);
     const b = req.body || {};
     if (!b.brand || !b.code) {
@@ -401,7 +377,7 @@ app.post('/api/listings', async (req, res) => {
       RETURNING id, status, created_at`;
     const r = await client.query(sql, [
       t,
-      b.seller_id != null ? String(b.seller_id) : actor.id || null,
+      b.seller_id != null ? String(b.seller_id) : (actor.id || actor.sub || null),
       String(b.brand),
       String(b.code),
       toOptionalInteger(b.qty_available, { min: 0 }) ?? 0,
@@ -444,7 +420,7 @@ app.get('/api/listings/:id', async (req, res) => {
 });
 
 // PATCH /api/listings/:id – 수량/상태/가격 등 수정
-app.patch('/api/listings/:id', async (req, res) => {
+app.patch('/api/listings/:id', requireSeller, async (req, res) => {
   try {
     const id = (req.params.id || '').toString();
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
@@ -653,11 +629,14 @@ app.get('/api/bids', async (req, res) => {
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
 });
 
-app.post('/api/bids', async (req, res) => {
+app.get('/api/seller/docs-requests', async (_req, res) => {
+  res.json({ ok: true, items: [] });
+});
+
+app.post('/api/bids', requireSeller, async (req, res) => {
   const client = await pool.connect();
   try {
-    const actor = parseActor(req);
-    if (!hasRole(actor, 'seller', 'admin')) return res.status(403).json({ error: 'seller role required' });
+    const actor = req.actor || {};
 
     const tenantId = getTenant(req);
     const body = req.body || {};
@@ -688,7 +667,7 @@ app.post('/api/bids', async (req, res) => {
     const r = await client.query(sql, [
       tenantId,
       prId,
-      actor.id || null,
+      actor.id || actor.sub || null,
       offerBrand,
       offerCode,
       isSubstitute,

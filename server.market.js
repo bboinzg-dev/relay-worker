@@ -20,170 +20,95 @@ const query = (text, params) => pool.query(text, params);
 const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
 
 const EXIM_API = 'https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON';
-const FX_TARGETS = new Set(['USD', 'JPY', 'CNY', 'CHF', 'KRW']);
+const FX_SET = new Set(['USD', 'JPY', 'CNY', 'CHF', 'KRW']);
 
-function prevYYYYMM(d = new Date()) {
-  const y = d.getFullYear();
-  const m = d.getMonth();
-  const pm = m === 0 ? 12 : m;
-  const py = m === 0 ? y - 1 : y;
-  return Number(`${py}${String(pm).padStart(2, '0')}`);
+function toKST(d = new Date()) {
+  return new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
 }
 
-function firstDayYYYYMM(yyyymm) {
-  const s = String(yyyymm).padStart(6, '0');
-  const year = Number(s.slice(0, 4));
-  const month = Number(s.slice(4, 6)) - 1;
-  return new Date(Date.UTC(year, month, 1));
+function ymdHyphenKST(d = new Date()) {
+  const k = toKST(d);
+  const yyyy = k.getFullYear();
+  const mm = String(k.getMonth() + 1).padStart(2, '0');
+  const dd = String(k.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
 }
 
-function nextMonth(date) {
-  const d = new Date(date.getTime());
-  d.setUTCMonth(d.getUTCMonth() + 1);
-  return d;
+function ymdNumKST(d = new Date()) {
+  return Number(ymdHyphenKST(d).replace(/-/g, ''));
 }
 
-function ymd(date) {
-  return date.toISOString().slice(0, 10).replace(/-/g, '');
+function ymdStr(d = new Date()) {
+  return ymdHyphenKST(d).replace(/-/g, '');
+}
+
+function prevBizday(d = new Date()) {
+  const k = toKST(d);
+  const dow = k.getDay();
+  const back = dow === 1 ? 3 : dow === 0 ? 2 : 1;
+  const p = new Date(k);
+  p.setDate(k.getDate() - back);
+  return p;
 }
 
 async function eximFetchDaily(yyyymmdd, apiKey) {
   const url = `${EXIM_API}?authkey=${encodeURIComponent(apiKey)}&searchdate=${yyyymmdd}&data=AP01`;
-  const rsp = await fetch(url, { method: 'GET' });
+  const rsp = await fetch(url);
   if (!rsp.ok) throw new Error(`exim_http_${rsp.status}`);
   const arr = await rsp.json();
   if (!Array.isArray(arr)) throw new Error('exim_bad_payload');
-  if (arr.length === 1 && arr[0] && typeof arr[0].result !== 'undefined' && arr[0].result !== 1) {
+  if (arr.length === 1 && typeof arr[0]?.result !== 'undefined' && arr[0].result !== 1) {
     throw new Error(`exim_result_${arr[0].result}`);
   }
   const out = {};
   for (const r of arr) {
     let unit = String(r.cur_unit || r.CUR_UNIT || '').trim();
-    let v = String(r.deal_bas_r || r.DEAL_BAS_R || '').replace(/,/g, '');
-    if (!unit || !v) continue;
-    let rate = Number(v);
-    if (!Number.isFinite(rate)) continue;
+    let rate = Number(String(r.deal_bas_r || r.DEAL_BAS_R || '').replace(/,/g, ''));
+    if (!unit || !Number.isFinite(rate)) continue;
     if (/^JPY/i.test(unit)) {
-      if (/\(100\)/.test(unit)) rate = rate / 100;
+      if (/\(100\)/.test(unit)) rate /= 100;
       unit = 'JPY';
-  }
-  if (unit === 'CNH') unit = 'CNY';
-  if (FX_TARGETS.has(unit)) out[unit] = rate;
+    }
+    if (unit === 'CNH') unit = 'CNY';
+    if (FX_SET.has(unit)) out[unit] = rate;
   }
   return out;
 }
 
-async function ensureMonthlyFX(yyyymm, client, { force = false } = {}) {
-  const ym = Number(yyyymm);
-  if (!Number.isFinite(ym) || String(ym).length < 6) {
-    throw new Error('invalid_yyyymm');
-  }
-
-  if (!force) {
-    const has = await client.query(
-      `SELECT 1 FROM public.fx_rates_monthly WHERE yyyymm=$1 AND currency IN ('USD','JPY','CNY','CHF') LIMIT 1`,
-      [ym]
-    );
-    if (has.rowCount) return;
-  }
-
-  const lockKey = 10_000_000_000n + BigInt(ym);
-  const lock = await client
-    .query('SELECT pg_try_advisory_lock($1::bigint) AS ok', [lockKey])
-    .then((r) => r.rows?.[0]?.ok);
-  if (!lock) {
-    if (!force) return;
-    throw new Error('fx_refresh_in_progress');
-  }
-
-  try {
-    if (!force) {
-      const again = await client.query(
-        `SELECT 1 FROM public.fx_rates_monthly WHERE yyyymm=$1 AND currency IN ('USD','JPY','CNY','CHF') LIMIT 1`,
-        [ym]
-      );
-      if (again.rowCount) return;
-    }
-
-    const apiKey = process.env.KOREAEXIM_API_KEY;
-    if (!apiKey) throw new Error('missing_KOREAEXIM_API_KEY');
-
-    const start = firstDayYYYYMM(ym);
-    const end = nextMonth(start);
-
-    for (let d = new Date(start.getTime()); d < end; d.setUTCDate(d.getUTCDate() + 1)) {
-      const ymdStr = ymd(d);
-      const daily = await eximFetchDaily(ymdStr, apiKey).catch((err) => {
-        console.warn('[fx] fetch skip', ymdStr, err?.message || err);
-        return null;
-      });
-      if (!daily) continue;
-      for (const cur of ['USD', 'JPY', 'CNY', 'CHF']) {
-        const rate = daily[cur];
-        if (!rate) continue;
-        await client.query(
-          `INSERT INTO public.fx_rates_daily (provider, currency, rate_date, rate, source)
-           VALUES ('koreaexim', $1, $2::date, $3, 'exim_deal_bas')
-           ON CONFLICT (currency, rate_date)
-           DO UPDATE SET rate = EXCLUDED.rate, source = EXCLUDED.source`,
-          [cur, ymdStr, rate]
-        );
-      }
-    }
-
-    for (const cur of ['USD', 'JPY', 'CNY', 'CHF']) {
-      const r = await client.query(
-        `SELECT AVG(rate) AS avg_rate
-           FROM public.fx_rates_daily
-          WHERE currency=$1 AND rate_date >= $2::date AND rate_date < $3::date`,
-        [cur, ymd(start), ymd(end)]
-      );
-      const avg = Number(r.rows?.[0]?.avg_rate || 0);
-      if (avg > 0) {
-        await client.query(
-          `INSERT INTO public.fx_rates_monthly (currency, yyyymm, rate, source)
-           VALUES ($1, $2, $3, 'exim_deal_bas_avg')
-           ON CONFLICT (currency, yyyymm)
-           DO UPDATE SET rate = EXCLUDED.rate, source = EXCLUDED.source`,
-          [cur, ym, avg]
-        );
-      }
-    }
-  } finally {
-    await client.query('SELECT pg_advisory_unlock($1::bigint)', [lockKey]).catch(() => {});
-  }
-}
-
-async function enrichKRW(client, currency, unitPriceCents) {
+async function enrichKRWDaily(client, currency, unitPriceCents) {
   const curr = String(currency || 'USD').toUpperCase();
   const cents = Number(unitPriceCents ?? 0);
+  const todayHyphen = ymdHyphenKST();
   if (!Number.isFinite(cents) || cents <= 0) {
-    return { krw_cents: null, rate: null, yyyymm: prevYYYYMM(), src: null };
+    return { krw_cents: null, rate: null, yyyymm: Number(todayHyphen.slice(0, 7).replace('-', '')), src: null };
   }
   if (curr === 'KRW') {
     const won = Math.round((cents / 100) / 10) * 10;
     return {
       krw_cents: won * 100,
       rate: 1,
-      yyyymm: prevYYYYMM(),
-      src: 'exim_deal_bas_avg',
+      yyyymm: Number(todayHyphen.slice(0, 7).replace('-', '')),
+      src: 'fixed_krw',
     };
   }
-  const ym = prevYYYYMM();
-  const rr = await client.query(
-    `SELECT rate, source FROM public.fx_rates_monthly WHERE currency=$1 AND yyyymm=$2 LIMIT 1`,
-    [curr, ym]
+
+  const r = await client.query(
+    `select rate, rate_date::text, source from public.fx_rates_daily where currency=$1 order by rate_date desc limit 1`,
+    [curr]
   );
-  const rate = Number(rr.rows?.[0]?.rate || 0);
+  const row = r.rows?.[0] || null;
+  const rate = Number(row?.rate || 0);
+  const rateDateHyphen = String(row?.rate_date || todayHyphen);
+  const yyyymm = Number(rateDateHyphen.slice(0, 7).replace('-', ''));
   if (!rate) {
-    return { krw_cents: null, rate: null, yyyymm: ym, src: null };
+    return { krw_cents: null, rate: null, yyyymm, src: row?.source || null };
   }
   const won = Math.round(((cents / 100) * rate) / 10) * 10;
   return {
     krw_cents: won * 100,
     rate,
-    yyyymm: ym,
-    src: rr.rows[0].source || 'exim_deal_bas_avg',
+    yyyymm,
+    src: row?.source || null,
   };
 }
 
@@ -258,76 +183,174 @@ const LISTING_STATUS = new Set(['pending', 'active', 'soldout', 'archived', 'ina
 
 /* ---------------- Listings (정찰제/재고) ---------------- */
 
-app.post('/api/fx/refresh', async (req, res) => {
-  const ym = Number((req.query.yyyymm || req.body?.yyyymm || prevYYYYMM()).toString());
-  if (!Number.isFinite(ym) || String(ym).length < 6) {
-    return res.status(400).json({ ok: false, error: 'invalid_yyyymm' });
-  }
-
-  const client = await pool.connect();
+app.post('/api/fx/fetch-daily', async (req, res) => {
   try {
-    await client.query('BEGIN');
-    await ensureMonthlyFX(ym, client, { force: true });
-    await client.query('COMMIT');
-    res.json({ ok: true, yyyymm: ym, provider: 'koreaexim', currencies: ['USD', 'JPY', 'CNY', 'CHF'] });
+    const apiKey = process.env.KOREAEXIM_API_KEY;
+    if (!apiKey) return res.status(400).json({ ok: false, error: 'missing_KOREAEXIM_API_KEY' });
+
+    const nowK = toKST();
+    const ymdToday = ymdNumKST(nowK);
+    const target = String(req.query.date || ymdToday);
+    const snapshot = await eximFetchDaily(target, apiKey).catch(() => null);
+
+    const client = await pool.connect();
+    let responsePayload = null;
+    try {
+      await client.query('BEGIN');
+      if (snapshot && (snapshot.USD || snapshot.JPY || snapshot.CNY || snapshot.CHF)) {
+        for (const cur of ['USD', 'JPY', 'CNY', 'CHF']) {
+          if (!snapshot[cur]) continue;
+          await client.query(
+            `INSERT INTO public.fx_rates_daily (provider,currency,rate_date,rate,source,collected_at)
+             VALUES ('koreaexim',$1,$2::date,$3,'exim_deal_bas_daily', now())
+             ON CONFLICT (currency,rate_date)
+             DO UPDATE SET rate=EXCLUDED.rate, source=EXCLUDED.source, collected_at=EXCLUDED.collected_at`,
+            [cur, target, snapshot[cur]]
+          );
+        }
+        responsePayload = { ok: true, date: target, source: 'exim_deal_bas_daily', fallback: false };
+      } else {
+        const prevDate = prevBizday(nowK);
+        const prevYmd = ymdStr(prevDate);
+        const fallbackRates = await eximFetchDaily(prevYmd, apiKey);
+        for (const cur of ['USD', 'JPY', 'CNY', 'CHF']) {
+          if (!fallbackRates[cur]) continue;
+          await client.query(
+            `INSERT INTO public.fx_rates_daily (provider,currency,rate_date,rate,source,collected_at)
+             VALUES ('koreaexim',$1,$2::date,$3,'exim_deal_bas_daily(prev_bizday)', now())
+             ON CONFLICT (currency,rate_date)
+             DO UPDATE SET rate=EXCLUDED.rate, source=EXCLUDED.source, collected_at=EXCLUDED.collected_at`,
+            [cur, prevYmd, fallbackRates[cur]]
+          );
+        }
+        responsePayload = {
+          ok: true,
+          date: prevYmd,
+          source: 'exim_deal_bas_daily(prev_bizday)',
+          fallback: true,
+        };
+      }
+      await client.query('COMMIT');
+      res.json(responsePayload);
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (e) {
-    await client.query('ROLLBACK');
     console.error(e);
-    const status = e.message === 'missing_KOREAEXIM_API_KEY' ? 400 : 500;
-    res.status(status).json({ ok: false, error: String(e.message || e) });
-  } finally {
-    client.release();
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-app.get('/api/fx/latest', async (req, res) => {
+app.post('/api/fx/recheck-today', async (req, res) => {
   try {
-    const curr = String((req.query.currency || req.query.curr || '')).toUpperCase() || 'KRW';
-    const ym = prevYYYYMM();
-    const autofill =
-      String(req.query.autofill ?? '1') !== '0' && String(process.env.FX_AUTO_FILL ?? '1') !== '0';
+    const apiKey = process.env.KOREAEXIM_API_KEY;
+    if (!apiKey) return res.status(400).json({ ok: false, error: 'missing_KOREAEXIM_API_KEY' });
 
-    if (curr === 'KRW') {
+    const y = String(ymdNumKST());
+    const snapshot = await eximFetchDaily(y, apiKey).catch(() => null);
+    if (!snapshot) return res.json({ ok: false, error: 'no_update' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const cur of ['USD', 'JPY', 'CNY', 'CHF']) {
+        if (!snapshot[cur]) continue;
+        await client.query(
+          `INSERT INTO public.fx_rates_daily (provider,currency,rate_date,rate,source,collected_at)
+           VALUES ('koreaexim',$1,$2::date,$3,'exim_deal_bas_daily', now())
+           ON CONFLICT (currency,rate_date)
+           DO UPDATE SET rate=EXCLUDED.rate, source=EXCLUDED.source, collected_at=EXCLUDED.collected_at`,
+          [cur, y, snapshot[cur]]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ ok: true, date: y, rechecked: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.get('/api/fx/today', async (req, res) => {
+  try {
+    const currency = String((req.query.currency || req.query.curr || '')).toUpperCase() || 'KRW';
+    if (!FX_SET.has(currency)) {
+      return res.status(400).json({ ok: false, error: 'unsupported_currency' });
+    }
+
+    if (currency === 'KRW') {
+      const now = new Date();
+      const todayHyphen = ymdHyphenKST(now);
       return res.json({
         ok: true,
         currency: 'KRW',
         rate: 1,
-        yyyymm: ym,
+        rate_date: todayHyphen,
+        collected_at: now.toISOString(),
         source: 'fixed_krw',
+        is_prev_bizday: false,
       });
     }
+
+    const todayHyphen = ymdHyphenKST();
+    const todayCompact = todayHyphen.replace(/-/g, '');
+    const autofill = String(req.query.autofill || '1') !== '0';
 
     const selectLatest = async () =>
       (
         await query(
-          `SELECT rate, source FROM public.fx_rates_monthly WHERE currency=$1 AND yyyymm=$2 LIMIT 1`,
-          [curr, ym]
+          `select rate, rate_date::text, source, collected_at from public.fx_rates_daily where currency=$1 and rate_date=$2::date limit 1`,
+          [currency, todayCompact]
         )
       ).rows[0] || null;
 
     let row = await selectLatest();
 
     if ((!row || !row.rate) && autofill) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        await ensureMonthlyFX(ym, client);
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        console.warn('[fx] autofill failed:', err?.message || err);
-      } finally {
-        client.release();
-      }
-      row = await selectLatest();
+      const base = process.env.WORKER_URL || '';
+      const endpoint = `${base}/api/fx/fetch-daily`;
+      await fetch(endpoint, { method: 'POST' }).catch(() => {});
+      row = (
+        await query(
+          `select rate, rate_date::text, source, collected_at from public.fx_rates_daily where currency=$1 order by rate_date desc limit 1`,
+          [currency]
+        )
+      ).rows[0] || null;
     }
+
+    if (!row) {
+      return res.json({
+        ok: true,
+        currency,
+        rate: null,
+        rate_date: null,
+        collected_at: null,
+        source: null,
+        is_prev_bizday: null,
+      });
+    }
+
+    const rateDateHyphen = String(row.rate_date || '');
+    const isPrev = rateDateHyphen.replace(/-/g, '') !== todayCompact;
 
     res.json({
       ok: true,
-      currency: curr,
-      rate: row?.rate || null,
-      yyyymm: ym,
-      source: row?.source || (autofill ? 'exim_deal_bas_avg' : null),
+      currency,
+      rate: Number(row.rate),
+      rate_date: rateDateHyphen,
+      collected_at: row.collected_at,
+      source: row.source,
+      is_prev_bizday: isPrev,
     });
   } catch (e) {
     console.error(e);
@@ -371,7 +394,7 @@ app.post('/api/listings', async (req, res) => {
     const unitPriceCents =
       toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
     const currency = (b.currency ? String(b.currency) : 'USD').toUpperCase();
-    const fx = await enrichKRW(client, currency, unitPriceCents);
+    const fx = await enrichKRWDaily(client, currency, unitPriceCents);
     const sql = `INSERT INTO public.listings
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency, lead_time_days, location, condition, packaging, note, status)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13,'USD'),$14,$15,$16,$17,$18,COALESCE($19,'pending'))
@@ -648,7 +671,7 @@ app.post('/api/bids', async (req, res) => {
           ? Math.max(0, Math.round(Number(body.unit_price) * 100))
           : 0);
     const currency = (body.currency || 'USD').toUpperCase();
-    const fx = await enrichKRW(client, currency, unitPriceCents);
+    const fx = await enrichKRWDaily(client, currency, unitPriceCents);
     const offerBrand = body.offer_brand ?? body.brand ?? null;
     const offerCode = body.offer_code ?? body.code ?? null;
     const isSubstitute = !!(
@@ -828,5 +851,24 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
     res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
+
+(async function warmFXOnBoot() {
+  try {
+    const apiKey = process.env.KOREAEXIM_API_KEY;
+    if (!apiKey) return;
+    const base = process.env.WORKER_URL || '';
+    await fetch(`${base}/api/fx/fetch-daily`, { method: 'POST' }).catch(() => {});
+
+    const nowK = toKST();
+    const minutesUntil1115 = (11 * 60 + 15) - (nowK.getHours() * 60 + nowK.getMinutes());
+    if (minutesUntil1115 > 0) {
+      setTimeout(() => {
+        fetch(`${base}/api/fx/recheck-today`, { method: 'POST' }).catch(() => {});
+      }, minutesUntil1115 * 60 * 1000);
+    }
+  } catch {
+    // ignore warmup errors
+  }
+})();
 
 module.exports = app;

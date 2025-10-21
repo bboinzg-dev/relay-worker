@@ -715,8 +715,8 @@ app.post('/api/bids', async (req, res) => {
 app.get('/api/seller/items', async (req, res) => {
   try {
     const actor = parseActor(req);
-    const sellerId = (req.query.seller_id || actor?.id || '').toString();
-    const status = (req.query.status || '').toString();
+    const sellerId = String(req.query.seller_id || actor?.id || '').trim();
+    const status = String(req.query.status || '').trim().toLowerCase();
     const requestedLimit = Number(req.query.limit || 50);
     const limit = Math.min(
       200,
@@ -744,6 +744,7 @@ app.get('/api/seller/items', async (req, res) => {
     const items = r.rows.map((row) => ({
       id: row.id,
       item_type: row.item_type,
+      seller_id: row.seller_id,
       brand: row.brand,
       code: row.code,
       quantity_available: row.quantity_available ?? 0,

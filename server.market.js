@@ -19,12 +19,59 @@ const pool = getPool();
 const query = (text, params) => pool.query(text, params);
 const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
 
+const EXIM_API = 'https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON';
+const FX_TARGETS = new Set(['USD', 'JPY', 'CNY', 'CHF', 'KRW']);
+
 function prevYYYYMM(d = new Date()) {
   const y = d.getFullYear();
   const m = d.getMonth();
   const pm = m === 0 ? 12 : m;
   const py = m === 0 ? y - 1 : y;
   return Number(`${py}${String(pm).padStart(2, '0')}`);
+}
+
+function firstDayYYYYMM(yyyymm) {
+  const s = String(yyyymm).padStart(6, '0');
+  const year = Number(s.slice(0, 4));
+  const month = Number(s.slice(4, 6)) - 1;
+  return new Date(Date.UTC(year, month, 1));
+}
+
+function nextMonth(date) {
+  const d = new Date(date.getTime());
+  d.setUTCMonth(d.getUTCMonth() + 1);
+  return d;
+}
+
+function ymd(date) {
+  return date.toISOString().slice(0, 10).replace(/-/g, '');
+}
+
+async function eximFetchDaily(yyyymmdd, apiKey) {
+  const url = `${EXIM_API}?authkey=${encodeURIComponent(apiKey)}&searchdate=${yyyymmdd}&data=AP01`;
+  const rsp = await fetch(url, { method: 'GET' });
+  if (!rsp.ok) throw new Error(`exim_http_${rsp.status}`);
+  const arr = await rsp.json();
+  if (!Array.isArray(arr)) throw new Error('exim_bad_payload');
+  if (arr.length === 1 && arr[0] && typeof arr[0].result !== 'undefined' && arr[0].result !== 1) {
+    throw new Error(`exim_result_${arr[0].result}`);
+  }
+  const out = {};
+  for (const r of arr) {
+    let unit = String(r.cur_unit || r.CUR_UNIT || '').trim();
+    let v = String(r.deal_bas_r || r.DEAL_BAS_R || '').replace(/,/g, '');
+    if (!unit || !v) continue;
+    let rate = Number(v);
+    if (!Number.isFinite(rate)) continue;
+    if (/^JPY/i.test(unit)) {
+      if (/\(100\)/.test(unit)) rate = rate / 100;
+      unit = 'JPY';
+    }
+    if (unit === 'CNH') unit = 'CNY';
+    if (FX_TARGETS.has(unit)) out[unit] = rate;
+  }
+  if (!out.KRW) out.KRW = 1;
+  return out;
 }
 
 async function enrichKRW(client, currency, unitPriceCents) {
@@ -39,7 +86,7 @@ async function enrichKRW(client, currency, unitPriceCents) {
       krw_cents: won * 100,
       rate: 1,
       yyyymm: prevYYYYMM(),
-      src: 'hana_first_avg',
+      src: 'exim_deal_bas_avg',
     };
   }
   const ym = prevYYYYMM();
@@ -56,7 +103,7 @@ async function enrichKRW(client, currency, unitPriceCents) {
     krw_cents: won * 100,
     rate,
     yyyymm: ym,
-    src: rr.rows[0].source || 'hana_first_avg',
+    src: rr.rows[0].source || 'exim_deal_bas_avg',
   };
 }
 
@@ -131,6 +178,72 @@ const LISTING_STATUS = new Set(['pending', 'active', 'soldout', 'archived', 'ina
 
 /* ---------------- Listings (정찰제/재고) ---------------- */
 
+app.post('/api/fx/refresh', async (req, res) => {
+  const apiKey = process.env.KOREAEXIM_API_KEY;
+  if (!apiKey) return res.status(400).json({ ok: false, error: 'missing_KOREAEXIM_API_KEY' });
+
+  const ym = Number((req.query.yyyymm || req.body?.yyyymm || prevYYYYMM()).toString());
+  if (!Number.isFinite(ym) || String(ym).length < 6) {
+    return res.status(400).json({ ok: false, error: 'invalid_yyyymm' });
+  }
+
+  const start = firstDayYYYYMM(ym);
+  const end = nextMonth(start);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    for (let d = new Date(start); d < end; d.setUTCDate(d.getUTCDate() + 1)) {
+      const ymdStr = ymd(d);
+      const daily = await eximFetchDaily(ymdStr, apiKey).catch((err) => {
+        console.warn('[fx] fetch skip', ymdStr, err.message);
+        return null;
+      });
+      if (!daily) continue;
+      for (const cur of ['USD', 'JPY', 'CNY', 'CHF']) {
+        const rate = daily[cur];
+        if (!rate) continue;
+        await client.query(
+          `INSERT INTO public.fx_rates_daily (provider, currency, rate_date, rate, source)
+           VALUES ('koreaexim', $1, $2::date, $3, 'exim_deal_bas')
+           ON CONFLICT (currency, rate_date)
+           DO UPDATE SET rate = EXCLUDED.rate, source = EXCLUDED.source`,
+          [cur, ymdStr, rate]
+        );
+      }
+    }
+
+    for (const cur of ['USD', 'JPY', 'CNY', 'CHF']) {
+      const r = await client.query(
+        `SELECT AVG(rate) AS avg_rate, COUNT(*) AS n
+           FROM public.fx_rates_daily
+          WHERE currency=$1 AND rate_date >= $2::date AND rate_date < $3::date`,
+        [cur, ymd(start), ymd(end)]
+      );
+      const avg = Number(r.rows?.[0]?.avg_rate || 0);
+      if (avg > 0) {
+        await client.query(
+          `INSERT INTO public.fx_rates_monthly (currency, yyyymm, rate, source)
+           VALUES ($1, $2, $3, 'exim_deal_bas_avg')
+           ON CONFLICT (currency, yyyymm)
+           DO UPDATE SET rate = EXCLUDED.rate, source = EXCLUDED.source`,
+          [cur, ym, avg]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({ ok: true, yyyymm: ym, provider: 'koreaexim', currencies: ['USD', 'JPY', 'CNY', 'CHF'] });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  } finally {
+    client.release();
+  }
+});
+
 app.get('/api/fx/latest', async (req, res) => {
   try {
     const curr = String((req.query.currency || req.query.curr || '')).toUpperCase();
@@ -141,7 +254,7 @@ app.get('/api/fx/latest', async (req, res) => {
         currency: 'KRW',
         rate: 1,
         yyyymm: ym,
-        source: 'hana_first_avg',
+        source: 'exim_deal_bas_avg',
       });
     }
     const r = await query(
@@ -154,7 +267,7 @@ app.get('/api/fx/latest', async (req, res) => {
       currency: curr,
       rate: row?.rate || null,
       yyyymm: ym,
-      source: row?.source || 'unknown',
+      source: row?.source || 'exim_deal_bas_avg',
     });
   } catch (e) {
     console.error(e);

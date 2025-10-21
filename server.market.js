@@ -415,6 +415,9 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       ON CONFLICT (seller_id, brand_norm, code_norm)
       DO UPDATE SET
         qty_available        = EXCLUDED.qty_available,
+        moq                  = EXCLUDED.moq,
+        mpq                  = EXCLUDED.mpq,
+        mpq_required_order   = EXCLUDED.mpq_required_order,
         unit_price_cents     = EXCLUDED.unit_price_cents,
         unit_price_krw_cents = EXCLUDED.unit_price_krw_cents,
         unit_price_fx_rate   = EXCLUDED.unit_price_fx_rate,
@@ -422,6 +425,10 @@ app.post('/api/listings', requireSeller, async (req, res) => {
         unit_price_fx_src    = EXCLUDED.unit_price_fx_src,
         currency             = EXCLUDED.currency,
         lead_time_days       = EXCLUDED.lead_time_days,
+        location             = EXCLUDED.location,
+        condition            = EXCLUDED.condition,
+        packaging            = EXCLUDED.packaging,
+        note                 = EXCLUDED.note,
         status               = EXCLUDED.status,
         updated_at           = now()
       RETURNING id, status, created_at`;
@@ -430,16 +437,15 @@ app.post('/api/listings', requireSeller, async (req, res) => {
     res.status(201).json(r.rows[0]);
   } catch (e) {
     if (e?.code === '23505' && e?.constraint === 'ux_listings_seller_brand_code') {
+      const sellerKey = sellerId != null ? String(sellerId) : String(actorSeller || actor?.id || actor?.sub || '');
+      const brandKey = String(b.brand || '');
+      const codeKey = String(b.code || '');
       try {
         const { rows } = await client.query(
           `SELECT id FROM public.listings
-            WHERE seller_id IS NOT DISTINCT FROM $1 AND brand_norm = lower($2) AND code_norm = lower($3)
+            WHERE seller_id = $1 AND brand_norm = lower($2) AND code_norm = lower($3)
             ORDER BY created_at DESC LIMIT 1`,
-          [
-            sellerId,
-            String(b.brand),
-            String(b.code),
-          ]
+          [sellerKey, brandKey, codeKey]
         );
         const exists = rows?.[0]?.id || null;
         return res.status(409).json({ ok: false, error: 'duplicate_listing', id: exists });

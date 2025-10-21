@@ -3,18 +3,30 @@ const { OAuth2Client } = require('google-auth-library');
 
 const gclient = new OAuth2Client();
 
-const pickBearer = (value) => (value && value.startsWith('Bearer ')) ? value.slice(7) : null;
+const clean = (value) => String(value || '').trim().replace(/^['"]|['"]$/g, '');
+const pickBearer = (value) => {
+  const token = clean(value);
+  if (!token) {
+    return null;
+  }
+  return token.startsWith('Bearer ') ? token.slice(7).trim() : token;
+};
 
 function parseAppActor(req) {
   const headers = req?.headers || {};
-  const hdr = headers['x-app-auth'] || headers['X-App-Auth'];
+  const hdr = headers['x-app-auth']
+    || headers['X-App-Auth']
+    || headers['x_app_auth']
+    || headers['x-appauth']
+    || headers['x_appauth'];
 
   const appToken = pickBearer(hdr);
   if (!appToken) {
+    console.warn('[auth] missing X-App-Auth header');
     return { ok: false, reason: 'no_app_token' };
   }
 
-  const secret = process.env.JWT_SECRET;
+  const secret = (process.env.JWT_SECRET || '').trim();
   if (!secret) {
     return { ok: false, reason: 'missing_jwt_secret' };
   }
@@ -23,7 +35,7 @@ function parseAppActor(req) {
     const dec = jwt.verify(appToken, secret, { algorithms: ['HS256'] });
     return { ok: true, user: dec };
   } catch (e) {
-    console.warn('[auth] app_jwt_verify_failed:', e?.message);
+    console.warn('[auth] jwt verify failed:', e?.message || e);
     return { ok: false, reason: e?.message || 'verify_failed' };
   }
 }

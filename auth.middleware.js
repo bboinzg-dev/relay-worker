@@ -20,7 +20,14 @@ function parseAppActor(req) {
     || headers['x-appauth']
     || headers['x_appauth'];
 
-  const appToken = pickBearer(hdr);
+  const body = (req.body && typeof req.body === 'object') ? req.body : null;
+  const query = req.query || null;
+  const fromBody = body?._app_auth || body?.app_auth || body?.appAuth;
+  const fromQuery = query?.app_auth || query?.appAuth;
+
+  const appToken = pickBearer(hdr)
+    || pickBearer(fromBody)
+    || pickBearer(fromQuery);
   if (!appToken) {
     console.warn('[auth] missing X-App-Auth header');
     return { ok: false, reason: 'no_app_token' };

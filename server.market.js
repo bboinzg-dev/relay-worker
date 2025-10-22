@@ -559,6 +559,28 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
       return undefined;
     };
 
+    if (has('brand')) {
+      const brandValue = body.brand != null ? String(body.brand).trim() : '';
+      if (!brandValue) {
+        return res.status(400).json({ ok: false, error: 'brand_required' });
+      }
+      const brandIdx = params.length + 1;
+      sets.push(`brand = $${brandIdx}`);
+      sets.push(`brand_norm = lower($${brandIdx})`);
+      params.push(brandValue);
+    }
+
+    if (has('code')) {
+      const codeValue = body.code != null ? String(body.code).trim() : '';
+      if (!codeValue) {
+        return res.status(400).json({ ok: false, error: 'code_required' });
+      }
+      const codeIdx = params.length + 1;
+      sets.push(`code = $${codeIdx}`);
+      sets.push(`code_norm = lower($${codeIdx})`);
+      params.push(codeValue);
+    }
+
     if (has('moq')) {
       sets.push(`moq = $${params.length + 1}`);
       params.push(toOptionalInteger(body.moq, { min: 0 }));
@@ -673,6 +695,9 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
     if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
     res.json({ ok: true, item: mapListingRow(r.rows[0]) });
   } catch (e) {
+    if (e?.code === '23505' && e?.constraint === 'ux_listings_seller_brand_code') {
+      return res.status(409).json({ ok: false, error: 'duplicate_listing' });
+    }
     console.error(e);
     res.status(500).json({ ok: false, error: 'db_error' });
   }

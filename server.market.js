@@ -134,6 +134,7 @@ const mapListingRow = (row = {}) => ({
   condition: row.condition ?? null,
   packaging: row.packaging ?? null,
   no_parcel: row.no_parcel === true,
+  noParcel: row.no_parcel === true,
   image_url: row.image_url ?? null,
   moq: row.moq ?? null,
   mpq: row.mpq ?? null,
@@ -180,6 +181,16 @@ function parseBooleanish(value) {
     return null;
   }
   return null;
+}
+
+function pickOwn(obj, ...keys) {
+  if (!obj) return undefined;
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(obj, key)) {
+      return obj[key];
+    }
+  }
+  return undefined;
 }
 
 function currentKSTYear() {
@@ -439,6 +450,8 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       hasIsOver2yrs = true;
     }
 
+    const noParcel = parseBooleanish(pickOwn(b, 'no_parcel', 'noParcel')) === true;
+
     const params = [
       t,
       sellerId,
@@ -459,7 +472,7 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       b.condition != null ? String(b.condition) : null,
       b.packaging != null ? String(b.packaging) : null,
       b.note != null ? String(b.note) : null,
-      b.no_parcel === true,
+      noParcel,
       b.image_url != null ? String(b.image_url) : null,
       LISTING_STATUS.has(String(b.status || '').toLowerCase()) ? String(b.status).toLowerCase() : 'pending',
       partType,
@@ -639,9 +652,11 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
       params.push(body.note != null ? String(body.note) : null);
     }
 
-    if (has('no_parcel')) {
+    const hasNoParcel = has('no_parcel') || Object.prototype.hasOwnProperty.call(body, 'noParcel');
+    if (hasNoParcel) {
+      const noParcelValue = has('no_parcel') ? body.no_parcel : body.noParcel;
       sets.push(`no_parcel = $${params.length + 1}`);
-      params.push(!!body.no_parcel);
+      params.push(parseBooleanish(noParcelValue) === true);
     }
 
     if (has('image_url')) {
@@ -957,7 +972,7 @@ app.post('/api/bids', requireSeller, async (req, res) => {
       currency,
       body.lead_time_days || null,
       note,
-      body.no_parcel === true,
+      parseBooleanish(pickOwn(body, 'no_parcel', 'noParcel')) === true,
       body.image_url != null ? String(body.image_url) : null,
       body.quote_valid_until || null,
     ]);

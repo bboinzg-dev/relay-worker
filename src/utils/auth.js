@@ -1,3 +1,5 @@
+const { parseAppActor } = require('../../auth.middleware');
+
 function pick(h, k) { return h[k] || h[k.toLowerCase()] || h[k.toUpperCase()] || undefined; }
 
 function parseActor(req) {
@@ -7,6 +9,31 @@ function parseActor(req) {
   const tenantId = pick(h, 'x-actor-tenant') || null;
   const rolesRaw = pick(h, 'x-actor-roles') || '';
   const roles = String(rolesRaw || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+  if (id) {
+    return { id: String(id), tenantId, roles: roles.length ? roles : ['user'] };
+  }
+
+  // Fallback: try App JWT (X-App-Auth)
+  try {
+    const parsed = parseAppActor(req);
+    if (parsed && parsed.ok && parsed.user) {
+      const user = parsed.user || {};
+      const userId = user.id || user.sub || null;
+      const userRoles = Array.isArray(user.roles)
+        ? user.roles.map(s => String(s).toLowerCase()).filter(Boolean)
+        : [];
+      if (userId) {
+        return {
+          id: String(userId),
+          tenantId,
+          roles: userRoles.length ? userRoles : (roles.length ? roles : ['user'])
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('[auth] parseAppActor failed in parseActor:', err?.message || err);
+  }
 
   // Fallbacks: try Cloud Run identity headers (optional)
   const email = pick(h, 'x-goog-authenticated-user-email') || null;

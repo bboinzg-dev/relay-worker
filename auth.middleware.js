@@ -61,7 +61,20 @@ async function parseIdTokenAsSeller(req) {
     }
     const ticket = await gclient.verifyIdToken({ idToken, audience });
     const payload = ticket.getPayload() || {};
-    return { sub: payload.sub || 'idtoken', roles: ['seller'] };
+    const actorId = payload.sub || payload.email || payload.user_id || null;
+    if (!actorId) {
+      console.warn('[auth] idtoken_fallback_missing_id');
+      return null;
+    }
+    const roles = Array.isArray(payload.roles)
+      ? payload.roles.map((r) => String(r).toLowerCase())
+      : ['seller'];
+    return {
+      id: String(actorId),
+      sub: payload.sub || String(actorId),
+      roles,
+      email: payload.email || null,
+    };
   } catch (err) {
     console.warn('[auth] idtoken_fallback_failed:', err?.message);
     return null;

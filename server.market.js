@@ -418,7 +418,7 @@ app.get('/api/listings', async (req, res) => {
 
 // POST /api/listings  (seller 전용)
 app.post('/api/listings', requireSeller, async (req, res) => {
-  const actor = req.actor || {};
+  const actor = parseActor(req) || {};
   const t = getTenant(req);
   const b = req.body || {};
   const merge = b.merge === true || b.merge === 'true';
@@ -581,6 +581,12 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
     const id = (req.params.id || '').toString();
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
 
+    const actor = parseActor(req) || {};
+    const sellerId = actor?.id != null ? String(actor.id) : null;
+    if (!sellerId) {
+      return res.status(401).json({ ok: false, error: 'auth_required' });
+    }
+
     const body = req.body || {};
     const sets = [];
     const params = [];
@@ -734,9 +740,13 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
     }
 
     sets.push('updated_at = now()');
-    params.push(id);
 
-    const sql = `UPDATE public.listings SET ${sets.join(', ')} WHERE id = $${params.length}
+    const idParamIdx = params.length + 1;
+    const sellerParamIdx = params.length + 2;
+    params.push(id);
+    params.push(sellerId);
+
+    const sql = `UPDATE public.listings SET ${sets.join(', ')} WHERE id = $${idParamIdx} AND seller_id = $${sellerParamIdx}
       RETURNING id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at`;
     const r = await query(sql, params);
     if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });

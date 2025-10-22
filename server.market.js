@@ -855,7 +855,11 @@ app.post('/api/bids', requireSeller, async (req, res) => {
 app.get('/api/seller/items', async (req, res) => {
   try {
     const actor = parseActor(req);
-    const sellerId = String(req.query.seller_id || actor?.id || '').trim();
+    if (!actor?.id) {
+      return res.status(401).json({ ok: false, error: 'auth_required' });
+    }
+
+    const sellerId = String(req.query.seller_id || actor.id || '').trim();
     const status = String(req.query.status || '').trim().toLowerCase();
     const requestedLimit = Number(req.query.limit || 50);
     const limit = Math.min(
@@ -875,26 +879,19 @@ app.get('/api/seller/items', async (req, res) => {
     }
     args.push(limit);
 
-    const sql = `SELECT * FROM public.seller_items_v
+    const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents,
+                        unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm,
+                        unit_price_fx_src, currency, lead_time_days, status, note,
+                        location, condition, packaging, moq, mpq, mpq_required_order,
+                        part_type, mfg_year, is_over_2yrs, created_at, updated_at
+                 FROM public.listings
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY created_at DESC
                  LIMIT $${args.length}`;
 
     const r = await query(sql, args);
     const items = r.rows.map((row) => ({
-      id: row.id,
-      item_type: row.item_type,
-      seller_id: row.seller_id,
-      brand: row.brand,
-      code: row.code,
-      quantity_available: row.quantity_available ?? row.qty_available ?? 0,
-      qty_available: row.qty_available ?? row.quantity_available ?? 0,
-      unit_price: (row.unit_price_cents ?? 0) / 100,
-      currency: row.currency || 'USD',
-      lead_time_days: row.lead_time_days,
-      status: row.status,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
+      ...mapListingRow(row),
     }));
 
     res.json({ ok: true, items });

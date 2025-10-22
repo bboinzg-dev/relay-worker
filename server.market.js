@@ -205,6 +205,7 @@ function toCents(unitPrice) {
 }
 
 const LISTING_STATUS = new Set(['pending', 'active', 'soldout', 'archived', 'inactive']);
+const BID_STATUS = new Set(['offered', 'accepted', 'rejected', 'withdrawn']);
 
 /* ---------------- Listings (정찰제/재고) ---------------- */
 
@@ -876,12 +877,9 @@ app.get('/api/bids', async (req, res) => {
     const actor = parseActor(req) || {};
     const mine = String(req.query.mine || '').toLowerCase();
     const isMine = mine === '1' || mine === 'true';
-    const sellerId = isMine
-      ? (actor.id || actor.sub || null)
-      : (req.query.seller_id || req.query.seller || null);
-    const prId = req.query.pr_id || req.query.pr || req.query.purchase_request_id || null;
-    const where = [];
-    const args = [];
+    const sellerId = isMine ? (actor.id || actor.sub || null) : (req.query.seller_id || null);
+    const prId = req.query.pr_id || null;
+    const where = []; const args = [];
     if (sellerId) where.push(`seller_id = $${args.push(String(sellerId))}`);
     if (prId)     where.push(`purchase_request_id = $${args.push(String(prId))}`);
     const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || '50')) || 50));
@@ -896,6 +894,63 @@ app.get('/api/bids', async (req, res) => {
                  LIMIT ${limit}`;
     const r = await query(sql, args);
     res.json({ ok: true, items: r.rows });
+  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+});
+
+app.get('/api/bids/:id', async (req, res) => {
+  try {
+    const { rows } = await query(`SELECT * FROM public.bids WHERE id=$1`, [String(req.params.id || '')]);
+    if (!rows.length) return res.status(404).json({ ok:false, error:'not_found' });
+    res.json({ ok:true, item: rows[0] });
+  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+});
+
+app.patch('/api/bids/:id', requireSeller, async (req, res) => {
+  try {
+    const id = String(req.params.id || ''); if (!id) return res.status(400).json({ ok:false, error:'id_required' });
+    const actor = req.actor || {};
+    const own = await query(`SELECT id FROM public.bids WHERE id=$1 AND seller_id=$2`, [id, String(actor.id || actor.sub || '')]);
+    if (!own.rows.length) return res.status(403).json({ ok:false, error:'forbidden' });
+
+    const body = req.body || {};
+    const sets = []; const params = [];
+    const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+
+    if (has('offer_qty')) { sets.push(`offer_qty = $${params.length+1}`); params.push(toOptionalInteger(body.offer_qty, {min:0})); }
+    if (has('unit_price') || has('unit_price_cents')) {
+      const cents = has('unit_price') ? (toCents(body.unit_price) ?? 0) : (toOptionalInteger(body.unit_price_cents,{min:0}) ?? 0);
+      sets.push(`unit_price_cents = $${params.length+1}`); params.push(cents);
+    }
+    if (has('currency')) { sets.push(`currency = $${params.length+1}`); params.push(body.currency ? String(body.currency).toUpperCase() : null); }
+    if (has('lead_time_days')) { sets.push(`lead_time_days = $${params.length+1}`); params.push(toOptionalInteger(body.lead_time_days,{min:0})); }
+    if (has('note')) { sets.push(`note = $${params.length+1}`); params.push(toOptionalTrimmed(body.note)); }
+    if (has('no_parcel') || Object.prototype.hasOwnProperty.call(body,'noParcel')) {
+      const v = has('no_parcel') ? body.no_parcel : body.noParcel;
+      sets.push(`no_parcel = $${params.length+1}`); params.push(parseBooleanish(v) === true);
+    }
+    if (has('image_url')) { sets.push(`image_url = $${params.length+1}`); params.push(body.image_url != null ? String(body.image_url) : null); }
+    if (has('quote_valid_until')) { sets.push(`quote_valid_until = $${params.length+1}`); params.push(body.quote_valid_until || null); }
+    if (has('status')) {
+      const st = String(body.status || '').toLowerCase();
+      if (!BID_STATUS.has(st)) return res.status(400).json({ ok:false, error:'bad_status' });
+      sets.push(`status = $${params.length+1}`); params.push(st);
+    }
+
+    if (!sets.length) return res.json({ ok:true, updated:false });
+    const sql = `UPDATE public.bids SET ${sets.join(', ')}, updated_at=now() WHERE id=$${params.length+1} RETURNING *`;
+    const r = await query(sql, [...params, id]);
+    res.json({ ok:true, item:r.rows[0] });
+  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+});
+
+app.delete('/api/bids/:id', requireSeller, async (req, res) => {
+  try {
+    const id = String(req.params.id || ''); if (!id) return res.status(400).json({ ok:false, error:'id_required' });
+    const actor = req.actor || {};
+    const own = await query(`SELECT id FROM public.bids WHERE id=$1 AND seller_id=$2`, [id, String(actor.id || actor.sub || '')]);
+    if (!own.rows.length) return res.status(403).json({ ok:false, error:'forbidden' });
+    const { rows } = await query(`UPDATE public.bids SET status='withdrawn', updated_at=now() WHERE id=$1 RETURNING id,status`, [id]);
+    res.json({ ok:true, withdrawn: !!rows.length });
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
 });
 

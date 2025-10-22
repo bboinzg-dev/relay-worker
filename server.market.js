@@ -136,6 +136,9 @@ const mapListingRow = (row = {}) => ({
   moq: row.moq ?? null,
   mpq: row.mpq ?? null,
   mpq_required_order: !!row.mpq_required_order,
+  part_type: row.part_type ?? null,
+  mfg_year: row.mfg_year ?? null,
+  is_over_2yrs: row.is_over_2yrs == null ? null : !!row.is_over_2yrs,
   created_at: row.created_at,
   updated_at: row.updated_at,
 });
@@ -154,6 +157,31 @@ function toOptionalInteger(value, { min } = {}) {
   const int = Math.round(n);
   if (Number.isFinite(min) && int < min) return min;
   return int;
+}
+
+function toOptionalTrimmed(value) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  return s === '' ? null : s;
+}
+
+function parseBooleanish(value) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (!v) return null;
+    if (['1', 'y', 'yes', 'true', 'on'].includes(v)) return true;
+    if (['0', 'n', 'no', 'false', 'off'].includes(v)) return false;
+    return null;
+  }
+  return null;
+}
+
+function currentKSTYear() {
+  return toKST().getFullYear();
 }
 
 function toCents(unitPrice) {
@@ -353,7 +381,7 @@ app.get('/api/listings', async (req, res) => {
     if (brand) { args.push(brand); where.push(`brand_norm = lower($${args.length})`); }
     if (code)  { args.push(code);  where.push(`code_norm  = lower($${args.length})`); }
     if (status) { args.push(status); where.push(`status = $${args.length}`); }
-    const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents, currency, lead_time_days, moq, mpq, mpq_required_order, location, condition, packaging, note, status, created_at
+    const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents, currency, lead_time_days, moq, mpq, mpq_required_order, location, condition, packaging, note, status, part_type, mfg_year, is_over_2yrs, created_at
                  FROM public.listings
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY created_at DESC
@@ -388,6 +416,27 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       b.quantity_available != null && b.quantity_available !== ''
         ? b.quantity_available
         : b.qty_available;
+    const partType = toOptionalTrimmed(b.part_type);
+    let leadTimeDays = toOptionalInteger(b.lead_time_days, { min: 0 });
+    if (leadTimeDays == null) leadTimeDays = 2;
+
+    let hasMfgYear = Object.prototype.hasOwnProperty.call(b, 'mfg_year');
+    let mfgYear = hasMfgYear ? toOptionalInteger(b.mfg_year) : undefined;
+
+    let hasIsOver2yrs = Object.prototype.hasOwnProperty.call(b, 'is_over_2yrs');
+    let isOver2yrs = hasIsOver2yrs ? parseBooleanish(b.is_over_2yrs) : null;
+    if (isOver2yrs === undefined) isOver2yrs = null;
+
+    const nowYear = currentKSTYear();
+    if (hasIsOver2yrs && isOver2yrs === true && !hasMfgYear) {
+      mfgYear = nowYear - 2;
+      hasMfgYear = true;
+    }
+    if (hasMfgYear && mfgYear != null && !hasIsOver2yrs) {
+      isOver2yrs = nowYear - mfgYear >= 2;
+      hasIsOver2yrs = true;
+    }
+
     const params = [
       t,
       sellerId,
@@ -403,24 +452,27 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       fx.yyyymm,
       fx.src,
       currency,
-      toOptionalInteger(b.lead_time_days, { min: 0 }),
+      leadTimeDays,
       b.location != null ? String(b.location) : null,
       b.condition != null ? String(b.condition) : null,
       b.packaging != null ? String(b.packaging) : null,
       b.note != null ? String(b.note) : null,
       LISTING_STATUS.has(String(b.status || '').toLowerCase()) ? String(b.status).toLowerCase() : 'pending',
+      partType,
+      hasMfgYear ? (mfgYear ?? null) : null,
+      hasIsOver2yrs ? isOver2yrs : null,
     ];
     const insertSql = `INSERT INTO public.listings
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-       currency, lead_time_days, location, condition, packaging, note, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'))
+       currency, lead_time_days, location, condition, packaging, note, status, part_type, mfg_year, is_over_2yrs)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'),$21,$22,$23)
       RETURNING id, status, created_at`;
     const mergeSql = `INSERT INTO public.listings
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-       currency, lead_time_days, location, condition, packaging, note, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'))
+       currency, lead_time_days, location, condition, packaging, note, status, part_type, mfg_year, is_over_2yrs)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'),$21,$22,$23)
       ON CONFLICT (seller_id, brand_norm, code_norm)
       DO UPDATE SET
         qty_available        = EXCLUDED.qty_available,
@@ -439,6 +491,9 @@ app.post('/api/listings', requireSeller, async (req, res) => {
         packaging            = EXCLUDED.packaging,
         note                 = EXCLUDED.note,
         status               = EXCLUDED.status,
+        part_type            = EXCLUDED.part_type,
+        mfg_year             = EXCLUDED.mfg_year,
+        is_over_2yrs         = EXCLUDED.is_over_2yrs,
         updated_at           = now()
       RETURNING id, status, created_at`;
     const sql = merge ? mergeSql : insertSql;
@@ -474,7 +529,7 @@ app.get('/api/listings/:id', async (req, res) => {
     const id = (req.params.id || '').toString();
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
     const r = await query(
-      `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, created_at, updated_at
+      `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
          FROM public.listings WHERE id = $1`,
       [id]
     );
@@ -536,11 +591,6 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
       params.push(body.currency != null ? String(body.currency) : null);
     }
 
-    if (has('lead_time_days')) {
-      sets.push(`lead_time_days = $${params.length + 1}`);
-      params.push(toOptionalInteger(body.lead_time_days, { min: 0 }));
-    }
-
     if (has('location')) {
       sets.push(`location = $${params.length + 1}`);
       params.push(body.location != null ? String(body.location) : null);
@@ -561,6 +611,46 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
       params.push(body.note != null ? String(body.note) : null);
     }
 
+    if (has('part_type')) {
+      sets.push(`part_type = $${params.length + 1}`);
+      params.push(toOptionalTrimmed(body.part_type));
+    }
+
+    if (has('lead_time_days')) {
+      let leadDays = toOptionalInteger(body.lead_time_days, { min: 0 });
+      if (leadDays == null) leadDays = 2;
+      sets.push(`lead_time_days = $${params.length + 1}`);
+      params.push(leadDays);
+    }
+
+    if (has('mfg_year') || has('is_over_2yrs')) {
+      let hasMfgYear = has('mfg_year');
+      let mfgYear = hasMfgYear ? toOptionalInteger(body.mfg_year) : undefined;
+
+      let hasIsOver = has('is_over_2yrs');
+      let isOver = hasIsOver ? parseBooleanish(body.is_over_2yrs) : undefined;
+      if (isOver === undefined) isOver = null;
+
+      const nowYear = currentKSTYear();
+      if (hasIsOver && isOver === true && !hasMfgYear) {
+        mfgYear = nowYear - 2;
+        hasMfgYear = true;
+      }
+      if (hasMfgYear && mfgYear != null && !hasIsOver) {
+        isOver = nowYear - mfgYear >= 2;
+        hasIsOver = true;
+      }
+
+      if (hasMfgYear) {
+        sets.push(`mfg_year = $${params.length + 1}`);
+        params.push(mfgYear ?? null);
+      }
+      if (hasIsOver) {
+        sets.push(`is_over_2yrs = $${params.length + 1}`);
+        params.push(isOver === null ? null : !!isOver);
+      }
+    }
+
     if (has('status')) {
       const status = String(body.status || '').toLowerCase();
       if (!LISTING_STATUS.has(status)) {
@@ -578,7 +668,7 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
     params.push(id);
 
     const sql = `UPDATE public.listings SET ${sets.join(', ')} WHERE id = $${params.length}
-      RETURNING id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, created_at, updated_at`;
+      RETURNING id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at`;
     const r = await query(sql, params);
     if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
     res.json({ ok: true, item: mapListingRow(r.rows[0]) });

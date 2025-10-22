@@ -1,70 +1,16 @@
-const { parseAppActor } = require('../../auth.middleware');
-
-function pick(h, k) { return h[k] || h[k.toLowerCase()] || h[k.toUpperCase()] || undefined; }
-
-function decodeJwtSub(bearer) {
-  try {
-    const m = String(bearer || '').match(/^Bearer\s+([\w-]+\.[\w-]+\.[\w-]+)$/i);
-    if (!m) return null;
-    const [, token] = m;
-    const mid = token.split('.')[1];
-    if (!mid) return null;
-    let padded = mid.replace(/-/g, '+').replace(/_/g, '/');
-    while (padded.length % 4) padded += '=';
-    const json = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
-    return json?.sub || json?.email || null;
-  } catch {
-    return null;
-  }
-}
+function pick(h, k) { return h?.[k] || h?.[k.toLowerCase()] || h?.[k.toUpperCase()] || undefined; }
 
 function parseActor(req) {
   const h = req.headers || {};
-  // Preferred explicit dev headers
   const id = pick(h, 'x-actor-id') || null;
   const tenantId = pick(h, 'x-actor-tenant') || null;
   const rolesRaw = pick(h, 'x-actor-roles') || '';
   const roles = String(rolesRaw || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-
-  if (id) {
-    return { id: String(id), tenantId, roles: roles.length ? roles : ['user'] };
-  }
-
-  // Fallback: try App JWT (X-App-Auth)
-  try {
-    const parsed = parseAppActor(req);
-    if (parsed && parsed.ok && parsed.user) {
-      const user = parsed.user || {};
-      const userId = user.id || user.sub || null;
-      const userRoles = Array.isArray(user.roles)
-        ? user.roles.map(s => String(s).toLowerCase()).filter(Boolean)
-        : [];
-      if (userId) {
-        return {
-          id: String(userId),
-          tenantId,
-          roles: userRoles.length ? userRoles : (roles.length ? roles : ['user'])
-        };
-      }
-    }
-  } catch (err) {
-    console.warn('[auth] parseAppActor failed in parseActor:', err?.message || err);
-  }
-
-  // Fallback: decode Authorization: Bearer <ID Token> (verification handled by requireSeller)
-  const sub = decodeJwtSub(pick(h, 'authorization'));
-  if (sub) {
-    return { id: String(sub), tenantId, roles: roles.length ? roles : ['seller'] };
-  }
-
-  // Fallbacks: try Cloud Run identity headers (optional)
-  const email = pick(h, 'x-goog-authenticated-user-email') || null;
-  if (!id && email) {
-    // email looks like "accounts.google.com:someone@example.com"
-    const at = String(email).split(':').pop();
-    return { id: at, tenantId, roles: roles.length ? roles : ['user'] };
-  }
-  return { id, tenantId, roles: roles.length ? roles : ['user'] };
+  return {
+    id: id ? String(id) : null,
+    tenantId: tenantId != null ? String(tenantId) : null,
+    roles: roles.length ? roles : ['user']
+  };
 }
 
 function hasRole(actor, ...need) {

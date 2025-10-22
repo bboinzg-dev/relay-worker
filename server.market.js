@@ -394,7 +394,7 @@ app.get('/api/listings', async (req, res) => {
     const mine = String(req.query.mine || '').toLowerCase();
     const isMine = mine === '1' || mine === 'true';
     const sellerId = isMine
-      ? String(actor?.id || actor?.sub || '')
+      ? (actor?.id != null ? String(actor.id) : null)
       : (req.query.seller_id != null ? String(req.query.seller_id) : null);
     if (isMine && !sellerId) {
       return res.json({ ok: true, items: [] });
@@ -422,12 +422,10 @@ app.post('/api/listings', requireSeller, async (req, res) => {
   const t = getTenant(req);
   const b = req.body || {};
   const merge = b.merge === true || b.merge === 'true';
-  const actorSeller = actor.id || actor.sub || null;
-  const sellerId = b.seller_id != null
-    ? String(b.seller_id)
-    : actorSeller != null
-      ? String(actorSeller)
-      : null;
+  const sellerId = actor?.id != null ? String(actor.id) : null;
+  if (!sellerId) {
+    return res.status(401).json({ ok: false, error: 'auth_required' });
+  }
   const client = await pool.connect();
   try {
     if (!b.brand || !b.code) {
@@ -532,7 +530,7 @@ app.post('/api/listings', requireSeller, async (req, res) => {
     res.status(201).json({ ok: true, item: r.rows[0] });
   } catch (e) {
     if (e?.code === '23505' && e?.constraint === 'ux_listings_seller_brand_code') {
-      const sellerKey = sellerId != null ? String(sellerId) : String(actorSeller || actor?.id || actor?.sub || '');
+      const sellerKey = String(sellerId);
       const brandKey = String(b.brand || '');
       const codeKey = String(b.code || '');
       try {
@@ -752,7 +750,10 @@ app.delete('/api/listings/:id', requireSeller, async (req, res) => {
   const id = (req.params.id || '').toString();
   if (!id) return res.status(400).json({ ok: false, error: 'id required' });
   const actor = parseActor(req) || {};
-  const actorId = String(actor.id || actor.sub || '');
+  if (!actor?.id) {
+    return res.status(401).json({ ok: false, error: 'auth_required' });
+  }
+  const actorId = String(actor.id);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -889,7 +890,7 @@ app.get('/api/bids', async (req, res) => {
     const mine = String(req.query.mine || '').toLowerCase();
     const isMine = mine === '1' || mine === 'true';
     const sellerId = isMine
-      ? String(actor?.id || actor?.sub || '')
+      ? (actor?.id != null ? String(actor.id) : null)
       : (req.query.seller_id != null ? String(req.query.seller_id) : null);
     if (isMine && !sellerId) {
       return res.json({ ok: true, items: [] });
@@ -934,7 +935,9 @@ app.patch('/api/bids/:id', requireSeller, async (req, res) => {
   try {
     const id = String(req.params.id || ''); if (!id) return res.status(400).json({ ok:false, error:'id_required' });
     const actor = req.actor || {};
-    const own = await query(`SELECT id FROM public.bids WHERE id=$1 AND seller_id=$2`, [id, String(actor.id || actor.sub || '')]);
+    const sellerId = actor?.id != null ? String(actor.id) : null;
+    if (!sellerId) return res.status(401).json({ ok:false, error:'auth_required' });
+    const own = await query(`SELECT id FROM public.bids WHERE id=$1 AND seller_id=$2`, [id, sellerId]);
     if (!own.rows.length) return res.status(403).json({ ok:false, error:'forbidden' });
 
     const body = req.body || {};
@@ -972,7 +975,9 @@ app.delete('/api/bids/:id', requireSeller, async (req, res) => {
   try {
     const id = String(req.params.id || ''); if (!id) return res.status(400).json({ ok:false, error:'id_required' });
     const actor = req.actor || {};
-    const own = await query(`SELECT id FROM public.bids WHERE id=$1 AND seller_id=$2`, [id, String(actor.id || actor.sub || '')]);
+    const sellerId = actor?.id != null ? String(actor.id) : null;
+    if (!sellerId) return res.status(401).json({ ok:false, error:'auth_required' });
+    const own = await query(`SELECT id FROM public.bids WHERE id=$1 AND seller_id=$2`, [id, sellerId]);
     if (!own.rows.length) return res.status(403).json({ ok:false, error:'forbidden' });
     const { rows } = await query(`UPDATE public.bids SET status='withdrawn', updated_at=now() WHERE id=$1 RETURNING id,status`, [id]);
     res.json({ ok:true, withdrawn: !!rows.length });
@@ -986,7 +991,10 @@ app.get('/api/seller/docs-requests', async (_req, res) => {
 app.post('/api/bids', requireSeller, async (req, res) => {
   const b = req.body || {};
   const actor = req.actor || {};
-  const sellerId = String(actor.id || actor.sub || '');
+  const sellerId = actor?.id != null ? String(actor.id) : null;
+  if (!sellerId) {
+    return res.status(401).json({ ok:false, error:'auth_required' });
+  }
   const client = await pool.connect();
   try {
     const unitPriceCents =

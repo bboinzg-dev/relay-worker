@@ -121,6 +121,11 @@ const mapListingRow = (row = {}) => ({
   qty_available: row.qty_available,
   unit_price: (row.unit_price_cents ?? 0) / 100,
   unit_price_cents: row.unit_price_cents ?? 0,
+  unit_price_krw: row.unit_price_krw_cents != null ? row.unit_price_krw_cents / 100 : null,
+  unit_price_krw_cents: row.unit_price_krw_cents ?? null,
+  unit_price_fx_rate: row.unit_price_fx_rate ?? null,
+  unit_price_fx_yyyymm: row.unit_price_fx_yyyymm ?? null,
+  unit_price_fx_src: row.unit_price_fx_src ?? null,
   currency: row.currency,
   lead_time_days: row.lead_time_days ?? 0,
   status: row.status,
@@ -379,12 +384,16 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
     const currency = (b.currency ? String(b.currency) : 'USD').toUpperCase();
     const fx = await enrichKRWDaily(client, currency, unitPriceCents);
+    const quantityInput =
+      b.quantity_available != null && b.quantity_available !== ''
+        ? b.quantity_available
+        : b.qty_available;
     const params = [
       t,
       sellerId,
       String(b.brand),
       String(b.code),
-      toOptionalInteger(b.qty_available, { min: 0 }) ?? 0,
+      toOptionalInteger(quantityInput, { min: 0 }) ?? 0,
       toOptionalInteger(b.moq, { min: 0 }),
       toOptionalInteger(b.mpq, { min: 0 }),
       !!b.mpq_required_order,
@@ -788,7 +797,8 @@ app.get('/api/seller/items', async (req, res) => {
       seller_id: row.seller_id,
       brand: row.brand,
       code: row.code,
-      quantity_available: row.quantity_available ?? 0,
+      quantity_available: row.quantity_available ?? row.qty_available ?? 0,
+      qty_available: row.qty_available ?? row.quantity_available ?? 0,
       unit_price: (row.unit_price_cents ?? 0) / 100,
       currency: row.currency || 'USD',
       lead_time_days: row.lead_time_days,

@@ -2,6 +2,22 @@ const { parseAppActor } = require('../../auth.middleware');
 
 function pick(h, k) { return h[k] || h[k.toLowerCase()] || h[k.toUpperCase()] || undefined; }
 
+function decodeJwtSub(bearer) {
+  try {
+    const m = String(bearer || '').match(/^Bearer\s+([\w-]+\.[\w-]+\.[\w-]+)$/i);
+    if (!m) return null;
+    const [, token] = m;
+    const mid = token.split('.')[1];
+    if (!mid) return null;
+    let padded = mid.replace(/-/g, '+').replace(/_/g, '/');
+    while (padded.length % 4) padded += '=';
+    const json = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+    return json?.sub || json?.email || null;
+  } catch {
+    return null;
+  }
+}
+
 function parseActor(req) {
   const h = req.headers || {};
   // Preferred explicit dev headers
@@ -33,6 +49,12 @@ function parseActor(req) {
     }
   } catch (err) {
     console.warn('[auth] parseAppActor failed in parseActor:', err?.message || err);
+  }
+
+  // Fallback: decode Authorization: Bearer <ID Token> (verification handled by requireSeller)
+  const sub = decodeJwtSub(pick(h, 'authorization'));
+  if (sub) {
+    return { id: String(sub), tenantId, roles: roles.length ? roles : ['seller'] };
   }
 
   // Fallbacks: try Cloud Run identity headers (optional)

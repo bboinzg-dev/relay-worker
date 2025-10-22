@@ -397,7 +397,7 @@ app.get('/api/listings', async (req, res) => {
       ? String(actor?.id || actor?.sub || '')
       : (req.query.seller_id != null ? String(req.query.seller_id) : null);
     if (isMine && !sellerId) {
-      return res.status(401).json({ ok: false, error: 'auth_required' });
+      return res.json({ ok: true, items: [] });
     }
 
     const where = [];
@@ -892,7 +892,7 @@ app.get('/api/bids', async (req, res) => {
       ? String(actor?.id || actor?.sub || '')
       : (req.query.seller_id != null ? String(req.query.seller_id) : null);
     if (isMine && !sellerId) {
-      return res.status(401).json({ ok: false, error: 'auth_required' });
+      return res.json({ ok: true, items: [] });
     }
     const prId = req.query.pr_id || null;
 

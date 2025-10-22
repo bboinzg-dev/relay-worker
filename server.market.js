@@ -387,11 +387,22 @@ app.get('/api/fx/today', async (req, res) => {
 // GET /api/listings?brand=&code=&status=active
 app.get('/api/listings', async (req, res) => {
   try {
+    const actor = parseActor(req);
     const brand = (req.query.brand || '').toString();
     const code  = (req.query.code  || '').toString();
     const status = (req.query.status || 'active').toString();
+    const mine = String(req.query.mine || '').toLowerCase();
+    const isMine = mine === '1' || mine === 'true';
+    const sellerId = isMine
+      ? String(actor?.id || actor?.sub || '')
+      : (req.query.seller_id != null ? String(req.query.seller_id) : null);
+    if (isMine && !sellerId) {
+      return res.status(401).json({ ok: false, error: 'auth_required' });
+    }
+
     const where = [];
     const args = [];
+    if (sellerId) { args.push(sellerId); where.push(`seller_id = $${args.length}`); }
     if (brand) { args.push(brand); where.push(`brand_norm = lower($${args.length})`); }
     if (code)  { args.push(code);  where.push(`code_norm  = lower($${args.length})`); }
     if (status) { args.push(status); where.push(`status = $${args.length}`); }
@@ -875,17 +886,20 @@ app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
 app.get('/api/bids', async (req, res) => {
   try {
     const actor = parseActor(req);
-    const isMine = /^(1|true)$/i.test(String(req.query.mine || ''));
+    const mine = String(req.query.mine || '').toLowerCase();
+    const isMine = mine === '1' || mine === 'true';
+    const sellerId = isMine
+      ? String(actor?.id || actor?.sub || '')
+      : (req.query.seller_id != null ? String(req.query.seller_id) : null);
+    if (isMine && !sellerId) {
+      return res.status(401).json({ ok: false, error: 'auth_required' });
+    }
     const prId = req.query.pr_id || null;
 
     const where = [];
     const args = [];
 
-    if (isMine) {
-      const sellerId = String(actor?.id || actor?.sub || '');
-      if (!sellerId) {
-        return res.status(401).json({ ok: false, error: 'auth_required' });
-      }
+    if (sellerId) {
       where.push(`seller_id = $${args.push(sellerId)}`);
     }
 

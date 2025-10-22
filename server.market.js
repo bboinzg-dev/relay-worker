@@ -678,6 +678,40 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
   }
 });
 
+// DELETE /api/listings/:id – 단건 삭제(셀러 전용)
+app.delete('/api/listings/:id', requireSeller, async (req, res) => {
+  const id = (req.params.id || '').toString();
+  if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+  const actor = parseActor(req) || {};
+  const actorId = String(actor.id || actor.sub || '');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `SELECT seller_id FROM public.listings WHERE id=$1`,
+      [id]
+    );
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+    const owner = String(rows[0].seller_id || '');
+    if (owner && actorId && owner !== actorId) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ ok: false, error: 'forbidden' });
+    }
+    await client.query(`DELETE FROM public.listings WHERE id=$1`, [id]);
+    await client.query('COMMIT');
+    return res.json({ ok: true, id });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error(e);
+    return res.status(500).json({ ok: false, error: 'db_error' });
+  } finally {
+    client.release();
+  }
+});
+
 // POST /api/listings/:id/purchase  → 주문 생성(간이)
 app.post('/api/listings/:id/purchase', async (req, res) => {
   const client = await pool.connect();

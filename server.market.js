@@ -874,50 +874,29 @@ app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
 app.get('/api/bids', async (req, res) => {
   try {
     const actor = parseActor(req) || {};
-    const mine = parseBooleanish(req.query.mine) === true;
-    const sellerIdParam = (req.query.seller_id || req.query.seller || '').toString();
-    const prParam = (req.query.pr_id || req.query.pr || req.query.purchase_request_id || '').toString();
-    const args = [];
+    const mine = String(req.query.mine || '').toLowerCase();
+    const isMine = mine === '1' || mine === 'true';
+    const sellerId = isMine
+      ? (actor.id || actor.sub || null)
+      : (req.query.seller_id || req.query.seller || null);
+    const prId = req.query.pr_id || req.query.pr || req.query.purchase_request_id || null;
     const where = [];
-
-    if (mine) {
-      const sellerId = actor?.id || actor?.sub || null;
-      if (!sellerId) {
-        return res.status(401).json({ ok: false, error: 'auth_required' });
-      }
-      args.push(String(sellerId));
-      where.push(`seller_id = $${args.length}`);
-    } else if (sellerIdParam) {
-      args.push(sellerIdParam);
-      where.push(`seller_id = $${args.length}`);
-    }
-
-    if (prParam) {
-      args.push(prParam);
-      where.push(`purchase_request_id = $${args.length}`);
-    }
-
-    const requestedLimit = Number(req.query.limit || 200);
-    const limit = Math.min(
-      200,
-      Number.isFinite(requestedLimit) && requestedLimit > 0 ? requestedLimit : 200
-    );
-
-    const sql = `SELECT id, tenant_id, purchase_request_id, seller_id, offer_brand, offer_code, offer_is_substitute,
-                        offer_qty, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm,
-                        unit_price_fx_src, currency, lead_time_days, note, quote_valid_until, status,
-                        no_parcel, image_url, created_at, updated_at
+    const args = [];
+    if (sellerId) where.push(`seller_id = $${args.push(String(sellerId))}`);
+    if (prId)     where.push(`purchase_request_id = $${args.push(String(prId))}`);
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || '50')) || 50));
+    const sql = `SELECT id, purchase_request_id, seller_id, unit_price_cents, currency,
+                        offer_qty, lead_time_days, note, status,
+                        offer_brand, offer_code, offer_is_substitute,
+                        no_parcel, image_url, quote_valid_until,
+                        created_at, updated_at
                  FROM public.bids
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY created_at DESC
                  LIMIT ${limit}`;
-
     const r = await query(sql, args);
     res.json({ ok: true, items: r.rows });
-  } catch (e) {
-    console.error(e);
-    res.status(400).json({ ok:false, error:String(e.message || e) });
-  }
+  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
 });
 
 app.get('/api/seller/docs-requests', async (_req, res) => {
@@ -925,58 +904,38 @@ app.get('/api/seller/docs-requests', async (_req, res) => {
 });
 
 app.post('/api/bids', requireSeller, async (req, res) => {
+  const b = req.body || {};
+  const actor = req.actor || {};
+  const sellerId = String(b.seller_id || actor.id || actor.sub || '');
   const client = await pool.connect();
   try {
-    const actor = req.actor || {};
-
-    const tenantId = getTenant(req);
-    const body = req.body || {};
-
-    const prId = body.pr_id || body.purchase_request_id || body.pr || null;
-    const offerQty =
-      body.offer_qty ?? body.offer_quantity ?? body.qty_offer ?? null;
-    const unitPriceCents = Number.isFinite(Number(body.unit_price_cents))
-      ? Number(body.unit_price_cents)
-      : (Number.isFinite(Number(body.unit_price))
-          ? Math.max(0, Math.round(Number(body.unit_price) * 100))
-          : 0);
-    const currency = (body.currency || 'USD').toUpperCase();
+    const unitPriceCents =
+      toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
+    const currency = (b.currency ? String(b.currency) : 'KRW').toUpperCase();
     const fx = await enrichKRWDaily(client, currency, unitPriceCents);
-    const offerBrand = body.offer_brand ?? body.brand ?? null;
-    const offerCode = body.offer_code ?? body.code ?? null;
-    const isSubstitute = !!(
-      body.offer_is_substitute ?? body.is_alternative ?? body.is_substitute
-    );
-    const note = body.note ?? body.notes ?? null;
-
     const sql = `INSERT INTO public.bids
-      (tenant_id, purchase_request_id, seller_id, offer_brand, offer_code, offer_is_substitute,
+      (purchase_request_id, seller_id, offer_brand, offer_code, offer_is_substitute,
        offer_qty, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency,
        lead_time_days, note, no_parcel, image_url, quote_valid_until, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13,'USD'),$14,$15,$16,$17,$18,'offered')
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,COALESCE($12,'KRW'),$13,$14,$15,$16,$17,'offered')
       RETURNING *`;
-
-    const r = await client.query(sql, [
-      tenantId,
-      prId,
-      actor.id || actor.sub || null,
-      offerBrand,
-      offerCode,
-      isSubstitute,
-      Number(offerQty || 0),
+    const params = [
+      b.pr_id || b.purchase_request_id || null,
+      sellerId || null,
+      b.offer_brand != null ? String(b.offer_brand) : null,
+      b.offer_code != null ? String(b.offer_code) : null,
+      b.offer_is_substitute === true || b.is_alternative === true,
+      toOptionalInteger(b.offer_qty, { min: 0 }) ?? 0,
       unitPriceCents,
-      fx.krw_cents,
-      fx.rate,
-      fx.yyyymm,
-      fx.src,
-      currency,
-      body.lead_time_days || null,
-      note,
-      parseBooleanish(pickOwn(body, 'no_parcel', 'noParcel')) === true,
-      body.image_url != null ? String(body.image_url) : null,
-      body.quote_valid_until || null,
-    ]);
-    res.json({ ok: true, item: r.rows[0] });
+      fx.krw_cents, fx.rate, fx.yyyymm, fx.src, currency,
+      toOptionalInteger(b.lead_time_days, { min: 0 }),
+      toOptionalTrimmed(b.note),
+      parseBooleanish(pickOwn(b, 'no_parcel', 'noParcel')) === true,
+      b.image_url != null ? String(b.image_url) : null,
+      b.quote_valid_until || null,
+    ];
+    const r = await client.query(sql, params);
+    res.status(201).json({ ok: true, item: r.rows[0] });
   } catch (e) {
     console.error(e);
     res.status(400).json({ ok:false, error:String(e.message || e) });

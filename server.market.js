@@ -394,7 +394,7 @@ app.get('/api/listings', async (req, res) => {
     const mine = String(req.query.mine || '').toLowerCase();
     const isMine = mine === '1' || mine === 'true';
     const sellerId = isMine
-      ? (actor?.id != null ? String(actor.id) : null)
+      ? (actor?.id != null ? String(actor.id) : '')
       : (req.query.seller_id != null ? String(req.query.seller_id) : null);
     if (isMine && !sellerId) {
       return res.json({ ok: true, items: [] });
@@ -557,10 +557,15 @@ app.get('/api/listings/:id', async (req, res) => {
   try {
     const id = (req.params.id || '').toString();
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
+    const actor = parseActor(req);
+    const sellerId = actor?.id != null ? String(actor.id) : '';
+    if (!sellerId) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
     const r = await query(
       `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
-         FROM public.listings WHERE id = $1`,
-      [id]
+         FROM public.listings WHERE id = $1 AND seller_id = $2`,
+      [id, sellerId]
     );
     if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
     res.json({ ok: true, item: mapListingRow(r.rows[0]) });
@@ -890,7 +895,7 @@ app.get('/api/bids', async (req, res) => {
     const mine = String(req.query.mine || '').toLowerCase();
     const isMine = mine === '1' || mine === 'true';
     const sellerId = isMine
-      ? (actor?.id != null ? String(actor.id) : null)
+      ? (actor?.id != null ? String(actor.id) : '')
       : (req.query.seller_id != null ? String(req.query.seller_id) : null);
     if (isMine && !sellerId) {
       return res.json({ ok: true, items: [] });

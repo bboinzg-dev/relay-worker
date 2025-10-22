@@ -434,7 +434,7 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       RETURNING id, status, created_at`;
     const sql = merge ? mergeSql : insertSql;
     const r = await client.query(sql, params);
-    res.status(201).json(r.rows[0]);
+    res.status(201).json({ ok: true, item: r.rows[0] });
   } catch (e) {
     if (e?.code === '23505' && e?.constraint === 'ux_listings_seller_brand_code') {
       const sellerKey = sellerId != null ? String(sellerId) : String(actorSeller || actor?.id || actor?.sub || '');

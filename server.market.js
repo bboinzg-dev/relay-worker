@@ -874,14 +874,25 @@ app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
 
 app.get('/api/bids', async (req, res) => {
   try {
-    const actor = parseActor(req) || {};
-    const mine = String(req.query.mine || '').toLowerCase();
-    const isMine = mine === '1' || mine === 'true';
-    const sellerId = isMine ? (actor.id || actor.sub || null) : (req.query.seller_id || null);
+    const actor = parseActor(req);
+    const isMine = /^(1|true)$/i.test(String(req.query.mine || ''));
     const prId = req.query.pr_id || null;
-    const where = []; const args = [];
-    if (sellerId) where.push(`seller_id = $${args.push(String(sellerId))}`);
-    if (prId)     where.push(`purchase_request_id = $${args.push(String(prId))}`);
+
+    const where = [];
+    const args = [];
+
+    if (isMine) {
+      const sellerId = String(actor?.id || actor?.sub || '');
+      if (!sellerId) {
+        return res.status(401).json({ ok: false, error: 'auth_required' });
+      }
+      where.push(`seller_id = $${args.push(sellerId)}`);
+    }
+
+    if (prId) {
+      where.push(`purchase_request_id = $${args.push(String(prId))}`);
+    }
+
     const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || '50')) || 50));
     const sql = `SELECT id, purchase_request_id, seller_id, unit_price_cents, currency,
                         offer_qty, lead_time_days, note, status,
@@ -961,7 +972,7 @@ app.get('/api/seller/docs-requests', async (_req, res) => {
 app.post('/api/bids', requireSeller, async (req, res) => {
   const b = req.body || {};
   const actor = req.actor || {};
-  const sellerId = String(b.seller_id || actor.id || actor.sub || '');
+  const sellerId = String(actor.id || actor.sub || '');
   const client = await pool.connect();
   try {
     const unitPriceCents =

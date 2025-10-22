@@ -402,16 +402,16 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       LISTING_STATUS.has(String(b.status || '').toLowerCase()) ? String(b.status).toLowerCase() : 'pending',
     ];
     const insertSql = `INSERT INTO public.listings
-      (tenant_id, seller_id, brand, code, brand_norm, code_norm, qty_available, moq, mpq, mpq_required_order,
+      (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
        currency, lead_time_days, location, condition, packaging, note, status)
-      VALUES ($1,$2,$3,$4,lower($3),lower($4),$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'))
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'))
       RETURNING id, status, created_at`;
     const mergeSql = `INSERT INTO public.listings
-      (tenant_id, seller_id, brand, code, brand_norm, code_norm, qty_available, moq, mpq, mpq_required_order,
+      (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
        currency, lead_time_days, location, condition, packaging, note, status)
-      VALUES ($1,$2,$3,$4,lower($3),lower($4),$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'))
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,COALESCE($20,'pending'))
       ON CONFLICT (seller_id, brand_norm, code_norm)
       DO UPDATE SET
         qty_available        = EXCLUDED.qty_available,

@@ -489,12 +489,17 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       hasMfgYear ? (mfgYear ?? null) : null,
       hasIsOver2yrs ? isOver2yrs : null,
     ];
+    const returningColumns = `
+      id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
+      unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+      currency, lead_time_days, location, condition, packaging, note, no_parcel, image_url, status,
+      part_type, mfg_year, is_over_2yrs, created_at, updated_at`;
     const insertSql = `INSERT INTO public.listings
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
        currency, lead_time_days, location, condition, packaging, note, no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,COALESCE($22,'pending'),$23,$24,$25)
-      RETURNING id, status, created_at`;
+      RETURNING ${returningColumns}`;
     const mergeSql = `INSERT INTO public.listings
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
@@ -524,10 +529,10 @@ app.post('/api/listings', requireSeller, async (req, res) => {
         mfg_year             = EXCLUDED.mfg_year,
         is_over_2yrs         = EXCLUDED.is_over_2yrs,
         updated_at           = now()
-      RETURNING id, status, created_at`;
+      RETURNING ${returningColumns}`;
     const sql = merge ? mergeSql : insertSql;
     const r = await client.query(sql, params);
-    res.status(201).json({ ok: true, item: r.rows[0], actor_id: sellerId });
+    res.status(201).json({ ok: true, item: mapListingRow(r.rows[0]), actor_id: sellerId });
   } catch (e) {
     if (e?.code === '23505' && e?.constraint === 'ux_listings_seller_brand_code') {
       const sellerKey = String(sellerId);

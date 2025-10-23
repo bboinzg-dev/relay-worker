@@ -234,21 +234,45 @@ app.post('/api/purchase-plans', async (req, res) => {
 app.delete('/api/purchase-plans/items/:id', async (req, res) => {
   try {
     const actor = parseActor(req);
-    if (!actor?.id) return res.status(401).json({ error: 'auth required' });
+    const userId = actor?.user_id ?? actor?.id;
+    if (!userId) return res.status(401).json({ ok: false, error: 'auth required' });
+
     const itemId = (req.params.id || '').toString();
-    if (!itemId) return res.status(400).json({ error: 'id required' });
+    if (!itemId) return res.status(400).json({ ok: false, error: 'id required' });
+
+    await pool.query(`
+      UPDATE public.purchase_requests
+         SET status = CASE WHEN status = 'open' THEN 'cancelled' ELSE status END,
+             updated_at = now()
+       WHERE id IN (
+         SELECT purchase_request_id FROM public.plan_item_pr_links WHERE plan_item_id = $1
+       )
+    `, [itemId]);
+
     const result = await pool.query(`
-      DELETE FROM public.purchase_plan_items
-       WHERE id = $1
-         AND plan_id IN (
-           SELECT id FROM public.purchase_plans WHERE buyer_user_id = $2
-         )
-      RETURNING *
-    `, [itemId, actor.id]);
-    if (!result.rows.length) return res.status(404).json({ error: 'item not found' });
+      WITH victim AS (
+        SELECT i.id, i.plan_id
+          FROM public.purchase_plan_items i
+          JOIN public.purchase_plans p ON p.id = i.plan_id
+         WHERE i.id = $1
+           AND p.buyer_user_id = $2
+      )
+      DELETE FROM public.purchase_plan_items i
+      USING victim v
+      WHERE i.id = v.id
+      RETURNING i.id, i.plan_id
+    `, [itemId, userId]);
+
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: 'not found' });
+    }
+
     const deleted = result.rows[0];
-    await pool.query('UPDATE public.purchase_plans SET updated_at = now() WHERE id = $1', [deleted.plan_id]);
-    res.json({ ok: true, deleted });
+    if (deleted?.plan_id) {
+      await pool.query('UPDATE public.purchase_plans SET updated_at = now() WHERE id = $1', [deleted.plan_id]);
+    }
+
+    res.json({ ok: true, id: deleted.id });
   } catch (err) {
     console.error(err);
     res.status(400).json({ ok: false, error: err?.message || String(err) });

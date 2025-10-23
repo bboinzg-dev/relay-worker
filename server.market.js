@@ -615,23 +615,17 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
 
     if (has('brand')) {
       const brandValue = body.brand != null ? String(body.brand).trim() : '';
-      if (!brandValue) {
-        return res.status(400).json({ ok: false, error: 'brand_required' });
-      }
+      if (!brandValue) return res.status(400).json({ ok: false, error: 'brand_required' });
       const brandIdx = params.length + 1;
       sets.push(`brand = $${brandIdx}`);
-      sets.push(`brand_norm = lower($${brandIdx})`);
       params.push(brandValue);
     }
 
     if (has('code')) {
       const codeValue = body.code != null ? String(body.code).trim() : '';
-      if (!codeValue) {
-        return res.status(400).json({ ok: false, error: 'code_required' });
-      }
+      if (!codeValue) return res.status(400).json({ ok: false, error: 'code_required' });
       const codeIdx = params.length + 1;
       sets.push(`code = $${codeIdx}`);
-      sets.push(`code_norm = lower($${codeIdx})`);
       params.push(codeValue);
     }
 
@@ -786,15 +780,17 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
            SET unit_price_krw_cents = $1,
                unit_price_fx_rate = $2,
                unit_price_fx_yyyymm = $3,
-               unit_price_fx_src = $4,
-               updated_at = now()
+               unit_price_fx_src = $4
          WHERE id = $5 AND seller_id = $6`,
         [fx.krw_cents, fx.rate, fx.yyyymm, fx.src, id, sellerId]
       );
     }
 
-    const finalRow = await client.query(
-      `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
+    await client.query('COMMIT');
+    inTransaction = false;
+
+    const out = await query(
+      `SELECT id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
               unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
               currency, lead_time_days, location, condition, packaging, note, no_parcel, image_url, status,
               part_type, mfg_year, is_over_2yrs, created_at, updated_at
@@ -802,19 +798,9 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
         WHERE id = $1 AND seller_id = $2`,
       [id, sellerId]
     );
-    if (!finalRow.rows.length) {
-      await client.query('ROLLBACK');
-      inTransaction = false;
-      return res.status(404).json({ ok: false, error: 'not_found' });
-    }
-
-    await client.query('COMMIT');
-    inTransaction = false;
-    res.json({ ok: true, item: mapListingRow(finalRow.rows[0]) });
+    return res.json({ ok: true, item: mapListingRow(out.rows[0]) });
   } catch (e) {
-    if (client && inTransaction) {
-      try { await client.query('ROLLBACK'); } catch (_) {}
-    }
+    if (inTransaction) { try { await client.query('ROLLBACK'); } catch {} }
     if (e?.code === '23505' && e?.constraint === 'ux_listings_seller_brand_code') {
       return res.status(409).json({ ok: false, error: 'duplicate_listing' });
     }

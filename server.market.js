@@ -133,6 +133,10 @@ const mapListingRow = (row = {}) => ({
   location: row.location ?? null,
   condition: row.condition ?? null,
   packaging: row.packaging ?? null,
+  incoming_schedule1: row.incoming_schedule1 ?? null,
+  incoming_qty1: row.incoming_qty1 ?? null,
+  incoming_schedule2: row.incoming_schedule2 ?? null,
+  incoming_qty2: row.incoming_qty2 ?? null,
   no_parcel: row.no_parcel === true,
   noParcel: row.no_parcel === true,
   image_url: row.image_url ?? null,
@@ -166,6 +170,15 @@ function toOptionalTrimmed(value) {
   if (value == null) return null;
   const s = String(value).trim();
   return s === '' ? null : s;
+}
+
+function toOptionalDateString(value) {
+  const trimmed = toOptionalTrimmed(value);
+  if (!trimmed) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
 }
 
 function parseBooleanish(value) {
@@ -205,7 +218,7 @@ function toCents(unitPrice) {
 }
 
 const LISTING_STATUS = new Set(['pending', 'active', 'soldout', 'archived', 'inactive']);
-const BID_STATUS = new Set(['offered', 'accepted', 'rejected', 'withdrawn']);
+const BID_STATUS = new Set(['offered', 'accepted', 'rejected', 'withdrawn', 'active']);
 
 /* ---------------- Listings (정찰제/재고) ---------------- */
 
@@ -406,7 +419,9 @@ app.get('/api/listings', async (req, res) => {
     if (brand) { args.push(brand); where.push(`brand_norm = lower($${args.length})`); }
     if (code)  { args.push(code);  where.push(`code_norm  = lower($${args.length})`); }
     if (status) { args.push(status); where.push(`status = $${args.length}`); }
-    const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency, lead_time_days, moq, mpq, mpq_required_order, location, condition, packaging, note, no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
+    const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency, lead_time_days, moq, mpq, mpq_required_order, location, condition, packaging, note,
+                       incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
+                       no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
                  FROM public.listings
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY created_at DESC
@@ -418,6 +433,10 @@ app.get('/api/listings', async (req, res) => {
       unit_price: (row.unit_price_cents ?? 0) / 100,
       unit_price_krw: row.unit_price_krw_cents != null ? row.unit_price_krw_cents / 100 : null,
       noParcel: row.no_parcel === true,
+      incoming_schedule1: row.incoming_schedule1 ?? null,
+      incoming_qty1: row.incoming_qty1 ?? null,
+      incoming_schedule2: row.incoming_schedule2 ?? null,
+      incoming_qty2: row.incoming_qty2 ?? null,
     }));
     res.json({ ok: true, items });
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
@@ -468,6 +487,10 @@ app.post('/api/listings', requireSeller, async (req, res) => {
     }
 
     const noParcel = parseBooleanish(pickOwn(b, 'no_parcel', 'noParcel')) === true;
+    const incomingSchedule1 = toOptionalDateString(pickOwn(b, 'incoming_schedule1', 'incomingSchedule1', 'incomingDate1'));
+    const incomingQty1 = toOptionalInteger(pickOwn(b, 'incoming_qty1', 'incomingQty1'), { min: 0 });
+    const incomingSchedule2 = toOptionalDateString(pickOwn(b, 'incoming_schedule2', 'incomingSchedule2', 'incomingDate2'));
+    const incomingQty2 = toOptionalInteger(pickOwn(b, 'incoming_qty2', 'incomingQty2'), { min: 0 });
 
     const params = [
       t,
@@ -489,6 +512,10 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       b.condition != null ? String(b.condition) : null,
       b.packaging != null ? String(b.packaging) : null,
       b.note != null ? String(b.note) : null,
+      incomingSchedule1,
+      incomingQty1,
+      incomingSchedule2,
+      incomingQty2,
       noParcel,
       b.image_url != null ? String(b.image_url) : null,
       LISTING_STATUS.has(String(b.status || '').toLowerCase()) ? String(b.status).toLowerCase() : 'pending',
@@ -499,19 +526,24 @@ app.post('/api/listings', requireSeller, async (req, res) => {
     const returningColumns = `
       id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
       unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-      currency, lead_time_days, location, condition, packaging, note, no_parcel, image_url, status,
-      part_type, mfg_year, is_over_2yrs, created_at, updated_at`;
+      currency, lead_time_days, location, condition, packaging, note,
+      incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
+      no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at`;
     const insertSql = `INSERT INTO public.listings
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-       currency, lead_time_days, location, condition, packaging, note, no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,COALESCE($22,'pending'),$23,$24,$25)
+       currency, lead_time_days, location, condition, packaging, note,
+       incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
+       no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,COALESCE($26,'pending'),$27,$28,$29)
       RETURNING ${returningColumns}`;
     const mergeSql = `INSERT INTO public.listings
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-       currency, lead_time_days, location, condition, packaging, note, no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,COALESCE($22,'pending'),$23,$24,$25)
+       currency, lead_time_days, location, condition, packaging, note,
+       incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
+       no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,COALESCE($26,'pending'),$27,$28,$29)
       ON CONFLICT (seller_id, brand_norm, code_norm)
       DO UPDATE SET
         qty_available        = EXCLUDED.qty_available,
@@ -529,6 +561,10 @@ app.post('/api/listings', requireSeller, async (req, res) => {
         condition            = EXCLUDED.condition,
         packaging            = EXCLUDED.packaging,
         note                 = EXCLUDED.note,
+        incoming_schedule1   = EXCLUDED.incoming_schedule1,
+        incoming_qty1        = EXCLUDED.incoming_qty1,
+        incoming_schedule2   = EXCLUDED.incoming_schedule2,
+        incoming_qty2        = EXCLUDED.incoming_qty2,
         no_parcel            = EXCLUDED.no_parcel,
         image_url            = EXCLUDED.image_url,
         status               = EXCLUDED.status,
@@ -575,7 +611,10 @@ app.get('/api/listings/:id', async (req, res) => {
       return res.status(404).json({ ok: false, error: 'not_found' });
     }
     const r = await query(
-      `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
+      `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days,
+              location, condition, packaging, note,
+              incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
+              no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
          FROM public.listings WHERE id = $1 AND seller_id = $2`,
       [id, sellerId]
     );
@@ -686,6 +725,27 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
       params.push(body.note != null ? String(body.note) : null);
     }
 
+    const incomingSchedule1Raw = pickFirst('incoming_schedule1', 'incomingSchedule1', 'incomingDate1');
+    if (incomingSchedule1Raw !== undefined) {
+      sets.push(`incoming_schedule1 = $${params.length + 1}`);
+      params.push(toOptionalDateString(incomingSchedule1Raw));
+    }
+    const incomingQty1Raw = pickFirst('incoming_qty1', 'incomingQty1');
+    if (incomingQty1Raw !== undefined) {
+      sets.push(`incoming_qty1 = $${params.length + 1}`);
+      params.push(toOptionalInteger(incomingQty1Raw, { min: 0 }));
+    }
+    const incomingSchedule2Raw = pickFirst('incoming_schedule2', 'incomingSchedule2', 'incomingDate2');
+    if (incomingSchedule2Raw !== undefined) {
+      sets.push(`incoming_schedule2 = $${params.length + 1}`);
+      params.push(toOptionalDateString(incomingSchedule2Raw));
+    }
+    const incomingQty2Raw = pickFirst('incoming_qty2', 'incomingQty2');
+    if (incomingQty2Raw !== undefined) {
+      sets.push(`incoming_qty2 = $${params.length + 1}`);
+      params.push(toOptionalInteger(incomingQty2Raw, { min: 0 }));
+    }
+
     const hasNoParcel = has('no_parcel') || Object.prototype.hasOwnProperty.call(body, 'noParcel');
     if (hasNoParcel) {
       const noParcelValue = has('no_parcel') ? body.no_parcel : body.noParcel;
@@ -792,7 +852,9 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
     const out = await query(
       `SELECT id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
               unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-              currency, lead_time_days, location, condition, packaging, note, no_parcel, image_url, status,
+              currency, lead_time_days, location, condition, packaging, note,
+              incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
+              no_parcel, image_url, status,
               part_type, mfg_year, is_over_2yrs, created_at, updated_at
          FROM public.listings
         WHERE id = $1 AND seller_id = $2`,
@@ -1030,6 +1092,14 @@ app.patch('/api/bids/:id', requireSeller, async (req, res) => {
       params.push(!!v);
     }
     if (has('image_url'))        { sets.push(`image_url = $${params.length+1}`);        params.push(body.image_url != null ? String(body.image_url) : null); }
+    if (has('status')) {
+      const statusRaw = body.status != null ? String(body.status).trim().toLowerCase() : '';
+      if (!BID_STATUS.has(statusRaw)) {
+        return res.status(400).json({ ok:false, error:'invalid_status' });
+      }
+      sets.push(`status = $${params.length+1}`);
+      params.push(statusRaw);
+    }
 
     if (!sets.length) return res.json({ ok:true, item:null });
 
@@ -1094,12 +1164,15 @@ app.post('/api/bids', requireSeller, async (req, res) => {
 
     await client.query('BEGIN');
     const fx = await enrichKRWDaily(client, currency, unitPriceCents);
+    const requestedStatus = toOptionalTrimmed(b.status);
+    const normalizedStatus = requestedStatus ? requestedStatus.toLowerCase() : '';
+    const status = BID_STATUS.has(normalizedStatus) ? normalizedStatus : 'offered';
     const sql = `INSERT INTO public.bids(
         seller_id, purchase_request_id, offer_qty,
         unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
         currency, lead_time_days, note,
         offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'offered')
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
       RETURNING *`;
     const params = [
       sellerId,
@@ -1116,6 +1189,7 @@ app.post('/api/bids', requireSeller, async (req, res) => {
       b.quote_valid_until ? String(b.quote_valid_until) : null,
       parseBooleanish(pickOwn(b, 'no_parcel', 'noParcel')) === true,
       b.image_url ? String(b.image_url) : null,
+      status,
     ];
     const r = await client.query(sql, params);
     await client.query('COMMIT');
@@ -1159,6 +1233,7 @@ app.get('/api/seller/items', async (req, res) => {
     const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents,
                         unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm,
                         unit_price_fx_src, currency, lead_time_days, status, note,
+                        incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
                         location, condition, packaging, no_parcel, image_url, moq, mpq, mpq_required_order,
                         part_type, mfg_year, is_over_2yrs, created_at, updated_at
                  FROM public.listings

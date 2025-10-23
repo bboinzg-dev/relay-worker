@@ -406,13 +406,20 @@ app.get('/api/listings', async (req, res) => {
     if (brand) { args.push(brand); where.push(`brand_norm = lower($${args.length})`); }
     if (code)  { args.push(code);  where.push(`code_norm  = lower($${args.length})`); }
     if (status) { args.push(status); where.push(`status = $${args.length}`); }
-    const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents, currency, lead_time_days, moq, mpq, mpq_required_order, location, condition, packaging, note, no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at
+    const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency, lead_time_days, moq, mpq, mpq_required_order, location, condition, packaging, note, no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
                  FROM public.listings
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY created_at DESC
                  LIMIT 200`;
     const r = await query(sql, args);
-    res.json({ ok: true, items: r.rows });
+    const items = r.rows.map((row) => ({
+      ...row,
+      quantity_available: row.qty_available,
+      unit_price: (row.unit_price_cents ?? 0) / 100,
+      unit_price_krw: row.unit_price_krw_cents != null ? row.unit_price_krw_cents / 100 : null,
+      noParcel: row.no_parcel === true,
+    }));
+    res.json({ ok: true, items });
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
 });
 
@@ -582,6 +589,8 @@ app.get('/api/listings/:id', async (req, res) => {
 
 // PATCH /api/listings/:id – 수량/상태/가격 등 수정
 app.patch('/api/listings/:id', requireSeller, async (req, res) => {
+  let client;
+  let inTransaction = false;
   try {
     const id = (req.params.id || '').toString();
     if (!id) return res.status(400).json({ ok: false, error: 'id required' });
@@ -645,17 +654,22 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
       params.push(toOptionalInteger(quantity, { min: 0 }) ?? 0);
     }
 
+    let shouldRecomputeFx = false;
     if (has('unit_price') || has('unit_price_cents')) {
       const cents = has('unit_price')
         ? (toCents(body.unit_price) ?? 0)
         : toOptionalInteger(body.unit_price_cents, { min: 0 }) ?? 0;
       sets.push(`unit_price_cents = $${params.length + 1}`);
       params.push(cents);
+      shouldRecomputeFx = true;
     }
 
     if (has('currency')) {
+      const currencyRaw = body.currency != null ? String(body.currency).trim() : null;
+      const normalizedCurrency = currencyRaw ? currencyRaw.toUpperCase() : currencyRaw;
       sets.push(`currency = $${params.length + 1}`);
-      params.push(body.currency != null ? String(body.currency) : null);
+      params.push(normalizedCurrency);
+      shouldRecomputeFx = true;
     }
 
     if (has('location')) {
@@ -746,22 +760,68 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
 
     sets.push('updated_at = now()');
 
+    client = await pool.connect();
+    await client.query('BEGIN');
+    inTransaction = true;
+
     const idParamIdx = params.length + 1;
     const sellerParamIdx = params.length + 2;
     params.push(id);
     params.push(sellerId);
 
     const sql = `UPDATE public.listings SET ${sets.join(', ')} WHERE id = $${idParamIdx} AND seller_id = $${sellerParamIdx}
-      RETURNING id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days, location, condition, packaging, note, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at`;
-    const r = await query(sql, params);
-    if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
-    res.json({ ok: true, item: mapListingRow(r.rows[0]) });
+      RETURNING id, tenant_id, seller_id, unit_price_cents, currency`;
+    const r = await client.query(sql, params);
+    if (!r.rows.length) {
+      await client.query('ROLLBACK');
+      inTransaction = false;
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    if (shouldRecomputeFx) {
+      const base = r.rows[0] || {};
+      const fx = await enrichKRWDaily(client, base.currency, base.unit_price_cents);
+      await client.query(
+        `UPDATE public.listings
+           SET unit_price_krw_cents = $1,
+               unit_price_fx_rate = $2,
+               unit_price_fx_yyyymm = $3,
+               unit_price_fx_src = $4,
+               updated_at = now()
+         WHERE id = $5 AND seller_id = $6`,
+        [fx.krw_cents, fx.rate, fx.yyyymm, fx.src, id, sellerId]
+      );
+    }
+
+    const finalRow = await client.query(
+      `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
+              unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+              currency, lead_time_days, location, condition, packaging, note, no_parcel, image_url, status,
+              part_type, mfg_year, is_over_2yrs, created_at, updated_at
+         FROM public.listings
+        WHERE id = $1 AND seller_id = $2`,
+      [id, sellerId]
+    );
+    if (!finalRow.rows.length) {
+      await client.query('ROLLBACK');
+      inTransaction = false;
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    await client.query('COMMIT');
+    inTransaction = false;
+    res.json({ ok: true, item: mapListingRow(finalRow.rows[0]) });
   } catch (e) {
+    if (client && inTransaction) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+    }
     if (e?.code === '23505' && e?.constraint === 'ux_listings_seller_brand_code') {
       return res.status(409).json({ ok: false, error: 'duplicate_listing' });
     }
     console.error(e);
     res.status(500).json({ ok: false, error: 'db_error' });
+  } finally {
+    if (client) client.release();
   }
 });
 

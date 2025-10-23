@@ -961,32 +961,30 @@ app.get('/api/bids', async (req, res) => {
     if (isMine && !sellerId) {
       return res.json({ ok: true, items: [] });
     }
-    const prId = req.query.pr_id || null;
+    const prId = (req.query.pr_id || '').toString() || null;
+    const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 200);
 
     const where = [];
     const args = [];
+    if (sellerId) { args.push(sellerId); where.push(`seller_id = $${args.length}`); }
+    if (prId)     { args.push(prId);     where.push(`purchase_request_id = $${args.length}`); }
 
-    if (sellerId) {
-      where.push(`seller_id = $${args.push(sellerId)}`);
-    }
-
-    if (prId) {
-      where.push(`purchase_request_id = $${args.push(String(prId))}`);
-    }
-
-    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || '50')) || 50));
-    const sql = `SELECT id, purchase_request_id, seller_id, unit_price_cents, currency,
-                        offer_qty, lead_time_days, note, status,
-                        offer_brand, offer_code, offer_is_substitute,
-                        no_parcel, image_url, quote_valid_until,
-                        created_at, updated_at
-                 FROM public.bids
-                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-                 ORDER BY created_at DESC
-                 LIMIT ${limit}`;
-    const r = await query(sql, args);
-    res.json({ ok: true, items: r.rows });
-  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+    const sql = `
+      SELECT id, seller_id, purchase_request_id, offer_qty,
+             unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+             currency, lead_time_days, note, status,
+             offer_brand, offer_code, offer_is_substitute, quote_valid_until,
+             no_parcel, image_url, created_at, updated_at
+        FROM public.bids
+       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY created_at DESC
+       LIMIT ${limit}`;
+    const { rows } = await query(sql, args);
+    return res.json({ ok: true, items: rows });
+  } catch (e) {
+    console.error(e);
+    return res.status(400).json({ ok:false, error:String(e.message || e) });
+  }
 });
 
 app.get('/api/bids/:id', async (req, res) => {
@@ -998,56 +996,83 @@ app.get('/api/bids/:id', async (req, res) => {
 });
 
 app.patch('/api/bids/:id', requireSeller, async (req, res) => {
+  const id = (req.params.id || '').toString();
+  if (!id) return res.status(400).json({ ok:false, error:'id_required' });
+
+  let client; let inTx = false;
   try {
-    const id = String(req.params.id || ''); if (!id) return res.status(400).json({ ok:false, error:'id_required' });
-    const actor = req.actor || {};
+    const actor = parseActor(req) || {};
     const sellerId = actor?.id != null ? String(actor.id) : null;
     if (!sellerId) return res.status(401).json({ ok:false, error:'auth_required' });
-    const own = await query(`SELECT id FROM public.bids WHERE id=$1 AND seller_id=$2`, [id, sellerId]);
-    if (!own.rows.length) return res.status(403).json({ ok:false, error:'forbidden' });
 
     const body = req.body || {};
     const sets = []; const params = [];
     const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
 
-    if (has('offer_qty')) { sets.push(`offer_qty = $${params.length+1}`); params.push(toOptionalInteger(body.offer_qty, {min:0})); }
+    let needFx = false;
+    if (has('offer_qty'))        { sets.push(`offer_qty = $${params.length+1}`);        params.push(toOptionalInteger(body.offer_qty, {min:0}) ?? 0); }
     if (has('unit_price') || has('unit_price_cents')) {
-      const cents = has('unit_price') ? (toCents(body.unit_price) ?? 0) : (toOptionalInteger(body.unit_price_cents,{min:0}) ?? 0);
+      const cents = has('unit_price') ? (toCents(body.unit_price) ?? 0)
+                                      : toOptionalInteger(body.unit_price_cents, { min:0 }) ?? 0;
       sets.push(`unit_price_cents = $${params.length+1}`); params.push(cents);
+      needFx = true;
     }
-    if (has('currency')) { sets.push(`currency = $${params.length+1}`); params.push(body.currency ? String(body.currency).toUpperCase() : null); }
-    if (has('lead_time_days')) { sets.push(`lead_time_days = $${params.length+1}`); params.push(toOptionalInteger(body.lead_time_days,{min:0})); }
-    if (has('note')) { sets.push(`note = $${params.length+1}`); params.push(toOptionalTrimmed(body.note)); }
-    if (has('no_parcel') || Object.prototype.hasOwnProperty.call(body,'noParcel')) {
+    if (has('currency'))         { sets.push(`currency = $${params.length+1}`);         params.push(body.currency ? String(body.currency).toUpperCase() : null); needFx = true; }
+    if (has('lead_time_days'))   { sets.push(`lead_time_days = $${params.length+1}`);   params.push(toOptionalInteger(body.lead_time_days, {min:0})); }
+    if (has('note'))             { sets.push(`note = $${params.length+1}`);             params.push(body.note != null ? String(body.note) : null); }
+    if (has('offer_brand'))      { sets.push(`offer_brand = $${params.length+1}`);      params.push(body.offer_brand != null ? String(body.offer_brand) : null); }
+    if (has('offer_code'))       { sets.push(`offer_code = $${params.length+1}`);       params.push(body.offer_code  != null ? String(body.offer_code)  : null); }
+    if (has('offer_is_substitute')) { sets.push(`offer_is_substitute = $${params.length+1}`); params.push(!!body.offer_is_substitute); }
+    if (has('quote_valid_until')){ sets.push(`quote_valid_until = $${params.length+1}`); params.push(body.quote_valid_until ? String(body.quote_valid_until) : null); }
+    if (has('no_parcel') || has('noParcel')) {
       const v = has('no_parcel') ? body.no_parcel : body.noParcel;
-      sets.push(`no_parcel = $${params.length+1}`); params.push(parseBooleanish(v) === true);
+      sets.push(`no_parcel = $${params.length+1}`);
+      params.push(!!v);
     }
-    if (has('image_url')) { sets.push(`image_url = $${params.length+1}`); params.push(body.image_url != null ? String(body.image_url) : null); }
-    if (has('quote_valid_until')) { sets.push(`quote_valid_until = $${params.length+1}`); params.push(body.quote_valid_until || null); }
-    if (has('status')) {
-      const st = String(body.status || '').toLowerCase();
-      if (!BID_STATUS.has(st)) return res.status(400).json({ ok:false, error:'bad_status' });
-      sets.push(`status = $${params.length+1}`); params.push(st);
-    }
+    if (has('image_url'))        { sets.push(`image_url = $${params.length+1}`);        params.push(body.image_url != null ? String(body.image_url) : null); }
 
-    if (!sets.length) return res.json({ ok:true, updated:false });
-    const sql = `UPDATE public.bids SET ${sets.join(', ')}, updated_at=now() WHERE id=$${params.length+1} RETURNING *`;
-    const r = await query(sql, [...params, id]);
-    res.json({ ok:true, item:r.rows[0] });
-  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+    if (!sets.length) return res.json({ ok:true, item:null });
+
+    client = await pool.connect(); inTx = true; await client.query('BEGIN');
+    const sql = `UPDATE public.bids SET ${sets.join(', ')}, updated_at=now()
+                 WHERE id=$${params.length+1} AND seller_id=$${params.length+2}
+                 RETURNING id, seller_id, unit_price_cents, currency`;
+    const r = await client.query(sql, [...params, id, sellerId]);
+    if (!r.rows.length) { await client.query('ROLLBACK'); inTx=false; return res.status(404).json({ ok:false, error:'not_found' }); }
+
+    if (needFx) {
+      const row = r.rows[0];
+      const fx = await enrichKRWDaily(client, row.currency, row.unit_price_cents);
+      await client.query(
+        `UPDATE public.bids
+            SET unit_price_krw_cents=$1, unit_price_fx_rate=$2, unit_price_fx_yyyymm=$3, unit_price_fx_src=$4
+          WHERE id=$5 AND seller_id=$6`,
+        [fx.krw_cents, fx.rate, fx.yyyymm, fx.src, id, sellerId]
+      );
+    }
+    await client.query('COMMIT'); inTx=false;
+    return res.json({ ok:true });
+  } catch (e) {
+    try { if (inTx) await client.query('ROLLBACK'); } catch {}
+    console.error(e);
+    return res.status(500).json({ ok:false, error:'db_error' });
+  } finally { try { client?.release(); } catch {} }
 });
 
 app.delete('/api/bids/:id', requireSeller, async (req, res) => {
   try {
-    const id = String(req.params.id || ''); if (!id) return res.status(400).json({ ok:false, error:'id_required' });
-    const actor = req.actor || {};
+    const id = (req.params.id || '').toString();
+    if (!id) return res.status(400).json({ ok:false, error:'id_required' });
+    const actor = parseActor(req);
     const sellerId = actor?.id != null ? String(actor.id) : null;
     if (!sellerId) return res.status(401).json({ ok:false, error:'auth_required' });
-    const own = await query(`SELECT id FROM public.bids WHERE id=$1 AND seller_id=$2`, [id, sellerId]);
-    if (!own.rows.length) return res.status(403).json({ ok:false, error:'forbidden' });
-    const { rows } = await query(`UPDATE public.bids SET status='withdrawn', updated_at=now() WHERE id=$1 RETURNING id,status`, [id]);
-    res.json({ ok:true, withdrawn: !!rows.length });
-  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+    const r = await query(`DELETE FROM public.bids WHERE id=$1 AND seller_id=$2 RETURNING id`, [id, sellerId]);
+    if (!r.rows.length) return res.status(404).json({ ok:false, error:'not_found' });
+    return res.json({ ok:true, id });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok:false, error:'db_error' });
+  }
 });
 
 app.get('/api/seller/docs-requests', async (_req, res) => {
@@ -1056,7 +1081,7 @@ app.get('/api/seller/docs-requests', async (_req, res) => {
 
 app.post('/api/bids', requireSeller, async (req, res) => {
   const b = req.body || {};
-  const actor = req.actor || {};
+  const actor = parseActor(req) || {};
   const sellerId = actor?.id != null ? String(actor.id) : null;
   if (!sellerId) {
     return res.status(401).json({ ok:false, error:'auth_required' });
@@ -1065,34 +1090,40 @@ app.post('/api/bids', requireSeller, async (req, res) => {
   try {
     const unitPriceCents =
       toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
-    const currency = (b.currency ? String(b.currency) : 'KRW').toUpperCase();
+    const currency = (b.currency ? String(b.currency) : 'USD').toUpperCase();
+
+    await client.query('BEGIN');
     const fx = await enrichKRWDaily(client, currency, unitPriceCents);
-    const sql = `INSERT INTO public.bids
-      (purchase_request_id, seller_id, offer_brand, offer_code, offer_is_substitute,
-       offer_qty, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency,
-       lead_time_days, note, no_parcel, image_url, quote_valid_until, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,COALESCE($12,'KRW'),$13,$14,$15,$16,$17,'offered')
+    const sql = `INSERT INTO public.bids(
+        seller_id, purchase_request_id, offer_qty,
+        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+        currency, lead_time_days, note,
+        offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'offered')
       RETURNING *`;
     const params = [
-      b.pr_id || b.purchase_request_id || null,
-      sellerId || null,
+      sellerId,
+      b.purchase_request_id ? String(b.purchase_request_id) : (b.pr_id ? String(b.pr_id) : null),
+      toOptionalInteger(b.offer_qty, { min: 0 }) ?? 0,
+      unitPriceCents,
+      fx.krw_cents, fx.rate, fx.yyyymm, fx.src,
+      currency,
+      toOptionalInteger(b.lead_time_days, { min: 0 }),
+      b.note != null ? String(b.note) : null,
       b.offer_brand != null ? String(b.offer_brand) : null,
       b.offer_code != null ? String(b.offer_code) : null,
       b.offer_is_substitute === true || b.is_alternative === true,
-      toOptionalInteger(b.offer_qty, { min: 0 }) ?? 0,
-      unitPriceCents,
-      fx.krw_cents, fx.rate, fx.yyyymm, fx.src, currency,
-      toOptionalInteger(b.lead_time_days, { min: 0 }),
-      toOptionalTrimmed(b.note),
+      b.quote_valid_until ? String(b.quote_valid_until) : null,
       parseBooleanish(pickOwn(b, 'no_parcel', 'noParcel')) === true,
-      b.image_url != null ? String(b.image_url) : null,
-      b.quote_valid_until || null,
+      b.image_url ? String(b.image_url) : null,
     ];
     const r = await client.query(sql, params);
-    res.status(201).json({ ok: true, item: r.rows[0] });
+    await client.query('COMMIT');
+    return res.status(201).json({ ok: true, item: r.rows[0] });
   } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
     console.error(e);
-    res.status(400).json({ ok:false, error:String(e.message || e) });
+    return res.status(500).json({ ok:false, error:'db_error' });
   } finally {
     client.release();
   }

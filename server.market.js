@@ -7,6 +7,7 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const multer = require('multer');
 const XLSX = require('xlsx');
+const { Storage } = require('@google-cloud/storage');
 const { getPool } = require('./db');
 const { parseActor } = require('./src/utils/auth');
 const { requireSeller } = require('./auth.middleware');
@@ -18,6 +19,19 @@ app.use(bodyParser.json({ limit: '10mb' }));
 const pool = getPool();
 const query = (text, params) => pool.query(text, params);
 const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
+
+const storage = new Storage();
+const PRODUCT_ASSET_BUCKET = (() => {
+  const raw = process.env.GCS_PRODUCT_BUCKET
+    || process.env.ASSET_BUCKET
+    || process.env.GCS_BUCKET
+    || '';
+  if (!raw) return '';
+  const cleaned = String(raw).replace(/^gs:\/\//, '').trim();
+  const slash = cleaned.indexOf('/');
+  return slash >= 0 ? cleaned.slice(0, slash) : cleaned;
+})();
+const PRODUCT_ASSET_PREFIX = process.env.GCS_PRODUCT_PREFIX || 'seller-products';
 
 const EXIM_API = 'https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON';
 const FX_SET = new Set(['USD', 'JPY', 'CNY', 'CHF', 'KRW']);
@@ -140,6 +154,7 @@ const mapListingRow = (row = {}) => ({
   no_parcel: row.no_parcel === true,
   noParcel: row.no_parcel === true,
   image_url: row.image_url ?? null,
+  datasheet_url: row.datasheet_url ?? null,
   moq: row.moq ?? null,
   mpq: row.mpq ?? null,
   mpq_required_order: !!row.mpq_required_order,
@@ -173,6 +188,7 @@ const mapBidRow = (row = {}) => ({
   quote_valid_until: row.quote_valid_until ?? null,
   no_parcel: row.no_parcel === true,
   image_url: row.image_url ?? null,
+  datasheet_url: row.datasheet_url ?? null,
   packaging: row.packaging ?? null,
   part_type: row.part_type ?? null,
   mfg_year: row.mfg_year ?? null,
@@ -198,6 +214,41 @@ function pickOwn(obj, ...keys) {
     }
   }
   return undefined;
+}
+
+function safeSlug(value) {
+  if (value == null) return '';
+  return String(value)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .toLowerCase();
+}
+
+function resolveProductObjectPath({ brand, code, family, sellerId, kind, extension }) {
+  const safeExt = String(extension || '').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
+  const parts = [safeSlug(brand), safeSlug(code), safeSlug(family), safeSlug(sellerId)];
+  const suffix = kind === 'datasheet' ? 'datasheet' : 'photo';
+  parts.push(suffix);
+  const baseName = parts.filter(Boolean).join('_') || `asset_${suffix}`;
+  const ymd = ymdHyphenKST();
+  const prefix = PRODUCT_ASSET_PREFIX.replace(/\/+$/g, '').replace(/^\/+/, '') || 'seller-products';
+  return `${prefix}/${ymd}/${baseName}.${safeExt}`;
+}
+
+function guessFileExtension(file = {}) {
+  const original = typeof file.originalname === 'string' ? file.originalname : '';
+  const match = /\.([a-zA-Z0-9]{1,16})$/.exec(original.trim());
+  if (match) {
+    return match[1].toLowerCase();
+  }
+  const mime = typeof file.mimetype === 'string' ? file.mimetype.toLowerCase() : '';
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('image/')) return mime.split('/')[1]?.replace(/[^a-z0-9]/g, '') || 'img';
+  if (mime === 'text/plain') return 'txt';
+  return '';
 }
 
 function parseBooleanish(value) {
@@ -277,6 +328,64 @@ const LISTING_STATUS = new Set(['pending', 'active', 'soldout', 'archived', 'ina
 const BID_STATUS = new Set(['offered', 'accepted', 'rejected', 'withdrawn', 'active']);
 
 /* ---------------- Listings (정찰제/재고) ---------------- */
+
+app.post('/api/uploads/product', requireSeller, upload.single('file'), async (req, res) => {
+  try {
+    if (!PRODUCT_ASSET_BUCKET) {
+      return res.status(500).json({ ok: false, error: 'GCS_BUCKET_NOT_CONFIGURED' });
+    }
+    const actor = safeParseActor(req) || {};
+    const sellerId = actor?.id != null ? String(actor.id) : null;
+    if (!sellerId) {
+      return res.status(401).json({ ok: false, error: 'auth_required' });
+    }
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ ok: false, error: 'file_required' });
+    }
+
+    let meta = {};
+    if (typeof req.body?.meta === 'string') {
+      try {
+        meta = JSON.parse(req.body.meta);
+      } catch (_) {
+        meta = {};
+      }
+    } else if (req.body && typeof req.body === 'object') {
+      meta = req.body;
+    }
+
+    const brand = pickOwn(meta, 'brand', 'offer_brand') || pickOwn(req.body, 'brand');
+    const code = pickOwn(meta, 'code', 'offer_code', 'part_number') || pickOwn(req.body, 'code');
+    const family = pickOwn(meta, 'family', 'part_type', 'partType');
+    const kindRaw = pickOwn(meta, 'kind') || req.body?.kind;
+    const kind = String(kindRaw || 'photo').toLowerCase() === 'datasheet' ? 'datasheet' : 'photo';
+    const extension = guessFileExtension(req.file);
+    const objectPath = resolveProductObjectPath({
+      brand,
+      code,
+      family,
+      sellerId,
+      kind,
+      extension,
+    });
+
+    const bucket = storage.bucket(PRODUCT_ASSET_BUCKET);
+    const file = bucket.file(objectPath);
+    await file.save(req.file.buffer, {
+      resumable: false,
+      contentType: req.file.mimetype || 'application/octet-stream',
+      metadata: { cacheControl: 'public,max-age=31536000' },
+    });
+
+    const gcsUri = `gs://${PRODUCT_ASSET_BUCKET}/${objectPath}`;
+    const publicUrl = `https://storage.googleapis.com/${PRODUCT_ASSET_BUCKET}/${encodeURI(objectPath)}`;
+
+    return res.json({ ok: true, gcsUri, publicUrl, filename: objectPath.split('/').pop(), objectPath });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ ok: false, error: 'upload_failed' });
+  }
+});
 
 app.post('/api/fx/fetch-daily', async (req, res) => {
   try {
@@ -477,7 +586,7 @@ app.get('/api/listings', async (req, res) => {
     if (status) { args.push(status); where.push(`status = $${args.length}`); }
     const sql = `SELECT id, seller_id, brand, code, qty_available, unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src, currency, lead_time_days, moq, mpq, mpq_required_order, location, condition, packaging, note,
                        incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
-                       no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
+                       no_parcel, image_url, datasheet_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
                  FROM public.listings
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                  ORDER BY created_at DESC
@@ -574,6 +683,7 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       incomingQty2,
       noParcel,
       b.image_url != null ? String(b.image_url) : null,
+      b.datasheet_url != null ? String(b.datasheet_url) : null,
       LISTING_STATUS.has(String(b.status || '').toLowerCase()) ? String(b.status).toLowerCase() : 'pending',
       partType,
       hasMfgYear ? (mfgYear ?? null) : null,
@@ -584,22 +694,22 @@ app.post('/api/listings', requireSeller, async (req, res) => {
       unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
       currency, lead_time_days, location, condition, packaging, note,
       incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
-      no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at`;
+      no_parcel, image_url, datasheet_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at`;
     const insertSql = `INSERT INTO public.listings
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
        currency, lead_time_days, location, condition, packaging, note,
        incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
-       no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,COALESCE($26,'pending'),$27,$28,$29)
+       no_parcel, image_url, datasheet_url, status, part_type, mfg_year, is_over_2yrs)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,COALESCE($27,'pending'),$28,$29,$30)
       RETURNING ${returningColumns}`;
     const mergeSql = `INSERT INTO public.listings
       (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
        currency, lead_time_days, location, condition, packaging, note,
        incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
-       no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,COALESCE($26,'pending'),$27,$28,$29)
+       no_parcel, image_url, datasheet_url, status, part_type, mfg_year, is_over_2yrs)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,COALESCE($27,'pending'),$28,$29,$30)
       ON CONFLICT (seller_id, brand_norm, code_norm)
       DO UPDATE SET
         qty_available        = EXCLUDED.qty_available,
@@ -623,6 +733,7 @@ app.post('/api/listings', requireSeller, async (req, res) => {
         incoming_qty2        = EXCLUDED.incoming_qty2,
         no_parcel            = EXCLUDED.no_parcel,
         image_url            = EXCLUDED.image_url,
+        datasheet_url        = EXCLUDED.datasheet_url,
         status               = EXCLUDED.status,
         part_type            = EXCLUDED.part_type,
         mfg_year             = EXCLUDED.mfg_year,
@@ -670,7 +781,7 @@ app.get('/api/listings/:id', async (req, res) => {
       `SELECT id, tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order, unit_price_cents, currency, lead_time_days,
               location, condition, packaging, note,
               incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
-              no_parcel, image_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
+              no_parcel, image_url, datasheet_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at
          FROM public.listings WHERE id = $1 AND seller_id = $2`,
       [id, sellerId]
     );
@@ -815,6 +926,17 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
       params.push(img);
     }
 
+    if (has('datasheet_url')) {
+      const datasheet = body.datasheet_url != null ? String(body.datasheet_url) : null;
+      sets.push(`datasheet_url = $${params.length + 1}`);
+      params.push(datasheet);
+    }
+    if (has('datasheetUrl')) {
+      const datasheet = body.datasheetUrl != null ? String(body.datasheetUrl) : null;
+      sets.push(`datasheet_url = $${params.length + 1}`);
+      params.push(datasheet);
+    }
+
     if (has('part_type')) {
       sets.push(`part_type = $${params.length + 1}`);
       params.push(toOptionalTrimmed(body.part_type));
@@ -910,7 +1032,7 @@ app.patch('/api/listings/:id', requireSeller, async (req, res) => {
               unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
               currency, lead_time_days, location, condition, packaging, note,
               incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
-              no_parcel, image_url, status,
+              no_parcel, image_url, datasheet_url, status,
               part_type, mfg_year, is_over_2yrs, created_at, updated_at
          FROM public.listings
         WHERE id = $1 AND seller_id = $2`,
@@ -1093,7 +1215,7 @@ app.get('/api/bids', async (req, res) => {
       SELECT id, purchase_request_id, seller_id,
              unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
              currency, offer_qty, lead_time_days, note, status,
-             offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url,
+             offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
              packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
              created_at, updated_at
         FROM public.bids
@@ -1119,7 +1241,7 @@ app.get('/api/bids/:id', requireSeller, async (req, res) => {
       SELECT id, purchase_request_id, seller_id,
              unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
              currency, offer_qty, lead_time_days, note, status,
-             offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url,
+             offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
              packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
              created_at, updated_at
         FROM public.bids
@@ -1211,6 +1333,9 @@ app.patch('/api/bids/:id', requireSeller, async (req, res) => {
     if (Object.prototype.hasOwnProperty.call(b, 'image_url') || Object.prototype.hasOwnProperty.call(b, 'imageUrl')) {
       changes.image_url = toOptionalTrimmed(pickOwn(b, 'image_url', 'imageUrl'));
     }
+    if (Object.prototype.hasOwnProperty.call(b, 'datasheet_url') || Object.prototype.hasOwnProperty.call(b, 'datasheetUrl')) {
+      changes.datasheet_url = toOptionalTrimmed(pickOwn(b, 'datasheet_url', 'datasheetUrl'));
+    }
     if (Object.prototype.hasOwnProperty.call(b, 'packaging')) {
       changes.packaging = toOptionalTrimmed(b.packaging);
     }
@@ -1254,10 +1379,10 @@ app.patch('/api/bids/:id', requireSeller, async (req, res) => {
        RETURNING
          id, purchase_request_id, seller_id,
          unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-         currency, offer_qty, lead_time_days, note, status,
-         offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url,
-         packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
-         created_at, updated_at`;
+        currency, offer_qty, lead_time_days, note, status,
+        offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
+        packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
+        created_at, updated_at`;
     const r = await client.query(sql, args);
     return res.json({ ok: true, item: mapBidRow(r.rows[0]) });
   } catch (e) {
@@ -1274,22 +1399,12 @@ app.delete('/api/bids/:id', requireSeller, async (req, res) => {
   const actor = safeParseActor(req) || {};
   const sellerId = actor?.id != null ? String(actor.id) : null;
   if (!sellerId) return res.status(401).json({ ok: false, error: 'auth_required' });
-  const id = String(req.params.id);
-  const hard = String(req.query.hard || '').toLowerCase() === '1';
+  const id = String(req.params.id || '').trim();
+  if (!id) return res.status(400).json({ ok: false, error: 'id_required' });
   try {
-    if (hard) {
-      const r = await query(`DELETE FROM public.bids WHERE id = $1 AND seller_id = $2 RETURNING id`, [id, sellerId]);
-      if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
-      return res.json({ ok: true, deleted_id: id });
-    }
-    const r = await query(
-      `UPDATE public.bids SET status = 'withdrawn', updated_at = now()
-         WHERE id = $1 AND seller_id = $2
-         RETURNING id`,
-      [id, sellerId]
-    );
+    const r = await query(`DELETE FROM public.bids WHERE id = $1 AND seller_id = $2 RETURNING id`, [id, sellerId]);
     if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
-    return res.json({ ok: true, withdrawn_id: id });
+    return res.json({ ok: true, deleted_id: id });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ ok: false, error: 'db_error' });
@@ -1326,6 +1441,7 @@ app.post('/api/bids', async (req, res) => {
     const quoteValidUntil = toOptionalDateString(pickOwn(b, 'quote_valid_until', 'quoteValidUntil'));
     const noParcel = parseBooleanish(pickOwn(b, 'no_parcel', 'noParcel')) === true;
     const imageUrl = toOptionalTrimmed(pickOwn(b, 'image_url', 'imageUrl'));
+    const datasheetUrl = toOptionalTrimmed(pickOwn(b, 'datasheet_url', 'datasheetUrl'));
     const packaging = toOptionalTrimmed(b.packaging);
     const partType = toOptionalTrimmed(pickOwn(b, 'part_type', 'partType'));
     const mfgYear = toOptionalInteger(pickOwn(b, 'mfg_year', 'mfgYear'));
@@ -1339,7 +1455,7 @@ app.post('/api/bids', async (req, res) => {
       t, purchaseRequestId || null, sellerId,
       unitPriceCents, fx.krw_cents, fx.rate, fx.yyyymm, fx.src,
       currency, offerQty, leadTimeDays, note, status,
-      offerBrand, offerCode, offerIsSub, quoteValidUntil, noParcel, imageUrl,
+      offerBrand, offerCode, offerIsSub, quoteValidUntil, noParcel, imageUrl, datasheetUrl,
       packaging, partType, mfgYear, isOver2yrs, hasStock, manufacturedMonth, deliveryDate,
     ];
 
@@ -1347,7 +1463,7 @@ app.post('/api/bids', async (req, res) => {
       id, purchase_request_id, seller_id,
       unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
       currency, offer_qty, lead_time_days, note, status,
-      offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url,
+      offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
       packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
       created_at, updated_at`;
 
@@ -1356,14 +1472,14 @@ app.post('/api/bids', async (req, res) => {
         (tenant_id, purchase_request_id, seller_id,
          unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
          currency, offer_qty, lead_time_days, note, status,
-         offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url,
+         offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
          packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date)
       VALUES
         ($1,$2,$3,
          $4,$5,$6,$7,$8,
          $9,$10,$11,$12,$13,
-         $14,$15,$16,$17,$18,$19,
-         $20,$21,$22,$23,$24,$25,$26)
+         $14,$15,$16,$17,$18,$19,$20,
+         $21,$22,$23,$24,$25,$26,$27)
       RETURNING ${returning}`;
 
     const r = await query(insertSql, params);
@@ -1405,7 +1521,7 @@ app.get('/api/seller/items', async (req, res) => {
                         unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm,
                         unit_price_fx_src, currency, lead_time_days, status, note,
                         incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
-                        location, condition, packaging, no_parcel, image_url, moq, mpq, mpq_required_order,
+                        location, condition, packaging, no_parcel, image_url, datasheet_url, moq, mpq, mpq_required_order,
                         part_type, mfg_year, is_over_2yrs, created_at, updated_at
                  FROM public.listings
                  ${where.length ? 'WHERE ' + where.join(' AND ') : ''}

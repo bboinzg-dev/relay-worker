@@ -150,6 +150,40 @@ const mapListingRow = (row = {}) => ({
   updated_at: row.updated_at,
 });
 
+// bids 행 → 응답 JSON 정규화
+const mapBidRow = (row = {}) => ({
+  id: row.id,
+  purchase_request_id: row.purchase_request_id ?? null,
+  seller_id: row.seller_id ?? null,
+  unit_price_cents: row.unit_price_cents ?? 0,
+  unit_price: (row.unit_price_cents ?? 0) / 100,
+  unit_price_krw_cents: row.unit_price_krw_cents ?? null,
+  unit_price_krw: row.unit_price_krw_cents != null ? row.unit_price_krw_cents / 100 : null,
+  unit_price_fx_rate: row.unit_price_fx_rate ?? null,
+  unit_price_fx_yyyymm: row.unit_price_fx_yyyymm ?? null,
+  unit_price_fx_src: row.unit_price_fx_src ?? null,
+  currency: row.currency ?? null,
+  offer_qty: row.offer_qty ?? null,
+  lead_time_days: row.lead_time_days ?? null,
+  note: row.note ?? null,
+  status: row.status ?? 'offered',
+  offer_brand: row.offer_brand ?? null,
+  offer_code: row.offer_code ?? null,
+  offer_is_substitute: row.offer_is_substitute == null ? null : !!row.offer_is_substitute,
+  quote_valid_until: row.quote_valid_until ?? null,
+  no_parcel: row.no_parcel === true,
+  image_url: row.image_url ?? null,
+  packaging: row.packaging ?? null,
+  part_type: row.part_type ?? null,
+  mfg_year: row.mfg_year ?? null,
+  is_over_2yrs: row.is_over_2yrs == null ? null : !!row.is_over_2yrs,
+  has_stock: row.has_stock == null ? null : !!row.has_stock,
+  manufactured_month: row.manufactured_month ?? null,
+  delivery_date: row.delivery_date ?? null,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+});
+
 function pick(h, k) { return h[k] || h[k.toLowerCase()] || h[k.toUpperCase()] || undefined; }
 function getTenant(req) {
   // tenant via header (can be empty for single-tenant)
@@ -179,6 +213,17 @@ function toOptionalDateString(value) {
   const parsed = new Date(trimmed);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString().slice(0, 10);
+}
+
+// 'YYYY-MM' 또는 'YYYY-MM-DD' → 그 달 1일로 보정
+function toMonthStartDateString(value) {
+  const s = toOptionalTrimmed(value);
+  if (!s) return null;
+  const m = /^(\d{4})-(\d{2})(?:-(\d{2}))?$/.exec(s);
+  if (!m) return toOptionalDateString(value);
+  const yyyy = Number(m[1]); const mm = Number(m[2]);
+  if (!Number.isInteger(yyyy) || mm < 1 || mm > 12) return null;
+  return `${m[1]}-${m[2]}-01`;
 }
 
 function parseBooleanish(value) {
@@ -1012,40 +1057,41 @@ app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
 
 /* ---------------- Bids ---------------- */
 
+// GET /api/bids?mine=1&pr_id=...&status=...&limit=50
 app.get('/api/bids', async (req, res) => {
   try {
     const actor = parseActor(req);
     const mine = String(req.query.mine || '').toLowerCase();
     const isMine = mine === '1' || mine === 'true';
-    const sellerId = isMine
-      ? (actor?.id != null ? String(actor.id) : '')
-      : (req.query.seller_id != null ? String(req.query.seller_id) : null);
-    if (isMine && !sellerId) {
-      return res.json({ ok: true, items: [] });
-    }
-    const prId = (req.query.pr_id || '').toString() || null;
-    const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 200);
+    const sellerId = isMine ? (actor?.id != null ? String(actor.id) : '') : (req.query.seller_id != null ? String(req.query.seller_id) : null);
+    if (isMine && !sellerId) return res.json({ ok: true, items: [] });
+
+    const prId = (req.query.pr_id || req.query.purchase_request_id || '').toString();
+    const status = (req.query.status || '').toString().trim();
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10) || 50, 1), 200);
 
     const where = [];
     const args = [];
     if (sellerId) { args.push(sellerId); where.push(`seller_id = $${args.length}`); }
     if (prId)     { args.push(prId);     where.push(`purchase_request_id = $${args.length}`); }
+    if (status)   { args.push(status);   where.push(`status = $${args.length}`); }
 
     const sql = `
-      SELECT id, seller_id, purchase_request_id, offer_qty,
+      SELECT id, purchase_request_id, seller_id,
              unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-             currency, lead_time_days, note, status,
-             offer_brand, offer_code, offer_is_substitute, quote_valid_until,
-             no_parcel, image_url, created_at, updated_at
+             currency, offer_qty, lead_time_days, note, status,
+             offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url,
+             packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
+             created_at, updated_at
         FROM public.bids
-       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-       ORDER BY created_at DESC
-       LIMIT ${limit}`;
-    const { rows } = await query(sql, args);
-    return res.json({ ok: true, items: rows });
+        ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+        ORDER BY created_at DESC
+        LIMIT ${limit}`;
+    const r = await query(sql, args);
+    res.json({ ok: true, items: r.rows.map(mapBidRow) });
   } catch (e) {
     console.error(e);
-    return res.status(400).json({ ok:false, error:String(e.message || e) });
+    res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
 
@@ -1149,55 +1195,82 @@ app.get('/api/seller/docs-requests', async (_req, res) => {
   res.json({ ok: true, items: [] });
 });
 
+// POST /api/bids  (seller 전용)
 app.post('/api/bids', requireSeller, async (req, res) => {
-  const b = req.body || {};
   const actor = parseActor(req) || {};
+  const t = getTenant(req);
+  const b = req.body || {};
   const sellerId = actor?.id != null ? String(actor.id) : null;
-  if (!sellerId) {
-    return res.status(401).json({ ok:false, error:'auth_required' });
-  }
+  if (!sellerId) return res.status(401).json({ ok: false, error: 'auth_required' });
+
   const client = await pool.connect();
   try {
-    const unitPriceCents =
-      toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
+    const purchaseRequestId = toOptionalTrimmed(pickOwn(b, 'purchase_request_id', 'pr_id', 'prId'));
+    const offerQty = toOptionalInteger(pickOwn(b, 'offer_qty', 'offer_quantity'), { min: 0 });
     const currency = (b.currency ? String(b.currency) : 'USD').toUpperCase();
-
-    await client.query('BEGIN');
+    const unitPriceCents = toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
     const fx = await enrichKRWDaily(client, currency, unitPriceCents);
-    const requestedStatus = toOptionalTrimmed(b.status);
-    const normalizedStatus = requestedStatus ? requestedStatus.toLowerCase() : '';
-    const status = BID_STATUS.has(normalizedStatus) ? normalizedStatus : 'offered';
-    const sql = `INSERT INTO public.bids(
-        seller_id, purchase_request_id, offer_qty,
-        unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-        currency, lead_time_days, note,
-        offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-      RETURNING *`;
+    let leadTimeDays = toOptionalInteger(b.lead_time_days, { min: 0 });
+    if (leadTimeDays == null) leadTimeDays = null;
+
+    const note = toOptionalTrimmed(b.note);
+    let status = toOptionalTrimmed(b.status);
+    status = status && BID_STATUS.has(status.toLowerCase()) ? status.toLowerCase() : 'offered';
+
+    const offerBrand = toOptionalTrimmed(pickOwn(b, 'offer_brand', 'brand'));
+    const offerCode  = toOptionalTrimmed(pickOwn(b, 'offer_code',  'code'));
+    const offerIsSub = parseBooleanish(pickOwn(b, 'is_alternative', 'offer_is_substitute')) === true;
+    const quoteValidUntil = toOptionalDateString(pickOwn(b, 'quote_valid_until', 'quoteValidUntil'));
+    const noParcel = parseBooleanish(pickOwn(b, 'no_parcel', 'noParcel')) === true;
+    const imageUrl = toOptionalTrimmed(pickOwn(b, 'image_url', 'imageUrl'));
+
+    // 견적 탭 확장 필드
+    const packaging = toOptionalTrimmed(b.packaging);
+    const partType  = toOptionalTrimmed(pickOwn(b, 'part_type', 'partType'));
+    const mfgYear   = toOptionalInteger(pickOwn(b, 'mfg_year', 'mfgYear'));
+    const isOver2yrs = parseBooleanish(pickOwn(b, 'is_over_2yrs', 'isOverTwoYears'));
+
+    // PR 응답 확장 필드
+    const hasStock = parseBooleanish(pickOwn(b, 'has_stock', 'hasStock'));
+    const manufacturedMonth = toMonthStartDateString(pickOwn(b, 'manufactured_month', 'manufacturedMonth'));
+    const deliveryDate = toOptionalDateString(pickOwn(b, 'delivery_date', 'deliveryDate'));
+
     const params = [
-      sellerId,
-      b.purchase_request_id ? String(b.purchase_request_id) : (b.pr_id ? String(b.pr_id) : null),
-      toOptionalInteger(b.offer_qty, { min: 0 }) ?? 0,
-      unitPriceCents,
-      fx.krw_cents, fx.rate, fx.yyyymm, fx.src,
-      currency,
-      toOptionalInteger(b.lead_time_days, { min: 0 }),
-      b.note != null ? String(b.note) : null,
-      b.offer_brand != null ? String(b.offer_brand) : null,
-      b.offer_code != null ? String(b.offer_code) : null,
-      b.offer_is_substitute === true || b.is_alternative === true,
-      b.quote_valid_until ? String(b.quote_valid_until) : null,
-      parseBooleanish(pickOwn(b, 'no_parcel', 'noParcel')) === true,
-      b.image_url ? String(b.image_url) : null,
-      status,
+      t, purchaseRequestId || null, sellerId,
+      unitPriceCents, fx.krw_cents, fx.rate, fx.yyyymm, fx.src,
+      currency, offerQty, leadTimeDays, note, status,
+      offerBrand, offerCode, offerIsSub, quoteValidUntil, noParcel, imageUrl,
+      packaging, partType, mfgYear, isOver2yrs, hasStock, manufacturedMonth, deliveryDate,
     ];
-    const r = await client.query(sql, params);
-    await client.query('COMMIT');
-    return res.status(201).json({ ok: true, item: r.rows[0] });
+
+    const returning = `
+      id, purchase_request_id, seller_id,
+      unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+      currency, offer_qty, lead_time_days, note, status,
+      offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url,
+      packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
+      created_at, updated_at`;
+
+    const insertSql = `
+      INSERT INTO public.bids
+        (tenant_id, purchase_request_id, seller_id,
+         unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+         currency, offer_qty, lead_time_days, note, status,
+         offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url,
+         packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date)
+      VALUES
+        ($1,$2,$3,
+         $4,$5,$6,$7,$8,
+         $9,$10,$11,$12,$13,
+         $14,$15,$16,$17,$18,$19,
+         $20,$21,$22,$23,$24,$25,$26)
+      RETURNING ${returning}`;
+
+    const r = await client.query(insertSql, params);
+    res.status(201).json({ ok: true, item: mapBidRow(r.rows[0]), actor_id: sellerId });
   } catch (e) {
-    try { await client.query('ROLLBACK'); } catch {}
     console.error(e);
-    return res.status(500).json({ ok:false, error:'db_error' });
+    res.status(500).json({ ok: false, error: 'db_error' });
   } finally {
     client.release();
   }

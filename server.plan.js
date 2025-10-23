@@ -187,7 +187,19 @@ app.post('/api/purchase-plans', async (req, res) => {
   try {
     const actor = parseActor(req);
     if (!actor?.id) return res.status(401).json({ error: 'auth required' });
-    const body = req.body || {};
+    const raw = req.body || {};
+    const body = raw && raw.item ? {
+      month: raw.month,
+      manufacturer: raw.item.manufacturer,
+      part_number: raw.item.partNumber,
+      category: raw.item.category,
+      required_qty: raw.item.requiredQty,
+      moq: raw.item.moq,
+      quote_deadline: raw.item.quoteDeadline,
+      delivery_deadline: raw.item.deliveryDeadline,
+      plan_title: raw.plan_title || raw.title,
+      plan_notes: raw.plan_notes || raw.notes,
+    } : raw;
     const month = normalizeMonth(body.period_month || body.month);
     if (!body.manufacturer || !body.part_number) {
       return res.status(400).json({ error: 'manufacturer & part_number required' });

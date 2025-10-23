@@ -1171,12 +1171,12 @@ app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
     await client.query('BEGIN');
     const PR = (await client.query(`SELECT * FROM public.purchase_requests WHERE id=$1 FOR UPDATE`, [prId])).rows[0];
     if (!PR) throw new Error('PR not found');
-    const BID = (await client.query(`SELECT * FROM public.bids WHERE id=$1 AND purchase_request_id=$2 FOR UPDATE`, [bidId, prId])).rows[0];
+    const BID = (await client.query(`SELECT * FROM public.plan_bids WHERE id=$1 AND purchase_request_id=$2 FOR UPDATE`, [bidId, prId])).rows[0];
     if (!BID) throw new Error('bid not found');
     const remaining = Number(PR.qty_required) - Number(PR.qty_confirmed);
     if (confirmQty > remaining) throw new Error('confirm exceeds remaining');
 
-    await client.query(`UPDATE public.bids SET status='accepted', updated_at=now() WHERE id=$1`, [bidId]);
+    await client.query(`UPDATE public.plan_bids SET status='accepted', updated_at=now() WHERE id=$1`, [bidId]);
     const newConfirmed = Number(PR.qty_confirmed) + confirmQty;
     const newStatus = newConfirmed >= Number(PR.qty_required) ? 'fulfilled' : 'partial';
     await client.query(`UPDATE public.purchase_requests SET qty_confirmed=$2, status=$3 WHERE id=$1`, [prId, newConfirmed, newStatus]);
@@ -1218,7 +1218,7 @@ app.get('/api/bids', async (req, res) => {
              offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
              packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
              created_at, updated_at
-        FROM public.bids
+        FROM public.plan_bids
         ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
         ORDER BY created_at DESC
         LIMIT ${limit}`;
@@ -1244,7 +1244,7 @@ app.get('/api/bids/:id', requireSeller, async (req, res) => {
              offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
              packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
              created_at, updated_at
-        FROM public.bids
+        FROM public.plan_bids
        WHERE id = $1 AND seller_id = $2
        LIMIT 1`;
     const r = await query(sql, [id, sellerId]);
@@ -1266,7 +1266,7 @@ app.patch('/api/bids/:id', requireSeller, async (req, res) => {
   const client = await pool.connect();
   try {
     const cur = await client.query(
-      `SELECT * FROM public.bids WHERE id = $1 AND seller_id = $2 LIMIT 1`,
+      `SELECT * FROM public.plan_bids WHERE id = $1 AND seller_id = $2 LIMIT 1`,
       [id, sellerId]
     );
     if (!cur.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
@@ -1373,7 +1373,7 @@ app.patch('/api/bids/:id', requireSeller, async (req, res) => {
     args.push(id);
     args.push(sellerId);
     const sql = `
-      UPDATE public.bids
+      UPDATE public.plan_bids
          SET ${sets.join(', ')}, updated_at = now()
        WHERE id = $${++n} AND seller_id = $${++n}
        RETURNING
@@ -1402,7 +1402,7 @@ app.delete('/api/bids/:id', requireSeller, async (req, res) => {
   const id = String(req.params.id || '').trim();
   if (!id) return res.status(400).json({ ok: false, error: 'id_required' });
   try {
-    const r = await query(`DELETE FROM public.bids WHERE id = $1 AND seller_id = $2 RETURNING id`, [id, sellerId]);
+    const r = await query(`DELETE FROM public.plan_bids WHERE id = $1 AND seller_id = $2 RETURNING id`, [id, sellerId]);
     if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
     return res.json({ ok: true, deleted_id: id });
   } catch (e) {
@@ -1468,7 +1468,7 @@ app.post('/api/bids', async (req, res) => {
       created_at, updated_at`;
 
     const insertSql = `
-      INSERT INTO public.bids
+      INSERT INTO public.plan_bids
         (tenant_id, purchase_request_id, seller_id,
          unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
          currency, offer_qty, lead_time_days, note, status,

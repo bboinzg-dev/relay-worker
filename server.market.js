@@ -287,6 +287,16 @@ function toCents(value) {
   return Math.round(n * 100);
 }
 
+function yn(v) {
+  return /^y|1|true$/i.test(String(v || '').trim());
+}
+
+function U(s) {
+  if (s == null) return null;
+  const trimmed = String(s).trim();
+  return trimmed ? trimmed : null;
+}
+
 // 'YYYY-MM' 또는 'YYYY-MM-DD' → 그 달 1일로 보정
 function toMonthStartDateString(value) {
   const s = toOptionalTrimmed(value);
@@ -607,164 +617,68 @@ app.get('/api/listings', async (req, res) => {
   } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
 });
 
-// POST /api/listings  (seller 전용)
-app.post('/api/listings', requireSeller, async (req, res) => {
-  const actor = parseActor(req) || {};
-  const t = getTenant(req);
-  const b = req.body || {};
-  const merge = b.merge === true || b.merge === 'true';
-  const sellerId = actor?.id != null ? String(actor.id) : null;
-  if (!sellerId) {
-    return res.status(401).json({ ok: false, error: 'auth_required' });
-  }
-  const client = await pool.connect();
+// POST /api/listings (seller 전용)
+app.post('/api/listings', async (req, res) => {
   try {
-    if (!b.brand || !b.code) {
-      return res.status(400).json({ error: 'brand, code required' });
-    }
-    const unitPriceCents =
-      toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
-    const currency = (b.currency ? String(b.currency) : 'USD').toUpperCase();
-    const fx = await enrichKRWDaily(client, currency, unitPriceCents);
-    const quantityInput =
-      b.quantity_available != null && b.quantity_available !== ''
-        ? b.quantity_available
-        : b.qty_available;
-    const partType = toOptionalTrimmed(b.part_type);
-    let leadTimeDays = toOptionalInteger(b.lead_time_days, { min: 0 });
-    if (leadTimeDays == null) leadTimeDays = 2;
-
-    let hasMfgYear = Object.prototype.hasOwnProperty.call(b, 'mfg_year');
-    let mfgYear = hasMfgYear ? toOptionalInteger(b.mfg_year) : undefined;
-
-    let hasIsOver2yrs = Object.prototype.hasOwnProperty.call(b, 'is_over_2yrs');
-    let isOver2yrs = hasIsOver2yrs ? parseBooleanish(b.is_over_2yrs) : null;
-    if (isOver2yrs === undefined) isOver2yrs = null;
-
-    const nowYear = currentKSTYear();
-    if (hasIsOver2yrs && isOver2yrs === true && !hasMfgYear) {
-      mfgYear = nowYear - 2;
-      hasMfgYear = true;
-    }
-    if (hasMfgYear && mfgYear != null && !hasIsOver2yrs) {
-      isOver2yrs = nowYear - mfgYear >= 2;
-      hasIsOver2yrs = true;
+    const actor = parseActor(req);
+    if (!actor?.id) {
+      return res.status(401).json({ ok: false, error: 'auth' });
     }
 
-    const noParcel = parseBooleanish(pickOwn(b, 'no_parcel', 'noParcel')) === true;
-    const incomingSchedule1 = toOptionalDateString(pickOwn(b, 'incoming_schedule1', 'incomingSchedule1', 'incomingDate1'));
-    const incomingQty1 = toOptionalInteger(pickOwn(b, 'incoming_qty1', 'incomingQty1'), { min: 0 });
-    const incomingSchedule2 = toOptionalDateString(pickOwn(b, 'incoming_schedule2', 'incomingSchedule2', 'incomingDate2'));
-    const incomingQty2 = toOptionalInteger(pickOwn(b, 'incoming_qty2', 'incomingQty2'), { min: 0 });
-
-    const params = [
-      t,
-      sellerId,
-      String(b.brand),
-      String(b.code),
-      toOptionalInteger(quantityInput, { min: 0 }) ?? 0,
-      toOptionalInteger(b.moq, { min: 0 }),
-      toOptionalInteger(b.mpq, { min: 0 }),
-      !!b.mpq_required_order,
-      unitPriceCents,
-      fx.krw_cents,
-      fx.rate,
-      fx.yyyymm,
-      fx.src,
-      currency,
-      leadTimeDays,
-      b.location != null ? String(b.location) : null,
-      b.condition != null ? String(b.condition) : null,
-      b.packaging != null ? String(b.packaging) : null,
-      b.note != null ? String(b.note) : null,
-      incomingSchedule1,
-      incomingQty1,
-      incomingSchedule2,
-      incomingQty2,
-      noParcel,
-      b.image_url != null ? String(b.image_url) : null,
-      b.datasheet_url != null ? String(b.datasheet_url) : null,
-      LISTING_STATUS.has(String(b.status || '').toLowerCase()) ? String(b.status).toLowerCase() : 'pending',
-      partType,
-      hasMfgYear ? (mfgYear ?? null) : null,
-      hasIsOver2yrs ? isOver2yrs : null,
+    const tenantId = actor?.tenantId ?? actor?.tenant_id ?? null;
+    const b = req.body || {};
+    const sql = `
+      INSERT INTO public.listings
+        (tenant_id, seller_id, brand, code,
+         qty_available, moq, mpq, mpq_required_order,
+         unit_price_cents, currency, lead_time_days,
+         location, condition, packaging, note, status,
+         no_parcel, image_url, incoming_schedule1, incoming_qty1,
+         incoming_schedule2, incoming_qty2, datasheet_url,
+         part_type, mfg_year, is_over_2yrs)
+      VALUES
+        ($1,$2,$3,$4,
+         $5,$6,$7,$8,
+         $9, upper($10), $11,
+         $12,$13,$14,$15, COALESCE($16,'pending'),
+         $17,$18,$19,$20,
+         $21,$22,$23,
+         $24,$25,$26)
+      RETURNING id`;
+    const vals = [
+      tenantId,
+      String(actor.id),
+      U(b.brand),
+      U(b.code),
+      Number(b.qty_available || 0),
+      U(b.moq),
+      U(b.mpq),
+      yn(b.mpq_required_order),
+      toCents(b.unit_price),
+      b.currency,
+      U(b.lead_time_days),
+      U(b.location),
+      U(b.condition),
+      U(b.packaging),
+      U(b.note),
+      U(b.status),
+      yn(b.no_parcel),
+      U(b.image_url),
+      U(b.incoming_schedule1),
+      U(b.incoming_qty1),
+      U(b.incoming_schedule2),
+      U(b.incoming_qty2),
+      U(b.datasheet_url),
+      U(b.part_type),
+      U(b.mfg_year),
+      yn(b.is_over_2yrs),
     ];
-    const returningColumns = `
-      id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
-      unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-      currency, lead_time_days, location, condition, packaging, note,
-      incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
-      no_parcel, image_url, datasheet_url, status, part_type, mfg_year, is_over_2yrs, created_at, updated_at`;
-    const insertSql = `INSERT INTO public.listings
-      (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
-       unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-       currency, lead_time_days, location, condition, packaging, note,
-       incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
-       no_parcel, image_url, datasheet_url, status, part_type, mfg_year, is_over_2yrs)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,COALESCE($27,'pending'),$28,$29,$30)
-      RETURNING ${returningColumns}`;
-    const mergeSql = `INSERT INTO public.listings
-      (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
-       unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-       currency, lead_time_days, location, condition, packaging, note,
-       incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2,
-       no_parcel, image_url, datasheet_url, status, part_type, mfg_year, is_over_2yrs)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,COALESCE($14,'USD'),$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,COALESCE($27,'pending'),$28,$29,$30)
-      ON CONFLICT (seller_id, brand_norm, code_norm)
-      DO UPDATE SET
-        qty_available        = EXCLUDED.qty_available,
-        moq                  = EXCLUDED.moq,
-        mpq                  = EXCLUDED.mpq,
-        mpq_required_order   = EXCLUDED.mpq_required_order,
-        unit_price_cents     = EXCLUDED.unit_price_cents,
-        unit_price_krw_cents = EXCLUDED.unit_price_krw_cents,
-        unit_price_fx_rate   = EXCLUDED.unit_price_fx_rate,
-        unit_price_fx_yyyymm = EXCLUDED.unit_price_fx_yyyymm,
-        unit_price_fx_src    = EXCLUDED.unit_price_fx_src,
-        currency             = EXCLUDED.currency,
-        lead_time_days       = EXCLUDED.lead_time_days,
-        location             = EXCLUDED.location,
-        condition            = EXCLUDED.condition,
-        packaging            = EXCLUDED.packaging,
-        note                 = EXCLUDED.note,
-        incoming_schedule1   = EXCLUDED.incoming_schedule1,
-        incoming_qty1        = EXCLUDED.incoming_qty1,
-        incoming_schedule2   = EXCLUDED.incoming_schedule2,
-        incoming_qty2        = EXCLUDED.incoming_qty2,
-        no_parcel            = EXCLUDED.no_parcel,
-        image_url            = EXCLUDED.image_url,
-        datasheet_url        = EXCLUDED.datasheet_url,
-        status               = EXCLUDED.status,
-        part_type            = EXCLUDED.part_type,
-        mfg_year             = EXCLUDED.mfg_year,
-        is_over_2yrs         = EXCLUDED.is_over_2yrs,
-        updated_at           = now()
-      RETURNING ${returningColumns}`;
-    const sql = merge ? mergeSql : insertSql;
-    const r = await client.query(sql, params);
-    res.status(201).json({ ok: true, item: mapListingRow(r.rows[0]), actor_id: sellerId });
+    const r = await query(sql, vals);
+    return res.json({ ok: true, id: r.rows[0]?.id });
   } catch (e) {
-    if (e?.code === '23505' && e?.constraint === 'ux_listings_seller_brand_code') {
-      const sellerKey = String(sellerId);
-      const brandKey = String(b.brand || '');
-      const codeKey = String(b.code || '');
-      try {
-        const { rows } = await client.query(
-          `SELECT id FROM public.listings
-            WHERE seller_id = $1 AND brand_norm = lower($2) AND code_norm = lower($3)
-            ORDER BY created_at DESC LIMIT 1`,
-          [sellerKey, brandKey, codeKey]
-        );
-        const exists = rows?.[0]?.id || null;
-        return res.status(409).json({ ok: false, error: 'duplicate_listing', id: exists });
-      } catch (_) {
-        return res.status(409).json({ ok: false, error: 'duplicate_listing' });
-      }
-    }
     console.error(e);
-    res.status(500).json({ ok: false, error: 'db_error' });
+    return res.status(500).json({ ok: false, error: 'db_error' });
   }
-  finally { client.release(); }
 });
 
 // GET /api/listings/:id – 단건 조회
@@ -1415,75 +1329,54 @@ app.get('/api/seller/docs-requests', async (_req, res) => {
   res.json({ ok: true, items: [] });
 });
 
-// POST /api/bids  (seller 전용)
+// POST /api/bids (seller 전용)
 app.post('/api/bids', async (req, res) => {
-  const actor = safeParseActor(req) || {};
-  const sellerId = actor?.id != null ? String(actor.id) : null;
-  if (!sellerId) return res.status(401).json({ ok: false, error: 'auth_required' });
   try {
-    const t = safeGetTenant(req);
+    const actor = parseActor(req);
+    if (!actor?.id) {
+      return res.status(401).json({ ok: false, error: 'auth' });
+    }
+
     const b = req.body || {};
-
-    const purchaseRequestId = toOptionalTrimmed(pickOwn(b, 'purchase_request_id', 'pr_id', 'prId'));
-    const offerQty = toOptionalInteger(pickOwn(b, 'offer_qty', 'offer_quantity'), { min: 0 });
-    const currency = (b.currency ? String(b.currency) : 'USD').toUpperCase();
-    const unitPriceCents = toCents(b.unit_price) ?? toOptionalInteger(b.unit_price_cents, { min: 0 }) ?? 0;
-    const fx = await fxHelper(null, currency, unitPriceCents);
-    let leadTimeDays = toOptionalInteger(b.lead_time_days, { min: 0 });
-    if (leadTimeDays == null) leadTimeDays = null;
-    const note = toOptionalTrimmed(b.note);
-    let status = toOptionalTrimmed(b.status);
-    status = status && BID_STATUS.has(status.toLowerCase()) ? status.toLowerCase() : 'offered';
-
-    const offerBrand = toOptionalTrimmed(pickOwn(b, 'offer_brand', 'brand'));
-    const offerCode = toOptionalTrimmed(pickOwn(b, 'offer_code', 'code'));
-    const offerIsSub = parseBooleanish(pickOwn(b, 'is_alternative', 'offer_is_substitute')) === true;
-    const quoteValidUntil = toOptionalDateString(pickOwn(b, 'quote_valid_until', 'quoteValidUntil'));
-    const noParcel = parseBooleanish(pickOwn(b, 'no_parcel', 'noParcel')) === true;
-    const imageUrl = toOptionalTrimmed(pickOwn(b, 'image_url', 'imageUrl'));
-    const datasheetUrl = toOptionalTrimmed(pickOwn(b, 'datasheet_url', 'datasheetUrl'));
-    const packaging = toOptionalTrimmed(b.packaging);
-    const partType = toOptionalTrimmed(pickOwn(b, 'part_type', 'partType'));
-    const mfgYear = toOptionalInteger(pickOwn(b, 'mfg_year', 'mfgYear'));
-    const isOver2yrs = parseBooleanish(pickOwn(b, 'is_over_2yrs', 'isOverTwoYears'));
-
-    const hasStock = parseBooleanish(pickOwn(b, 'has_stock', 'hasStock'));
-    const manufacturedMonth = toMonthStartDateString(pickOwn(b, 'manufactured_month', 'manufacturedMonth'));
-    const deliveryDate = toOptionalDateString(pickOwn(b, 'delivery_date', 'deliveryDate'));
-
-    const params = [
-      t, purchaseRequestId || null, sellerId,
-      unitPriceCents, fx.krw_cents, fx.rate, fx.yyyymm, fx.src,
-      currency, offerQty, leadTimeDays, note, status,
-      offerBrand, offerCode, offerIsSub, quoteValidUntil, noParcel, imageUrl, datasheetUrl,
-      packaging, partType, mfgYear, isOver2yrs, hasStock, manufacturedMonth, deliveryDate,
-    ];
-
-    const returning = `
-      id, purchase_request_id, seller_id,
-      unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-      currency, offer_qty, lead_time_days, note, status,
-      offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
-      packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
-      created_at, updated_at`;
-
-    const insertSql = `
-      INSERT INTO public.plan_bids
-        (tenant_id, purchase_request_id, seller_id,
-         unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-         currency, offer_qty, lead_time_days, note, status,
-         offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
-         packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date)
+    const sql = `
+      INSERT INTO public.bids
+        (seller_id, purchase_request_id,
+         offer_qty, unit_price_cents, currency, lead_time_days, note,
+         offer_brand, offer_code, offer_is_substitute, quote_valid_until,
+         no_parcel, image_url, packaging, part_type, mfg_year, is_over_2yrs,
+         has_stock, manufactured_month, delivery_date, datasheet_url, status)
       VALUES
-        ($1,$2,$3,
-         $4,$5,$6,$7,$8,
-         $9,$10,$11,$12,$13,
-         $14,$15,$16,$17,$18,$19,$20,
-         $21,$22,$23,$24,$25,$26,$27)
-      RETURNING ${returning}`;
-
-    const r = await query(insertSql, params);
-    return res.status(201).json({ ok: true, item: mapBidRow(r.rows[0]), actor_id: sellerId });
+        ($1, $2,
+         $3, $4, upper($5), $6, $7,
+         $8, $9, $10, $11,
+         $12, $13, $14, $15, $16, $17,
+         $18, $19, $20, $21, 'offered')
+      RETURNING id`;
+    const vals = [
+      String(actor.id),
+      U(b.purchase_request_id),
+      Number(b.offer_qty || 0),
+      toCents(b.unit_price),
+      b.currency,
+      U(b.lead_time_days),
+      U(b.note),
+      U(b.brand),
+      U(b.code),
+      yn(b.offer_is_substitute),
+      U(b.quote_valid_until),
+      yn(b.no_parcel),
+      U(b.image_url),
+      U(b.packaging),
+      U(b.part_type),
+      U(b.mfg_year),
+      yn(b.is_over_2yrs),
+      yn(b.has_stock),
+      U(b.manufactured_month),
+      U(b.delivery_date),
+      U(b.datasheet_url),
+    ];
+    const r = await query(sql, vals);
+    return res.json({ ok: true, id: r.rows[0]?.id });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ ok: false, error: 'db_error' });
@@ -1543,7 +1436,8 @@ app.get('/api/seller/items', async (req, res) => {
 app.post('/api/import/seller-items', upload.single('file'), async (req, res) => {
   try {
     const buf = req.file?.buffer;
-    const kind = String(req.body?.kind || 'stock');
+    const kind = String(req.body?.kind || 'stock').toLowerCase();
+    const auto = String(req.body?.mode || 'auto').toLowerCase() === 'auto';
     if (!buf) return res.status(400).json({ ok: false, error: 'file_required' });
 
     const wb = XLSX.read(buf, { type: 'buffer' });
@@ -1580,7 +1474,7 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
       image_url: idx(['image_url', 'image url', 'image', '이미지']),
     };
 
-    const data = [];
+    const items = [];
     for (let r = 1; r < rows.length; r++) {
       const row = rows[r] || [];
       const brand = map.brand >= 0 ? row[map.brand] : row[0];
@@ -1633,7 +1527,7 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
       };
 
       if (kind === 'quote') {
-        data.push({
+        items.push({
           ...base,
           offer_qty:
             map.offer_qty >= 0
@@ -1647,7 +1541,7 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
           image_url: imageUrl || null,
         });
       } else {
-        data.push({
+        items.push({
           ...base,
           qty_available:
             map.qty >= 0
@@ -1658,101 +1552,113 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
       }
     }
 
-    if (String(req.body?.mode || '').toLowerCase() === 'auto' && data.length) {
-      const actor = safeParseActor(req) || {};
-      const sellerId = actor?.id != null ? String(actor.id) : null;
-      if (!sellerId) {
-        return res.status(401).json({ ok: false, error: 'auth_required' });
-      }
-
-      const client = await pool.connect();
-      let committed = 0;
-      try {
-        await client.query('BEGIN');
-        for (const it of data) {
-          const cents = Math.round(Number(it.unit_price || 0) * 100);
-          const curr = String(it.currency || 'KRW').toUpperCase();
-          const fx = await fxHelper(client, curr, cents);
-
-          if (kind === 'stock') {
-            const status =
-              typeof it.status === 'string' && LISTING_STATUS.has(it.status)
-                ? it.status
-                : 'pending';
-            await client.query(
-              `INSERT INTO public.listings
-               (tenant_id, seller_id, brand, code, qty_available, moq, mpq,
-                unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-                currency, lead_time_days, location, condition, packaging, note, status, no_parcel)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13,'USD'),$14,$15,$16,$17,$18,COALESCE($19,'pending'),$20)`,
-              [
-                actor.tenant_id || null,
-                sellerId,
-                it.brand,
-                it.code,
-                it.qty_available || 0,
-                it.moq || null,
-                it.mpq || null,
-                cents,
-                fx.krw_cents,
-                fx.rate,
-                fx.yyyymm,
-                fx.src,
-                curr,
-                it.lead_time_days || null,
-                it.location || null,
-                it.condition || null,
-                it.packaging || null,
-                it.note || null,
-                status,
-                it.no_parcel === true,
-              ]
-            );
-          } else {
-            await client.query(
-              `INSERT INTO public.bids(
-                 seller_id, purchase_request_id, offer_qty,
-                 unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-                 currency, lead_time_days, note,
-                 offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, status)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'offered')`,
-              [
-                sellerId,
-                it.purchase_request_id || null,
-                it.offer_qty || 0,
-                cents,
-                fx.krw_cents,
-                fx.rate,
-                fx.yyyymm,
-                fx.src,
-                curr,
-                it.lead_time_days || null,
-                it.note || null,
-                it.brand,
-                it.code,
-                !!it.offer_is_substitute,
-                toOptionalDateString(it.quote_valid_until),
-                it.no_parcel === true,
-                it.image_url || null,
-              ]
-            );
-          }
-          committed += 1;
-        }
-        await client.query('COMMIT');
-        return res.json({ ok: true, committed, items: data });
-      } catch (e) {
-        try {
-          await client.query('ROLLBACK');
-        } catch (_) {}
-        console.error(e);
-        return res.status(500).json({ ok: false, error: 'commit_failed' });
-      } finally {
-        client.release();
-      }
+    if (!auto || !items.length) {
+      return res.json({ ok: true, items });
     }
 
-    res.json({ ok: true, items: data });
+    const actor = parseActor(req);
+    if (!actor?.id) {
+      return res.status(401).json({ ok: false, error: 'auth' });
+    }
+    const tenantId = actor?.tenantId ?? actor?.tenant_id ?? null;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const it of items) {
+        if (kind === 'stock') {
+          await client.query(
+            `INSERT INTO public.listings
+             (tenant_id, seller_id, brand, code, qty_available, moq, mpq, mpq_required_order,
+              unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+              currency, lead_time_days, location, condition, packaging, note, status,
+              no_parcel, image_url, incoming_schedule1, incoming_qty1, incoming_schedule2, incoming_qty2, datasheet_url)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,
+                     $9,$10,$11,$12,$13,
+                     upper($14),$15,$16,$17,$18,$19,COALESCE($20,'pending'),
+                     $21,$22,$23,$24,$25,$26,$27)` ,
+            [
+              tenantId,
+              String(actor.id),
+              U(it.brand),
+              U(it.code),
+              Number(it.qty_available || 0),
+              U(it.moq),
+              U(it.mpq),
+              yn(it.mpq_required_order),
+              toCents(it.unit_price),
+              it.krw_cents ?? null,
+              it.fx_rate ?? null,
+              it.fx_yyyymm ?? null,
+              it.fx_src ?? null,
+              it.currency,
+              U(it.lead_time_days),
+              U(it.location),
+              U(it.condition),
+              U(it.packaging),
+              U(it.note),
+              U(it.status),
+              yn(it.no_parcel),
+              U(it.image_url),
+              U(it.incoming_schedule1),
+              U(it.incoming_qty1),
+              U(it.incoming_schedule2),
+              U(it.incoming_qty2),
+              U(it.datasheet_url),
+            ]
+          );
+        } else {
+          await client.query(
+            `INSERT INTO public.bids
+             (seller_id, purchase_request_id, offer_qty,
+              unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+              currency, lead_time_days, note,
+              offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, packaging, part_type, mfg_year, is_over_2yrs,
+              has_stock, manufactured_month, delivery_date, datasheet_url, status)
+             VALUES ($1,$2,$3,
+                     $4,$5,$6,$7,$8,
+                     upper($9),$10,$11,
+                     $12,$13,$14,$15,$16,$17,$18,$19,$20,$21,
+                     $22,$23,$24,$25,'offered')` ,
+            [
+              String(actor.id),
+              U(it.purchase_request_id),
+              Number(it.offer_qty || 0),
+              toCents(it.unit_price),
+              it.krw_cents ?? null,
+              it.fx_rate ?? null,
+              it.fx_yyyymm ?? null,
+              it.fx_src ?? null,
+              it.currency,
+              U(it.lead_time_days),
+              U(it.note),
+              U(it.brand),
+              U(it.code),
+              yn(it.offer_is_substitute),
+              U(it.quote_valid_until),
+              yn(it.no_parcel),
+              U(it.image_url),
+              U(it.packaging),
+              U(it.part_type),
+              U(it.mfg_year),
+              yn(it.is_over_2yrs),
+              yn(it.has_stock),
+              U(it.manufactured_month),
+              U(it.delivery_date),
+              U(it.datasheet_url),
+            ]
+          );
+        }
+      }
+      await client.query('COMMIT');
+      return res.json({ ok: true, committed: items.length });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+      console.error(e);
+      return res.status(500).json({ ok: false, error: 'commit_failed' });
+    } finally {
+      client.release();
+    }
   } catch (e) {
     console.error(e);
     res.status(400).json({ ok: false, error: String(e.message || e) });

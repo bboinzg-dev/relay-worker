@@ -1565,11 +1565,19 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
       currency: idx(['currency', '통화']),
       qty: idx(['qty', '수량', '가용']),
       moq: idx(['moq']),
+      mpq: idx(['mpq']),
       lead: idx(['lead', '리드', '납기', 'days']),
       status: idx(['status', '상태']),
+      location: idx(['location', '위치']),
+      condition: idx(['condition', '컨디션', '상태\s*\(품질\)?']),
+      packaging: idx(['packaging', '포장']),
+      note: idx(['note', '비고']),
       offer_qty: idx(['offer', '견적\\s*수량']),
       is_alt: idx(['substitute', '대체']),
       valid_until: idx(['valid', '유효']),
+      pr_id: idx(['pr', 'pr\\s*id', 'purchase\\s*request', 'purchase_request_id']),
+      no_parcel: idx(['no\\s*parcel', '택배불가', 'no\\s*delivery']),
+      image_url: idx(['image_url', 'image url', 'image', '이미지']),
     };
 
     const data = [];
@@ -1581,6 +1589,12 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
       const price = Number(String(rawPrice || '').replace(/[^\d.]/g, '')) || 0;
       if (!brand || !code || !price) continue;
 
+      const altYN = map.is_alt >= 0 ? String(row[map.is_alt] || '').trim() : '';
+      const noParcelYN =
+        map.no_parcel >= 0 ? String(row[map.no_parcel] || '').trim() : '';
+      const prId = map.pr_id >= 0 ? String(row[map.pr_id] || '').trim() : '';
+      const imageUrl = map.image_url >= 0 ? String(row[map.image_url] || '').trim() : '';
+
       const base = {
         brand,
         code,
@@ -1591,11 +1605,31 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
             ? Number(String(row[map.lead]).replace(/[^\d]/g, '')) || null
             : null,
         status:
-          map.status >= 0 ? String(row[map.status] || '').toLowerCase() : undefined,
+          map.status >= 0
+            ? String(row[map.status] || '').toLowerCase().trim() || undefined
+            : undefined,
         moq:
           map.moq >= 0
             ? Number(String(row[map.moq]).replace(/[^\d]/g, '')) || null
             : null,
+        mpq:
+          map.mpq >= 0
+            ? Number(String(row[map.mpq]).replace(/[^\d]/g, '')) || null
+            : null,
+        location:
+          map.location >= 0
+            ? String(row[map.location] || '').trim() || null
+            : null,
+        condition:
+          map.condition >= 0
+            ? String(row[map.condition] || '').trim() || null
+            : null,
+        packaging:
+          map.packaging >= 0
+            ? String(row[map.packaging] || '').trim() || null
+            : null,
+        note:
+          map.note >= 0 ? String(row[map.note] || '').trim() || null : null,
       };
 
       if (kind === 'quote') {
@@ -1605,12 +1639,12 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
             map.offer_qty >= 0
               ? Number(String(row[map.offer_qty]).replace(/[^\d]/g, '')) || 0
               : 0,
-          offer_is_substitute:
-            map.is_alt >= 0
-              ? /y|1|true|대체/i.test(String(row[map.is_alt] || ''))
-              : false,
+          offer_is_substitute: /^y(es)?$/i.test(altYN),
           quote_valid_until:
             map.valid_until >= 0 ? String(row[map.valid_until] || '') : null,
+          purchase_request_id: prId || null,
+          no_parcel: /^y(es)?$/i.test(noParcelYN),
+          image_url: imageUrl || null,
         });
       } else {
         data.push({
@@ -1619,7 +1653,102 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
             map.qty >= 0
               ? Number(String(row[map.qty]).replace(/[^\d]/g, '')) || 0
               : 0,
+          no_parcel: /^y(es)?$/i.test(noParcelYN),
         });
+      }
+    }
+
+    if (String(req.body?.mode || '').toLowerCase() === 'auto' && data.length) {
+      const actor = safeParseActor(req) || {};
+      const sellerId = actor?.id != null ? String(actor.id) : null;
+      if (!sellerId) {
+        return res.status(401).json({ ok: false, error: 'auth_required' });
+      }
+
+      const client = await pool.connect();
+      let committed = 0;
+      try {
+        await client.query('BEGIN');
+        for (const it of data) {
+          const cents = Math.round(Number(it.unit_price || 0) * 100);
+          const curr = String(it.currency || 'KRW').toUpperCase();
+          const fx = await fxHelper(client, curr, cents);
+
+          if (kind === 'stock') {
+            const status =
+              typeof it.status === 'string' && LISTING_STATUS.has(it.status)
+                ? it.status
+                : 'pending';
+            await client.query(
+              `INSERT INTO public.listings
+               (tenant_id, seller_id, brand, code, qty_available, moq, mpq,
+                unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+                currency, lead_time_days, location, condition, packaging, note, status, no_parcel)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13,'USD'),$14,$15,$16,$17,$18,COALESCE($19,'pending'),$20)`,
+              [
+                actor.tenant_id || null,
+                sellerId,
+                it.brand,
+                it.code,
+                it.qty_available || 0,
+                it.moq || null,
+                it.mpq || null,
+                cents,
+                fx.krw_cents,
+                fx.rate,
+                fx.yyyymm,
+                fx.src,
+                curr,
+                it.lead_time_days || null,
+                it.location || null,
+                it.condition || null,
+                it.packaging || null,
+                it.note || null,
+                status,
+                it.no_parcel === true,
+              ]
+            );
+          } else {
+            await client.query(
+              `INSERT INTO public.bids(
+                 seller_id, purchase_request_id, offer_qty,
+                 unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+                 currency, lead_time_days, note,
+                 offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, status)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'offered')`,
+              [
+                sellerId,
+                it.purchase_request_id || null,
+                it.offer_qty || 0,
+                cents,
+                fx.krw_cents,
+                fx.rate,
+                fx.yyyymm,
+                fx.src,
+                curr,
+                it.lead_time_days || null,
+                it.note || null,
+                it.brand,
+                it.code,
+                !!it.offer_is_substitute,
+                toOptionalDateString(it.quote_valid_until),
+                it.no_parcel === true,
+                it.image_url || null,
+              ]
+            );
+          }
+          committed += 1;
+        }
+        await client.query('COMMIT');
+        return res.json({ ok: true, committed, items: data });
+      } catch (e) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (_) {}
+        console.error(e);
+        return res.status(500).json({ ok: false, error: 'commit_failed' });
+      } finally {
+        client.release();
       }
     }
 

@@ -1340,21 +1340,20 @@ app.post('/api/bids', async (req, res) => {
     const b = req.body || {};
     const sql = `
       INSERT INTO public.bids
-        (seller_id, purchase_request_id,
+        (seller_id,
          offer_qty, unit_price_cents, currency, lead_time_days, note,
          offer_brand, offer_code, offer_is_substitute, quote_valid_until,
          no_parcel, image_url, packaging, part_type, mfg_year, is_over_2yrs,
          has_stock, manufactured_month, delivery_date, datasheet_url, status)
       VALUES
-        ($1, $2,
-         $3, $4, upper($5), $6, $7,
-         $8, $9, $10, $11,
-         $12, $13, $14, $15, $16, $17,
-         $18, $19, $20, $21, 'offered')
+        ($1,
+         $2, $3, upper($4), $5, $6,
+         $7, $8, $9, $10,
+         $11, $12, $13, $14, $15, $16,
+         $17, $18, $19, $20, 'offered')
       RETURNING id`;
     const vals = [
       String(actor.id),
-      U(b.purchase_request_id),
       Number(b.offer_qty || 0),
       toCents(b.unit_price),
       b.currency,
@@ -1608,46 +1607,89 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
             ]
           );
         } else {
-          await client.query(
-            `INSERT INTO public.bids
-             (seller_id, purchase_request_id, offer_qty,
-              unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-              currency, lead_time_days, note,
-              offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, packaging, part_type, mfg_year, is_over_2yrs,
-              has_stock, manufactured_month, delivery_date, datasheet_url, status)
-             VALUES ($1,$2,$3,
-                     $4,$5,$6,$7,$8,
-                     upper($9),$10,$11,
-                     $12,$13,$14,$15,$16,$17,$18,$19,$20,$21,
-                     $22,$23,$24,$25,'offered')` ,
-            [
-              String(actor.id),
-              U(it.purchase_request_id),
-              Number(it.offer_qty || 0),
-              toCents(it.unit_price),
-              it.krw_cents ?? null,
-              it.fx_rate ?? null,
-              it.fx_yyyymm ?? null,
-              it.fx_src ?? null,
-              it.currency,
-              U(it.lead_time_days),
-              U(it.note),
-              U(it.brand),
-              U(it.code),
-              yn(it.offer_is_substitute),
-              U(it.quote_valid_until),
-              yn(it.no_parcel),
-              U(it.image_url),
-              U(it.packaging),
-              U(it.part_type),
-              U(it.mfg_year),
-              yn(it.is_over_2yrs),
-              yn(it.has_stock),
-              U(it.manufactured_month),
-              U(it.delivery_date),
-              U(it.datasheet_url),
-            ]
-          );
+          const prId = U(it.purchase_request_id);
+          if (prId) {
+            await client.query(
+              `INSERT INTO public.plan_bids
+               (purchase_request_id, seller_id, offer_qty,
+                unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+                currency, lead_time_days, note,
+                offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, packaging, part_type, mfg_year,
+                is_over_2yrs, has_stock, manufactured_month, delivery_date, datasheet_url, status)
+               VALUES ($1,$2,$3,
+                       $4,$5,$6,$7,$8,
+                       upper($9),$10,$11,
+                       $12,$13,$14,$15,$16,$17,$18,$19,$20,
+                       $21,$22,$23,$24,$25,'offered')` ,
+              [
+                prId,
+                String(actor.id),
+                Number(it.offer_qty || 0),
+                toCents(it.unit_price),
+                it.krw_cents ?? null,
+                it.fx_rate ?? null,
+                it.fx_yyyymm ?? null,
+                it.fx_src ?? null,
+                it.currency,
+                U(it.lead_time_days),
+                U(it.note),
+                U(it.brand),
+                U(it.code),
+                yn(it.offer_is_substitute),
+                U(it.quote_valid_until),
+                yn(it.no_parcel),
+                U(it.image_url),
+                U(it.packaging),
+                U(it.part_type),
+                U(it.mfg_year),
+                yn(it.is_over_2yrs),
+                yn(it.has_stock),
+                U(it.manufactured_month),
+                U(it.delivery_date),
+                U(it.datasheet_url),
+              ]
+            );
+          } else {
+            await client.query(
+              `INSERT INTO public.bids
+               (seller_id, offer_qty,
+                unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+                currency, lead_time_days, note,
+                offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, packaging, part_type, mfg_year,
+                is_over_2yrs, has_stock, manufactured_month, delivery_date, datasheet_url, status)
+               VALUES ($1,$2,
+                       $3,$4,$5,$6,$7,
+                       upper($8),$9,$10,
+                       $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                       $21,$22,$23,$24,'offered')` ,
+              [
+                String(actor.id),
+                Number(it.offer_qty || 0),
+                toCents(it.unit_price),
+                it.krw_cents ?? null,
+                it.fx_rate ?? null,
+                it.fx_yyyymm ?? null,
+                it.fx_src ?? null,
+                it.currency,
+                U(it.lead_time_days),
+                U(it.note),
+                U(it.brand),
+                U(it.code),
+                yn(it.offer_is_substitute),
+                U(it.quote_valid_until),
+                yn(it.no_parcel),
+                U(it.image_url),
+                U(it.packaging),
+                U(it.part_type),
+                U(it.mfg_year),
+                yn(it.is_over_2yrs),
+                yn(it.has_stock),
+                U(it.manufactured_month),
+                U(it.delivery_date),
+                U(it.datasheet_url),
+              ]
+            );
+          }
         }
       }
       await client.query('COMMIT');

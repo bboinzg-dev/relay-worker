@@ -11,6 +11,7 @@ const { Storage } = require('@google-cloud/storage');
 const { getPool } = require('./db');
 const { parseActor } = require('./src/utils/auth');
 const { requireSeller } = require('./auth.middleware');
+const { fetchFx, toKrwCentsRounded10 } = require('./src/lib/fx');
 
 const app = express();
 app.use(cors());
@@ -19,6 +20,10 @@ app.use(bodyParser.json({ limit: '10mb' }));
 const pool = getPool();
 const query = (text, params) => pool.query(text, params);
 const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
+const datasheetUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+});
 
 const storage = new Storage();
 const PRODUCT_ASSET_BUCKET = (() => {
@@ -677,6 +682,10 @@ app.post('/api/listings', async (req, res) => {
     return res.json({ ok: true, id: r.rows[0]?.id });
   } catch (e) {
     console.error(e);
+    const msg = e?.message || String(e);
+    if (msg && msg.startsWith('fx_rate_not_found')) {
+      return res.status(400).json({ ok: false, error: 'fx_rate_not_found' });
+    }
     return res.status(500).json({ ok: false, error: 'db_error' });
   }
 });
@@ -1100,6 +1109,149 @@ app.post('/api/purchase-requests/:id/confirm', async (req, res) => {
     try { await client.query('ROLLBACK'); } catch {}
     console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) });
   } finally { client.release(); }
+});
+
+app.get('/api/bid/open-items', async (req, res) => {
+  try {
+    const actor = parseActor(req);
+    if (!actor?.id) return res.status(401).json({ error: 'auth required' });
+    const sql = `
+      SELECT id AS purchase_request_id, brand, code, qty_required,
+             need_by_date, bid_deadline_at, category
+        FROM public.vw_open_pr_for_seller
+       ORDER BY COALESCE(bid_deadline_at, now() + interval '100 years') ASC,
+                COALESCE(need_by_date, now() + interval '100 years') ASC,
+                brand ASC, code ASC
+    `;
+    const r = await query(sql);
+    return res.json(r.rows);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.post('/api/uploads/datasheet', datasheetUpload.single('file'), async (req, res) => {
+  try {
+    const actor = parseActor(req);
+    if (!actor?.id) return res.status(401).json({ ok: false, error: 'auth required' });
+    const file = req.file;
+    if (!file) return res.status(400).json({ ok: false, error: 'file required' });
+
+    const inserted = await query(`
+      INSERT INTO public.file_blobs (content_type, filename, byte_len, data)
+      VALUES ($1,$2,$3,$4)
+      RETURNING id
+    `, [file.mimetype || 'application/octet-stream', file.originalname || 'file', file.buffer?.length || 0, file.buffer]);
+
+    const blobId = inserted.rows[0]?.id;
+    return res.json({ ok: true, blob_id: blobId, url: blobId ? `/api/files/${blobId}` : null });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: 'db_error' });
+  }
+});
+
+app.get('/api/files/:id', async (req, res) => {
+  try {
+    const id = (req.params.id || '').toString();
+    if (!id) return res.status(400).json({ error: 'id required' });
+    const r = await query(`
+      SELECT content_type, filename, data
+        FROM public.file_blobs
+       WHERE id = $1
+       LIMIT 1
+    `, [id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
+    const row = r.rows[0];
+    const contentType = row.content_type || 'application/octet-stream';
+    const filename = row.filename || 'file';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+    return res.send(row.data);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.get('/api/fx/latest/:currency', async (req, res) => {
+  try {
+    const currency = (req.params.currency || 'KRW').toString().toUpperCase();
+    const fx = await fetchFx(pool, currency);
+    return res.json({
+      ok: true,
+      currency,
+      rate: Number(fx.rate || 0),
+      yyyymm: fx.yyyymm || null,
+      source: fx.source || null,
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(404).json({ ok: false, error: 'fx_rate_not_found' });
+  }
+});
+
+app.post('/api/bid/submit', async (req, res) => {
+  try {
+    const actor = parseActor(req);
+    if (!actor?.id) return res.status(401).json({ ok: false, error: 'auth required' });
+    const body = req.body || {};
+    const purchaseRequestId = (body.purchase_request_id || body.pr_id || '').toString().trim();
+    const unitPriceRaw = body.unit_price ?? body.unitPrice;
+    const unitPrice = Number(unitPriceRaw);
+    if (!purchaseRequestId) return res.status(400).json({ ok: false, error: 'purchase_request_id required' });
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+      return res.status(400).json({ ok: false, error: 'unit_price must be > 0' });
+    }
+
+    const currency = (body.currency || 'KRW').toString().toUpperCase();
+    const fx = await fetchFx(pool, currency);
+    const unitPriceCents = Math.max(0, Math.round(unitPrice * 100));
+    const unitPriceKrwCents = toKrwCentsRounded10(unitPrice, currency, fx.rate);
+    const offerQty = toOptionalInteger(body.offer_qty ?? body.offerQty, { min: 0 });
+    const leadTimeDays = toOptionalInteger(body.lead_time_days ?? body.leadTimeDays, { min: 0 });
+    const note = toOptionalTrimmed(body.note);
+    const packaging = toOptionalTrimmed(body.packaging);
+    const partType = toOptionalTrimmed(body.part_type ?? body.partType);
+    const quoteValid = body.quote_valid_until || body.quoteValidUntil || null;
+    const datasheetUrl = toOptionalTrimmed(body.datasheet_url ?? body.datasheetUrl);
+
+    const sql = `
+      INSERT INTO public.plan_bids
+        (purchase_request_id, seller_id,
+         unit_price_cents, currency,
+         unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
+         offer_qty, lead_time_days, note, packaging, part_type,
+         quote_valid_until, datasheet_url, status)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'offered')
+      RETURNING id
+    `;
+
+    const result = await query(sql, [
+      purchaseRequestId,
+      String(actor.id),
+      unitPriceCents,
+      currency,
+      unitPriceKrwCents,
+      fx.rate || null,
+      fx.yyyymm || null,
+      fx.source || null,
+      offerQty,
+      leadTimeDays,
+      note,
+      packaging,
+      partType,
+      quoteValid || null,
+      datasheetUrl || null,
+    ]);
+
+    return res.json({ ok: true, id: result.rows[0]?.id || null });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: 'db_error' });
+  }
 });
 
 /* ---------------- Bids ---------------- */

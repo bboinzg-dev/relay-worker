@@ -44,9 +44,18 @@ async function ensureTables() {
         moq integer,
         quote_deadline date,
         delivery_deadline date,
+        notes text,
         created_at timestamptz DEFAULT now(),
         updated_at timestamptz DEFAULT now()
       )
+    `);
+    await pool.query(`
+      ALTER TABLE public.purchase_plan_items
+      ADD COLUMN IF NOT EXISTS notes text
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_purchase_plan_items_plan
+        ON public.purchase_plan_items(plan_id)
     `);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS public.bom_lists (
@@ -228,6 +237,158 @@ app.post('/api/purchase-plans', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(400).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+app.post('/api/purchase-plans/:planId/items', async (req, res) => {
+  const actor = parseActor(req);
+  if (!actor?.id) {
+    return res.status(401).json({ error: 'auth required' });
+  }
+
+  const planId = String(req.params.planId || '').trim();
+  if (!planId) {
+    return res.status(400).json({ error: 'plan_id required' });
+  }
+
+  const body = req.body || {};
+  const manufacturer = (body.manufacturer || body.brand || '').toString().trim();
+  const partNumber = (body.part_number || body.partNumber || '').toString().trim();
+  if (!manufacturer || !partNumber) {
+    return res.status(400).json({ error: 'manufacturer & part_number required' });
+  }
+
+  const category = body.category || null;
+  const requiredQty = coerceInt(body.required_qty ?? body.requiredQty, 0);
+  const quoteDeadline = body.quote_deadline || body.quoteDeadline || null;
+  const deliveryDeadline = body.delivery_deadline || body.deliveryDeadline || null;
+  const notes = body.notes || body.note || null;
+  const openRfQ = body.open_rfq === undefined || body.open_rfq === null ? true : !!body.open_rfq;
+  const tenantId = getTenant(req) || actor.tenantId || null;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const plan = await client.query(`
+      SELECT id
+        FROM public.purchase_plans
+       WHERE id = $1 AND buyer_user_id = $2
+       FOR UPDATE
+    `, [planId, actor.id]);
+    if (!plan.rows.length) {
+      throw new Error('plan_not_found');
+    }
+
+    const inserted = await client.query(`
+      INSERT INTO public.purchase_plan_items
+        (plan_id, manufacturer, part_number, category, required_qty, quote_deadline, delivery_deadline, notes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      RETURNING *
+    `, [
+      planId,
+      manufacturer,
+      partNumber,
+      category || null,
+      requiredQty,
+      quoteDeadline || null,
+      deliveryDeadline || null,
+      notes || null,
+    ]);
+
+    const item = inserted.rows[0];
+    let purchaseRequestId = null;
+
+    if (openRfQ) {
+      const qty = coerceInt(body.offer_qty ?? body.offerQty, requiredQty) || requiredQty || 0;
+      const summary = `${manufacturer} ${partNumber}`.trim();
+      const createArgs = [
+        tenantId,
+        actor.id,
+        manufacturer,
+        partNumber,
+        qty,
+        deliveryDeadline ? new Date(deliveryDeadline) : null,
+        quoteDeadline ? new Date(quoteDeadline) : null,
+        summary || null,
+        notes || null,
+        category || null,
+      ];
+
+      let prId = null;
+      try {
+        const pr = await client.query(`
+          SELECT public.create_purchase_request(
+            $1::text, $2::text, $3::text, $4::text, $5::int,
+            $6::timestamptz, $7::timestamptz, true,
+            $8::text, $9::text,
+            '[]'::jsonb, jsonb_build_object('category', $10::text)
+          ) AS id
+        `, createArgs);
+        prId = pr.rows[0]?.id || null;
+      } catch (err) {
+        try {
+          const pr = await client.query(`
+            INSERT INTO public.purchase_requests
+              (tenant_id, buyer_id, brand, code, qty_required, need_by_date, bid_deadline_at, notes, status, extra)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open', jsonb_build_object('category', $9))
+            RETURNING id
+          `, [
+            tenantId,
+            actor.id,
+            manufacturer,
+            partNumber,
+            qty,
+            deliveryDeadline || null,
+            quoteDeadline || null,
+            notes || null,
+            category || null,
+          ]);
+          prId = pr.rows[0]?.id || null;
+        } catch (fallbackErr) {
+          const pr = await client.query(`
+            INSERT INTO public.purchase_requests
+              (tenant_id, buyer_id, brand, code, qty_required, need_by_date, notes, status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,'open')
+            RETURNING id
+          `, [
+            tenantId,
+            actor.id,
+            manufacturer,
+            partNumber,
+            qty,
+            deliveryDeadline || null,
+            notes || null,
+          ]);
+          prId = pr.rows[0]?.id || null;
+        }
+      }
+
+      if (prId) {
+        purchaseRequestId = prId;
+        await client.query(`
+          INSERT INTO public.plan_item_pr_links (plan_item_id, purchase_request_id)
+          VALUES ($1,$2)
+          ON CONFLICT DO NOTHING
+        `, [item.id, prId]);
+      }
+    }
+
+    await client.query('UPDATE public.purchase_plan_items SET updated_at = now() WHERE id = $1', [item.id]);
+    await client.query('UPDATE public.purchase_plans SET updated_at = now() WHERE id = $1', [planId]);
+    await client.query('COMMIT');
+
+    return res.json({
+      ok: true,
+      plan_item: item,
+      purchase_request_id: purchaseRequestId,
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('[plan] create item failed:', err?.message || err);
+    const msg = err?.message === 'plan_not_found' ? 'plan_not_found' : err?.message || 'internal_error';
+    return res.status(err?.message === 'plan_not_found' ? 404 : 400).json({ ok: false, error: msg });
+  } finally {
+    client.release();
   }
 });
 

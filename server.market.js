@@ -170,6 +170,20 @@ const mapListingRow = (row = {}) => ({
   updated_at: row.updated_at,
 });
 
+const mapPurchaseRequestRow = (row = {}) => ({
+  id: row.id,
+  brand: row.brand,
+  code: row.code,
+  required_qty: Number(row.required_qty ?? row.qty_required ?? 0) || 0,
+  note: row.note ?? row.notes ?? null,
+  need_by_date: row.need_by_date ?? null,
+  bid_deadline_at: row.bid_deadline_at ?? null,
+  allow_substitutes: row.allow_substitutes == null ? true : !!row.allow_substitutes,
+  status: row.status,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+});
+
 // bids 행 → 응답 JSON 정규화
 const mapBidRow = (row = {}) => ({
   id: row.id,
@@ -1052,16 +1066,27 @@ app.get('/api/purchase-requests', async (req, res) => {
   try {
     const brand = (req.query.brand || '').toString();
     const code  = (req.query.code  || '').toString();
+    const status = (req.query.status || 'open').toString();
+
     const where = [];
     const args = [];
     if (brand) { args.push(brand); where.push(`brand_norm = lower($${args.length})`); }
     if (code)  { args.push(code);  where.push(`code_norm  = lower($${args.length})`); }
-    const sql = `SELECT * FROM public.purchase_requests
-                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-                 ORDER BY created_at DESC LIMIT 200`;
+    if (status) { args.push(status); where.push(`status = $${args.length}`); }
+
+    const sql = `
+      SELECT id, brand, code, qty_required, notes, need_by_date, bid_deadline_at,
+             allow_substitutes, status, created_at, updated_at
+        FROM public.purchase_requests
+       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY created_at DESC
+       LIMIT 200`;
     const r = await query(sql, args);
-    res.json({ ok: true, items: r.rows });
-  } catch (e) { console.error(e); res.status(400).json({ ok:false, error:String(e.message || e) }); }
+    res.json({ ok: true, items: r.rows.map(mapPurchaseRequestRow) });
+  } catch (e) {
+    console.error(e);
+    res.status(400).json({ ok:false, error:String(e.message || e) });
+  }
 });
 
 app.post('/api/purchase-requests', async (req, res) => {

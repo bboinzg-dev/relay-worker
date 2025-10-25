@@ -622,7 +622,8 @@ app.get('/api/purchase-plans/items/:id/bids', async (req, res) => {
       ...pr,
       bids: bidsByPr.get(pr.id) || [],
     }));
-    res.json({ ok: true, purchase_requests: data });
+    const items = data.flatMap((pr) => pr.bids || []);
+    res.json({ ok: true, purchase_requests: data, items });
   } catch (err) {
     console.error(err);
     res.status(400).json({ ok: false, error: err?.message || String(err) });

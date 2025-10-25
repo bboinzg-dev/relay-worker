@@ -3,7 +3,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../../db');
-const { parseActor } = require('../utils/auth');
+const { parseActor, getSellerKeySet } = require('../utils/auth');
 
 function parseIntOrDefault(value, defaultValue) {
   const parsed = Number.parseInt(value, 10);
@@ -11,8 +11,10 @@ function parseIntOrDefault(value, defaultValue) {
 }
 
 function getUserId(req) {
+  const keys = getSellerKeySet(req);
+  if (keys.length > 0) return keys[0];
   const actor = parseActor(req);
-  return actor?.id || req.user?.id || req.headers['x-user-id'] || req.query.user_id || null;
+  return actor?.id || null;
 }
 
 // [A] 구매자용 - 목록/검색
@@ -201,21 +203,31 @@ function coerceNullableText(value) {
   return text.length ? text : null;
 }
 
-async function fetchPlanBidDetail(id, sellerId) {
+async function fetchPlanBidDetail(id, sellerKeySet) {
   const params = [id];
   let sellerFilter = '';
-  if (sellerId) {
-    sellerFilter = ' AND pb.seller_id = $2';
-    params.push(String(sellerId));
+
+  if (Array.isArray(sellerKeySet) && sellerKeySet.length) {
+    sellerFilter = `
+      AND pb.seller_id IN (
+        SELECT match_key FROM (
+          SELECT UNNEST($2::text[]) AS match_key
+          UNION
+          SELECT id::text FROM public.users WHERE id::text = ANY($2::text[]) OR username = ANY($2::text[])
+          UNION
+          SELECT username FROM public.users WHERE id::text = ANY($2::text[]) OR username = ANY($2::text[])
+        ) __seller_keys
+      )`;
+    params.push(sellerKeySet);
   }
 
-  const { rows } = await db.query(
-    `SELECT
+  const baseSql = `SELECT
         pb.id,
         pb.purchase_request_id,
         COALESCE(pb.offer_brand, pr.brand)   AS brand,
         COALESCE(pb.offer_code,  pr.code)    AS code,
         pb.offer_qty,
+        pb.offer_qty        AS qty_offer,
         pb.unit_price_cents,
         pb.currency,
         pb.lead_time_days,
@@ -229,10 +241,9 @@ async function fetchPlanBidDetail(id, sellerId) {
         pb.updated_at
       FROM public.plan_bids pb
       LEFT JOIN public.purchase_requests pr ON pr.id = pb.purchase_request_id
-     WHERE pb.id = $1${sellerFilter}`,
-    params
-  );
+     WHERE pb.id = $1${sellerFilter}`;
 
+  const { rows } = await db.query(baseSql, params);
   return rows[0] || null;
 }
 
@@ -246,20 +257,30 @@ router.get('/plan-bids', async (req, res) => {
       return res.status(400).json({ error: 'pr_id required (or use mine=1)' });
     }
 
-    let sellerId = null;
+    let sellerKeySet = [];
     if (isMine) {
-      sellerId = getUserId(req);
-      if (!sellerId) return res.status(401).json({ error: 'signin_required' });
+      sellerKeySet = getSellerKeySet(req);
+      if (!sellerKeySet.length) return res.status(401).json({ error: 'signin_required' });
     }
 
     if (isMine && !prId) {
       const { rows } = await db.query(
-        `SELECT
+        `WITH me AS (
+            SELECT UNNEST($1::text[]) AS k
+          ), mapped AS (
+            SELECT k FROM me
+            UNION
+            SELECT id::text FROM public.users WHERE id::text IN (SELECT k FROM me) OR username IN (SELECT k FROM me)
+            UNION
+            SELECT username FROM public.users WHERE id::text IN (SELECT k FROM me) OR username IN (SELECT k FROM me)
+          )
+          SELECT
             pb.id,
             pb.purchase_request_id,
             COALESCE(pb.offer_brand, pr.brand)   AS brand,
             COALESCE(pb.offer_code,  pr.code)    AS code,
             pb.offer_qty,
+            pb.offer_qty        AS qty_offer,
             pb.unit_price_cents,
             pb.currency,
             pb.lead_time_days,
@@ -273,22 +294,32 @@ router.get('/plan-bids', async (req, res) => {
             pb.updated_at
           FROM public.plan_bids pb
           LEFT JOIN public.purchase_requests pr ON pr.id = pb.purchase_request_id
-         WHERE pb.seller_id = $1
+         WHERE pb.seller_id IN (SELECT k FROM mapped)
          ORDER BY pb.created_at DESC
          LIMIT 200`,
-        [String(sellerId)]
+        [sellerKeySet]
       );
       return res.json(rows);
     }
 
     if (isMine) {
       const { rows } = await db.query(
-        `SELECT
+        `WITH me AS (
+            SELECT UNNEST($2::text[]) AS k
+          ), mapped AS (
+            SELECT k FROM me
+            UNION
+            SELECT id::text FROM public.users WHERE id::text IN (SELECT k FROM me) OR username IN (SELECT k FROM me)
+            UNION
+            SELECT username FROM public.users WHERE id::text IN (SELECT k FROM me) OR username IN (SELECT k FROM me)
+          )
+          SELECT
             pb.id,
             pb.purchase_request_id,
             COALESCE(pb.offer_brand, pr.brand)   AS brand,
             COALESCE(pb.offer_code,  pr.code)    AS code,
             pb.offer_qty,
+            pb.offer_qty        AS qty_offer,
             pb.unit_price_cents,
             pb.currency,
             pb.lead_time_days,
@@ -303,9 +334,9 @@ router.get('/plan-bids', async (req, res) => {
           FROM public.plan_bids pb
           LEFT JOIN public.purchase_requests pr ON pr.id = pb.purchase_request_id
          WHERE pb.purchase_request_id = $1
-           AND pb.seller_id = $2
+           AND pb.seller_id IN (SELECT k FROM mapped)
          ORDER BY pb.created_at DESC`,
-        [prId, String(sellerId)]
+        [prId, sellerKeySet]
       );
       return res.json(rows);
     }
@@ -344,8 +375,8 @@ router.get('/plan-bids', async (req, res) => {
 // [F] 구매계획 입찰 수정
 router.patch('/plan-bids/:id', async (req, res) => {
   try {
-    const sellerId = getUserId(req);
-    if (!sellerId) return res.status(401).json({ error: 'signin_required' });
+    const sellerKeySet = getSellerKeySet(req);
+    if (!sellerKeySet.length) return res.status(401).json({ error: 'signin_required' });
 
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'id required' });
@@ -376,25 +407,35 @@ router.patch('/plan-bids/:id', async (req, res) => {
       coerceNullableText(body.offer_brand),
       coerceNullableText(body.offer_code),
       coerceNullableText(body.note),
-      String(sellerId),
+      sellerKeySet,
     ];
 
     const { rows } = await db.query(
-      `UPDATE public.plan_bids
-          SET offer_qty = COALESCE($2, offer_qty),
-              unit_price_cents = COALESCE($3, unit_price_cents),
-              currency = COALESCE($4, currency),
-              lead_time_days = COALESCE($5, lead_time_days),
-              no_parcel = COALESCE($6, no_parcel),
-              has_stock = COALESCE($7, has_stock),
-              delivery_date = COALESCE($8, delivery_date),
-              quote_valid_until = COALESCE($9, quote_valid_until),
-              offer_brand = COALESCE($10, offer_brand),
-              offer_code = COALESCE($11, offer_code),
-              note = COALESCE($12, note),
-              updated_at = now()
-        WHERE id = $1 AND seller_id = $13
-        RETURNING id`,
+      `WITH me AS (
+          SELECT UNNEST($13::text[]) AS k
+        ), mapped AS (
+          SELECT k FROM me
+          UNION
+          SELECT id::text FROM public.users WHERE id::text IN (SELECT k FROM me) OR username IN (SELECT k FROM me)
+          UNION
+          SELECT username FROM public.users WHERE id::text IN (SELECT k FROM me) OR username IN (SELECT k FROM me)
+        )
+        UPDATE public.plan_bids
+           SET offer_qty = COALESCE($2, offer_qty),
+               unit_price_cents = COALESCE($3, unit_price_cents),
+               currency = COALESCE($4, currency),
+               lead_time_days = COALESCE($5, lead_time_days),
+               no_parcel = COALESCE($6, no_parcel),
+               has_stock = COALESCE($7, has_stock),
+               delivery_date = COALESCE($8, delivery_date),
+               quote_valid_until = COALESCE($9, quote_valid_until),
+               offer_brand = COALESCE($10, offer_brand),
+               offer_code = COALESCE($11, offer_code),
+               note = COALESCE($12, note),
+               updated_at = now()
+         WHERE id = $1
+           AND seller_id IN (SELECT k FROM mapped)
+         RETURNING id`,
       params
     );
 
@@ -402,7 +443,7 @@ router.patch('/plan-bids/:id', async (req, res) => {
       return res.status(404).json({ error: 'not_found' });
     }
 
-    const detail = await fetchPlanBidDetail(id, sellerId);
+    const detail = await fetchPlanBidDetail(id, sellerKeySet);
     return res.json(detail || rows[0]);
   } catch (err) {
     console.error('[docs-requests] plan bid update error:', err);
@@ -413,15 +454,26 @@ router.patch('/plan-bids/:id', async (req, res) => {
 // [G] 구매계획 입찰 삭제
 router.delete('/plan-bids/:id', async (req, res) => {
   try {
-    const sellerId = getUserId(req);
-    if (!sellerId) return res.status(401).json({ error: 'signin_required' });
+    const sellerKeySet = getSellerKeySet(req);
+    if (!sellerKeySet.length) return res.status(401).json({ error: 'signin_required' });
 
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: 'id required' });
 
     const result = await db.query(
-      `DELETE FROM public.plan_bids WHERE id = $1 AND seller_id = $2`,
-      [id, String(sellerId)]
+      `WITH me AS (
+          SELECT UNNEST($2::text[]) AS k
+        ), mapped AS (
+          SELECT k FROM me
+          UNION
+          SELECT id::text FROM public.users WHERE id::text IN (SELECT k FROM me) OR username IN (SELECT k FROM me)
+          UNION
+          SELECT username FROM public.users WHERE id::text IN (SELECT k FROM me) OR username IN (SELECT k FROM me)
+        )
+        DELETE FROM public.plan_bids
+         WHERE id = $1
+           AND seller_id IN (SELECT k FROM mapped)`,
+      [id, sellerKeySet]
     );
 
     if (!result.rowCount) {

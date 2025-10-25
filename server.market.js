@@ -9,7 +9,7 @@ const multer = require('multer');
 const XLSX = require('xlsx');
 const { Storage } = require('@google-cloud/storage');
 const { getPool } = require('./db');
-const { parseActor } = require('./src/utils/auth');
+const { parseActor, getSellerKeySet } = require('./src/utils/auth');
 const { requireSeller } = require('./auth.middleware');
 const { fetchFx, toKrwCentsRounded10 } = require('./src/lib/fx');
 
@@ -1224,8 +1224,9 @@ app.get('/api/fx/latest/:currency', async (req, res) => {
 
 app.post('/api/bid/submit', async (req, res) => {
   try {
-    const actor = parseActor(req);
-    if (!actor?.id) return res.status(401).json({ ok: false, error: 'auth required' });
+    const sellerKeySet = getSellerKeySet(req);
+    if (!sellerKeySet.length) return res.status(401).json({ ok: false, error: 'auth required' });
+    const sellerId = sellerKeySet[0];
     const body = req.body || {};
     const purchaseRequestId = (body.purchase_request_id || body.pr_id || '').toString().trim();
     const unitPriceRaw = body.unit_price ?? body.unitPrice;
@@ -1261,7 +1262,7 @@ app.post('/api/bid/submit', async (req, res) => {
 
     const result = await query(sql, [
       purchaseRequestId,
-      String(actor.id),
+      String(sellerId),
       unitPriceCents,
       currency,
       unitPriceKrwCents,
@@ -1514,10 +1515,11 @@ app.get('/api/seller/docs-requests', async (_req, res) => {
 // POST /api/bids (seller 전용)
 app.post('/api/bids', async (req, res) => {
   try {
-    const actor = parseActor(req);
-    if (!actor?.id) {
+    const sellerKeySet = getSellerKeySet(req);
+    if (!sellerKeySet.length) {
       return res.status(401).json({ ok: false, error: 'auth' });
     }
+    const sellerId = sellerKeySet[0];
 
     const b = req.body || {};
     const sql = `
@@ -1535,7 +1537,7 @@ app.post('/api/bids', async (req, res) => {
          $17, $18, $19, $20, 'offered')
       RETURNING id`;
     const vals = [
-      String(actor.id),
+      String(sellerId),
       Number(b.offer_qty || 0),
       toCents(b.unit_price),
       b.currency,
@@ -1737,10 +1739,12 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
       return res.json({ ok: true, items });
     }
 
-    const actor = parseActor(req);
-    if (!actor?.id) {
+    const sellerKeySet = getSellerKeySet(req);
+    if (!sellerKeySet.length) {
       return res.status(401).json({ ok: false, error: 'auth' });
     }
+    const sellerId = sellerKeySet[0];
+    const actor = parseActor(req) || {};
     const tenantId = actor?.tenantId ?? actor?.tenant_id ?? null;
 
     const client = await pool.connect();
@@ -1760,7 +1764,7 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
                      $21,$22,$23,$24,$25,$26,$27)` ,
             [
               tenantId,
-              String(actor.id),
+              String(sellerId),
               U(it.brand),
               U(it.code),
               Number(it.qty_available || 0),
@@ -1805,7 +1809,7 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
                        $21,$22,$23,$24,$25,'offered')` ,
               [
                 prId,
-                String(actor.id),
+                String(sellerId),
                 Number(it.offer_qty || 0),
                 toCents(it.unit_price),
                 it.krw_cents ?? null,
@@ -1845,7 +1849,7 @@ app.post('/api/import/seller-items', upload.single('file'), async (req, res) => 
                        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
                        $21,$22,$23,$24,'offered')` ,
               [
-                String(actor.id),
+                String(sellerId),
                 Number(it.offer_qty || 0),
                 toCents(it.unit_price),
                 it.krw_cents ?? null,

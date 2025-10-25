@@ -170,19 +170,24 @@ const mapListingRow = (row = {}) => ({
   updated_at: row.updated_at,
 });
 
-const mapPurchaseRequestRow = (row = {}) => ({
-  id: row.id,
-  brand: row.brand,
-  code: row.code,
-  required_qty: Number(row.required_qty ?? row.qty_required ?? 0) || 0,
-  note: row.note ?? row.notes ?? null,
-  need_by_date: row.need_by_date ?? null,
-  bid_deadline_at: row.bid_deadline_at ?? null,
-  allow_substitutes: row.allow_substitutes == null ? true : !!row.allow_substitutes,
-  status: row.status,
-  created_at: row.created_at,
-  updated_at: row.updated_at,
-});
+const mapPurchaseRequestRow = (row = {}) => {
+  const required = Number(row.required_qty ?? row.qty_required ?? row.quantity_total ?? 0) || 0;
+  return {
+    id: row.id,
+    brand: row.brand,
+    code: row.code,
+    required_qty: required,
+    quantity_total: Number(row.quantity_total ?? required) || 0,
+    quantity_outstanding: Number(row.quantity_outstanding ?? required) || 0,
+    note: row.note ?? row.notes ?? null,
+    need_by_date: row.need_by_date ?? null,
+    bid_deadline_at: row.bid_deadline_at ?? null,
+    allow_substitutes: row.allow_substitutes == null ? true : !!row.allow_substitutes,
+    status: row.status,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+};
 
 // bids 행 → 응답 JSON 정규화
 const mapBidRow = (row = {}) => ({

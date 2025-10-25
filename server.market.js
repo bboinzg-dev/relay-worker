@@ -1298,24 +1298,22 @@ app.get('/api/bids', async (req, res) => {
       : (req.query.seller_id != null ? String(req.query.seller_id) : null);
     if (isMine && !sellerId) return res.json({ ok: true, items: [] });
 
-    const prId = (req.query.pr_id || req.query.purchase_request_id || '').toString().trim();
     const status = (req.query.status || '').toString().trim();
     const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10) || 50, 1), 200);
 
     const where = [];
     const args = [];
     if (sellerId) { args.push(sellerId); where.push(`seller_id = $${args.length}`); }
-    if (prId)     { args.push(prId);     where.push(`purchase_request_id = $${args.length}`); }
     if (status)   { args.push(status);   where.push(`status = $${args.length}`); }
 
     const sql = `
-      SELECT id, purchase_request_id, seller_id,
+      SELECT id, seller_id,
              unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
              currency, offer_qty, lead_time_days, note, status,
              offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
              packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
              created_at, updated_at
-        FROM public.plan_bids
+        FROM public.bids
         ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
         ORDER BY created_at DESC
         LIMIT ${limit}`;
@@ -1335,13 +1333,13 @@ app.get('/api/bids/:id', requireSeller, async (req, res) => {
     if (!sellerId) return res.status(401).json({ ok: false, error: 'auth_required' });
     const id = String(req.params.id);
     const sql = `
-      SELECT id, purchase_request_id, seller_id,
+      SELECT id, seller_id,
              unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
              currency, offer_qty, lead_time_days, note, status,
              offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
              packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
              created_at, updated_at
-        FROM public.plan_bids
+        FROM public.bids
        WHERE id = $1 AND seller_id = $2
        LIMIT 1`;
     const r = await query(sql, [id, sellerId]);
@@ -1363,7 +1361,7 @@ app.patch('/api/bids/:id', requireSeller, async (req, res) => {
   const client = await pool.connect();
   try {
     const cur = await client.query(
-      `SELECT * FROM public.plan_bids WHERE id = $1 AND seller_id = $2 LIMIT 1`,
+      `SELECT * FROM public.bids WHERE id = $1 AND seller_id = $2 LIMIT 1`,
       [id, sellerId]
     );
     if (!cur.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
@@ -1470,16 +1468,16 @@ app.patch('/api/bids/:id', requireSeller, async (req, res) => {
     args.push(id);
     args.push(sellerId);
     const sql = `
-      UPDATE public.plan_bids
+      UPDATE public.bids
          SET ${sets.join(', ')}, updated_at = now()
        WHERE id = $${++n} AND seller_id = $${++n}
        RETURNING
-         id, purchase_request_id, seller_id,
+         id, seller_id,
          unit_price_cents, unit_price_krw_cents, unit_price_fx_rate, unit_price_fx_yyyymm, unit_price_fx_src,
-        currency, offer_qty, lead_time_days, note, status,
-        offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
-        packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
-        created_at, updated_at`;
+         currency, offer_qty, lead_time_days, note, status,
+         offer_brand, offer_code, offer_is_substitute, quote_valid_until, no_parcel, image_url, datasheet_url,
+         packaging, part_type, mfg_year, is_over_2yrs, has_stock, manufactured_month, delivery_date,
+         created_at, updated_at`;
     const r = await client.query(sql, args);
     return res.json({ ok: true, item: mapBidRow(r.rows[0]) });
   } catch (e) {
@@ -1499,7 +1497,7 @@ app.delete('/api/bids/:id', requireSeller, async (req, res) => {
   const id = String(req.params.id || '').trim();
   if (!id) return res.status(400).json({ ok: false, error: 'id_required' });
   try {
-    const r = await query(`DELETE FROM public.plan_bids WHERE id = $1 AND seller_id = $2 RETURNING id`, [id, sellerId]);
+    const r = await query(`DELETE FROM public.bids WHERE id = $1 AND seller_id = $2 RETURNING id`, [id, sellerId]);
     if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
     return res.json({ ok: true, deleted_id: id });
   } catch (e) {

@@ -557,6 +557,12 @@ try { app.use(require('./server.bom'));      console.log('[BOOT] mounted /api/bo
 try { app.use(require('./server.plan'));     console.log('[BOOT] mounted /api/purchase-plans/*'); } catch {}
 try { app.use(require('./server.notify'));   console.log('[BOOT] mounted /api/notify/*'); } catch {}
 try { app.use(require('./server.docs'));     console.log('[BOOT] mounted /api/docs/*'); } catch {}
+try {
+  app.use('/api', require('./src/routes/docs-requests'));
+  console.log('[BOOT] mounted /api/docs-requests, /api/seller/docs-requests, /api/plan-bids');
+} catch (err) {
+  console.error('[BOOT] failed to mount docs-requests router:', err?.message || err);
+}
 try { app.use(require('./server.market'));   console.log('[BOOT] mounted /api/listings, /api/purchase-requests, /api/bids'); } catch {}
 try { app.use(require('./server.retail')); console.log('[BOOT] mounted /api/retail/*'); } catch (e) { console.error(e); }
 try { app.use(require('./server.retail.import')); console.log('[BOOT] mounted /api/retail/import'); } catch {}

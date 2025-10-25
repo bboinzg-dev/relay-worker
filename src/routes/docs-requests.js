@@ -181,6 +181,22 @@ router.get('/plan-bids', async (req, res) => {
     const prId = req.query.pr_id;
     if (!prId) return res.status(400).json({ error: 'pr_id required' });
 
+    const { mine } = req.query;
+    if (mine) {
+      const sellerId = getUserId(req);
+      if (!sellerId) return res.status(401).json({ error: 'signin_required' });
+
+      const { rows } = await db.query(
+        `SELECT *
+           FROM public.vw_purchase_plan_bids
+          WHERE purchase_request_id = $1
+            AND seller_id = $2
+          ORDER BY created_at DESC`,
+        [prId, String(sellerId)]
+      );
+      return res.json(rows);
+    }
+
     const { rows } = await db.query(
       `SELECT *
          FROM public.vw_purchase_plan_bids

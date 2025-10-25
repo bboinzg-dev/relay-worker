@@ -3,6 +3,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../../db');
+const { parseActor } = require('../utils/auth');
 
 function parseIntOrDefault(value, defaultValue) {
   const parsed = Number.parseInt(value, 10);
@@ -10,7 +11,8 @@ function parseIntOrDefault(value, defaultValue) {
 }
 
 function getUserId(req) {
-  return req.user?.id || req.headers['x-user-id'] || req.query.user_id || null;
+  const actor = parseActor(req);
+  return actor?.id || req.user?.id || req.headers['x-user-id'] || req.query.user_id || null;
 }
 
 // [A] 구매자용 - 목록/검색

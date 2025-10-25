@@ -175,38 +175,260 @@ router.post('/seller/docs-requests/:targetId/respond', async (req, res) => {
   }
 });
 
+function coerceNullableNumber(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function coerceNullableBoolean(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value === 1;
+  if (typeof value === 'string') {
+    const lowered = value.toLowerCase();
+    if (['true', '1', 'yes', 'y'].includes(lowered)) return true;
+    if (['false', '0', 'no', 'n'].includes(lowered)) return false;
+  }
+  return null;
+}
+
+function coerceNullableText(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text.length ? text : null;
+}
+
+async function fetchPlanBidDetail(id, sellerId) {
+  const params = [id];
+  let sellerFilter = '';
+  if (sellerId) {
+    sellerFilter = ' AND pb.seller_id = $2';
+    params.push(String(sellerId));
+  }
+
+  const { rows } = await db.query(
+    `SELECT
+        pb.id,
+        pb.purchase_request_id,
+        COALESCE(pb.offer_brand, pr.brand)   AS brand,
+        COALESCE(pb.offer_code,  pr.code)    AS code,
+        pb.offer_qty,
+        pb.unit_price_cents,
+        pb.currency,
+        pb.lead_time_days,
+        pb.no_parcel,
+        pb.has_stock,
+        pb.delivery_date,
+        pb.quote_valid_until,
+        pb.status,
+        pb.note,
+        pb.created_at,
+        pb.updated_at
+      FROM public.plan_bids pb
+      LEFT JOIN public.purchase_requests pr ON pr.id = pb.purchase_request_id
+     WHERE pb.id = $1${sellerFilter}`,
+    params
+  );
+
+  return rows[0] || null;
+}
+
 // [E] 구매계획 입찰 목록
 router.get('/plan-bids', async (req, res) => {
   try {
     const prId = req.query.pr_id;
-    if (!prId) return res.status(400).json({ error: 'pr_id required' });
+    const isMine = String(req.query.mine || '') === '1';
 
-    const { mine } = req.query;
-    if (mine) {
-      const sellerId = getUserId(req);
+    if (!isMine && !prId) {
+      return res.status(400).json({ error: 'pr_id required (or use mine=1)' });
+    }
+
+    let sellerId = null;
+    if (isMine) {
+      sellerId = getUserId(req);
       if (!sellerId) return res.status(401).json({ error: 'signin_required' });
+    }
 
+    if (isMine && !prId) {
       const { rows } = await db.query(
-        `SELECT *
-           FROM public.vw_purchase_plan_bids
-          WHERE purchase_request_id = $1
-            AND seller_id = $2
-          ORDER BY created_at DESC`,
+        `SELECT
+            pb.id,
+            pb.purchase_request_id,
+            COALESCE(pb.offer_brand, pr.brand)   AS brand,
+            COALESCE(pb.offer_code,  pr.code)    AS code,
+            pb.offer_qty,
+            pb.unit_price_cents,
+            pb.currency,
+            pb.lead_time_days,
+            pb.no_parcel,
+            pb.has_stock,
+            pb.delivery_date,
+            pb.quote_valid_until,
+            pb.status,
+            pb.note,
+            pb.created_at,
+            pb.updated_at
+          FROM public.plan_bids pb
+          LEFT JOIN public.purchase_requests pr ON pr.id = pb.purchase_request_id
+         WHERE pb.seller_id = $1
+         ORDER BY pb.created_at DESC
+         LIMIT 200`,
+        [String(sellerId)]
+      );
+      return res.json(rows);
+    }
+
+    if (isMine) {
+      const { rows } = await db.query(
+        `SELECT
+            pb.id,
+            pb.purchase_request_id,
+            COALESCE(pb.offer_brand, pr.brand)   AS brand,
+            COALESCE(pb.offer_code,  pr.code)    AS code,
+            pb.offer_qty,
+            pb.unit_price_cents,
+            pb.currency,
+            pb.lead_time_days,
+            pb.no_parcel,
+            pb.has_stock,
+            pb.delivery_date,
+            pb.quote_valid_until,
+            pb.status,
+            pb.note,
+            pb.created_at,
+            pb.updated_at
+          FROM public.plan_bids pb
+          LEFT JOIN public.purchase_requests pr ON pr.id = pb.purchase_request_id
+         WHERE pb.purchase_request_id = $1
+           AND pb.seller_id = $2
+         ORDER BY pb.created_at DESC`,
         [prId, String(sellerId)]
       );
       return res.json(rows);
     }
 
     const { rows } = await db.query(
-      `SELECT *
-         FROM public.vw_purchase_plan_bids
-        WHERE purchase_request_id = $1
-        ORDER BY created_at DESC`,
+      `SELECT
+          pb.id,
+          pb.purchase_request_id,
+          COALESCE(pb.offer_brand, pr.brand)   AS brand,
+          COALESCE(pb.offer_code,  pr.code)    AS code,
+          pb.offer_qty,
+          pb.unit_price_cents,
+          pb.currency,
+          pb.lead_time_days,
+          pb.no_parcel,
+          pb.has_stock,
+          pb.delivery_date,
+          pb.quote_valid_until,
+          pb.status,
+          pb.note,
+          pb.created_at,
+          pb.updated_at
+        FROM public.plan_bids pb
+        LEFT JOIN public.purchase_requests pr ON pr.id = pb.purchase_request_id
+       WHERE pb.purchase_request_id = $1
+       ORDER BY pb.created_at DESC`,
       [prId]
     );
     return res.json(rows);
   } catch (err) {
     console.error('[docs-requests] plan bids error:', err);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// [F] 구매계획 입찰 수정
+router.patch('/plan-bids/:id', async (req, res) => {
+  try {
+    const sellerId = getUserId(req);
+    if (!sellerId) return res.status(401).json({ error: 'signin_required' });
+
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ error: 'id required' });
+
+    const body = req.body || {};
+    let cents = null;
+
+    const rawUnitPriceCents = coerceNullableNumber(body.unit_price_cents);
+    if (rawUnitPriceCents !== null) {
+      cents = Math.round(rawUnitPriceCents);
+    } else {
+      const rawUnitPrice = coerceNullableNumber(body.unit_price);
+      if (rawUnitPrice !== null) {
+        cents = Math.round(rawUnitPrice * 100);
+      }
+    }
+
+    const params = [
+      id,
+      coerceNullableNumber(body.offer_qty),
+      cents,
+      coerceNullableText(body.currency),
+      coerceNullableNumber(body.lead_time_days),
+      coerceNullableBoolean(body.no_parcel),
+      coerceNullableBoolean(body.has_stock),
+      coerceNullableText(body.delivery_date),
+      coerceNullableText(body.quote_valid_until),
+      coerceNullableText(body.offer_brand),
+      coerceNullableText(body.offer_code),
+      coerceNullableText(body.note),
+      String(sellerId),
+    ];
+
+    const { rows } = await db.query(
+      `UPDATE public.plan_bids
+          SET offer_qty = COALESCE($2, offer_qty),
+              unit_price_cents = COALESCE($3, unit_price_cents),
+              currency = COALESCE($4, currency),
+              lead_time_days = COALESCE($5, lead_time_days),
+              no_parcel = COALESCE($6, no_parcel),
+              has_stock = COALESCE($7, has_stock),
+              delivery_date = COALESCE($8, delivery_date),
+              quote_valid_until = COALESCE($9, quote_valid_until),
+              offer_brand = COALESCE($10, offer_brand),
+              offer_code = COALESCE($11, offer_code),
+              note = COALESCE($12, note),
+              updated_at = now()
+        WHERE id = $1 AND seller_id = $13
+        RETURNING id`,
+      params
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+
+    const detail = await fetchPlanBidDetail(id, sellerId);
+    return res.json(detail || rows[0]);
+  } catch (err) {
+    console.error('[docs-requests] plan bid update error:', err);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// [G] 구매계획 입찰 삭제
+router.delete('/plan-bids/:id', async (req, res) => {
+  try {
+    const sellerId = getUserId(req);
+    if (!sellerId) return res.status(401).json({ error: 'signin_required' });
+
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ error: 'id required' });
+
+    const result = await db.query(
+      `DELETE FROM public.plan_bids WHERE id = $1 AND seller_id = $2`,
+      [id, String(sellerId)]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+
+    return res.status(204).end();
+  } catch (err) {
+    console.error('[docs-requests] plan bid delete error:', err);
     return res.status(500).json({ error: 'internal_error' });
   }
 });

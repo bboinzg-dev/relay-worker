@@ -607,8 +607,10 @@ app.get('/api/purchase-plans/items/:id/bids', async (req, res) => {
       SELECT * FROM public.purchase_requests WHERE id = ANY($1::uuid[])
     `, [prIds]);
     const bidsRows = await pool.query(`
-      SELECT * FROM public.bids WHERE purchase_request_id = ANY($1::uuid[])
-      ORDER BY created_at DESC
+      SELECT pb.*, pb.offer_qty AS qty_offer
+        FROM public.plan_bids pb
+       WHERE pb.purchase_request_id = ANY($1::uuid[])
+       ORDER BY pb.created_at DESC
     `, [prIds]);
     const bidsByPr = new Map();
     for (const bid of bidsRows.rows) {

@@ -247,6 +247,77 @@ async function fetchPlanBidDetail(id, sellerKeySet) {
   return rows[0] || null;
 }
 
+// [D+] 구매계획 입찰 생성
+router.post('/plan-bids', async (req, res) => {
+  try {
+    const sellerKeySet = getSellerKeySet(req) || [];
+    if (!sellerKeySet.length) return res.status(401).json({ error: 'signin_required' });
+
+    const sellerId = String(sellerKeySet[0]);
+    const body = req.body || {};
+
+    const prId =
+      body.purchase_request_id ||
+      body.pr_id ||
+      body.purchaseRequestId ||
+      body.pr ||
+      null;
+    if (!prId) {
+      return res.status(400).json({ error: 'purchase_request_id required' });
+    }
+
+    const rawCents = coerceNullableNumber(body.unit_price_cents);
+    const cents =
+      rawCents !== null
+        ? Math.round(rawCents)
+        : (() => {
+            const won = coerceNullableNumber(body.unit_price);
+            return won !== null ? Math.round(won * 100) : null;
+          })();
+    if (cents === null || cents <= 0) {
+      return res.status(400).json({ error: 'unit_price required' });
+    }
+
+    const params = [
+      prId,
+      sellerId,
+      coerceNullableNumber(body.offer_qty),
+      cents,
+      (coerceNullableText(body.currency) || 'KRW').toUpperCase(),
+      coerceNullableNumber(body.lead_time_days),
+      coerceNullableText(body.note),
+      coerceNullableText(body.offer_brand || body.brand),
+      coerceNullableText(body.offer_code || body.code),
+      coerceNullableBoolean(body.no_parcel) ?? false,
+      coerceNullableBoolean(body.has_stock) ?? false,
+      coerceNullableText(body.delivery_date),
+      coerceNullableText(body.quote_valid_until),
+    ];
+
+    const { rows } = await db.query(
+      `INSERT INTO public.plan_bids
+        (purchase_request_id, seller_id,
+         offer_qty, unit_price_cents, currency,
+         lead_time_days, note, offer_brand, offer_code,
+         no_parcel, has_stock, delivery_date, quote_valid_until)
+       VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING id`,
+      params
+    );
+
+    if (!rows.length) {
+      return res.status(500).json({ error: 'failed_to_create' });
+    }
+
+    const created = await fetchPlanBidDetail(rows[0].id, sellerKeySet);
+    return res.status(201).json(created || rows[0]);
+  } catch (err) {
+    console.error('[docs-requests] plan bid create error:', err);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // [E] 구매계획 입찰 목록
 router.get('/plan-bids', async (req, res) => {
   try {

@@ -543,10 +543,10 @@ app.post('/api/purchase-plans/items/:id/rfq', async (req, res) => {
     const allowSubsRaw = body.allow_substitutes;
     const allowSubs = allowSubsRaw === undefined || allowSubsRaw === null ? null : !!allowSubsRaw;
     const notes = body.notes || body.note || null;
-    const summary = `${item.manufacturer || ''} ${item.part_number || ''}`.trim() || null;
+    const rfqTitle = `${item.manufacturer || ''} ${item.part_number || ''}`.trim() || null;
     const pr = await client.query(`
       INSERT INTO public.purchase_requests
-        (tenant_id, buyer_id, brand, code, qty_required, need_by_date, bid_deadline_at, target_unit_price_cents, allow_substitutes, notes, summary, status)
+        (tenant_id, buyer_id, brand, code, qty_required, need_by_date, bid_deadline_at, target_unit_price_cents, allow_substitutes, notes, rfq_title, status)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,true),$10,$11,'open')
       RETURNING *
     `, [
@@ -560,7 +560,7 @@ app.post('/api/purchase-plans/items/:id/rfq', async (req, res) => {
       targetPrice || null,
       allowSubs,
       notes,
-      summary,
+      rfqTitle,
     ]);
     const prRow = pr.rows[0];
     await client.query(`

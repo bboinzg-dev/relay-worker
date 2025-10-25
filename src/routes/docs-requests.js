@@ -237,6 +237,14 @@ async function fetchPlanBidDetail(id, sellerKeySet) {
         pb.quote_valid_until,
         pb.status,
         pb.note,
+        pb.packaging,
+        pb.part_type,
+        pb.mfg_year,
+        pb.is_over_2yrs,
+        pb.manufactured_month,
+        pb.datasheet_url,
+        pb.image_url,
+        pb.offer_is_substitute,
         pb.created_at,
         pb.updated_at
       FROM public.plan_bids pb
@@ -266,6 +274,16 @@ router.post('/plan-bids', async (req, res) => {
       return res.status(400).json({ error: 'purchase_request_id required' });
     }
 
+    const { rows: prRows } = await db.query(
+      `SELECT id, allow_substitutes FROM public.purchase_requests WHERE id = $1`,
+      [prId]
+    );
+    if (!prRows.length) {
+      return res.status(404).json({ error: 'purchase_request_not_found' });
+    }
+
+    const purchaseRequest = prRows[0];
+
     const rawCents = coerceNullableNumber(body.unit_price_cents);
     const cents =
       rawCents !== null
@@ -278,6 +296,23 @@ router.post('/plan-bids', async (req, res) => {
       return res.status(400).json({ error: 'unit_price required' });
     }
 
+    const offerIsSubstitute = coerceNullableBoolean(body.offer_is_substitute);
+    const isSubstitute = offerIsSubstitute === null ? false : offerIsSubstitute;
+    const datasheetUrl = coerceNullableText(body.datasheet_url);
+    const note = coerceNullableText(body.note);
+
+    if (isSubstitute) {
+      if (purchaseRequest.allow_substitutes === false) {
+        return res.status(400).json({ error: 'substitute_not_allowed_for_this_pr' });
+      }
+      if (!datasheetUrl) {
+        return res.status(400).json({ error: 'datasheet_required_for_substitute' });
+      }
+      if (!note) {
+        return res.status(400).json({ error: 'note_required_for_substitute' });
+      }
+    }
+
     const params = [
       prId,
       sellerId,
@@ -285,13 +320,22 @@ router.post('/plan-bids', async (req, res) => {
       cents,
       (coerceNullableText(body.currency) || 'KRW').toUpperCase(),
       coerceNullableNumber(body.lead_time_days),
-      coerceNullableText(body.note),
+      note,
       coerceNullableText(body.offer_brand || body.brand),
       coerceNullableText(body.offer_code || body.code),
       coerceNullableBoolean(body.no_parcel) ?? false,
       coerceNullableBoolean(body.has_stock) ?? false,
       coerceNullableText(body.delivery_date),
       coerceNullableText(body.quote_valid_until),
+      coerceNullableText(body.status) || 'offered',
+      coerceNullableText(body.packaging),
+      coerceNullableText(body.part_type),
+      coerceNullableNumber(body.mfg_year),
+      coerceNullableBoolean(body.is_over_2yrs),
+      coerceNullableText(body.manufactured_month),
+      datasheetUrl,
+      coerceNullableText(body.image_url),
+      offerIsSubstitute,
     ];
 
     const { rows } = await db.query(
@@ -299,9 +343,11 @@ router.post('/plan-bids', async (req, res) => {
         (purchase_request_id, seller_id,
          offer_qty, unit_price_cents, currency,
          lead_time_days, note, offer_brand, offer_code,
-         no_parcel, has_stock, delivery_date, quote_valid_until)
+         no_parcel, has_stock, delivery_date, quote_valid_until,
+         status, packaging, part_type, mfg_year, is_over_2yrs,
+         manufactured_month, datasheet_url, image_url, offer_is_substitute)
        VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
        RETURNING id`,
       params
     );
@@ -361,6 +407,14 @@ router.get('/plan-bids', async (req, res) => {
             pb.quote_valid_until,
             pb.status,
             pb.note,
+            pb.packaging,
+            pb.part_type,
+            pb.mfg_year,
+            pb.is_over_2yrs,
+            pb.manufactured_month,
+            pb.datasheet_url,
+            pb.image_url,
+            pb.offer_is_substitute,
             pb.created_at,
             pb.updated_at
           FROM public.plan_bids pb
@@ -400,6 +454,14 @@ router.get('/plan-bids', async (req, res) => {
             pb.quote_valid_until,
             pb.status,
             pb.note,
+            pb.packaging,
+            pb.part_type,
+            pb.mfg_year,
+            pb.is_over_2yrs,
+            pb.manufactured_month,
+            pb.datasheet_url,
+            pb.image_url,
+            pb.offer_is_substitute,
             pb.created_at,
             pb.updated_at
           FROM public.plan_bids pb
@@ -428,6 +490,14 @@ router.get('/plan-bids', async (req, res) => {
           pb.quote_valid_until,
           pb.status,
           pb.note,
+          pb.packaging,
+          pb.part_type,
+          pb.mfg_year,
+          pb.is_over_2yrs,
+          pb.manufactured_month,
+          pb.datasheet_url,
+          pb.image_url,
+          pb.offer_is_substitute,
           pb.created_at,
           pb.updated_at
         FROM public.plan_bids pb
@@ -465,11 +535,58 @@ router.patch('/plan-bids/:id', async (req, res) => {
       }
     }
 
+    const { rows: existingRows } = await db.query(
+      `SELECT pb.purchase_request_id,
+              pb.offer_is_substitute,
+              pb.note,
+              pb.datasheet_url,
+              pr.allow_substitutes
+         FROM public.plan_bids pb
+         LEFT JOIN public.purchase_requests pr ON pr.id = pb.purchase_request_id
+        WHERE pb.id = $1`,
+      [id]
+    );
+
+    if (!existingRows.length) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+
+    const existing = existingRows[0];
+
+    const offerIsSubstitutePatch = coerceNullableBoolean(body.offer_is_substitute);
+    const finalOfferIsSubstitute =
+      offerIsSubstitutePatch === null ? !!existing.offer_is_substitute : offerIsSubstitutePatch;
+
+    const noteProvided = Object.prototype.hasOwnProperty.call(body, 'note');
+    const noteParam = noteProvided ? coerceNullableText(body.note) : null;
+    const finalNote = noteProvided ? noteParam ?? existing.note : existing.note;
+
+    const datasheetProvided = Object.prototype.hasOwnProperty.call(body, 'datasheet_url');
+    const datasheetParam = datasheetProvided ? coerceNullableText(body.datasheet_url) : null;
+    const finalDatasheet = datasheetProvided ? datasheetParam ?? existing.datasheet_url : existing.datasheet_url;
+
+    if (finalOfferIsSubstitute) {
+      if (existing.allow_substitutes === false) {
+        return res.status(400).json({ error: 'substitute_not_allowed_for_this_pr' });
+      }
+      if (!finalDatasheet) {
+        return res.status(400).json({ error: 'datasheet_required_for_substitute' });
+      }
+      if (!finalNote) {
+        return res.status(400).json({ error: 'note_required_for_substitute' });
+      }
+    }
+
+    const currencyParam = (() => {
+      const cur = coerceNullableText(body.currency);
+      return cur ? cur.toUpperCase() : null;
+    })();
+
     const params = [
       id,
       coerceNullableNumber(body.offer_qty),
       cents,
-      coerceNullableText(body.currency),
+      currencyParam,
       coerceNullableNumber(body.lead_time_days),
       coerceNullableBoolean(body.no_parcel),
       coerceNullableBoolean(body.has_stock),
@@ -477,13 +594,22 @@ router.patch('/plan-bids/:id', async (req, res) => {
       coerceNullableText(body.quote_valid_until),
       coerceNullableText(body.offer_brand),
       coerceNullableText(body.offer_code),
-      coerceNullableText(body.note),
+      noteProvided ? noteParam : null,
+      coerceNullableText(body.status),
+      coerceNullableText(body.packaging),
+      coerceNullableText(body.part_type),
+      coerceNullableNumber(body.mfg_year),
+      coerceNullableBoolean(body.is_over_2yrs),
+      coerceNullableText(body.manufactured_month),
+      datasheetProvided ? datasheetParam : null,
+      coerceNullableText(body.image_url),
+      offerIsSubstitutePatch,
       sellerKeySet,
     ];
 
     const { rows } = await db.query(
       `WITH me AS (
-          SELECT UNNEST($13::text[]) AS k
+          SELECT UNNEST($22::text[]) AS k
         ), mapped AS (
           SELECT k FROM me
           UNION
@@ -503,6 +629,15 @@ router.patch('/plan-bids/:id', async (req, res) => {
                offer_brand = COALESCE($10, offer_brand),
                offer_code = COALESCE($11, offer_code),
                note = COALESCE($12, note),
+               status = COALESCE($13, status),
+               packaging = COALESCE($14, packaging),
+               part_type = COALESCE($15, part_type),
+               mfg_year = COALESCE($16, mfg_year),
+               is_over_2yrs = COALESCE($17, is_over_2yrs),
+               manufactured_month = COALESCE($18, manufactured_month),
+               datasheet_url = COALESCE($19, datasheet_url),
+               image_url = COALESCE($20, image_url),
+               offer_is_substitute = COALESCE($21, offer_is_substitute),
                updated_at = now()
          WHERE id = $1
            AND seller_id IN (SELECT k FROM mapped)

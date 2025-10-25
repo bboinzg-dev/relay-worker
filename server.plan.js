@@ -529,15 +529,25 @@ app.post('/api/purchase-plans/items/:id/rfq', async (req, res) => {
     const item = itemRes.rows[0];
     const qty = coerceInt(body.qty || body.qty_required, item.required_qty || 0);
     if (!qty || qty <= 0) throw new Error('qty_required must be > 0');
-    const needBy = body.need_by_date || body.quote_deadline || item.quote_deadline || null;
+    const needBy = body.need_by_date
+      || body.needByDate
+      || item.delivery_deadline
+      || null;
+    const bidDeadline = body.bid_deadline_at
+      || body.bidDeadlineAt
+      || body.quote_deadline
+      || body.quoteDeadline
+      || item.quote_deadline
+      || null;
     const targetPrice = body.target_unit_price_cents || null;
     const allowSubsRaw = body.allow_substitutes;
     const allowSubs = allowSubsRaw === undefined || allowSubsRaw === null ? null : !!allowSubsRaw;
     const notes = body.notes || body.note || null;
+    const summary = `${item.manufacturer || ''} ${item.part_number || ''}`.trim() || null;
     const pr = await client.query(`
       INSERT INTO public.purchase_requests
-        (tenant_id, buyer_id, brand, code, qty_required, need_by_date, target_unit_price_cents, allow_substitutes, notes, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,true),$9,'open')
+        (tenant_id, buyer_id, brand, code, qty_required, need_by_date, bid_deadline_at, target_unit_price_cents, allow_substitutes, notes, summary, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,true),$10,$11,'open')
       RETURNING *
     `, [
       tenant,
@@ -546,9 +556,11 @@ app.post('/api/purchase-plans/items/:id/rfq', async (req, res) => {
       item.part_number,
       qty,
       needBy || null,
+      bidDeadline || null,
       targetPrice || null,
       allowSubs,
       notes,
+      summary,
     ]);
     const prRow = pr.rows[0];
     await client.query(`
